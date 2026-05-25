@@ -104,10 +104,12 @@ class ToolRouter:
     """
 
     _TOOL_ICONS: Dict[str, str] = {
-        "chimerax":    "🎨",
-        "camsol":      "💧",
-        "esm":         "🧬",
-        "proteinmpnn": "🔬",
+        "chimerax":      "🎨",
+        "camsol":        "💧",
+        "esm":           "🧬",
+        "proteinmpnn":   "🔬",
+        "rosetta":       "⚗️",
+        "mutation_scan": "🔬⚗️",
     }
 
     def __init__(
@@ -122,6 +124,8 @@ class ToolRouter:
         self._camsol_bridge:      Optional[Any] = None
         self._esm_bridge:         Optional[Any] = None
         self._proteinmpnn_bridge: Optional[Any] = None
+        self._rosetta_bridge:     Optional[Any] = None
+        self._mutation_scanner:   Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -174,6 +178,21 @@ class ToolRouter:
             return f"ESM-2 evolutionary conservation — #{mid}"
         if tool == "proteinmpnn":
             return "ProteinMPNN sequence redesign (stub)"
+        if tool == "rosetta":
+            inp  = tool_inputs.get("rosetta", {})
+            mid  = inp.get("model_id") or self._first_model_id()
+            muts = inp.get("mutations", [])
+            return (
+                f"Rosetta ddG — #{mid}, "
+                f"{len(muts)} mutation(s)"
+                if muts else f"Rosetta ddG — #{mid}"
+            )
+        if tool == "mutation_scan":
+            inp   = tool_inputs.get("mutation_scan", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            focus = inp.get("focus", "solubility")
+            return f"CamSol + ESM + Rosetta scan — #{mid} chain {chain} [{focus}]"
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -259,11 +278,16 @@ class ToolRouter:
                 return self._run_esm(inputs)
             if tool == "proteinmpnn":
                 return self._run_proteinmpnn(inputs)
+            if tool == "rosetta":
+                return self._run_rosetta(inputs)
+            if tool == "mutation_scan":
+                return self._run_mutation_scan(inputs)
             return ToolStepResult(
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
-                    "Available: chimerax, camsol, esm, proteinmpnn."
+                    "Available: chimerax, camsol, esm, proteinmpnn, "
+                    "rosetta, mutation_scan."
                 ),
             )
         except Exception as exc:
@@ -313,6 +337,132 @@ class ToolRouter:
         bridge = self._get_proteinmpnn_bridge()
         return bridge.analyze(inputs, session=self.session)
 
+    def _run_rosetta(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        bridge    = self._get_rosetta_bridge()
+        model_id  = inputs.get("model_id") or self._first_model_id()
+        mutations = inputs.get("mutations", [])
+        chain     = inputs.get("chain")
+
+        if not mutations:
+            return ToolStepResult(
+                tool="rosetta", success=False,
+                error=(
+                    "No mutations supplied to rosetta tool.\n"
+                    "  Provide tool_inputs: {\"rosetta\": {\"mutations\": "
+                    "[{\"chain\": \"A\", \"position\": 82, \"from_aa\": \"V\", "
+                    "\"to_aa\": \"A\"}]}}"
+                ),
+            )
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="rosetta", success=False,
+                error=(
+                    "Rosetta requires a local PDB file.\n"
+                    "  Load the structure from a local .pdb file, or ensure\n"
+                    "  internet access so StructureBot can download it from RCSB."
+                ),
+            )
+
+        return bridge.analyze(
+            pdb_path  = pdb_path,
+            mutations = mutations,
+            session   = self.session,
+            model_id  = model_id,
+            chain     = chain,
+        )
+
+    def _run_mutation_scan(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain", "A")
+        focus    = inputs.get("focus", "solubility")
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+
+        if not sequence:
+            return ToolStepResult(
+                tool="mutation_scan", success=False,
+                error=(
+                    "No amino-acid sequence available for mutation scan.\n"
+                    "  Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+        if not pdb_path:
+            return ToolStepResult(
+                tool="mutation_scan", success=False,
+                error=(
+                    "Mutation scan requires a local PDB file for Rosetta ddG.\n"
+                    "  StructureBot will attempt to download from RCSB if the\n"
+                    "  structure has a 4-letter PDB ID and internet is available."
+                ),
+            )
+
+        # Build filters from inputs
+        filters: Dict[str, Any] = {}
+        for key in ("camsol_threshold", "esm_threshold", "max_candidates",
+                    "candidates_per_pos", "binding_site_residues",
+                    "w_ddg", "w_sol", "w_tol"):
+            if key in inputs:
+                filters[key] = inputs[key]
+        filters["focus"] = focus
+
+        from mutation_scanner import MutationScanner
+
+        def _progress(msg: str) -> None:
+            pass  # progress shown by main.py via status_callback
+
+        scanner = MutationScanner(
+            session   = self.session,
+            model_id  = model_id,
+            progress_callback = _progress,
+        )
+
+        import time as _time
+        t0      = _time.perf_counter()
+        results = scanner.scan(
+            pdb_path = pdb_path,
+            chain_id = chain,
+            sequence = sequence,
+            filters  = filters,
+        )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if not results:
+            return ToolStepResult(
+                tool      = "mutation_scan",
+                success   = True,
+                data      = {"candidates": [], "count": 0},
+                summary   = "Mutation scan complete — no candidates met the criteria.",
+                elapsed_ms = elapsed_ms,
+            )
+
+        # Generate visualization for top 5
+        viz_cmds, viz_exps = scanner.generate_chimerax_commands(results, top_n=5)
+
+        top = results[0]
+        summary = (
+            f"Mutation scan: {len(results)} candidate(s) found. "
+            f"Top: {top['from_aa']}{top['position']}{top['to_aa']} "
+            f"(score={top['combined_score']:+.2f}, "
+            f"ddG={top['ddg']:+.2f} kcal/mol, "
+            f"solubility Δ={top['solubility_delta']:+.2f})"
+        )
+
+        return ToolStepResult(
+            tool             = "mutation_scan",
+            success          = True,
+            data             = {
+                "candidates": results,
+                "count":      len(results),
+                "top":        top,
+            },
+            viz_commands     = viz_cmds,
+            viz_explanations = viz_exps,
+            summary          = summary,
+            elapsed_ms       = elapsed_ms,
+        )
+
     # ── Bridge accessors (lazy init) ───────────────────────────────────────────
 
     def _get_camsol_bridge(self):
@@ -332,6 +482,58 @@ class ToolRouter:
             from proteinmpnn_bridge import ProteinMPNNBridge
             self._proteinmpnn_bridge = ProteinMPNNBridge()
         return self._proteinmpnn_bridge
+
+    def _get_rosetta_bridge(self):
+        if self._rosetta_bridge is None:
+            from rosetta_bridge import RosettaBridge
+            self._rosetta_bridge = RosettaBridge()
+        return self._rosetta_bridge
+
+    # ── PDB file retrieval ────────────────────────────────────────────────────
+
+    def _ensure_pdb_file(self, model_id: str) -> Optional[str]:
+        """
+        Get or download the PDB file for a loaded structure.
+
+        Priority:
+          1. session.structures[model_id]["path"] (if file exists locally)
+          2. Download from RCSB if the structure name is a 4-char PDB ID
+             → cached to cache/<ID>.pdb
+
+        Returns the local path string, or None on failure.
+        """
+        info = self.session.get_structure(model_id)
+        if not info:
+            return None
+
+        # Check for a cached local path
+        path = info.get("path")
+        if path and Path(path).is_file():
+            return path
+
+        # Try downloading from RCSB for known PDB IDs
+        name = info.get("name", "")
+        if not re.match(r"^[A-Za-z0-9]{4}$", name):
+            return None
+
+        cache_dir  = Path("cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local_path = cache_dir / f"{name.upper()}.pdb"
+
+        if local_path.is_file():
+            info["path"] = str(local_path)
+            return str(local_path)
+
+        try:
+            import requests
+            url  = f"https://files.rcsb.org/download/{name.upper()}.pdb"
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            local_path.write_bytes(resp.content)
+            info["path"] = str(local_path)
+            return str(local_path)
+        except Exception:
+            return None
 
     # ── Sequence retrieval ─────────────────────────────────────────────────────
 
@@ -458,15 +660,37 @@ class ToolRouter:
         """Return {tool_name: status_string} for all tools."""
         status: Dict[str, str] = {"chimerax": "active"}
 
-        for name, module in [("camsol_bridge", "CamsolBridge"),
-                              ("esm_bridge",   "EsmBridge")]:
+        for name in ("camsol_bridge", "esm_bridge"):
             try:
                 __import__(name)
                 status[name.replace("_bridge", "")] = "active"
             except ImportError:
                 status[name.replace("_bridge", "")] = "module not found"
 
-        status["proteinmpnn"] = "stub — not yet configured"
+        status["proteinmpnn"] = "stub — set PROTEINMPNN_DIR to enable"
+
+        # Rosetta: report which backend is configured
+        try:
+            from rosetta_bridge import RosettaBridge, _select_backend
+            backend = _select_backend()
+            import os
+            api_key = os.environ.get("ROBETTA_API_KEY", "").strip()
+            if backend == "pyrosetta":
+                status["rosetta"] = "PyRosetta (local) — active"
+            elif api_key:
+                status["rosetta"] = "Robetta web API — active"
+            else:
+                status["rosetta"] = "Robetta web API — set ROBETTA_API_KEY to enable"
+        except ImportError:
+            status["rosetta"] = "module not found"
+
+        # mutation_scan depends on rosetta_bridge + mutation_scanner
+        try:
+            __import__("mutation_scanner")
+            status["mutation_scan"] = "active (depends on rosetta)"
+        except ImportError:
+            status["mutation_scan"] = "module not found"
+
         return status
 
     def __repr__(self) -> str:

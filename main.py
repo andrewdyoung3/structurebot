@@ -85,6 +85,8 @@ BANNER = """\
     [cyan]Save a publication-quality image to my desktop as figure1.png[/cyan]
     [cyan]Run CamSol solubility analysis on the loaded structure[/cyan]
     [cyan]Color the structure by evolutionary conservation (ESM-2)[/cyan]
+    [cyan]Calculate ddG for mutation V82A in chain A[/cyan]
+    [cyan]Suggest mutations to improve solubility of chain A[/cyan]
 
   [dim]Type [bold]help[/bold] for more examples or [bold]quit[/bold] to exit.[/dim]
 """
@@ -124,9 +126,17 @@ HELP_TEXT = """
   color by conservation — conserved residues blue, variable red
   open 1HSG and show aggregation-prone patches
 
+[bold]Protein engineering[/bold]
+  calculate ddG for mutation V82A in chain A
+  is mutation L75K stabilising?
+  suggest mutations to improve solubility of chain A
+  what mutations would reduce aggregation?
+  run the full engineering pipeline on the loaded structure
+
 [bold]Special commands[/bold]
   [cmd]history[/cmd]           show last 15 commands
   [cmd]state[/cmd]             dump current session state
+  [cmd]jobs[/cmd]              show status of pending Robetta ddG jobs
   [cmd]undo[/cmd]              undo the last ChimeraX action
   [cmd]clear[/cmd]             close all models, reset session
   [cmd]save session NAME[/cmd] save ChimeraX session + state to sessions/NAME
@@ -271,6 +281,8 @@ class StructureBot:
                 self._cmd_reset()
             elif lower == "help":
                 self._cmd_help()
+            elif lower == "jobs":
+                self._cmd_jobs()
             elif re.match(r"^save session\b", lower):
                 name = user_input.split(maxsplit=2)[2] if len(user_input.split()) > 2 else "default"
                 self._cmd_save_session(name)
@@ -715,6 +727,56 @@ class StructureBot:
         if json_path.is_file():
             self.session = SessionState.load(str(json_path))
             console.print(f"[ok]✓[/ok] Restored session state from {json_path}")
+
+    def _cmd_jobs(self) -> None:
+        """Show all Robetta / PyRosetta jobs tracked in this session."""
+        jobs = self.session.list_rosetta_jobs()
+        if not jobs:
+            console.print("[dim]No Rosetta jobs in this session.[/dim]")
+            return
+
+        console.print(Rule("[bold]⚗️  Rosetta Jobs[/bold]"))
+        table = Table(border_style="magenta", show_lines=True)
+        table.add_column("Job ID",    style="bold cyan", no_wrap=True)
+        table.add_column("Backend",   style="dim",       width=10)
+        table.add_column("Status",    width=12)
+        table.add_column("Mutations", width=10)
+        table.add_column("Submitted", style="dim")
+
+        for jid, job in jobs.items():
+            status  = job.get("status", "?")
+            backend = job.get("backend", "?")
+            nmut    = len(job.get("mutations", []))
+            ts      = job.get("submitted_at", "?")
+
+            if status == "completed":
+                status_str = f"[ok]{escape(status)}[/ok]"
+            elif status in ("failed", "error"):
+                status_str = f"[err]{escape(status)}[/err]"
+            else:
+                status_str = f"[warn]{escape(status)}[/warn]"
+
+            table.add_row(
+                escape(jid),
+                escape(backend),
+                status_str,
+                str(nmut),
+                escape(ts),
+            )
+
+        console.print(table)
+
+        # Show results for completed jobs
+        for jid, job in jobs.items():
+            if job.get("status") == "completed" and job.get("results"):
+                console.print(f"\n  [bold]Results for job #{escape(jid)}:[/bold]")
+                scores = job["results"]
+                for mut_key, ddg in sorted(scores.items(), key=lambda x: x[1]):
+                    colour = "cyan" if ddg < 0 else "yellow" if ddg < 1.0 else "red"
+                    console.print(
+                        f"    [{colour}]{escape(mut_key)}[/{colour}]  "
+                        f"ΔΔG = {ddg:+.3f} kcal/mol"
+                    )
 
     def _cmd_help(self) -> None:
         console.print(HELP_TEXT)

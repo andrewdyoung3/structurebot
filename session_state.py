@@ -188,6 +188,11 @@ class SessionState:
         self.command_history: List[Dict[str, Any]] = []
         # tool_results[tool_name][model_id] = result_data_dict
         self.tool_results:   Dict[str, Dict[str, Any]] = {}
+        # Rosetta / Robetta job tracking (persisted so jobs survive restarts)
+        # job_id → {status, mutations, pdb_path, backend, submitted_at, results?}
+        self.rosetta_jobs:   Dict[str, Dict[str, Any]] = {}
+        # Full mutation-scan results per model: model_id → scan result list
+        self.scan_results:   Dict[str, Dict[str, Any]] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -286,6 +291,67 @@ class SessionState:
         else:
             self.tool_results.clear()
 
+    # ── Rosetta job tracking ──────────────────────────────────────────────────
+
+    def add_rosetta_job(
+        self,
+        job_id:   str,
+        job_data: Dict[str, Any],
+    ) -> None:
+        """
+        Register a newly submitted Robetta / PyRosetta job.
+
+        job_data keys:
+          mutations    : list of {chain, position, from_aa, to_aa}
+          pdb_path     : local path of the PDB file submitted
+          backend      : "robetta" | "pyrosetta"
+          submitted_at : ISO timestamp string
+          status       : initial status string (e.g. "submitted")
+        """
+        self.rosetta_jobs[str(job_id)] = dict(job_data)
+
+    def get_rosetta_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Return the stored data for a job, or None if not found."""
+        return self.rosetta_jobs.get(str(job_id))
+
+    def update_rosetta_job(
+        self,
+        job_id:  str,
+        updates: Dict[str, Any],
+    ) -> None:
+        """Merge *updates* into an existing job record.  Silent no-op if not found."""
+        entry = self.rosetta_jobs.get(str(job_id))
+        if entry is not None:
+            entry.update(updates)
+
+    def list_rosetta_jobs(self) -> Dict[str, Dict[str, Any]]:
+        """Return a copy of all tracked job records."""
+        return dict(self.rosetta_jobs)
+
+    def clear_rosetta_job(self, job_id: str) -> None:
+        """Remove a single job record."""
+        self.rosetta_jobs.pop(str(job_id), None)
+
+    # ── Scan result tracking ──────────────────────────────────────────────────
+
+    def add_scan_result(
+        self,
+        model_id: str,
+        data:     Dict[str, Any],
+    ) -> None:
+        """Store the output of a MutationScanner.scan() call."""
+        self.scan_results[str(model_id)] = {
+            "data":      data,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def get_scan_result(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return the most recent scan result for a model, or None."""
+        entry = self.scan_results.get(str(model_id))
+        if entry:
+            return entry.get("data")
+        return None
+
     # ── Selection tracking ────────────────────────────────────────────────────
 
     def save_selection(self, label: str, spec: str) -> None:
@@ -380,8 +446,36 @@ class SessionState:
                         n = len(dat.get("conservation", {}))
                         m = dat.get("mean_conservation", 0)
                         lines.append(f"  esm     #{mid}  [{ts}]  {n} residues, mean cons {m:.2f}")
+                    elif tool == "rosetta":
+                        n = len(dat.get("ddg_scores", {}))
+                        lines.append(f"  rosetta #{mid}  [{ts}]  {n} mutations scored")
                     else:
                         lines.append(f"  {tool:<8} #{mid}  [{ts}]")
+
+        if self.scan_results:
+            lines.append("\nMutation scan results:")
+            for mid, entry in self.scan_results.items():
+                ts  = entry.get("timestamp", "?")
+                dat = entry.get("data", {})
+                n   = len(dat) if isinstance(dat, list) else "?"
+                lines.append(f"  scan    #{mid}  [{ts}]  {n} ranked candidates")
+
+        if self.rosetta_jobs:
+            pending = {
+                jid: job for jid, job in self.rosetta_jobs.items()
+                if job.get("status") not in ("completed", "failed", "error")
+            }
+            if pending:
+                lines.append(f"\nPending Rosetta jobs ({len(pending)}):")
+                for jid, job in pending.items():
+                    backend = job.get("backend", "?")
+                    status  = job.get("status", "?")
+                    ts      = job.get("submitted_at", "?")
+                    nmut    = len(job.get("mutations", []))
+                    lines.append(
+                        f"  job #{jid}  [{backend}]  {status}  "
+                        f"{nmut} mutation(s)  submitted {ts}"
+                    )
 
         recent = self.get_recent_history(5)
         if recent:
@@ -405,6 +499,8 @@ class SessionState:
             "applied_styles":    self.applied_styles,
             "command_history":   self.command_history,
             "tool_results":      self.tool_results,
+            "rosetta_jobs":      self.rosetta_jobs,
+            "scan_results":      self.scan_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -423,6 +519,8 @@ class SessionState:
         state.applied_styles   = data.get("applied_styles", [])
         state.command_history  = data.get("command_history", [])
         state.tool_results     = data.get("tool_results",  {})
+        state.rosetta_jobs     = data.get("rosetta_jobs",  {})
+        state.scan_results     = data.get("scan_results",  {})
         return state
 
     def __repr__(self) -> str:

@@ -169,46 +169,100 @@ class _EsmBackend:
         if self._model is not None:
             return
 
-        # ── Try fair-esm ──────────────────────────────────────────────────────
-        try:
-            import esm as esm_lib
-            print(
-                f"\n[ESM] Loading {self.model_name} via fair-esm "
-                f"(~30 MB download on first use)…"
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        # ── Ensure venv site-packages takes priority over any global install ─
+        #
+        # On Windows, pip install --user drops packages into
+        #   %APPDATA%\Python\PythonXYZ\site-packages
+        # which may appear on sys.path *before* the venv's site-packages,
+        # causing the wrong (torch-less) copy of fair-esm to be loaded.
+        #
+        # We locate the venv relative to this file, and if any AppData path
+        # precedes it we move the venv path to position 0 so the venv's
+        # packages always win.  We also evict any already-cached 'esm.*'
+        # modules so the re-import isn't short-circuited by sys.modules.
+
+        _project_root   = Path(__file__).resolve().parent
+        _venv_site_pkgs = _project_root / "venv" / "Lib" / "site-packages"
+        _appdata_marker = str(Path.home() / "AppData" / "Roaming" / "Python")
+
+        if _venv_site_pkgs.is_dir():
+            _venv_str = str(_venv_site_pkgs)
+
+            # Case-insensitive path lookup (Windows paths are not case-sensitive)
+            _venv_idx = next(
+                (i for i, p in enumerate(sys.path)
+                 if Path(p).resolve() == _venv_site_pkgs),
+                None,
             )
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                loader = getattr(esm_lib.pretrained, self.model_name, None)
-                if loader is None:
-                    raise AttributeError(f"Unknown model: {self.model_name}")
-                self._model, self._alphabet = loader()
-            self._model.eval()
-            self._backend = "fair_esm"
-            print("[ESM] Model loaded (fair-esm).")
-            return
-        except ImportError:
-            pass
-        except Exception as exc:
-            print(f"[ESM] fair-esm load failed: {exc}. Trying transformers…")
+            _appdata_idxs = [
+                i for i, p in enumerate(sys.path)
+                if _appdata_marker.lower() in p.lower()
+            ]
+
+            _needs_fix = (
+                _venv_idx is None                                       # not on path at all
+                or (_appdata_idxs and min(_appdata_idxs) < _venv_idx)  # AppData wins the race
+            )
+
+            if _needs_fix:
+                # Remove the duplicate entry first (avoids double entries)
+                if _venv_idx is not None:
+                    sys.path.pop(_venv_idx)
+                sys.path.insert(0, _venv_str)
+
+                # Evict every cached esm.* module so that the subsequent
+                # `import esm` re-resolves against the corrected sys.path
+                # rather than returning the already-loaded global copy.
+                for _mod in [m for m in list(sys.modules)
+                             if m == "esm" or m.startswith("esm.")]:
+                    del sys.modules[_mod]
+
+        # ── Try fair-esm ──────────────────────────────────────────────────────
+        if importlib.util.find_spec("esm") is not None:
+            try:
+                import esm as esm_lib
+                print(
+                    f"\n[ESM] Loading {self.model_name} via fair-esm "
+                    f"(~30 MB download on first use)…"
+                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    loader = getattr(esm_lib.pretrained, self.model_name, None)
+                    if loader is None:
+                        raise AttributeError(f"Unknown model: {self.model_name}")
+                    self._model, self._alphabet = loader()
+                self._model.eval()
+                self._backend = "fair_esm"
+                print("[ESM] Model loaded (fair-esm).")
+                return
+            except ImportError:
+                pass
+            except Exception as exc:
+                print(f"[ESM] fair-esm load failed: {exc}. Trying transformers…")
 
         # ── Try transformers (HuggingFace) ────────────────────────────────────
-        try:
-            from transformers import EsmForMaskedLM, EsmTokenizer  # type: ignore
-            hf_name = f"facebook/{self.model_name}"
-            print(
-                f"\n[ESM] Loading {hf_name} via transformers "
-                f"(~30 MB download on first use)…"
-            )
-            self._tokenizer = EsmTokenizer.from_pretrained(hf_name)
-            self._model     = EsmForMaskedLM.from_pretrained(hf_name)
-            self._model.eval()
-            self._backend   = "transformers"
-            print("[ESM] Model loaded (transformers).")
-            return
-        except ImportError:
-            pass
-        except Exception as exc:
-            print(f"[ESM] transformers load failed: {exc}.")
+        if importlib.util.find_spec("transformers") is not None:
+            try:
+                from transformers import EsmForMaskedLM, EsmTokenizer  # type: ignore
+                hf_name = f"facebook/{self.model_name}"
+                print(
+                    f"\n[ESM] Loading {hf_name} via transformers "
+                    f"(~30 MB download on first use)…"
+                )
+                self._tokenizer = EsmTokenizer.from_pretrained(hf_name)
+                self._model     = EsmForMaskedLM.from_pretrained(hf_name)
+                self._model.eval()
+                self._backend   = "transformers"
+                print("[ESM] Model loaded (transformers).")
+                return
+            except ImportError:
+                pass
+            except Exception as exc:
+                print(f"[ESM] transformers load failed: {exc}.")
 
         raise ImportError(
             "ESM-2 requires either 'fair-esm' or 'transformers'.\n"

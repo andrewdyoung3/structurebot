@@ -56,6 +56,25 @@ def desktop_path() -> str:
     p = Path(f"C:/Users/{username}/Desktop")
     return p.as_posix()  # forward slashes — ChimeraX save prefers them
 
+# ── Rosetta / Robetta ─────────────────────────────────────────────────────────
+
+# Which Rosetta backend to prefer: "auto" | "pyrosetta" | "robetta"
+# "auto" tries PyRosetta first, falls back to Robetta if unavailable.
+ROSETTA_BACKEND: str = os.environ.get("ROSETTA_BACKEND", "auto").strip()
+
+# Robetta web API (https://robetta.bakerlab.org — free academic registration)
+# API key obtained from your profile page after registration.
+ROBETTA_EMAIL:   str = os.environ.get("ROBETTA_EMAIL",   "").strip()
+ROBETTA_API_KEY: str = os.environ.get("ROBETTA_API_KEY", "").strip()
+
+# Set PYROSETTA_AVAILABLE=true in .env.local when PyRosetta is installed.
+# Python 3.14 wheels are not yet released; this is False by default.
+# See rosetta_bridge.py for installation instructions.
+PYROSETTA_AVAILABLE: bool = (
+    os.environ.get("PYROSETTA_AVAILABLE", "").strip().lower()
+    in ("1", "true", "yes")
+)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 
