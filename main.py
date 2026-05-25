@@ -55,6 +55,7 @@ except ImportError:
 from chimerax_bridge import ChimeraXBridge
 from translator import CommandTranslator
 from session_state import SessionState
+from tool_router import ToolRouter
 
 # ── Console ───────────────────────────────────────────────────────────────────
 
@@ -82,6 +83,8 @@ BANNER = """\
     [cyan]Show the ligand as spheres and color it by element[/cyan]
     [cyan]Find all residues within 4 Å of the ligand[/cyan]
     [cyan]Save a publication-quality image to my desktop as figure1.png[/cyan]
+    [cyan]Run CamSol solubility analysis on the loaded structure[/cyan]
+    [cyan]Color the structure by evolutionary conservation (ESM-2)[/cyan]
 
   [dim]Type [bold]help[/bold] for more examples or [bold]quit[/bold] to exit.[/dim]
 """
@@ -113,6 +116,13 @@ HELP_TEXT = """
 [bold]Export[/bold]
   save an image to my desktop called figure1.png at 3000×3000
   save a publication-quality image with a white background
+
+[bold]Computational analysis[/bold]
+  run CamSol solubility analysis on chain A
+  color the structure by aggregation-prone regions
+  analyze evolutionary conservation with ESM-2
+  color by conservation — conserved residues blue, variable red
+  open 1HSG and show aggregation-prone patches
 
 [bold]Special commands[/bold]
   [cmd]history[/cmd]           show last 15 commands
@@ -151,6 +161,7 @@ class StructureBot:
 
         self.translator = CommandTranslator()
         self.session    = SessionState.load(SESSION_FILE) if resume else SessionState()
+        self.router     = ToolRouter(self.bridge, self.session)
 
         self.auto_proceed       = auto_proceed
         self.auto_proceed_delay = auto_proceed_delay
@@ -276,7 +287,10 @@ class StructureBot:
         with console.status("[cyan]Translating…[/cyan]"):
             result = self.translator.translate(user_input, self.session)
 
-        # 2. Clarification loop (max 2 rounds)
+        # 2. Route (augment with tool pipeline info; no execution yet)
+        result = self.router.route(result)
+
+        # 3. Clarification loop (max 2 rounds)
         for _ in range(2):
             q = result.get("clarification_needed")
             if not q:
@@ -289,6 +303,7 @@ class StructureBot:
             self.translator.add_clarification(answer)
             with console.status("[cyan]Retranslating…[/cyan]"):
                 result = self.translator.translate(answer, self.session)
+            result = self.router.route(result)
 
         if result.get("clarification_needed"):
             console.print("[warn]Still ambiguous — please rephrase.[/warn]")
@@ -298,33 +313,87 @@ class StructureBot:
         explanations: List[str] = result.get("explanations", [])
         warnings:     List[str] = result.get("warnings", [])
         confidence:   str       = result.get("confidence", "medium")
+        has_extra     = result.get("has_extra_tools", False)
+        tools_needed: List[str] = result.get("tools_needed", ["chimerax"])
 
-        if not commands:
+        # Require at least commands OR extra tools
+        if not commands and not has_extra:
             console.print("[warn]No commands generated.[/warn]")
             return
 
-        # 3. Show warnings
+        # 4. Show warnings
         for w in warnings:
             console.print(f"[warn]⚠ {escape(w)}[/warn]")
 
-        # 4. Preview table
+        # 5. Preview
         console.print()
-        self._show_preview(commands, explanations, confidence)
+        if has_extra:
+            self._show_tool_pipeline(result)
+        if commands:
+            self._show_preview(commands, explanations, confidence)
+        elif has_extra:
+            # No initial ChimeraX commands — tool output will generate viz
+            console.print(
+                "[dim]  (visualization commands will be generated after "
+                "the tool completes)[/dim]"
+            )
 
-        # 5. Confirm / auto-proceed / edit
+        # 6. Confirm / auto-proceed / edit
         should_execute = self._confirm_execution(confidence)
         if should_execute is None:
             return  # cancelled
-        if should_execute == "edit":
+        if should_execute == "edit" and commands:
             commands = self._edit_commands(commands)
             if not commands:
                 return
 
-        # 6. Execute
         console.print()
-        success, failed_cmd, error_msg = self._execute_commands(commands)
 
-        # 7. Auto-fix on first failure (once only)
+        # 7. Execute initial ChimeraX commands (if any)
+        all_commands = list(commands)
+        success      = True
+        failed_cmd:  Optional[str] = None
+        error_msg:   Optional[str] = None
+
+        if commands:
+            success, failed_cmd, error_msg = self._execute_commands(commands)
+
+        # 8. Execute extra tools (CamSol, ESM, etc.) if initial phase succeeded
+        if success and has_extra:
+            def _status(msg: str) -> None:
+                console.print(f"  [info]{msg}[/info]")
+
+            with console.status("[cyan]Running computational tools…[/cyan]"):
+                result = self.router.execute(result, status_callback=_status)
+
+            # Show tool summaries
+            summaries = result.get("tool_summaries", {})
+            for tool, summary in summaries.items():
+                icon = ToolRouter._TOOL_ICONS.get(tool, "⚙️")
+                if result.get("pipeline_success"):
+                    console.print(f"  [ok]✓[/ok] {icon} {escape(summary)}")
+                else:
+                    err = result.get("pipeline_error", "unknown error")
+                    console.print(f"  [err]✗[/err] {icon} {tool}: {escape(err)}")
+
+            if not result.get("pipeline_success"):
+                err = result.get("pipeline_error", "")
+                console.print(f"\n[err]Tool pipeline failed: {escape(err[:120])}[/err]")
+                # Keep going — viz commands might still be partially available
+
+            # 9. Execute visualization commands generated by the tools
+            viz_cmds = result.get("all_viz_commands", [])
+            viz_exps = result.get("all_viz_explanations", [])
+            if viz_cmds:
+                console.print()
+                console.print("[dim]  Applying visualization…[/dim]")
+                self._show_preview(viz_cmds, viz_exps, "high")
+                viz_ok, viz_failed, viz_err = self._execute_commands(viz_cmds)
+                if not viz_ok:
+                    console.print(f"[warn]  Visualization command failed: {escape(viz_err or '')}[/warn]")
+                all_commands.extend(viz_cmds)
+
+        # 10. Auto-fix on first failure (once only, ChimeraX commands only)
         if not success and not is_retry and failed_cmd and error_msg:
             console.print("\n[warn]Asking Claude for a corrected command…[/warn]")
             fix = self.translator.translate_error_fix(failed_cmd, error_msg, self.session)
@@ -340,13 +409,30 @@ class StructureBot:
                 if choice in ("y", "yes", ""):
                     fix_success, _, _ = self._execute_commands(fix_cmds)
                     if fix_success:
-                        commands = commands + fix_cmds
+                        all_commands.extend(fix_cmds)
 
-        # 8. Update state
-        self.session.add_to_history(user_input, commands, success=success, error=error_msg)
-        self._maybe_update_structure_state(commands)
+        # 11. Update state
+        self.session.add_to_history(user_input, all_commands, success=success, error=error_msg)
+        self._maybe_update_structure_state(all_commands)
         self.translator.trim_history()
-        self._log_exchange(user_input, commands, success, error_msg)
+        self._log_exchange(user_input, all_commands, success, error_msg)
+
+    def _show_tool_pipeline(self, result: dict) -> None:
+        """Display the tool pipeline before the ChimeraX command preview."""
+        steps = result.get("tool_steps_info", [])
+        if not steps:
+            return
+        table = Table(title="[bold]Tool Pipeline[/bold]", border_style="magenta", show_lines=True)
+        table.add_column("#",    style="dim",   width=3,  no_wrap=True)
+        table.add_column("Tool", style="bold",  width=14, no_wrap=True)
+        table.add_column("Action", style="white")
+        for i, step in enumerate(steps, 1):
+            icon = step.get("icon", "⚙️")
+            tool = step.get("tool", "?")
+            desc = step.get("description", "")
+            table.add_row(str(i), f"{icon} {tool}", escape(desc))
+        console.print(table)
+        console.print()
 
     def _show_preview(
         self,
@@ -546,6 +632,14 @@ class StructureBot:
     def _cmd_state(self) -> None:
         console.print(Rule("[bold]Session State[/bold]"))
         console.print(self.session.get_context_summary())
+        # Show tool availability
+        console.print()
+        console.print(Rule("[bold]Tool Status[/bold]"))
+        available = self.router.available_tools()
+        for tool, status in available.items():
+            icon  = ToolRouter._TOOL_ICONS.get(tool, "⚙️")
+            color = "ok" if status == "active" else "warn" if "stub" in status else "dim"
+            console.print(f"  {icon} [bold]{tool:<12}[/bold] [{color}]{escape(status)}[/{color}]")
 
     def _cmd_undo(self) -> None:
         # Send undo to ChimeraX

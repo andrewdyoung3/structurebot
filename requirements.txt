@@ -1,3 +1,23 @@
 anthropic>=0.40.0
 requests>=2.31.0
 rich>=13.7.0
+
+# ── Computational biology tools (optional) ────────────────────────────────────
+#
+# ESM-2 protein language model (evolutionary conservation scoring)
+# Install ONE of the following:
+#
+#   Option A — Meta's official fair-esm package:
+#     pip install fair-esm
+#
+#   Note: fair-esm may have compatibility issues with Python 3.14+.
+#   If you get import errors, use Option B instead.
+#
+#   Option B — HuggingFace transformers (fallback):
+#     pip install transformers torch
+#
+# Either package will be detected automatically by esm_bridge.py.
+# The ESM-2 model (~30 MB) is downloaded on first use and cached locally.
+#
+# CamSol solubility scoring uses only the Python standard library —
+# no additional packages required.

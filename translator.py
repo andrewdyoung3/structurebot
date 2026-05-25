@@ -45,7 +45,9 @@ Always respond with exactly this JSON object and nothing else:
   "explanations":        ["what cmd1 does", "what cmd2 does", ...],
   "warnings":            ["anything the user should know before running"],
   "clarification_needed": null,
-  "confidence":          "high"
+  "confidence":          "high",
+  "tools_needed":        ["chimerax"],
+  "tool_inputs":         {{}}
 }}
 
 confidence values:
@@ -53,13 +55,26 @@ confidence values:
   "medium" — minor assumptions made; commands should work but review is advised
   "low"    — request is complex or unclear; user should carefully review
 
+tools_needed values (list — may contain one or more):
+  "chimerax"    — visualization only (ALWAYS include by default)
+  "camsol"      — per-residue solubility scoring
+  "esm"         — evolutionary conservation via ESM-2
+  "proteinmpnn" — sequence redesign (stub)
+
+tool_inputs: dict of tool-specific parameters, e.g.:
+  {{"camsol": {{"model_id": "1", "chain": "A"}}}}
+  {{"esm":    {{"model_id": "1", "chain": "A"}}}}
+  When not using extra tools, set tool_inputs to {{}}.
+
 If the request cannot be safely translated without more information:
 {{
   "commands":            [],
   "explanations":        [],
   "warnings":            [],
   "clarification_needed": "A single concise question for the user",
-  "confidence":          "low"
+  "confidence":          "low",
+  "tools_needed":        ["chimerax"],
+  "tool_inputs":         {{}}
 }}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -105,10 +120,75 @@ TRANSLATION RULES
 AVAILABLE TOOLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 chimerax   : visualization, selection, measurement, image export  [ACTIVE]
+camsol     : per-residue solubility / aggregation-prone scoring  [ACTIVE]
+esm        : evolutionary conservation via ESM-2 language model  [ACTIVE]
+proteinmpnn: fixed-backbone sequence redesign                    [STUB — NOT YET CONFIGURED]
 rosetta    : stability prediction, ddG calculation               [NOT YET CONFIGURED]
-esm        : evolutionary scoring, mutation tolerance            [NOT YET CONFIGURED]
-proteinmpnn: sequence redesign                                   [NOT YET CONFIGURED]
-camsol     : solubility scoring                                  [NOT YET CONFIGURED]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL ROUTING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Set tools_needed and tool_inputs when the user asks for computational analysis.
+The "chimerax" tool is ONLY needed when you also have ChimeraX setup commands.
+
+SOLUBILITY / AGGREGATION requests:
+  "solubility analysis", "aggregation-prone regions", "CamSol", "color by solubility"
+  → tools_needed: ["camsol"]          (no initial ChimeraX commands needed)
+  → tools_needed: ["chimerax","camsol"] if you also need to open/setup the structure
+  → tool_inputs: {{"camsol": {{"model_id": "1", "chain": "A"}}}}
+  → commands: [] (no extra commands; CamSol bridge generates the viz automatically)
+
+CONSERVATION / EVOLUTIONARY requests:
+  "conservation", "evolutionary conservation", "important residues by evolution",
+  "ESM", "mutation tolerance", "color by conservation"
+  → tools_needed: ["esm"]
+  → tools_needed: ["chimerax","esm"] if setup commands are needed
+  → tool_inputs: {{"esm": {{"model_id": "1"}}}}
+  → commands: [] or setup commands only
+
+SEQUENCE DESIGN requests:
+  "ProteinMPNN", "design sequences", "sequence redesign"
+  → tools_needed: ["proteinmpnn"]
+  → tool_inputs: {{"proteinmpnn": {{"model_id": "1", "chain": "A"}}}}
+
+PURE VISUALIZATION (default — no extra tools):
+  All other requests → tools_needed: ["chimerax"], tool_inputs: {{}}
+
+CHAIN EXTRACTION: If the user specifies a chain (e.g. "analyze chain A"),
+put it in tool_inputs: {{"camsol": {{"model_id": "1", "chain": "A"}}}}
+
+EXAMPLE — "Run solubility analysis on the loaded structure":
+{{
+  "commands":     [],
+  "explanations": [],
+  "warnings":     [],
+  "clarification_needed": null,
+  "confidence":   "high",
+  "tools_needed": ["camsol"],
+  "tool_inputs":  {{"camsol": {{"model_id": "1"}}}}
+}}
+
+EXAMPLE — "Open 1HSG then show me which residues are aggregation-prone":
+{{
+  "commands":     ["open 1HSG", "cartoon #1", "color bychain", "view"],
+  "explanations": ["Fetch 1HSG from RCSB", "Show as cartoon", "Color by chain", "Fit in view"],
+  "warnings":     [],
+  "clarification_needed": null,
+  "confidence":   "high",
+  "tools_needed": ["chimerax", "camsol"],
+  "tool_inputs":  {{"camsol": {{"model_id": "1"}}}}
+}}
+
+EXAMPLE — "Color by evolutionary conservation":
+{{
+  "commands":     [],
+  "explanations": [],
+  "warnings":     ["ESM-2 model (~30 MB) will be downloaded on first use"],
+  "clarification_needed": null,
+  "confidence":   "high",
+  "tools_needed": ["esm"],
+  "tool_inputs":  {{"esm": {{"model_id": "1"}}}}
+}}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHIMERAX COMMAND REFERENCE
@@ -299,10 +379,20 @@ class CommandTranslator:
         result.setdefault("warnings",            [])
         result.setdefault("clarification_needed", None)
         result.setdefault("confidence",          "medium")
+        result.setdefault("tools_needed",        ["chimerax"])
+        result.setdefault("tool_inputs",         {})
 
         # Coerce confidence to one of three values
         if result["confidence"] not in ("high", "medium", "low"):
             result["confidence"] = "medium"
+
+        # Ensure tools_needed is always a non-empty list
+        if not isinstance(result["tools_needed"], list) or not result["tools_needed"]:
+            result["tools_needed"] = ["chimerax"]
+
+        # Ensure tool_inputs is a dict
+        if not isinstance(result["tool_inputs"], dict):
+            result["tool_inputs"] = {}
 
         # Pad short explanations list
         while len(result["explanations"]) < len(result["commands"]):

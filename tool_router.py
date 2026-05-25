@@ -1,0 +1,478 @@
+"""
+tool_router.py
+--------------
+Routes translator output through the appropriate computational tools.
+
+Dispatcher for the StructureBot tool pipeline:
+  chimerax     -> ChimeraXBridge  (visualization — always handled by main.py)
+  camsol       -> CamsolBridge    (per-residue solubility scoring)
+  esm          -> EsmBridge       (evolutionary conservation via ESM-2)
+  proteinmpnn  -> ProteinMPNNBridge (sequence redesign — stub)
+
+The translator emits a 'tools_needed' list such as:
+  ["chimerax"]                      - visualization only (default)
+  ["camsol"]                        - solubility + auto-visualization
+  ["esm"]                           - conservation + auto-visualization
+  ["camsol", "esm"]                 - both analyses, then visualize
+  ["chimerax", "camsol"]            - open/setup, then solubility
+
+Workflow
+--------
+1.  route(translator_result)
+      Augments the translator dict with tool routing metadata.
+      Safe to call before user confirmation; no tool runs.
+
+2.  execute(routed_result, status_callback=...)
+      Runs the non-chimerax tools in order.
+      Returns the same dict augmented with step results and viz_commands.
+      main.py then runs those viz_commands through ChimeraXBridge.
+
+Each bridge's analyze() method returns a ToolStepResult with:
+  - data          : tool-specific output (dict)
+  - viz_commands  : ChimeraX commands to visualize results
+  - viz_explanations : human-readable explanations for each viz command
+  - summary       : one-line result description
+  - error         : error string or None
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chimerax_bridge import ChimeraXBridge
+    from session_state import SessionState
+
+
+# ── Tool step result ──────────────────────────────────────────────────────────
+
+class ToolStepResult:
+    """Encapsulates the result of one non-chimerax tool step."""
+
+    def __init__(
+        self,
+        tool:              str,
+        success:           bool,
+        data:              Optional[Dict[str, Any]] = None,
+        viz_commands:      Optional[List[str]] = None,
+        viz_explanations:  Optional[List[str]] = None,
+        summary:           str = "",
+        error:             Optional[str] = None,
+        elapsed_ms:        float = 0.0,
+    ):
+        self.tool             = tool
+        self.success          = success
+        self.data             = data or {}
+        self.viz_commands     = viz_commands or []
+        self.viz_explanations = viz_explanations or []
+        self.summary          = summary
+        self.error            = error
+        self.elapsed_ms       = elapsed_ms
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tool":             self.tool,
+            "success":          self.success,
+            "data":             self.data,
+            "viz_commands":     self.viz_commands,
+            "viz_explanations": self.viz_explanations,
+            "summary":          self.summary,
+            "error":            self.error,
+            "elapsed_ms":       round(self.elapsed_ms, 1),
+        }
+
+
+# ── Router ─────────────────────────────────────────────────────────────────────
+
+class ToolRouter:
+    """
+    Routes translator output through the correct computational tools.
+
+    Usage::
+
+        router = ToolRouter(bridge, session)
+
+        # After translation — augments result, no execution yet:
+        routed = router.route(translator_result)
+
+        # After user confirms — runs computational tools:
+        routed = router.execute(routed, status_callback=console.status)
+        # routed["all_viz_commands"] and routed["all_viz_explanations"]
+        # are now populated; main.py runs them through the bridge.
+    """
+
+    _TOOL_ICONS: Dict[str, str] = {
+        "chimerax":    "🎨",
+        "camsol":      "💧",
+        "esm":         "🧬",
+        "proteinmpnn": "🔬",
+    }
+
+    def __init__(
+        self,
+        bridge:  "ChimeraXBridge",
+        session: "SessionState",
+    ):
+        self.bridge  = bridge
+        self.session = session
+
+        # Bridges are instantiated lazily on first use
+        self._camsol_bridge:      Optional[Any] = None
+        self._esm_bridge:         Optional[Any] = None
+        self._proteinmpnn_bridge: Optional[Any] = None
+
+    # ── Phase 1: Route (no execution) ─────────────────────────────────────────
+
+    def route(self, translator_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Augment a translator result with tool routing metadata.
+
+        Adds the following keys (safe to call before user confirmation):
+          "tools_needed"    — list of tools from translator (default ["chimerax"])
+          "tool_steps_info" — list of {tool, icon, description} for each step
+          "has_extra_tools" — True if any non-chimerax tools are present
+        """
+        tools_needed = translator_result.get("tools_needed") or ["chimerax"]
+        tool_inputs  = translator_result.get("tool_inputs") or {}
+
+        result = dict(translator_result)
+        result["tools_needed"] = tools_needed
+        result["tool_inputs"]  = tool_inputs
+
+        step_info: List[Dict[str, Any]] = []
+        for tool in tools_needed:
+            icon = self._TOOL_ICONS.get(tool, "⚙️")
+            step_info.append({
+                "tool":        tool,
+                "icon":        icon,
+                "description": self._step_description(tool, tool_inputs, result),
+            })
+
+        result["tool_steps_info"] = step_info
+        result["has_extra_tools"] = any(t != "chimerax" for t in tools_needed)
+        return result
+
+    def _step_description(
+        self,
+        tool:        str,
+        tool_inputs: Dict[str, Any],
+        result:      Dict[str, Any],
+    ) -> str:
+        if tool == "chimerax":
+            n = len(result.get("commands", []))
+            return f"Execute {n} ChimeraX command(s)"
+        if tool == "camsol":
+            inp   = tool_inputs.get("camsol", {})
+            chain = inp.get("chain", "all chains")
+            mid   = inp.get("model_id") or self._first_model_id()
+            return f"CamSol solubility analysis — #{mid} chain {chain}"
+        if tool == "esm":
+            inp = tool_inputs.get("esm", {})
+            mid = inp.get("model_id") or self._first_model_id()
+            return f"ESM-2 evolutionary conservation — #{mid}"
+        if tool == "proteinmpnn":
+            return "ProteinMPNN sequence redesign (stub)"
+        return f"Unknown tool: {tool}"
+
+    # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
+
+    def execute(
+        self,
+        routed_result:   Dict[str, Any],
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run all non-chimerax tools in the pipeline.
+
+        Adds to the returned dict:
+          "tool_step_results"    — list of ToolStepResult.to_dict() per non-cx step
+          "all_viz_commands"     — ChimeraX commands from all tools combined
+          "all_viz_explanations" — corresponding human-readable explanations
+          "tool_summaries"       — {tool_name: summary_string}
+          "pipeline_success"     — True if no tool step failed
+          "pipeline_error"       — first error message, or None
+        """
+        tools_needed = routed_result.get("tools_needed") or ["chimerax"]
+        tool_inputs  = routed_result.get("tool_inputs") or {}
+
+        step_results:   List[Dict[str, Any]] = []
+        all_viz_cmds:   List[str] = []
+        all_viz_exps:   List[str] = []
+        tool_summaries: Dict[str, str] = {}
+        pipeline_error: Optional[str] = None
+
+        for tool in tools_needed:
+            if tool == "chimerax":
+                # ChimeraX execution is handled by main.py; skip here
+                step_results.append({
+                    "tool":    "chimerax",
+                    "skipped": True,
+                    "note":    "executed by main.py",
+                })
+                continue
+
+            icon = self._TOOL_ICONS.get(tool, "⚙️")
+            if status_callback:
+                status_callback(f"{icon} Running {tool}…")
+
+            t0   = time.perf_counter()
+            step = self._dispatch_tool(tool, tool_inputs.get(tool) or {})
+            step.elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            step_results.append(step.to_dict())
+            tool_summaries[tool] = step.summary
+
+            if step.success:
+                # Cache results in session state for later use / display
+                mid = (tool_inputs.get(tool) or {}).get("model_id") or self._first_model_id()
+                self.session.add_tool_result(tool, mid, step.data)
+
+                if step.viz_commands:
+                    all_viz_cmds.extend(step.viz_commands)
+                    all_viz_exps.extend(step.viz_explanations)
+            else:
+                pipeline_error = pipeline_error or step.error
+
+        result = dict(routed_result)
+        result["tool_step_results"]    = step_results
+        result["all_viz_commands"]     = all_viz_cmds
+        result["all_viz_explanations"] = all_viz_exps
+        result["tool_summaries"]       = tool_summaries
+        result["pipeline_success"]     = pipeline_error is None
+        result["pipeline_error"]       = pipeline_error
+        return result
+
+    # ── Dispatch ───────────────────────────────────────────────────────────────
+
+    def _dispatch_tool(
+        self,
+        tool:   str,
+        inputs: Dict[str, Any],
+    ) -> ToolStepResult:
+        """Route to the correct bridge; return ToolStepResult."""
+        try:
+            if tool == "camsol":
+                return self._run_camsol(inputs)
+            if tool == "esm":
+                return self._run_esm(inputs)
+            if tool == "proteinmpnn":
+                return self._run_proteinmpnn(inputs)
+            return ToolStepResult(
+                tool=tool, success=False,
+                error=(
+                    f"Unknown tool '{tool}'. "
+                    "Available: chimerax, camsol, esm, proteinmpnn."
+                ),
+            )
+        except Exception as exc:
+            return ToolStepResult(
+                tool=tool, success=False,
+                error=f"{tool} raised an unexpected error: {exc}",
+            )
+
+    def _run_camsol(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        bridge   = self._get_camsol_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain")
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+
+        if not sequence:
+            return ToolStepResult(
+                tool="camsol", success=False,
+                error=(
+                    "No amino-acid sequence available. "
+                    "Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+        return bridge.analyze(
+            sequence,
+            model_id=model_id,
+            chain=chain,
+            session=self.session,
+        )
+
+    def _run_esm(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        bridge   = self._get_esm_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain")
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+
+        if not sequence:
+            return ToolStepResult(
+                tool="esm", success=False,
+                error=(
+                    "No amino-acid sequence available. "
+                    "Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+        return bridge.analyze(sequence, model_id=model_id, session=self.session)
+
+    def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        bridge = self._get_proteinmpnn_bridge()
+        return bridge.analyze(inputs, session=self.session)
+
+    # ── Bridge accessors (lazy init) ───────────────────────────────────────────
+
+    def _get_camsol_bridge(self):
+        if self._camsol_bridge is None:
+            from camsol_bridge import CamsolBridge
+            self._camsol_bridge = CamsolBridge()
+        return self._camsol_bridge
+
+    def _get_esm_bridge(self):
+        if self._esm_bridge is None:
+            from esm_bridge import EsmBridge
+            self._esm_bridge = EsmBridge()
+        return self._esm_bridge
+
+    def _get_proteinmpnn_bridge(self):
+        if self._proteinmpnn_bridge is None:
+            from proteinmpnn_bridge import ProteinMPNNBridge
+            self._proteinmpnn_bridge = ProteinMPNNBridge()
+        return self._proteinmpnn_bridge
+
+    # ── Sequence retrieval ─────────────────────────────────────────────────────
+
+    def _fetch_sequence(
+        self,
+        model_id: str,
+        chain:    Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Attempt to get an amino-acid sequence for a loaded structure.
+
+        Priority:
+          1. Session state cache (sequences stored after first fetch)
+          2. RCSB FASTA API (if the structure name is a 4-char PDB ID)
+          3. ChimeraX 'sequence chain' command (may not return text via REST)
+        """
+        info = self.session.get_structure(model_id)
+        if info:
+            meta = info.get("metadata", {})
+            # Check cached sequences dict
+            if chain and isinstance(meta.get("sequences"), dict):
+                seq = meta["sequences"].get(chain)
+                if seq:
+                    return seq
+            elif meta.get("sequence"):
+                return meta["sequence"]
+
+            # Try RCSB for 4-letter PDB IDs
+            name = info.get("name", "")
+            if re.match(r"^[A-Za-z0-9]{4}$", name):
+                seq = self._fetch_rcsb_fasta(name, chain)
+                if seq:
+                    # Cache for next time
+                    if "sequences" not in meta:
+                        meta["sequences"] = {}
+                    key = chain or "A"
+                    meta["sequences"][key] = seq
+                    return seq
+
+        # Last resort: ask ChimeraX
+        return self._fetch_sequence_from_chimerax(model_id, chain)
+
+    def _fetch_rcsb_fasta(
+        self,
+        pdb_id: str,
+        chain:  Optional[str] = None,
+    ) -> Optional[str]:
+        """Fetch the amino-acid FASTA sequence from RCSB for a PDB ID + chain."""
+        try:
+            import requests
+            url  = f"https://www.rcsb.org/fasta/entry/{pdb_id.upper()}/display"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                return None
+            # Parse multi-entry FASTA; find the matching chain
+            sequences = self._parse_fasta(resp.text)
+            if not sequences:
+                return None
+            if chain:
+                # RCSB FASTA headers contain the chain letter, e.g.:
+                # >1HSG_1|Chain A|...
+                for header, seq in sequences.items():
+                    if f"|Chain {chain.upper()}|" in header or f"Chain {chain.upper()}" in header:
+                        return seq
+            # Fall back to first sequence
+            return next(iter(sequences.values()))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_fasta(text: str) -> Dict[str, str]:
+        """Parse a FASTA string into {header: sequence} dict."""
+        sequences: Dict[str, str] = {}
+        current_header = ""
+        current_seq:    List[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith(">"):
+                if current_header and current_seq:
+                    sequences[current_header] = "".join(current_seq)
+                current_header = line[1:]
+                current_seq    = []
+            else:
+                current_seq.append(line)
+        if current_header and current_seq:
+            sequences[current_header] = "".join(current_seq)
+        return sequences
+
+    def _fetch_sequence_from_chimerax(
+        self,
+        model_id: str,
+        chain:    Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Ask ChimeraX for the sequence of a model/chain.
+        Note: 'sequence chain' outputs to the GUI log, not always the REST response.
+        This is a best-effort fallback.
+        """
+        if not self.bridge.is_running():
+            return None
+        spec = f"#{model_id}/{chain}" if chain else f"#{model_id}"
+        result = self.bridge.run_command(f"sequence chain {spec}")
+        if result.get("error") or not result.get("value"):
+            return None
+        text = result["value"]
+        # Strip header line(s), join remaining text, keep only AA letters
+        lines = text.strip().splitlines()
+        seq_parts = []
+        for line in lines:
+            part = line.split(":", 1)[-1].strip()
+            seq_parts.append(part)
+        seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", "".join(seq_parts).upper())
+        return seq if len(seq) >= 5 else None
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _first_model_id(self) -> str:
+        """Return the first loaded structure's model ID, or '1'."""
+        if self.session.structures:
+            return next(iter(self.session.structures))
+        return "1"
+
+    def available_tools(self) -> Dict[str, str]:
+        """Return {tool_name: status_string} for all tools."""
+        status: Dict[str, str] = {"chimerax": "active"}
+
+        for name, module in [("camsol_bridge", "CamsolBridge"),
+                              ("esm_bridge",   "EsmBridge")]:
+            try:
+                __import__(name)
+                status[name.replace("_bridge", "")] = "active"
+            except ImportError:
+                status[name.replace("_bridge", "")] = "module not found"
+
+        status["proteinmpnn"] = "stub — not yet configured"
+        return status
+
+    def __repr__(self) -> str:
+        extra = [t for t in (self._camsol_bridge, self._esm_bridge, self._proteinmpnn_bridge)
+                 if t is not None]
+        return (
+            f"<ToolRouter bridge={self.bridge!r} "
+            f"loaded_bridges={len(extra)}>"
+        )

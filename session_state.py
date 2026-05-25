@@ -186,6 +186,8 @@ class SessionState:
         self.named_selections: Dict[str, str] = {}
         self.applied_styles: List[str] = []
         self.command_history: List[Dict[str, Any]] = []
+        # tool_results[tool_name][model_id] = result_data_dict
+        self.tool_results:   Dict[str, Dict[str, Any]] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -237,6 +239,52 @@ class SessionState:
         if not self.structures:
             return "1"
         return str(max(int(k) for k in self.structures) + 1)
+
+    # ── Tool result tracking ──────────────────────────────────────────────────
+
+    def add_tool_result(
+        self,
+        tool:        str,
+        model_id:    str,
+        data:        Dict[str, Any],
+    ) -> None:
+        """
+        Store the result of a computational tool run.
+
+        Parameters
+        ----------
+        tool     : tool name, e.g. "camsol", "esm"
+        model_id : ChimeraX model ID the tool was run against
+        data     : the tool's output data dict
+        """
+        if tool not in self.tool_results:
+            self.tool_results[tool] = {}
+        self.tool_results[tool][str(model_id)] = {
+            "data":      data,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def get_tool_result(
+        self,
+        tool:     str,
+        model_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve cached tool result data.
+
+        Returns the data dict, or None if no result is stored.
+        """
+        entry = self.tool_results.get(tool, {}).get(str(model_id))
+        if entry:
+            return entry.get("data")
+        return None
+
+    def clear_tool_results(self, tool: Optional[str] = None) -> None:
+        """Clear cached tool results. Pass *tool* to clear just one tool."""
+        if tool:
+            self.tool_results.pop(tool, None)
+        else:
+            self.tool_results.clear()
 
     # ── Selection tracking ────────────────────────────────────────────────────
 
@@ -317,6 +365,24 @@ class SessionState:
             for lbl, spec in self.named_selections.items():
                 lines.append(f"  {lbl!r:20s} → {spec}")
 
+        if self.tool_results:
+            lines.append("\nCached tool results:")
+            for tool, by_model in self.tool_results.items():
+                for mid, entry in by_model.items():
+                    ts  = entry.get("timestamp", "?")
+                    dat = entry.get("data", {})
+                    # Show a brief summary depending on tool
+                    if tool == "camsol":
+                        n = len(dat.get("scores", {}))
+                        h = len(dat.get("aggregation_hot_spots", []))
+                        lines.append(f"  camsol  #{mid}  [{ts}]  {n} residues, {h} hot-spots")
+                    elif tool == "esm":
+                        n = len(dat.get("conservation", {}))
+                        m = dat.get("mean_conservation", 0)
+                        lines.append(f"  esm     #{mid}  [{ts}]  {n} residues, mean cons {m:.2f}")
+                    else:
+                        lines.append(f"  {tool:<8} #{mid}  [{ts}]")
+
         recent = self.get_recent_history(5)
         if recent:
             lines.append(f"\nRecent commands (last {len(recent)}):")
@@ -338,6 +404,7 @@ class SessionState:
             "named_selections":  self.named_selections,
             "applied_styles":    self.applied_styles,
             "command_history":   self.command_history,
+            "tool_results":      self.tool_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -355,6 +422,7 @@ class SessionState:
         state.named_selections = data.get("named_selections", {})
         state.applied_styles   = data.get("applied_styles", [])
         state.command_history  = data.get("command_history", [])
+        state.tool_results     = data.get("tool_results",  {})
         return state
 
     def __repr__(self) -> str:
