@@ -56,20 +56,24 @@ def desktop_path() -> str:
     p = Path(f"C:/Users/{username}/Desktop")
     return p.as_posix()  # forward slashes — ChimeraX save prefers them
 
-# ── Rosetta / Robetta ─────────────────────────────────────────────────────────
+# ── Stability / ddG ───────────────────────────────────────────────────────────
 
-# Which Rosetta backend to prefer: "auto" | "pyrosetta" | "robetta"
-# "auto" tries PyRosetta first, falls back to Robetta if unavailable.
+# Which stability backend to use:
+#   "auto"       — PyRosetta if available, else DynaMut2 (default)
+#   "dynamut2"   — DynaMut2 web API (free, no registration)
+#   "empirical"  — offline BLOSUM62 estimates (no network required)
+#   "pyrosetta"  — local PyRosetta (requires Python <= 3.13 + wheel)
+#   "local"      — local Rosetta binary (requires ROSETTA_LOCAL_PATH)
 ROSETTA_BACKEND: str = os.environ.get("ROSETTA_BACKEND", "auto").strip()
 
-# Robetta web API (https://robetta.bakerlab.org — free academic registration)
-# API key obtained from your profile page after registration.
-ROBETTA_EMAIL:   str = os.environ.get("ROBETTA_EMAIL",   "").strip()
-ROBETTA_API_KEY: str = os.environ.get("ROBETTA_API_KEY", "").strip()
+# Path to local Rosetta binary directory (ROSETTA_BACKEND=local only).
+# Example: /path/to/rosetta/source/bin
+# Linux/Mac only; see rosetta_bridge._run_rosetta_local() for setup.
+ROSETTA_LOCAL_PATH: str = os.environ.get("ROSETTA_LOCAL_PATH", "").strip()
 
 # Set PYROSETTA_AVAILABLE=true in .env.local when PyRosetta is installed.
 # Python 3.14 wheels are not yet released; this is False by default.
-# See rosetta_bridge.py for installation instructions.
+# See rosetta_bridge._run_pyrosetta() docstring for installation instructions.
 PYROSETTA_AVAILABLE: bool = (
     os.environ.get("PYROSETTA_AVAILABLE", "").strip().lower()
     in ("1", "true", "yes")

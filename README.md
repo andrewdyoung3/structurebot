@@ -132,6 +132,36 @@ Save the current view as figure.png at 3000x3000 with transparent background
 
 ---
 
+## Stability / ddG analysis
+
+StructureBot can calculate per-mutation ΔΔG (stability change in kcal/mol) and
+rank engineering candidates by combining stability, solubility, and evolutionary
+conservation scores.
+
+| Backend | Accuracy | Notes |
+|---|---|---|
+| **DynaMut2** (default) | Pearson r ~0.65 | Free web API, no registration. Suitable for candidate screening. |
+| **Empirical** (fallback) | Pearson r ~0.4 | Offline BLOSUM62 + B-factor. Activates if DynaMut2 is unreachable. |
+| **Local Rosetta** (stub) | Pearson r ~0.8 | Publication quality. Linux/Mac + academic license. Not yet implemented. |
+| **PyRosetta** (stub) | Pearson r ~0.8 | Requires Python <= 3.13 wheel. Not yet active on Python 3.14. |
+
+**Example prompts:**
+```
+Calculate ddG for V82A mutation in chain A of the loaded structure
+Scan the surface of 1HSG chain A for solubility-improving mutations
+What mutations at position 82 are best tolerated evolutionarily?
+```
+
+Configure in `.env.local`:
+```ini
+# Default is DynaMut2 — no configuration needed.
+# Force offline mode:  ROSETTA_BACKEND=empirical
+# Future local Rosetta: ROSETTA_BACKEND=local
+#                       ROSETTA_LOCAL_PATH=/path/to/rosetta/source/bin
+```
+
+---
+
 ## Architecture
 
 ```
@@ -146,10 +176,13 @@ structurebot/
 ├── session_state.py      # Loaded structures, selections, history
 │                         #   • parse_pdb_header() for local .pdb files
 │                         #   • fetch_rcsb_metadata() for PDB IDs (gets ligand codes)
+├── rosetta_bridge.py     # Stability / ddG backend: DynaMut2 + empirical fallback
+├── mutation_scanner.py   # Multi-criterion mutation ranking pipeline
 ├── chimerax_commands.md  # Curated reference injected into every API call
 ├── test_bridge.py        # Standalone ChimeraX connectivity test (run first)
 ├── tests/
-│   └── test_integration.py  # End-to-end 1HSG workflow test
+│   ├── test_integration.py  # End-to-end 1HSG workflow test
+│   └── test_rosetta.py      # RosettaBridge + MutationScanner unit tests
 ├── logs/                 # session_YYYYMMDD_HHMMSS.jsonl (auto-created)
 ├── sessions/             # Saved sessions: NAME.cxs + NAME.json (auto-created)
 ├── requirements.txt

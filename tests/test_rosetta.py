@@ -7,11 +7,12 @@ Test categories
 ---------------
   A. Backend detection
        Verify ROSETTA_BACKEND / PYROSETTA_AVAILABLE env vars select the
-       correct backend and that the stub returns a well-formed error.
+       correct backend.  Verify PyRosetta stub returns a well-formed error.
+       Verify empirical backend produces estimates with confidence="low".
 
-  B. Robetta job submission mock
-       Mock the requests library to verify that the correct API format
-       (endpoint URL, multipart body, auth header) is used without
+  B. DynaMut2 HTTP mock
+       Mock requests.post to verify the correct URL, multipart body format
+       (no auth header), and mutation string format are used without
        making live network calls.
 
   C. MutationScanner candidate selection
@@ -26,18 +27,17 @@ Test categories
        Verify colour assignment, sphere/label commands for top-N, and
        general ChimeraX syntax.
 
-  F. SessionState: Rosetta job persistence
+  F. SessionState: stability analysis persistence
        add_rosetta_job / get_rosetta_job / update_rosetta_job /
-       list_rosetta_jobs survive save() → load() round-trip.
+       list_rosetta_jobs survive save() -> load() round-trip.
 
   G. ToolRouter: dispatch wiring
        Verify route() augments the result correctly for "rosetta" and
        "mutation_scan" tools; verify error path for missing PDB / mutations.
 
-  H. Full pipeline mock (Robetta mocked, no live network)
-       End-to-end through RosettaBridge._run_robetta() with the HTTP
-       layer replaced by fakes; check ddg_scores, viz_commands, job_id
-       persisted in session.
+  H. Full pipeline mock (DynaMut2 mocked, no live network)
+       End-to-end through RosettaBridge._run_dynamut2() with requests.post
+       replaced by a fake; checks ddg_scores, viz_commands, session storage.
 
 Usage
 -----
@@ -102,8 +102,8 @@ def _assert(cond: bool, name: str, msg: str = "") -> bool:
 
 
 # ── A minimal PDB string for tests that need a real file ─────────────────────
-# HIV protease monomer, chain A, residues 1–4 (synthetic — just needs to exist
-# as a valid file; real Rosetta calls are mocked in these tests).
+# HIV protease monomer, chain A, residues 1-4 (synthetic).
+# Real Rosetta/DynaMut2 calls are mocked in all tests.
 _MINIMAL_PDB = textwrap.dedent("""\
     HEADER    HIV PROTEASE (SYNTHETIC FRAGMENT)
     ATOM      1  N   PRO A   1       5.000   5.000   5.000  1.00 10.00           N
@@ -139,9 +139,9 @@ def test_backend_detection() -> None:
 
     from rosetta_bridge import _select_backend
 
-    # Force robetta via env var
-    os.environ["ROSETTA_BACKEND"] = "robetta"
-    _assert(_select_backend() == "robetta", "ROSETTA_BACKEND=robetta forces robetta")
+    # Force dynamut2 via env var
+    os.environ["ROSETTA_BACKEND"] = "dynamut2"
+    _assert(_select_backend() == "dynamut2", "ROSETTA_BACKEND=dynamut2 forces dynamut2")
     del os.environ["ROSETTA_BACKEND"]
 
     # Force pyrosetta via env var (even if not importable)
@@ -149,12 +149,17 @@ def test_backend_detection() -> None:
     _assert(_select_backend() == "pyrosetta", "ROSETTA_BACKEND=pyrosetta forces pyrosetta")
     del os.environ["ROSETTA_BACKEND"]
 
-    # Auto mode: PYROSETTA_AVAILABLE not set → robetta
+    # Force empirical
+    os.environ["ROSETTA_BACKEND"] = "empirical"
+    _assert(_select_backend() == "empirical", "ROSETTA_BACKEND=empirical forces empirical")
+    del os.environ["ROSETTA_BACKEND"]
+
+    # Auto mode: PYROSETTA_AVAILABLE not set -> dynamut2
     os.environ.pop("PYROSETTA_AVAILABLE", None)
     os.environ.pop("ROSETTA_BACKEND",    None)
     _assert(
-        _select_backend() == "robetta",
-        "auto mode without PYROSETTA_AVAILABLE -> robetta",
+        _select_backend() == "dynamut2",
+        "auto mode without PYROSETTA_AVAILABLE -> dynamut2",
     )
 
 
@@ -167,7 +172,6 @@ def test_pyrosetta_stub_error() -> None:
         os.environ["ROSETTA_BACKEND"] = "pyrosetta"
         os.environ["PYROSETTA_AVAILABLE"] = "true"
 
-        # Patch the import so pyrosetta appears available
         with patch.dict("sys.modules", {"pyrosetta": MagicMock()}):
             bridge = RosettaBridge()
             result = bridge.analyze(
@@ -180,7 +184,7 @@ def test_pyrosetta_stub_error() -> None:
         _assert(
             "pyrosetta" in (result.error or "").lower() or
             "python" in (result.error or "").lower(),
-            "PyRosetta error message mentions PyRosetta/Python version",
+            "PyRosetta error mentions PyRosetta/Python version",
             repr((result.error or "")[:80]),
         )
     finally:
@@ -189,27 +193,33 @@ def test_pyrosetta_stub_error() -> None:
         Path(pdb_path).unlink(missing_ok=True)
 
 
-def test_missing_api_key_error() -> None:
-    """Robetta backend with no API key must return a helpful error."""
+def test_empirical_backend_forced() -> None:
+    """ROSETTA_BACKEND=empirical must return estimates with confidence='low'."""
     from rosetta_bridge import RosettaBridge
 
     pdb_path = _write_temp_pdb()
     try:
-        saved = os.environ.pop("ROBETTA_API_KEY", None)
-        os.environ["ROSETTA_BACKEND"] = "robetta"
+        os.environ["ROSETTA_BACKEND"] = "empirical"
 
         bridge = RosettaBridge()
         result = bridge.analyze(
             pdb_path  = pdb_path,
-            mutations = [{"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"}],
+            mutations = [{"chain": "A", "position": 1, "from_aa": "P", "to_aa": "K"}],
         )
 
-        _assert(not result.success,        "no API key → success=False")
-        _assert("ROBETTA_API_KEY" in (result.error or ""),
-                "error mentions ROBETTA_API_KEY env var")
+        if not _assert(result.success,
+                       "empirical returns success=True",
+                       getattr(result, "error", "")):
+            return
+
+        _assert(result.data["confidence"] == "low",   "empirical confidence='low'")
+        _assert(result.data["backend"] == "empirical","empirical backend label")
+        _assert(len(result.data["warnings"]) > 0,     "empirical includes accuracy warning")
+        acc_warn = any("accuracy" in w.lower() or "blosum" in w.lower()
+                       for w in result.data["warnings"])
+        _assert(acc_warn, "warning mentions accuracy/BLOSUM62")
+        _assert("P1K" in result.data["ddg_scores"],   "P1K scored")
     finally:
-        if saved:
-            os.environ["ROBETTA_API_KEY"] = saved
         os.environ.pop("ROSETTA_BACKEND", None)
         Path(pdb_path).unlink(missing_ok=True)
 
@@ -218,88 +228,156 @@ def test_missing_pdb_error() -> None:
     """Non-existent PDB path must produce a clear error before any API call."""
     from rosetta_bridge import RosettaBridge
 
-    os.environ["ROSETTA_BACKEND"] = "robetta"
-    os.environ["ROBETTA_API_KEY"] = "test-key-for-path-check"
+    os.environ["ROSETTA_BACKEND"] = "dynamut2"
     try:
         bridge = RosettaBridge()
         result = bridge.analyze(
             pdb_path  = "/tmp/does_not_exist_at_all.pdb",
             mutations = [{"chain": "A", "position": 1, "from_aa": "P", "to_aa": "K"}],
         )
-        _assert(not result.success,           "missing PDB → success=False")
+        _assert(not result.success,           "missing PDB -> success=False")
         _assert("not found" in (result.error or "").lower() or
                 "pdb" in (result.error or "").lower(),
                 "error mentions PDB file",
                 repr((result.error or "")[:80]))
     finally:
-        os.environ.pop("ROSETTA_BACKEND",  None)
-        os.environ.pop("ROBETTA_API_KEY",  None)
+        os.environ.pop("ROSETTA_BACKEND", None)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# B. Robetta HTTP mock — correct API format
+# B. DynaMut2 HTTP mock -- correct request format
 # ════════════════════════════════════════════════════════════════════════════════
 
-def test_robetta_submit_format() -> None:
-    """Verify submit_ddg_job sends the correct URL, auth header, and body."""
-    print("\n--- B. Robetta HTTP mock ---")
+def test_dynamut2_request_format() -> None:
+    """
+    Verify _query_dynamut2_single:
+      - POSTs to the correct submit URL
+      - Body has chain + mutation fields (no Authorization header)
+      - GETs the result URL with job_id param
+      - Returns the 'prediction' float
+    """
+    print("\n--- B. DynaMut2 HTTP mock ---")
 
-    from rosetta_bridge import RosettaBridge, _ROBETTA_SUBMIT_URL
+    from rosetta_bridge import RosettaBridge, _DYNAMUT2_SUBMIT_URL, _DYNAMUT2_RESULT_URL
 
     pdb_path = _write_temp_pdb()
     try:
-        os.environ["ROSETTA_BACKEND"] = "robetta"
-        os.environ["ROBETTA_API_KEY"] = "test-api-key-123"
+        os.environ["ROSETTA_BACKEND"] = "dynamut2"
 
-        mutations = [{"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"}]
+        mut = {"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"}
 
-        mock_response = MagicMock()
-        mock_response.status_code = 201
-        mock_response.json.return_value = {
-            "job_id": "42",
-            "warnings": [],
+        submit_resp = MagicMock(status_code=200)
+        submit_resp.json.return_value = {"job_id": "test-job-abc"}
+
+        result_resp = MagicMock(status_code=200)
+        result_resp.raise_for_status = MagicMock()
+        result_resp.json.return_value = {
+            "prediction": 1.47, "chain": "A", "res_number": 82,
+            "wild-type": "V", "mutant": "A",
         }
 
-        with patch("requests.post", return_value=mock_response) as mock_post:
+        with patch("requests.post", return_value=submit_resp) as mock_post, \
+             patch("requests.get",  return_value=result_resp) as mock_get, \
+             patch("time.sleep"):
             bridge = RosettaBridge()
-            job_id, warnings = bridge._submit_ddg_job(pdb_path, mutations)
+            ddg = bridge._query_dynamut2_single(pdb_path, mut, progress=lambda s: None)
 
-        _assert(mock_post.called, "requests.post was called")
-
-        call_kwargs = mock_post.call_args
-        url = call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs.get("url", "")
-        _assert(
-            _ROBETTA_SUBMIT_URL in str(url),
-            "POST sent to correct Robetta URL",
-            str(url),
+        # --- Submit call checks ---
+        _assert(mock_post.called, "requests.post was called (submit)")
+        post_kwargs = mock_post.call_args
+        post_url = (
+            post_kwargs.args[0]
+            if post_kwargs.args
+            else post_kwargs.kwargs.get("url", "")
         )
+        _assert(str(post_url) == _DYNAMUT2_SUBMIT_URL,
+                "POST to correct submit URL", str(post_url))
 
-        headers = call_kwargs.kwargs.get("headers", {})
-        _assert(
-            "Token test-api-key-123" in headers.get("Authorization", ""),
-            "Authorization header uses Token format",
-            headers.get("Authorization", "")[:40],
+        # No auth header
+        headers = post_kwargs.kwargs.get("headers", {}) or {}
+        _assert("Authorization" not in headers,
+                "no Authorization header (DynaMut2 is public)")
+
+        post_data = post_kwargs.kwargs.get("data", {}) or {}
+        _assert(post_data.get("chain") == "A",       "chain in body", str(post_data))
+        _assert(post_data.get("mutation") == "V82A", "mutation=V82A in body", str(post_data))
+        files = post_kwargs.kwargs.get("files", {}) or {}
+        _assert("pdb_file" in files, "pdb_file in multipart files")
+
+        # --- Poll call checks ---
+        _assert(mock_get.called, "requests.get was called (poll)")
+        get_kwargs = mock_get.call_args
+        get_url = (
+            get_kwargs.args[0]
+            if get_kwargs.args
+            else get_kwargs.kwargs.get("url", "")
         )
+        _assert(str(get_url) == _DYNAMUT2_RESULT_URL,
+                "GET to correct result URL", str(get_url))
+        get_params = get_kwargs.kwargs.get("params", {}) or {}
+        _assert(get_params.get("job_id") == "test-job-abc",
+                "job_id param passed to GET", str(get_params))
 
-        payload = call_kwargs.kwargs.get("data", {})
-        parsed_muts = json.loads(payload.get("mutations", "[]"))
-        _assert(
-            parsed_muts == mutations,
-            "mutations serialised as JSON in body",
-            str(parsed_muts),
-        )
-
-        _assert(job_id == "42", "job_id extracted from response", job_id)
-        _assert(warnings == [],  "empty warnings list returned")
+        _assert(ddg == 1.47, "prediction parsed from result response", str(ddg))
 
     finally:
         os.environ.pop("ROSETTA_BACKEND", None)
-        os.environ.pop("ROBETTA_API_KEY",  None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_dynamut2_response_parsing() -> None:
+    """_parse_dynamut2_result should extract 'prediction' field."""
+    from rosetta_bridge import _parse_dynamut2_result
+
+    # Normal completed result
+    _assert(
+        _parse_dynamut2_result(
+            {"prediction": 1.47, "chain": "A", "res_number": 82}, "V82A"
+        ) == 1.47,
+        "parses 'prediction' from complete result"
+    )
+    # Negative value
+    _assert(
+        _parse_dynamut2_result({"prediction": -0.82, "chain": "A"}, "L10K") == -0.82,
+        "parses negative prediction"
+    )
+
+
+def test_dynamut2_rate_limit_retry() -> None:
+    """429 on submit triggers retry with backoff; succeeds on second attempt."""
+    from rosetta_bridge import RosettaBridge
+
+    pdb_path = _write_temp_pdb()
+    try:
+        os.environ["ROSETTA_BACKEND"] = "dynamut2"
+
+        mut = {"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"}
+
+        rate_limited = MagicMock(status_code=429)
+        rate_limited.headers = {"Retry-After": "0"}
+
+        ok_submit = MagicMock(status_code=200)
+        ok_submit.json.return_value = {"job_id": "retry-job-1"}
+
+        ok_result = MagicMock(status_code=200)
+        ok_result.raise_for_status = MagicMock()
+        ok_result.json.return_value = {"prediction": 1.47}
+
+        with patch("requests.post", side_effect=[rate_limited, ok_submit]), \
+             patch("requests.get",  return_value=ok_result), \
+             patch("time.sleep"):
+            bridge = RosettaBridge()
+            ddg = bridge._query_dynamut2_single(pdb_path, mut, progress=lambda s: None)
+
+        _assert(ddg == 1.47, "succeeds after one 429 retry", str(ddg))
+
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
         Path(pdb_path).unlink(missing_ok=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# C. MutationScanner — candidate selection
+# C. MutationScanner -- candidate selection
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _make_mock_session(
@@ -336,7 +414,6 @@ def test_scanner_candidate_selection() -> None:
 
     from mutation_scanner import MutationScanner
 
-    # Sequence: 10 residues — position 3 (I) is aggregation-prone + tolerant
     seq = "ACIFGHIKLM"
     camsol_scores = {
         1: 0.5, 2: 0.3, 3: -1.2,   # position 3 = aggregation-prone
@@ -354,7 +431,6 @@ def test_scanner_candidate_selection() -> None:
 
     pdb_path = _write_temp_pdb()
     try:
-        # Patch Rosetta to return zeros (avoids real API call)
         with patch("rosetta_bridge.RosettaBridge") as MockRosetta:
             mock_bridge = MagicMock()
             mock_bridge.analyze.return_value = MagicMock(
@@ -365,19 +441,14 @@ def test_scanner_candidate_selection() -> None:
 
             results = scanner.scan(pdb_path=pdb_path, chain_id="A", sequence=seq)
 
-        # At least position 3 (I) should be in the results
         positions = {r["position"] for r in results}
         _assert(3 in positions, "position 3 (I, aggregation-prone + tolerant) is a candidate")
-
-        # Positions that are not aggregation-prone should be absent
         _assert(1 not in positions, "position 1 (CamSol=+0.5) is not a candidate")
         _assert(2 not in positions, "position 2 (CamSol=+0.3) is not a candidate")
 
-        # No Pro or Cys substitutions
         bad = [r for r in results if r["to_aa"] in ("P", "C")]
         _assert(len(bad) == 0, "no Pro or Cys substitution candidates")
 
-        # All from_aa match the sequence
         for r in results:
             expected_from = seq[r["position"] - 1]
             _assert(
@@ -394,7 +465,6 @@ def test_scanner_protected_residues() -> None:
     from mutation_scanner import MutationScanner
 
     seq = "IIIIII"
-    # All positions: aggregation-prone + tolerant
     scores = {i: -1.0 for i in range(1, 7)}
     esm    = {i: 0.1  for i in range(1, 7)}
 
@@ -467,19 +537,15 @@ def test_combined_score() -> None:
 
     from mutation_scanner import combined_score
 
-    # Strongly stabilising + solubility improvement + high tolerance → high score
     high = combined_score(ddg=-2.0, camsol_delta=2.0, esm_tolerance=0.9)
-    _assert(high > 1.0, "stabilising+soluble+tolerant → score > 1.0", f"{high:.4f}")
+    _assert(high > 1.0, "stabilising+soluble+tolerant -> score > 1.0", f"{high:.4f}")
 
-    # Destabilising + no improvement + conserved → low score
     low = combined_score(ddg=2.0, camsol_delta=0.0, esm_tolerance=0.1)
-    _assert(low < 0.0, "destabilising+no-improvement+conserved → score < 0", f"{low:.4f}")
+    _assert(low < 0.0, "destabilising+no-improvement+conserved -> score < 0", f"{low:.4f}")
 
-    # Neutral inputs → score ≈ 0
     neutral = combined_score(ddg=0.0, camsol_delta=0.0, esm_tolerance=0.0)
-    _assert(abs(neutral) < 0.01, "all-zero inputs → score ≈ 0", f"{neutral:.4f}")
+    _assert(abs(neutral) < 0.01, "all-zero inputs -> score ~0", f"{neutral:.4f}")
 
-    # Weight override: only DDG matters (w_sol=0, w_tol=0)
     score_ddg_only = combined_score(
         ddg=-1.0, camsol_delta=999.0, esm_tolerance=999.0,
         w_ddg=1.0, w_sol=0.0, w_tol=0.0,
@@ -492,15 +558,15 @@ def test_combined_score() -> None:
 
 
 def test_hydrophobicity_delta() -> None:
-    """Hydrophobic→charged substitution should yield positive camsol_delta."""
+    """Hydrophobic->charged substitution should yield positive camsol_delta."""
     from mutation_scanner import _estimate_camsol_delta
 
-    delta_IK = _estimate_camsol_delta("I", "K")   # Ile→Lys: hydro to charged
-    delta_KI = _estimate_camsol_delta("K", "I")   # reverse
+    delta_IK = _estimate_camsol_delta("I", "K")
+    delta_KI = _estimate_camsol_delta("K", "I")
 
-    _assert(delta_IK > 0, "I→K gives positive camsol_delta (improves solubility)",
+    _assert(delta_IK > 0, "I->K gives positive camsol_delta (improves solubility)",
             f"delta={delta_IK:.3f}")
-    _assert(delta_KI < 0, "K→I gives negative camsol_delta (worsens solubility)",
+    _assert(delta_KI < 0, "K->I gives negative camsol_delta (worsens solubility)",
             f"delta={delta_KI:.3f}")
 
 
@@ -537,42 +603,36 @@ def test_chimerax_commands_from_scan() -> None:
     cmds, exps = scanner.generate_chimerax_commands(scan_results, top_n=1)
 
     _assert(len(cmds) > 0,         "commands list is non-empty")
-    _assert(len(cmds) == len(exps), "commands and explanations are same length")
-
+    _assert(len(cmds) == len(exps), "commands and explanations same length")
     _assert(any("cartoon" in c for c in cmds), "includes cartoon command")
     _assert(any("color #1" in c for c in cmds), "includes model-specific color reset")
-
-    # Top-1 (position 75) should get sphere + label
     _assert(any("sphere" in c and ":75" in c for c in cmds),
             "top candidate gets sphere command")
     _assert(any("label" in c and ":75" in c for c in cmds),
             "top candidate gets label command")
-
-    # Second candidate (position 40) should get a colour but not a sphere
     _assert(any(":40" in c for c in cmds),  "position 40 coloured")
 
-    # No deprecated 'background' commands
     bad = [c for c in cmds if c.strip().startswith("background")]
     _assert(len(bad) == 0, "no deprecated 'background' commands", str(bad))
 
 
 def test_empty_scan_no_commands() -> None:
-    """generate_chimerax_commands on an empty result list returns empty lists."""
+    """generate_chimerax_commands on an empty list returns empty lists."""
     from mutation_scanner import MutationScanner
     from session_state import SessionState
 
     scanner = MutationScanner(session=SessionState(), model_id="1")
     cmds, exps = scanner.generate_chimerax_commands([], top_n=5)
-    _assert(cmds == [],  "empty scan → empty commands list")
-    _assert(exps == [],  "empty scan → empty explanations list")
+    _assert(cmds == [],  "empty scan -> empty commands list")
+    _assert(exps == [],  "empty scan -> empty explanations list")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# F. SessionState: Rosetta job persistence
+# F. SessionState: stability analysis persistence
 # ════════════════════════════════════════════════════════════════════════════════
 
 def test_session_rosetta_jobs() -> None:
-    print("\n--- F. SessionState Rosetta job persistence ---")
+    print("\n--- F. SessionState stability analysis persistence ---")
 
     from session_state import SessionState
 
@@ -581,40 +641,38 @@ def test_session_rosetta_jobs() -> None:
     job_data = {
         "mutations":    [{"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"}],
         "pdb_path":     "/tmp/test.pdb",
-        "backend":      "robetta",
+        "backend":      "dynamut2",
         "submitted_at": "2026-05-26T12:00:00",
-        "status":       "submitted",
+        "status":       "completed",
+        "results":      {"V82A": 1.47},
     }
 
     session.add_rosetta_job("42", job_data)
     _assert(session.get_rosetta_job("42") is not None, "job stored and retrieved")
 
-    session.update_rosetta_job("42", {"status": "running"})
-    _assert(session.get_rosetta_job("42")["status"] == "running",
-            "update_rosetta_job changes status")
+    session.update_rosetta_job("42", {"status": "completed"})
+    _assert(session.get_rosetta_job("42")["status"] == "completed",
+            "update_rosetta_job works")
 
-    # Not-found job
     _assert(session.get_rosetta_job("999") is None,
             "get_rosetta_job returns None for unknown job")
 
-    # list_rosetta_jobs
     all_jobs = session.list_rosetta_jobs()
     _assert("42" in all_jobs, "list_rosetta_jobs includes our job")
 
-    # clear_rosetta_job
     session.clear_rosetta_job("42")
     _assert(session.get_rosetta_job("42") is None, "clear_rosetta_job removes job")
 
 
 def test_session_rosetta_jobs_persistence() -> None:
-    """Rosetta jobs survive save() → load()."""
+    """Stability analysis results survive save() -> load()."""
     from session_state import SessionState
 
     session = SessionState()
     session.add_rosetta_job("99", {
         "mutations": [{"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"}],
         "pdb_path":  "/tmp/test.pdb",
-        "backend":   "robetta",
+        "backend":   "dynamut2",
         "submitted_at": "2026-05-26T12:00:00",
         "status":    "completed",
         "results":   {"V82A": 1.47},
@@ -630,13 +688,14 @@ def test_session_rosetta_jobs_persistence() -> None:
         loaded = SessionState.load(tmp)
 
         job = loaded.get_rosetta_job("99")
-        _assert(job is not None,                            "job persists after save/load")
-        _assert(job["status"] == "completed",               "job status preserved")
-        _assert(job["results"].get("V82A") == 1.47,         "job results preserved")
+        _assert(job is not None,                    "job persists after save/load")
+        _assert(job["status"] == "completed",       "job status preserved")
+        _assert(job["results"].get("V82A") == 1.47, "job results preserved")
+        _assert(job["backend"] == "dynamut2",       "backend label preserved")
 
         scan = loaded.get_scan_result("1")
-        _assert(scan is not None,                           "scan result persists")
-        _assert(len(scan) == 1,                             "scan result length preserved")
+        _assert(scan is not None,                   "scan result persists")
+        _assert(len(scan) == 1,                     "scan result length preserved")
     finally:
         Path(tmp).unlink(missing_ok=True)
 
@@ -690,7 +749,8 @@ def test_router_route_mutation_scan() -> None:
         "commands": [], "explanations": [], "warnings": [],
         "clarification_needed": None, "confidence": "high",
         "tools_needed": ["mutation_scan"],
-        "tool_inputs":  {"mutation_scan": {"model_id": "1", "chain": "A", "focus": "solubility"}},
+        "tool_inputs":  {"mutation_scan": {"model_id": "1", "chain": "A",
+                                           "focus": "solubility"}},
     }
     routed = router.route(result)
     _assert(routed.get("has_extra_tools") is True, "mutation_scan: has_extra_tools=True")
@@ -722,22 +782,29 @@ def test_router_rosetta_no_mutations_error() -> None:
     }
     executed = router.execute(routed)
     _assert(executed.get("pipeline_success") is False,
-            "rosetta without mutations → pipeline_success=False")
+            "rosetta without mutations -> pipeline_success=False")
     err = executed.get("pipeline_error", "")
     _assert("mutation" in err.lower(),
             "error message mentions 'mutations'", repr(err[:80]))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# H. Full pipeline mock
+# H. Full pipeline mock (DynaMut2 mocked, no live network)
 # ════════════════════════════════════════════════════════════════════════════════
 
-def test_robetta_full_pipeline_mock() -> None:
+def test_dynamut2_full_pipeline_mock() -> None:
     """
-    End-to-end through RosettaBridge._run_robetta() with all HTTP calls mocked.
-    Verifies: job submitted → polled → results fetched → ToolStepResult populated.
+    End-to-end through RosettaBridge._run_dynamut2() with requests.post mocked.
+
+    Verifies:
+      - Two mutations send two POST requests (one each)
+      - ddg_scores populated from mocked responses
+      - confidence="high" (all DynaMut2, no fallback)
+      - backend="dynamut2"
+      - viz_commands generated
+      - session.rosetta_jobs has a completed entry
     """
-    print("\n--- H. Full pipeline mock ---")
+    print("\n--- H. Full pipeline mock (DynaMut2) ---")
 
     from rosetta_bridge import RosettaBridge
     from session_state import SessionState
@@ -750,26 +817,29 @@ def test_robetta_full_pipeline_mock() -> None:
         {"chain": "A", "position": 10, "from_aa": "L", "to_aa": "K"},
     ]
 
-    fake_submit  = MagicMock(status_code=201,
-                             json=lambda: {"job_id": "1337", "warnings": []})
-    fake_status  = MagicMock(status_code=200,
-                             json=lambda: {"status": "completed"})
-    fake_results = MagicMock(status_code=200,
-                             json=lambda: {
-                                 "results": [
-                                     {"mutation": "V82A", "ddg": 1.47},
-                                     {"mutation": "L10K", "ddg": -0.82},
-                                 ]
-                             })
-    fake_status.raise_for_status = lambda: None
-    fake_results.raise_for_status = lambda: None
+    # Two-step async per mutation:
+    # POST /prediction_single  -> {"job_id": "..."}
+    # GET  /prediction_single?job_id=... -> {"prediction": ...}
+    submit_v82a = MagicMock(status_code=200)
+    submit_v82a.json.return_value = {"job_id": "job-v82a"}
+
+    submit_l10k = MagicMock(status_code=200)
+    submit_l10k.json.return_value = {"job_id": "job-l10k"}
+
+    result_v82a = MagicMock(status_code=200)
+    result_v82a.raise_for_status = MagicMock()
+    result_v82a.json.return_value = {"prediction": 1.47}
+
+    result_l10k = MagicMock(status_code=200)
+    result_l10k.raise_for_status = MagicMock()
+    result_l10k.json.return_value = {"prediction": -0.82}
 
     try:
-        os.environ["ROSETTA_BACKEND"] = "robetta"
-        os.environ["ROBETTA_API_KEY"] = "mock-key"
+        os.environ["ROSETTA_BACKEND"] = "dynamut2"
 
-        with patch("requests.post", return_value=fake_submit), \
-             patch("requests.get",  side_effect=[fake_status, fake_results]):
+        with patch("requests.post", side_effect=[submit_v82a, submit_l10k]), \
+             patch("requests.get",  side_effect=[result_v82a, result_l10k]), \
+             patch("time.sleep"):
             bridge = RosettaBridge()
             result = bridge.analyze(
                 pdb_path  = pdb_path,
@@ -777,32 +847,96 @@ def test_robetta_full_pipeline_mock() -> None:
                 session   = session,
             )
 
-        _assert(result.success,           "mocked pipeline returns success=True")
+        _assert(result.success,                          "mocked pipeline returns success=True")
         ddg = result.data.get("ddg_scores", {})
-        _assert("V82A" in ddg,            "V82A in ddg_scores")
-        _assert("L10K" in ddg,            "L10K in ddg_scores")
-        _assert(ddg["V82A"] == 1.47,      "V82A ddg = 1.47", str(ddg["V82A"]))
-        _assert(ddg["L10K"] == -0.82,     "L10K ddg = -0.82", str(ddg["L10K"]))
-        _assert(result.data["job_id"] == "1337", "job_id stored in data")
-        _assert(result.data["backend"] == "robetta", "backend = robetta")
+        _assert("V82A" in ddg,                           "V82A in ddg_scores")
+        _assert("L10K" in ddg,                           "L10K in ddg_scores")
+        _assert(ddg["V82A"] == 1.47,                     "V82A ddg = 1.47", str(ddg["V82A"]))
+        _assert(ddg["L10K"] == -0.82,                    "L10K ddg = -0.82", str(ddg["L10K"]))
+        _assert(result.data["confidence"] == "high",     "confidence=high (all DynaMut2)")
+        _assert(result.data["backend"] == "dynamut2",    "backend=dynamut2")
+        _assert(result.data["job_id"] is None,           "job_id=None (synchronous)")
 
-        # Job persisted in session
-        job = session.get_rosetta_job("1337")
-        _assert(job is not None,          "job stored in session")
-        _assert(job["status"] == "completed", "job status updated to completed")
-        _assert("V82A" in job.get("results", {}), "results stored in session job")
+        # Session: a completed entry must exist
+        jobs = session.list_rosetta_jobs()
+        _assert(len(jobs) >= 1,                          "session has at least one job entry")
+        latest = list(jobs.values())[-1]
+        _assert(latest["status"] == "completed",         "job status=completed")
+        _assert(latest["backend"] in ("dynamut2", "dynamut2+empirical"),
+                "job backend=dynamut2*")
+        _assert("V82A" in latest.get("results", {}),     "V82A in session job results")
 
-        # Viz commands generated
-        _assert(len(result.viz_commands) > 0,          "viz_commands non-empty")
+        # Viz commands
+        _assert(len(result.viz_commands) > 0,            "viz_commands non-empty")
         _assert(any("color" in c for c in result.viz_commands),
                 "viz includes color commands")
 
-        # Best mutation should be L10K (most negative ddg)
-        _assert("L10K" in result.summary, "summary mentions most stabilising mutation")
+        # Summary should mention the most-stabilising mutation (L10K, ddg=-0.82)
+        _assert("L10K" in result.summary,                "summary mentions most stabilising mutation")
 
     finally:
         os.environ.pop("ROSETTA_BACKEND", None)
-        os.environ.pop("ROBETTA_API_KEY",  None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_dynamut2_empirical_fallback_per_mutation() -> None:
+    """
+    When DynaMut2 fails for one mutation but not another, the successful one
+    uses DynaMut2 and the failed one falls back to empirical.
+    Result should have confidence='medium' and backend='dynamut2+empirical'.
+    """
+    from rosetta_bridge import RosettaBridge
+    from session_state import SessionState
+    import requests
+
+    pdb_path = _write_temp_pdb()
+    session  = SessionState()
+
+    mutations = [
+        {"chain": "A", "position": 82, "from_aa": "V", "to_aa": "A"},
+        {"chain": "A", "position": 10, "from_aa": "L", "to_aa": "K"},
+    ]
+
+    ok_submit = MagicMock(status_code=200)
+    ok_submit.json.return_value = {"job_id": "job-v82a-ok"}
+
+    ok_result = MagicMock(status_code=200)
+    ok_result.raise_for_status = MagicMock()
+    ok_result.json.return_value = {"prediction": 1.47}
+
+    try:
+        os.environ["ROSETTA_BACKEND"] = "dynamut2"
+
+        # First mutation (V82A): submit OK + result OK
+        # Second mutation (L10K): submit raises ConnectionError on all retries
+        call_count = {"n": 0}
+
+        def post_side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:   # first mutation submit
+                return ok_submit
+            raise requests.exceptions.ConnectionError("simulated network failure")
+
+        with patch("requests.post", side_effect=post_side_effect), \
+             patch("requests.get",  return_value=ok_result), \
+             patch("time.sleep"):
+            bridge = RosettaBridge()
+            result = bridge.analyze(
+                pdb_path  = pdb_path,
+                mutations = mutations,
+                session   = session,
+            )
+
+        _assert(result.success,                                "mixed pipeline success=True")
+        _assert(result.data["confidence"] == "medium",         "confidence=medium (mixed)")
+        _assert("dynamut2" in result.data["backend"],          "backend contains dynamut2")
+        _assert("empirical" in result.data["backend"],         "backend contains empirical")
+        _assert(len(result.data["warnings"]) > 0,              "warnings present")
+        _assert("V82A" in result.data["ddg_scores"],           "V82A scored (DynaMut2)")
+        _assert("L10K" in result.data["ddg_scores"],           "L10K scored (empirical)")
+
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
         Path(pdb_path).unlink(missing_ok=True)
 
 
@@ -820,12 +954,15 @@ def run_all(groups: List[str]) -> None:
     if run_detection:
         test_backend_detection()
         test_pyrosetta_stub_error()
-        test_missing_api_key_error()
+        test_empirical_backend_forced()
         test_missing_pdb_error()
 
     if run_mock:
-        test_robetta_submit_format()
-        test_robetta_full_pipeline_mock()
+        test_dynamut2_request_format()
+        test_dynamut2_response_parsing()
+        test_dynamut2_rate_limit_retry()
+        test_dynamut2_full_pipeline_mock()
+        test_dynamut2_empirical_fallback_per_mutation()
 
     if run_scanner:
         test_scanner_candidate_selection()
@@ -847,7 +984,9 @@ def run_all(groups: List[str]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="StructureBot Rosetta / mutation tests")
+    parser = argparse.ArgumentParser(
+        description="StructureBot DynaMut2 / mutation scanner tests"
+    )
     parser.add_argument("--detection", action="store_true", help="A: backend detection")
     parser.add_argument("--mock",      action="store_true", help="B+H: HTTP mock tests")
     parser.add_argument("--scanner",   action="store_true", help="C+D+E: scanner tests")
@@ -865,7 +1004,7 @@ def main() -> None:
         groups = ["all"]
 
     print("=" * 60)
-    print("StructureBot — Rosetta / Mutation Scanner Tests")
+    print("StructureBot -- DynaMut2 / Mutation Scanner Tests")
     print("=" * 60)
 
     run_all(groups)

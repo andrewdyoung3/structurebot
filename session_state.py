@@ -188,8 +188,12 @@ class SessionState:
         self.command_history: List[Dict[str, Any]] = []
         # tool_results[tool_name][model_id] = result_data_dict
         self.tool_results:   Dict[str, Dict[str, Any]] = {}
-        # Rosetta / Robetta job tracking (persisted so jobs survive restarts)
-        # job_id → {status, mutations, pdb_path, backend, submitted_at, results?}
+        # Stability analysis cache (keyed by job_id string).
+        # Populated by RosettaBridge after each successful analysis.
+        # DynaMut2 (default backend) is synchronous — status is always
+        # "completed" immediately.  Preserved across save/load for the
+        # `jobs` display command.
+        # job_id -> {status, mutations, pdb_path, backend, submitted_at, results?}
         self.rosetta_jobs:   Dict[str, Dict[str, Any]] = {}
         # Full mutation-scan results per model: model_id → scan result list
         self.scan_results:   Dict[str, Dict[str, Any]] = {}
@@ -299,14 +303,15 @@ class SessionState:
         job_data: Dict[str, Any],
     ) -> None:
         """
-        Register a newly submitted Robetta / PyRosetta job.
+        Store a stability analysis result.
 
         job_data keys:
           mutations    : list of {chain, position, from_aa, to_aa}
-          pdb_path     : local path of the PDB file submitted
-          backend      : "robetta" | "pyrosetta"
+          pdb_path     : local path of the PDB file analysed
+          backend      : "dynamut2" | "empirical" | "dynamut2+empirical" | "pyrosetta"
           submitted_at : ISO timestamp string
-          status       : initial status string (e.g. "submitted")
+          status       : "completed" for DynaMut2/empirical; other for async backends
+          results      : {mutation_key: ddg_float} (present when status="completed")
         """
         self.rosetta_jobs[str(job_id)] = dict(job_data)
 
@@ -461,12 +466,27 @@ class SessionState:
                 lines.append(f"  scan    #{mid}  [{ts}]  {n} ranked candidates")
 
         if self.rosetta_jobs:
+            completed = {
+                jid: job for jid, job in self.rosetta_jobs.items()
+                if job.get("status") == "completed"
+            }
             pending = {
                 jid: job for jid, job in self.rosetta_jobs.items()
                 if job.get("status") not in ("completed", "failed", "error")
             }
+            if completed:
+                lines.append(f"\nStability analyses ({len(completed)} completed):")
+                for jid, job in list(completed.items())[-3:]:  # show last 3
+                    backend = job.get("backend", "?")
+                    ts      = job.get("submitted_at", "?")
+                    nmut    = len(job.get("mutations", []))
+                    nres    = len(job.get("results", {}))
+                    lines.append(
+                        f"  [{backend}]  {nmut} mutation(s) scored  "
+                        f"{nres} results  {ts}"
+                    )
             if pending:
-                lines.append(f"\nPending Rosetta jobs ({len(pending)}):")
+                lines.append(f"\nPending stability jobs ({len(pending)}):")
                 for jid, job in pending.items():
                     backend = job.get("backend", "?")
                     status  = job.get("status", "?")

@@ -183,7 +183,13 @@ class MutationScanner:
     ):
         self.session  = session
         self.model_id = model_id
-        self._progress = progress_callback or (lambda msg: print(msg))
+        def _safe_print(msg: str) -> None:
+            try:
+                print(msg)
+            except UnicodeEncodeError:
+                print(msg.encode("ascii", errors="replace").decode("ascii"))
+
+        self._progress = progress_callback or _safe_print
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
