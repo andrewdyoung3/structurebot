@@ -195,20 +195,22 @@ class MutationScanner:
 
     def scan(
         self,
-        pdb_path:  str,
-        chain_id:  Optional[str] = None,
-        sequence:  Optional[str] = None,
-        filters:   Optional[Dict[str, Any]] = None,
+        pdb_path:           str,
+        chain_id:           Optional[str] = None,
+        sequence:           Optional[str] = None,
+        filters:            Optional[Dict[str, Any]] = None,
+        protected_residues: Optional[List[int]] = None,
+        analysis_mode:      str = "monomer",
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
 
         Parameters
         ----------
-        pdb_path  : local PDB/CIF file (required for Rosetta)
-        chain_id  : chain to analyse (None = use all / first available)
-        sequence  : amino-acid sequence string (fetched from session if None)
-        filters   : optional dict overriding default thresholds:
+        pdb_path           : local PDB/CIF file (required for Rosetta)
+        chain_id           : chain to analyse (None = use all / first available)
+        sequence           : amino-acid sequence string (fetched from session if None)
+        filters            : optional dict overriding default thresholds:
             camsol_threshold      float  default -0.5
             esm_threshold         float  default 0.3  (conservation, lower=tolerant)
             max_candidates        int    default 20
@@ -216,12 +218,17 @@ class MutationScanner:
             focus                 str    "solubility" | "stability" | "both"
             binding_site_residues list   residue numbers to protect
             w_ddg / w_sol / w_tol float  weight overrides
+        protected_residues : explicit list of residue IDs to exclude from scan
+                             (e.g. interface residues from AssemblyAnalyser in
+                             multimer mode).  Merged with binding_site_residues.
+        analysis_mode      : "monomer" | "multimer" — used for reporting only.
 
         Returns
         -------
         List of candidate dicts, sorted by combined_score descending.
         Each dict contains: position, chain, from_aa, to_aa, ddg,
-        solubility_delta, esm_tolerance, combined_score, recommendation.
+        solubility_delta, esm_tolerance, combined_score, recommendation,
+        and optionally interface_proximal (bool).
         """
         filt               = filters or {}
         camsol_thr         = filt.get("camsol_threshold",   -0.5)
@@ -232,6 +239,11 @@ class MutationScanner:
         w_ddg              = filt.get("w_ddg", _W_DDG)
         w_sol              = filt.get("w_sol", _W_SOL)
         w_tol              = filt.get("w_tol", _W_TOL)
+
+        # Merge in explicit protected_residues (e.g. interface residues)
+        _interface_protected: set = set(protected_residues or [])
+        protected = protected | _interface_protected
+        self._analysis_mode = analysis_mode
 
         # ── Step 1: Fetch / compute CamSol scores ─────────────────────────────
         self._progress("💧 Step 1/4: CamSol solubility scoring…")
@@ -253,16 +265,25 @@ class MutationScanner:
 
         # ── Step 3: Identify candidates ───────────────────────────────────────
         self._progress("🔬 Step 3/4: Identifying candidate positions…")
+
+        # Report interface exclusions in multimer mode
+        if _interface_protected:
+            self._progress(
+                f"  ⛔ {len(_interface_protected)} position(s) excluded — "
+                f"at chain interface (multimer mode)."
+            )
+
         raw_candidates = self._identify_candidates(
-            sequence     = sequence,
-            camsol_scores = camsol_scores,
-            esm_scores    = esm_scores,
-            camsol_thr    = camsol_thr,
-            esm_thr       = esm_thr,
-            protected     = protected,
-            cands_per_pos = cands_per_pos,
+            sequence       = sequence,
+            camsol_scores  = camsol_scores,
+            esm_scores     = esm_scores,
+            camsol_thr     = camsol_thr,
+            esm_thr        = esm_thr,
+            protected      = protected,
+            cands_per_pos  = cands_per_pos,
             max_candidates = max_candidates,
-            chain_id      = chain_id,
+            chain_id       = chain_id,
+            interface_residues = _interface_protected,
         )
 
         if not raw_candidates:
@@ -298,17 +319,26 @@ class MutationScanner:
 
             score = combined_score(ddg, camsol_delta, esm_tol, w_ddg, w_sol, w_tol)
 
+            # Check interface-proximal: within 3 positions of an interface residue
+            is_proximal = cand.get("interface_proximal", False)
+
+            rec = _recommendation(ddg, camsol_delta, esm_tol, score)
+            if is_proximal:
+                rec += " — ⚠ interface-proximal, mutate with caution"
+
             results.append({
-                "position":        pos,
-                "chain":           chain_id or "A",
-                "from_aa":         from_aa,
-                "to_aa":           to_aa,
-                "ddg":             round(ddg, 3),
-                "solubility_delta": camsol_delta,
-                "esm_tolerance":   esm_tol,
-                "combined_score":  score,
-                "camsol_score":    round(camsol_scores.get(pos, 0.0), 3),
-                "recommendation":  _recommendation(ddg, camsol_delta, esm_tol, score),
+                "position":          pos,
+                "chain":             chain_id or "A",
+                "from_aa":           from_aa,
+                "to_aa":             to_aa,
+                "ddg":               round(ddg, 3),
+                "solubility_delta":  camsol_delta,
+                "esm_tolerance":     esm_tol,
+                "combined_score":    score,
+                "camsol_score":      round(camsol_scores.get(pos, 0.0), 3),
+                "recommendation":    rec,
+                "interface_proximal": is_proximal,
+                "analysis_mode":     getattr(self, "_analysis_mode", "monomer"),
             })
 
         results.sort(key=lambda r: r["combined_score"], reverse=True)
@@ -480,21 +510,35 @@ class MutationScanner:
 
     def _identify_candidates(
         self,
-        sequence:      str,
-        camsol_scores: Dict[int, float],
-        esm_scores:    Dict[int, float],
-        camsol_thr:    float,
-        esm_thr:       float,
-        protected:     set,
-        cands_per_pos: int,
-        max_candidates: int,
-        chain_id:      Optional[str],
+        sequence:          str,
+        camsol_scores:     Dict[int, float],
+        esm_scores:        Dict[int, float],
+        camsol_thr:        float,
+        esm_thr:           float,
+        protected:         set,
+        cands_per_pos:     int,
+        max_candidates:    int,
+        chain_id:          Optional[str],
+        interface_residues: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
         Build the list of (position, from_aa, to_aa, estimated_camsol_delta) dicts
         that pass both the CamSol and ESM thresholds.
+
+        Positions in *interface_residues* are excluded (already in *protected*).
+        Positions within 3 residues of an interface residue are flagged as
+        interface_proximal=True — still included, but labelled "mutate with caution".
         """
         candidates: List[Dict[str, Any]] = []
+        iface_set = interface_residues or set()
+
+        # Pre-compute proximal positions: within 3 of any interface residue
+        proximal_set: set = set()
+        if iface_set:
+            for ir in iface_set:
+                for offset in range(-3, 4):
+                    proximal_set.add(ir + offset)
+            proximal_set -= iface_set  # exclude direct interface residues
 
         for pos, from_aa in enumerate(sequence, 1):
             if pos in protected:
@@ -509,6 +553,8 @@ class MutationScanner:
             if esm_val >= esm_thr:
                 continue     # too conserved — risky to mutate
 
+            is_proximal = pos in proximal_set
+
             # Generate substitution candidates for this position
             subs = self._substitution_candidates(from_aa, cands_per_pos)
             for to_aa, camsol_delta in subs:
@@ -518,6 +564,7 @@ class MutationScanner:
                     "from_aa":               from_aa,
                     "to_aa":                 to_aa,
                     "estimated_camsol_delta": camsol_delta,
+                    "interface_proximal":     is_proximal,
                 })
                 if len(candidates) >= max_candidates:
                     return candidates

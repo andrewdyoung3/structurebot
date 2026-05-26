@@ -197,6 +197,15 @@ class SessionState:
         self.rosetta_jobs:   Dict[str, Dict[str, Any]] = {}
         # Full mutation-scan results per model: model_id → scan result list
         self.scan_results:   Dict[str, Dict[str, Any]] = {}
+        # Assembly analysis: pdb_id → assembly metadata from RCSB
+        self.assembly_info:  Dict[str, Dict[str, Any]] = {}
+        # Analysis mode per model: model_id → "monomer" | "multimer"
+        self.analysis_mode:  Dict[str, str] = {}
+        # Interface residues per model: model_id → {(c1,c2): [resno,...]}
+        # Keys are stored as "C1:C2" strings (tuples not JSON-serialisable)
+        self.interface_residues: Dict[str, Dict[str, List[int]]] = {}
+        # ProteinMPNN redesign results per model: model_id → result list
+        self.proteinmpnn_results: Dict[str, Dict[str, Any]] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -357,6 +366,93 @@ class SessionState:
             return entry.get("data")
         return None
 
+    # ── Assembly analysis tracking ────────────────────────────────────────────
+
+    def set_assembly_info(self, pdb_id: str, info: Dict[str, Any]) -> None:
+        """Store RCSB assembly metadata for a PDB ID."""
+        self.assembly_info[pdb_id.upper()] = dict(info)
+
+    def get_assembly_info(self, pdb_id: str) -> Optional[Dict[str, Any]]:
+        """Return cached assembly info for a PDB ID, or None."""
+        return self.assembly_info.get(pdb_id.upper())
+
+    def set_analysis_mode(self, model_id: str, mode: str) -> None:
+        """Set the analysis mode ('monomer' or 'multimer') for a model."""
+        self.analysis_mode[str(model_id)] = mode
+
+    def get_analysis_mode(self, model_id: str) -> str:
+        """Return the current analysis mode for a model (default 'monomer')."""
+        return self.analysis_mode.get(str(model_id), "monomer")
+
+    def set_interface_residues(
+        self,
+        model_id:   str,
+        interfaces: Dict,   # {(c1,c2): [resno,...]} — keys may be tuples
+    ) -> None:
+        """
+        Store interface residues for a model.
+
+        Tuple keys (c1, c2) are serialised as "c1:c2" strings for JSON compat.
+        """
+        serialised: Dict[str, List[int]] = {}
+        for key, resnos in interfaces.items():
+            if isinstance(key, tuple):
+                skey = f"{key[0]}:{key[1]}"
+            else:
+                skey = str(key)
+            serialised[skey] = sorted(resnos)
+        self.interface_residues[str(model_id)] = serialised
+
+    def get_interface_residues(
+        self,
+        model_id: str,
+    ) -> Dict:
+        """
+        Return interface residues as {(c1,c2): [resno,...]} for a model.
+        Returns {} if nothing stored.
+        """
+        raw = self.interface_residues.get(str(model_id), {})
+        result = {}
+        for skey, resnos in raw.items():
+            parts = skey.split(":")
+            if len(parts) == 2:
+                result[(parts[0], parts[1])] = resnos
+            else:
+                result[skey] = resnos
+        return result
+
+    def get_protected_residues_for_chain(
+        self,
+        model_id: str,
+        chain_id: str,
+    ) -> List[int]:
+        """
+        Return all interface residue numbers for a specific chain in a model.
+        Used by MutationScanner to protect interface residues in multimer mode.
+        """
+        interfaces = self.get_interface_residues(model_id)
+        protected: set = set()
+        for (c1, c2), resnos in interfaces.items():
+            if chain_id.upper() in (c1.upper(), c2.upper()):
+                protected.update(resnos)
+        return sorted(protected)
+
+    def add_proteinmpnn_result(
+        self,
+        model_id: str,
+        data:     Dict[str, Any],
+    ) -> None:
+        """Store ProteinMPNN sequence redesign results for a model."""
+        self.proteinmpnn_results[str(model_id)] = {
+            "data":      data,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def get_proteinmpnn_result(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return ProteinMPNN results for a model, or None."""
+        entry = self.proteinmpnn_results.get(str(model_id))
+        return entry.get("data") if entry else None
+
     # ── Selection tracking ────────────────────────────────────────────────────
 
     def save_selection(self, label: str, spec: str) -> None:
@@ -463,7 +559,17 @@ class SessionState:
                 ts  = entry.get("timestamp", "?")
                 dat = entry.get("data", {})
                 n   = len(dat) if isinstance(dat, list) else "?"
-                lines.append(f"  scan    #{mid}  [{ts}]  {n} ranked candidates")
+                mode = self.get_analysis_mode(mid)
+                lines.append(f"  scan    #{mid}  [{ts}]  {n} ranked candidates  [{mode} mode]")
+
+        if self.interface_residues:
+            lines.append("\nDetected interfaces:")
+            for mid, ifaces in self.interface_residues.items():
+                mode = self.get_analysis_mode(mid)
+                for pair_key, resnos in ifaces.items():
+                    lines.append(
+                        f"  #{mid}  {pair_key}  {len(resnos)} residues  [{mode} mode]"
+                    )
 
         if self.rosetta_jobs:
             completed = {
@@ -512,15 +618,19 @@ class SessionState:
 
     def save(self, path: str = "session.json") -> None:
         data = {
-            "session_start":     self.session_start,
-            "working_dir":       self.working_dir,
-            "structures":        self.structures,
-            "named_selections":  self.named_selections,
-            "applied_styles":    self.applied_styles,
-            "command_history":   self.command_history,
-            "tool_results":      self.tool_results,
-            "rosetta_jobs":      self.rosetta_jobs,
-            "scan_results":      self.scan_results,
+            "session_start":      self.session_start,
+            "working_dir":        self.working_dir,
+            "structures":         self.structures,
+            "named_selections":   self.named_selections,
+            "applied_styles":     self.applied_styles,
+            "command_history":    self.command_history,
+            "tool_results":       self.tool_results,
+            "rosetta_jobs":       self.rosetta_jobs,
+            "scan_results":       self.scan_results,
+            "assembly_info":      self.assembly_info,
+            "analysis_mode":      self.analysis_mode,
+            "interface_residues": self.interface_residues,
+            "proteinmpnn_results": self.proteinmpnn_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -532,15 +642,19 @@ class SessionState:
             return state
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        state.session_start    = data.get("session_start", state.session_start)
-        state.working_dir      = data.get("working_dir",   state.working_dir)
-        state.structures       = data.get("structures",    {})
-        state.named_selections = data.get("named_selections", {})
-        state.applied_styles   = data.get("applied_styles", [])
-        state.command_history  = data.get("command_history", [])
-        state.tool_results     = data.get("tool_results",  {})
-        state.rosetta_jobs     = data.get("rosetta_jobs",  {})
-        state.scan_results     = data.get("scan_results",  {})
+        state.session_start       = data.get("session_start", state.session_start)
+        state.working_dir         = data.get("working_dir",   state.working_dir)
+        state.structures          = data.get("structures",    {})
+        state.named_selections    = data.get("named_selections", {})
+        state.applied_styles      = data.get("applied_styles", [])
+        state.command_history     = data.get("command_history", [])
+        state.tool_results        = data.get("tool_results",  {})
+        state.rosetta_jobs        = data.get("rosetta_jobs",  {})
+        state.scan_results        = data.get("scan_results",  {})
+        state.assembly_info       = data.get("assembly_info", {})
+        state.analysis_mode       = data.get("analysis_mode", {})
+        state.interface_residues  = data.get("interface_residues", {})
+        state.proteinmpnn_results = data.get("proteinmpnn_results", {})
         return state
 
     def __repr__(self) -> str:

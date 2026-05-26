@@ -82,6 +82,37 @@ _CONS_COLOUR_BANDS: List[Tuple[float, float, str]] = [
 ]
 
 
+# ── CUDA probe ───────────────────────────────────────────────────────────────
+
+def _probe_cuda_device(preferred: str = "cuda") -> str:
+    """
+    Test whether CUDA is actually usable for tensor operations.
+
+    Returns "cuda" if a minimal tensor computation succeeds, "cpu" otherwise.
+    This catches cases where torch.cuda.is_available() is True but the GPU
+    kernel image is not available for the device's compute capability (e.g.
+    Blackwell sm_120 with a cu126 torch build).
+    """
+    if preferred != "cuda":
+        return preferred
+    try:
+        import torch
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _t = torch.zeros(4, device="cuda")
+            _ = (_t + 1).sum().item()   # forces a kernel launch
+        return "cuda"
+    except Exception:
+        print(
+            "[ESM] CUDA device detected but kernel execution failed "
+            "(compute capability mismatch). Falling back to CPU.\n"
+            "      RTX 5070 Ti (sm_120 Blackwell) requires PyTorch cu130 "
+            "with CUDA 13 support."
+        )
+        return "cpu"
+
+
 # ── Entropy helpers ───────────────────────────────────────────────────────────
 
 def _entropy(probs: List[float]) -> float:
@@ -249,9 +280,11 @@ class _EsmBackend:
                 self._model.eval()
                 import torch as _torch
                 _env_dev = os.environ.get("ESM_DEVICE", "").strip().lower()
-                self._device = _env_dev if _env_dev in ("cuda", "cpu") else (
-                    "cuda" if _torch.cuda.is_available() else "cpu"
-                )
+                if _env_dev in ("cuda", "cpu"):
+                    preferred = _env_dev
+                else:
+                    preferred = "cuda" if _torch.cuda.is_available() else "cpu"
+                self._device = _probe_cuda_device(preferred)
                 self._model = self._model.to(self._device)
                 self._backend = "fair_esm"
                 print(f"[ESM] Model loaded (fair-esm) on {self._device}.")
@@ -275,9 +308,11 @@ class _EsmBackend:
                 self._model.eval()
                 import torch as _torch
                 _env_dev = os.environ.get("ESM_DEVICE", "").strip().lower()
-                self._device = _env_dev if _env_dev in ("cuda", "cpu") else (
-                    "cuda" if _torch.cuda.is_available() else "cpu"
-                )
+                if _env_dev in ("cuda", "cpu"):
+                    preferred = _env_dev
+                else:
+                    preferred = "cuda" if _torch.cuda.is_available() else "cpu"
+                self._device = _probe_cuda_device(preferred)
                 self._model = self._model.to(self._device)
                 self._backend   = "transformers"
                 print(f"[ESM] Model loaded (transformers) on {self._device}.")

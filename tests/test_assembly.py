@@ -1,0 +1,510 @@
+"""
+test_assembly.py
+----------------
+Tests for assembly_analyser.py — biological assembly detection,
+interface mapping, and monomer/multimer mode selection.
+
+All RCSB API calls and ChimeraX bridge calls are mocked to run offline.
+"""
+
+from __future__ import annotations
+
+import sys
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Ensure project root is on sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from assembly_analyser import (
+    AssemblyAnalyser,
+    fetch_assembly_info,
+    parse_contacts_output,
+    _stoichiometry_label,
+)
+from session_state import SessionState
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_session():
+    """A minimal SessionState for testing."""
+    session = SessionState(working_dir=str(Path(__file__).parent.parent))
+    session.add_structure(
+        model_id = "1",
+        name     = "1HSG",
+        metadata = {
+            "pdb_id":       "1HSG",
+            "title":        "HIV-1 PROTEASE",
+            "chains":       ["A", "B"],
+            "ligand_codes": ["MK1"],
+            "resolution":   "1.9",
+        },
+    )
+    return session
+
+
+@pytest.fixture
+def mock_bridge():
+    """A mock ChimeraXBridge that returns canned contacts output."""
+    bridge = MagicMock()
+    bridge.is_running.return_value = True
+    # Return a realistic contacts output for 1HSG chains A and B
+    contacts_text = (
+        "#1/A:25 GLY <-> #1/B:99 PRO  dist 4.2\n"
+        "#1/A:26 ASP <-> #1/B:98 ALA  dist 3.9\n"
+        "#1/A:27 THR <-> #1/B:97 GLY  dist 4.8\n"
+        "#1/A:50 ILE <-> #1/B:50 ILE  dist 3.1\n"
+        "#1/A:51 GLY <-> #1/B:51 GLY  dist 2.8\n"
+        "#1/A:52 GLY <-> #1/B:52 GLY  dist 3.0\n"
+        "#1/A:76 THR <-> #1/B:24 THR  dist 4.5\n"
+        "#1/A:99 PRO <-> #1/B:25 GLY  dist 4.2\n"
+    )
+    bridge.run_command.return_value = {"value": contacts_text, "error": None}
+    return bridge
+
+
+@pytest.fixture
+def hsg_assembly_data():
+    """Canned RCSB assembly API response for 1HSG (homodimer)."""
+    return {
+        "rcsb_assembly_info": {
+            "polymer_entity_instance_count_protein": 2,
+            "stoichiometry": "A2",
+        },
+        "pdbx_struct_assembly": {
+            "oligomeric_details": "homodimer",
+            "oligomeric_count":   2,
+        },
+        "pdbx_struct_assembly_gen": [
+            {"asym_id_list": ["A", "B"]},
+        ],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. RCSB assembly query — mock API, verify homodimer detection for 1HSG
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_fetch_assembly_info_homodimer(hsg_assembly_data):
+    """fetch_assembly_info correctly identifies 1HSG as a homodimer."""
+    with patch("assembly_analyser._requests") as mock_req:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = hsg_assembly_data
+        mock_req.get.return_value = mock_resp
+
+        result = fetch_assembly_info("1HSG")
+
+    assert result["pdb_id"] == "1HSG"
+    assert result["assembly_type"] in ("homodimer", "homo-2mer", "A2"), (
+        f"Expected homodimer description, got: {result['assembly_type']}"
+    )
+    assert result["n_subunits"] == 2
+    assert "A" in result["chains"] or "B" in result["chains"]
+    assert result["error"] is None
+
+
+def test_fetch_assembly_info_network_error():
+    """fetch_assembly_info returns error dict gracefully on network failure."""
+    with patch("assembly_analyser._requests") as mock_req:
+        mock_req.get.side_effect = Exception("Connection refused")
+        result = fetch_assembly_info("1HSG")
+
+    assert result["error"] is not None
+    assert result["assembly_type"] is None
+
+
+def test_stoichiometry_label():
+    """_stoichiometry_label maps RCSB stoich strings to readable names."""
+    assert _stoichiometry_label("A2", 2) == "homodimer"
+    assert _stoichiometry_label("A1", 1) == "monomer"
+    assert _stoichiometry_label("A4", 4) == "homotetramer"
+    assert _stoichiometry_label("AB", 2) == "heterodimer"
+    assert "hetero" in _stoichiometry_label("A2B2", 4).lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Interface detection — mock ChimeraX contacts output, verify residue extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_parse_contacts_output_basic():
+    """parse_contacts_output correctly extracts chain pairs and residue numbers."""
+    contacts = (
+        "#1/A:25 GLY <-> #1/B:99 PRO  dist 4.2\n"
+        "#1/A:26 ASP <-> #1/B:98 ALA  dist 3.9\n"
+        "#1/A:50 ILE <-> #1/B:50 ILE  dist 3.1\n"
+    )
+    result = parse_contacts_output(contacts)
+
+    # Should have one interface: A-B (or B-A, stored as sorted)
+    assert len(result) == 1
+    pair = list(result.keys())[0]
+    assert set(pair) == {"A", "B"}
+
+    resnos = result[pair]
+    assert 25 in resnos
+    assert 26 in resnos
+    assert 50 in resnos
+    assert 99 in resnos
+    assert 98 in resnos
+
+
+def test_parse_contacts_output_intrachain_ignored():
+    """Intra-chain contacts (same chain) are ignored."""
+    contacts = (
+        "#1/A:10 ALA <-> #1/A:20 GLY  dist 3.0\n"  # intra-chain
+        "#1/A:25 GLY <-> #1/B:99 PRO  dist 4.2\n"  # inter-chain
+    )
+    result = parse_contacts_output(contacts)
+    assert len(result) == 1  # only the inter-chain contact
+    pair = list(result.keys())[0]
+    assert set(pair) == {"A", "B"}
+
+
+def test_parse_contacts_output_empty():
+    """Empty contacts text returns empty dict."""
+    result = parse_contacts_output("")
+    assert result == {}
+
+
+def test_detect_interfaces(mock_bridge, mock_session):
+    """AssemblyAnalyser.detect_interfaces returns correct chain-residue mapping."""
+    analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+    interfaces = analyser.detect_interfaces(model_id="1", contact_distance=5.0)
+
+    assert len(interfaces) >= 1
+    # All pairs should be inter-chain
+    for (c1, c2), resnos in interfaces.items():
+        assert c1 != c2, "Intra-chain contact leaked into interface dict"
+        assert len(resnos) > 0
+    # Should detect A-B interface
+    pairs = {frozenset(pair) for pair in interfaces}
+    assert frozenset({"A", "B"}) in pairs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. Monomer mode — verify interface residues NOT excluded
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_monomer_mode_no_interface_exclusion(mock_bridge, mock_session, hsg_assembly_data):
+    """In MONOMER mode, protected_residues is empty and interfaces not detected."""
+    with patch("assembly_analyser.fetch_assembly_info") as mock_fetch:
+        mock_fetch.return_value = {
+            **hsg_assembly_data.get("rcsb_assembly_info", {}),
+            "pdb_id": "1HSG",
+            "assembly_type": "homodimer",
+            "n_subunits": 2,
+            "chains": ["A", "B"],
+            "is_obligate": True,
+            "error": None,
+            "stoichiometry": "A2",
+            "oligomeric_state": "homodimer",
+        }
+
+        analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+        result   = analyser.analyse(
+            model_id = "1",
+            pdb_id   = "1HSG",
+            mode     = "monomer",
+            chain_id = "A",
+        )
+
+    assert result["mode"] == "monomer"
+    assert result["protected_residues"] == []
+    assert result["excluded_count"] == 0
+    # In monomer mode, no bridge call for contacts should have been made
+    mock_bridge.run_command.assert_not_called()
+
+    # But should warn about obligate multimer in monomer mode
+    warnings = result.get("warnings", [])
+    has_multimer_warning = any("obligate" in w.lower() or "multimer" in w.lower()
+                               for w in warnings)
+    assert has_multimer_warning, (
+        "Expected a warning about analysing obligate multimer as monomer"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. Multimer mode — verify interface residues excluded from candidates
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_multimer_mode_interface_exclusion(mock_bridge, mock_session):
+    """In MULTIMER mode, interface residues populate protected_residues."""
+    analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+    result   = analyser.analyse(
+        model_id = "1",
+        pdb_id   = None,  # skip RCSB lookup for simplicity
+        mode     = "multimer",
+        chain_id = "A",
+    )
+
+    assert result["mode"] == "multimer"
+    # Bridge should have been called for contacts
+    mock_bridge.run_command.assert_called()
+
+    # Should have found interfaces
+    assert len(result["interfaces"]) > 0
+
+    # protected_residues should be non-empty for chain A
+    assert len(result["protected_residues"]) > 0, (
+        "Expected interface residues to be protected in multimer mode"
+    )
+
+    # All protected residues should appear in interface data
+    all_iface_resnos: set = set()
+    for (c1, c2), resnos in result["interfaces"].items():
+        if "A" in (c1, c2):
+            all_iface_resnos.update(resnos)
+
+    for prot in result["protected_residues"]:
+        assert prot in all_iface_resnos, (
+            f"Protected residue {prot} not found in interface data"
+        )
+
+
+def test_session_stores_interface_residues(mock_bridge, mock_session):
+    """AssemblyAnalyser stores interface residues in session state correctly."""
+    analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+    analyser.analyse(model_id="1", mode="multimer", chain_id="A")
+
+    # Session should have stored the interface data
+    stored = mock_session.get_interface_residues("1")
+    assert len(stored) >= 1, "Session should store interface residues after multimer analysis"
+
+    # get_protected_residues_for_chain should return chain A's interface residues
+    protected = mock_session.get_protected_residues_for_chain("1", "A")
+    assert len(protected) > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. Interface-proximal warning — residues within 3Å flagged
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_interface_proximal_flagging():
+    """MutationScanner flags residues within 3 positions of interface as proximal."""
+    from mutation_scanner import MutationScanner
+
+    session = SessionState()
+    session.add_structure("1", "TEST", metadata={"sequences": {"A": "ACDEFGHIKLM"}})
+
+    # Store interface residues at positions 5, 6 in session
+    session.set_interface_residues("1", {("A", "B"): [5, 6]})
+    session.set_analysis_mode("1", "multimer")
+
+    scanner = MutationScanner(session=session, model_id="1")
+
+    # Positions 2-4 and 7-9 (within 3 of positions 5, 6) should be proximal
+    from mutation_scanner import MutationScanner
+
+    # _identify_candidates is internal but we can test via scan() indirectly
+    # by checking that candidates near the interface have interface_proximal=True
+    # We'll inject fake camsol/esm results and check
+    session.add_tool_result("camsol", "1", {
+        "scores": {str(i): -1.0 for i in range(1, 12)},
+        "aggregation_hot_spots": list(range(1, 12)),
+    })
+    session.add_tool_result("esm", "1", {
+        "conservation": {str(i): 0.1 for i in range(1, 12)},
+        "mean_conservation": 0.1,
+    })
+
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w") as f:
+        # Minimal valid PDB content to satisfy Path.is_file() check
+        f.write("HEADER    TEST\nEND\n")
+        pdb_path = f.name
+
+    try:
+        results = scanner.scan(
+            pdb_path           = pdb_path,
+            chain_id           = "A",
+            sequence           = "ACDEFGHIKLM",
+            filters            = {"camsol_threshold": 0.0, "esm_threshold": 1.0},
+            protected_residues = [5, 6],
+            analysis_mode      = "multimer",
+        )
+    finally:
+        os.unlink(pdb_path)
+
+    # Positions 5 and 6 should be absent (protected)
+    positions_in_results = {r["position"] for r in results}
+    assert 5 not in positions_in_results, "Position 5 should be excluded (interface)"
+    assert 6 not in positions_in_results, "Position 6 should be excluded (interface)"
+
+    # Positions near interface (2-4, 7-9) should be flagged as proximal
+    proximal_positions = {r["position"] for r in results if r.get("interface_proximal")}
+    # At least some proximal positions should be flagged
+    expected_proximal = {2, 3, 4, 7, 8, 9}
+    found_proximal = proximal_positions & expected_proximal
+    assert len(found_proximal) > 0, (
+        f"Expected some proximal positions from {expected_proximal}, "
+        f"got proximal: {proximal_positions}"
+    )
+
+    # Check that proximal positions have a caution note in recommendation
+    for r in results:
+        if r.get("interface_proximal"):
+            assert "caution" in r["recommendation"].lower(), (
+                f"Expected caution in recommendation for proximal position {r['position']}"
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. Assembly metadata display format
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_assembly_display_format(mock_bridge, mock_session):
+    """get_assembly_display returns correctly formatted string."""
+    analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+    asm_info = {
+        "assembly_type": "homodimer",
+        "chains": ["A", "B"],
+        "n_subunits": 2,
+        "error": None,
+    }
+    display = analyser.get_assembly_display("1HSG", asm_info)
+
+    assert "homodimer" in display.lower()
+    # Should also include structure metadata (ligands, resolution) from session
+    assert "MK1" in display or "1.9" in display or len(display) > 0
+
+
+def test_assembly_header_monomer():
+    """_build_header returns correct label for monomer analysis."""
+    bridge  = MagicMock()
+    session = SessionState()
+    analyser = AssemblyAnalyser(bridge=bridge, session=session)
+
+    asm_info = {"assembly_type": "homodimer", "chains": ["A", "B"]}
+    header   = analyser._build_header("1HSG", asm_info, "monomer")
+    assert "monomer analysis" in header.lower()
+    assert "1HSG" in header
+
+
+def test_assembly_header_multimer():
+    """_build_header returns correct label for multimer analysis."""
+    bridge  = MagicMock()
+    session = SessionState()
+    analyser = AssemblyAnalyser(bridge=bridge, session=session)
+
+    asm_info = {"assembly_type": "homodimer", "chains": ["A", "B"]}
+    header   = analyser._build_header("1HSG", asm_info, "multimer")
+    assert "multimer analysis" in header.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. Visualization command generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_interface_viz_commands(mock_bridge, mock_session):
+    """generate_interface_viz_commands produces valid ChimeraX commands."""
+    analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+    interfaces = {("A", "B"): [25, 26, 27, 50, 51]}
+
+    cmds, exps = analyser.generate_interface_viz_commands(
+        model_id   = "1",
+        interfaces = interfaces,
+    )
+
+    assert len(cmds) > 0
+    assert len(cmds) == len(exps)
+
+    # Should start with cartoon and white reset
+    assert any("cartoon" in c for c in cmds)
+    assert any("white" in c for c in cmds)
+
+    # Should include color command for the interface residues
+    color_cmds = [c for c in cmds if c.startswith("color") and "25" in c or
+                  c.startswith("color") and "26" in c]
+    # Should include some coloring
+    color_cmds_all = [c for c in cmds if "color" in c and "#1" in c and "white" not in c]
+    assert len(color_cmds_all) >= 1
+
+
+def test_interface_viz_empty_interfaces(mock_bridge, mock_session):
+    """generate_interface_viz_commands returns empty lists for no interfaces."""
+    analyser = AssemblyAnalyser(bridge=mock_bridge, session=mock_session)
+    cmds, exps = analyser.generate_interface_viz_commands("1", {})
+    assert cmds == []
+    assert exps == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. SessionState assembly fields
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_session_assembly_info_roundtrip():
+    """SessionState correctly stores and retrieves assembly info."""
+    session = SessionState()
+    info    = {"assembly_type": "homodimer", "n_subunits": 2, "chains": ["A", "B"]}
+    session.set_assembly_info("1HSG", info)
+
+    retrieved = session.get_assembly_info("1HSG")
+    assert retrieved is not None
+    assert retrieved["assembly_type"] == "homodimer"
+    assert retrieved["n_subunits"] == 2
+
+
+def test_session_analysis_mode():
+    """SessionState correctly stores and retrieves analysis mode."""
+    session = SessionState()
+    session.set_analysis_mode("1", "multimer")
+    assert session.get_analysis_mode("1") == "multimer"
+    assert session.get_analysis_mode("2") == "monomer"  # default
+
+
+def test_session_interface_residues_roundtrip():
+    """SessionState correctly stores and retrieves interface residues."""
+    session = SessionState()
+    interfaces = {("A", "B"): [10, 20, 30], ("A", "C"): [50, 60]}
+    session.set_interface_residues("1", interfaces)
+
+    retrieved = session.get_interface_residues("1")
+    assert len(retrieved) == 2
+
+    # Check that chain pair A-B is present
+    found_ab = False
+    for key, resnos in retrieved.items():
+        if set(key) == {"A", "B"}:
+            assert set(resnos) == {10, 20, 30}
+            found_ab = True
+    assert found_ab, "A-B interface not found in retrieved data"
+
+
+def test_session_protected_residues_for_chain():
+    """get_protected_residues_for_chain returns correct residues for chain."""
+    session = SessionState()
+    session.set_interface_residues("1", {
+        ("A", "B"): [10, 20, 30, 50],
+        ("A", "C"): [70, 80],
+        ("B", "C"): [5, 6, 7],   # does not involve A
+    })
+
+    protected_a = session.get_protected_residues_for_chain("1", "A")
+    assert set(protected_a) == {10, 20, 30, 50, 70, 80}
+
+    protected_b = session.get_protected_residues_for_chain("1", "B")
+    assert set(protected_b) == {10, 20, 30, 50, 5, 6, 7}  # A-B and B-C
+
+
+def test_session_save_load_assembly_fields(tmp_path):
+    """Assembly fields are preserved through save/load."""
+    session = SessionState()
+    session.set_assembly_info("1HSG", {"assembly_type": "homodimer"})
+    session.set_analysis_mode("1", "multimer")
+    session.set_interface_residues("1", {("A", "B"): [10, 20]})
+
+    save_path = str(tmp_path / "test_session.json")
+    session.save(save_path)
+
+    loaded = SessionState.load(save_path)
+    assert loaded.get_assembly_info("1HSG")["assembly_type"] == "homodimer"
+    assert loaded.get_analysis_mode("1") == "multimer"
+    ifaces = loaded.get_interface_residues("1")
+    assert len(ifaces) == 1

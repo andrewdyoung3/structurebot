@@ -87,6 +87,8 @@ BANNER = """\
     [cyan]Color the structure by evolutionary conservation (ESM-2)[/cyan]
     [cyan]Calculate ddG for mutation V82A in chain A[/cyan]
     [cyan]Suggest mutations to improve solubility of chain A[/cyan]
+    [cyan]Suggest mutations avoiding chain interfaces[/cyan]
+    [cyan]Show me the interface between chains A and B[/cyan]
 
   [dim]Type [bold]help[/bold] for more examples or [bold]quit[/bold] to exit.[/dim]
 """
@@ -130,8 +132,16 @@ HELP_TEXT = """
   calculate ddG for mutation V82A in chain A
   is mutation L75K stabilising?
   suggest mutations to improve solubility of chain A
+  analyse solubility of chain A as a monomer
+  suggest mutations to improve solubility avoiding chain interfaces
   what mutations would reduce aggregation?
   run the full engineering pipeline on the loaded structure
+
+[bold]Assembly analysis[/bold]
+  show me the interface between chains A and B
+  analyse as multimer — avoid interface residues
+  what is the biological assembly of this structure?
+  find all inter-chain contacts within 5 angstroms
 
 [bold]Special commands[/bold]
   [cmd]history[/cmd]           show last 15 commands
@@ -378,6 +388,9 @@ class StructureBot:
             with console.status("[cyan]Running computational tools…[/cyan]"):
                 result = self.router.execute(result, status_callback=_status)
 
+            # Show assembly interface summary (before other summaries)
+            self._show_interface_summary(result)
+
             # Show tool summaries
             summaries = result.get("tool_summaries", {})
             for tool, summary in summaries.items():
@@ -577,6 +590,8 @@ class StructureBot:
                         path = str(Path(self.session.working_dir) / name)
                     # add_structure fetches RCSB metadata if name is a 4-char PDB ID
                     self.session.add_structure(mid, name, path=path)
+                    # Display assembly type for PDB IDs
+                    self._display_assembly_type_on_open(name, mid)
 
             elif s.startswith("close"):
                 if "all" in s:
@@ -591,6 +606,49 @@ class StructureBot:
                 if s.startswith(kw):
                     self.session.record_style(cmd)
                     break
+
+    def _display_assembly_type_on_open(self, name: str, model_id: str) -> None:
+        """
+        After a structure is opened, query RCSB for assembly type and display it.
+        Only runs for 4-letter PDB IDs; silently skips on any error.
+        """
+        if not re.match(r"^[A-Za-z0-9]{4}$", name.strip()):
+            return
+        try:
+            from assembly_analyser import fetch_assembly_info, AssemblyAnalyser
+            cached = self.session.get_assembly_info(name.upper())
+            asm_info = cached if cached else fetch_assembly_info(name)
+            if not cached and asm_info and not asm_info.get("error"):
+                self.session.set_assembly_info(name.upper(), asm_info)
+
+            if asm_info and not asm_info.get("error"):
+                analyser = AssemblyAnalyser(self.bridge, self.session)
+                display  = analyser.get_assembly_display(name, asm_info)
+                console.print(f"  [dim]✓ {name.upper()} → {escape(display)}[/dim]")
+        except Exception:
+            pass  # assembly info is non-critical; never interrupt the flow
+
+    def _show_interface_summary(self, result: dict) -> None:
+        """Show interface summary from assembly_analyser step results."""
+        step_results = result.get("tool_step_results", [])
+        for step in step_results:
+            if step.get("tool") == "assembly_analyser" and step.get("success"):
+                data = step.get("data", {})
+                summary = data.get("interface_summary", "")
+                header  = data.get("header", "")
+                warnings = data.get("warnings", [])
+
+                if header:
+                    console.print(f"\n  [bold]🔗 {escape(header)}[/bold]")
+                if summary:
+                    console.print(f"  [info]{escape(summary)}[/info]")
+                for w in warnings:
+                    console.print(f"  [warn]⚠ {escape(w)}[/warn]")
+                excluded = data.get("excluded_count", 0)
+                if excluded:
+                    console.print(
+                        f"  [dim]  → {excluded} residue(s) will be excluded from mutation scan[/dim]"
+                    )
 
     # ── Logging ───────────────────────────────────────────────────────────────
 

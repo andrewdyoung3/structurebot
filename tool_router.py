@@ -106,12 +106,13 @@ class ToolRouter:
     """
 
     _TOOL_ICONS: Dict[str, str] = {
-        "chimerax":      "🎨",
-        "camsol":        "💧",
-        "esm":           "🧬",
-        "proteinmpnn":   "🔬",
-        "rosetta":       "⚗️",
-        "mutation_scan": "🔬⚗️",
+        "chimerax":          "🎨",
+        "camsol":            "💧",
+        "esm":               "🧬",
+        "proteinmpnn":       "🔬",
+        "rosetta":           "⚗️",
+        "mutation_scan":     "🔬⚗️",
+        "assembly_analyser": "🔗",
     }
 
     def __init__(
@@ -123,11 +124,12 @@ class ToolRouter:
         self.session = session
 
         # Bridges are instantiated lazily on first use
-        self._camsol_bridge:      Optional[Any] = None
-        self._esm_bridge:         Optional[Any] = None
-        self._proteinmpnn_bridge: Optional[Any] = None
-        self._rosetta_bridge:     Optional[Any] = None
-        self._mutation_scanner:   Optional[Any] = None
+        self._camsol_bridge:        Optional[Any] = None
+        self._esm_bridge:           Optional[Any] = None
+        self._proteinmpnn_bridge:   Optional[Any] = None
+        self._rosetta_bridge:       Optional[Any] = None
+        self._mutation_scanner:     Optional[Any] = None
+        self._assembly_analyser:    Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -194,7 +196,17 @@ class ToolRouter:
             mid   = inp.get("model_id") or self._first_model_id()
             chain = inp.get("chain", "A")
             focus = inp.get("focus", "solubility")
-            return f"CamSol + ESM + Rosetta scan — #{mid} chain {chain} [{focus}]"
+            mode  = inp.get("analysis_mode", "monomer")
+            return f"CamSol + ESM + Rosetta scan — #{mid} chain {chain} [{focus}] [{mode} mode]"
+        if tool == "assembly_analyser":
+            inp  = tool_inputs.get("assembly_analyser", {})
+            mid  = inp.get("model_id") or self._first_model_id()
+            mode = inp.get("mode", "multimer")
+            ch   = inp.get("chain_id", "")
+            return (
+                f"Assembly analysis — #{mid} [{mode} mode]"
+                + (f", chain {ch}" if ch else "")
+            )
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -284,12 +296,14 @@ class ToolRouter:
                 return self._run_rosetta(inputs)
             if tool == "mutation_scan":
                 return self._run_mutation_scan(inputs)
+            if tool == "assembly_analyser":
+                return self._run_assembly_analyser(inputs)
             return ToolStepResult(
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
                     "Available: chimerax, camsol, esm, proteinmpnn, "
-                    "rosetta, mutation_scan."
+                    "rosetta, mutation_scan, assembly_analyser."
                 ),
             )
         except Exception as exc:
@@ -376,12 +390,96 @@ class ToolRouter:
             chain     = chain,
         )
 
-    def _run_mutation_scan(self, inputs: Dict[str, Any]) -> ToolStepResult:
+    def _run_assembly_analyser(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run biological assembly analysis (MONOMER or MULTIMER mode)."""
+        import time as _time
+        t0 = _time.perf_counter()
+
         model_id = inputs.get("model_id") or self._first_model_id()
-        chain    = inputs.get("chain", "A")
-        focus    = inputs.get("focus", "solubility")
-        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
-        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        mode     = inputs.get("mode", "multimer")
+        chain_id = inputs.get("chain_id") or inputs.get("chain")
+        visualize= inputs.get("visualize", False)
+        dist     = float(inputs.get("contact_distance", 5.0))
+
+        # Determine PDB ID for RCSB assembly query
+        pdb_id: Optional[str] = None
+        info = self.session.get_structure(model_id)
+        if info:
+            name = info.get("name", "")
+            if re.match(r"^[A-Za-z0-9]{4}$", name):
+                pdb_id = name.upper()
+
+        analyser = self._get_assembly_analyser()
+        result   = analyser.analyse(
+            model_id          = model_id,
+            pdb_id            = pdb_id,
+            mode              = mode,
+            chain_id          = chain_id,
+            contact_distance  = dist,
+        )
+
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        # Build summary string
+        asm_info   = result.get("assembly_info", {})
+        asm_type   = asm_info.get("assembly_type", "unknown")
+        n_ifaces   = len(result.get("interfaces", {}))
+        n_excluded = result.get("excluded_count", 0)
+        mode_str   = result.get("mode", mode)
+        header     = result.get("header", "")
+
+        summary_parts = [f"Assembly: {asm_type} [{mode_str} mode]"]
+        if mode_str == "multimer":
+            summary_parts.append(f"{n_ifaces} interface(s) detected")
+            if n_excluded:
+                ch_label = chain_id or "chain"
+                summary_parts.append(
+                    f"{n_excluded} positions excluded from scan (chain {ch_label} interface)"
+                )
+        summary = " — ".join(summary_parts)
+
+        # Warnings
+        warnings_out = result.get("warnings", [])
+
+        # Visualization commands (if requested and interfaces detected)
+        viz_cmds: List[str] = []
+        viz_exps: List[str] = []
+        if visualize and mode_str == "multimer" and result.get("interfaces"):
+            viz_cmds, viz_exps = analyser.generate_interface_viz_commands(
+                model_id   = model_id,
+                interfaces = result["interfaces"],
+            )
+
+        return ToolStepResult(
+            tool             = "assembly_analyser",
+            success          = True,
+            data             = {
+                "mode":               mode_str,
+                "assembly_type":      asm_type,
+                "assembly_info":      asm_info,
+                "interfaces":         {
+                    f"{k[0]}:{k[1]}": v
+                    for k, v in result.get("interfaces", {}).items()
+                },
+                "protected_residues": result.get("protected_residues", []),
+                "excluded_count":     n_excluded,
+                "header":             header,
+                "interface_summary":  result.get("interface_summary", ""),
+                "warnings":           warnings_out,
+            },
+            viz_commands     = viz_cmds,
+            viz_explanations = viz_exps,
+            summary          = summary,
+            elapsed_ms       = elapsed_ms,
+        )
+
+    def _run_mutation_scan(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        model_id       = inputs.get("model_id") or self._first_model_id()
+        chain          = inputs.get("chain", "A")
+        focus          = inputs.get("focus", "solubility")
+        analysis_mode  = inputs.get("analysis_mode", "monomer")
+        sequence       = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+        pdb_path       = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
 
         if not sequence:
             return ToolStepResult(
@@ -410,33 +508,53 @@ class ToolRouter:
                 filters[key] = inputs[key]
         filters["focus"] = focus
 
+        # In multimer mode, pull interface residues from session state
+        protected_residues: List[int] = []
+        if analysis_mode == "multimer":
+            protected_residues = self.session.get_protected_residues_for_chain(
+                model_id, chain
+            )
+            if not protected_residues:
+                # Interface data not yet computed — it should have been run
+                # via assembly_analyser first, but we proceed without it
+                pass
+
         from mutation_scanner import MutationScanner
 
         def _progress(msg: str) -> None:
             pass  # progress shown by main.py via status_callback
 
         scanner = MutationScanner(
-            session   = self.session,
-            model_id  = model_id,
+            session           = self.session,
+            model_id          = model_id,
             progress_callback = _progress,
         )
 
         import time as _time
         t0      = _time.perf_counter()
         results = scanner.scan(
-            pdb_path = pdb_path,
-            chain_id = chain,
-            sequence = sequence,
-            filters  = filters,
+            pdb_path           = pdb_path,
+            chain_id           = chain,
+            sequence           = sequence,
+            filters            = filters,
+            protected_residues = protected_residues,
+            analysis_mode      = analysis_mode,
         )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
         if not results:
+            excluded_note = ""
+            if protected_residues:
+                excluded_note = (
+                    f" ({len(protected_residues)} positions excluded "
+                    f"due to interface contacts)"
+                )
             return ToolStepResult(
                 tool      = "mutation_scan",
                 success   = True,
-                data      = {"candidates": [], "count": 0},
-                summary   = "Mutation scan complete — no candidates met the criteria.",
+                data      = {"candidates": [], "count": 0,
+                             "excluded_count": len(protected_residues)},
+                summary   = f"Mutation scan complete — no candidates met the criteria.{excluded_note}",
                 elapsed_ms = elapsed_ms,
             )
 
@@ -444,8 +562,14 @@ class ToolRouter:
         viz_cmds, viz_exps = scanner.generate_chimerax_commands(results, top_n=5)
 
         top = results[0]
+        excluded_note = ""
+        if protected_residues:
+            excluded_note = (
+                f" [{len(protected_residues)} interface position(s) excluded]"
+            )
+
         summary = (
-            f"Mutation scan: {len(results)} candidate(s) found. "
+            f"Mutation scan [{analysis_mode} mode]: {len(results)} candidate(s) found.{excluded_note} "
             f"Top: {top['from_aa']}{top['position']}{top['to_aa']} "
             f"(score={top['combined_score']:+.2f}, "
             f"ddG={top['ddg']:+.2f} kcal/mol, "
@@ -456,9 +580,11 @@ class ToolRouter:
             tool             = "mutation_scan",
             success          = True,
             data             = {
-                "candidates": results,
-                "count":      len(results),
-                "top":        top,
+                "candidates":    results,
+                "count":         len(results),
+                "top":           top,
+                "excluded_count": len(protected_residues),
+                "analysis_mode": analysis_mode,
             },
             viz_commands     = viz_cmds,
             viz_explanations = viz_exps,
@@ -467,6 +593,15 @@ class ToolRouter:
         )
 
     # ── Bridge accessors (lazy init) ───────────────────────────────────────────
+
+    def _get_assembly_analyser(self):
+        if self._assembly_analyser is None:
+            from assembly_analyser import AssemblyAnalyser
+            self._assembly_analyser = AssemblyAnalyser(
+                bridge  = self.bridge,
+                session = self.session,
+            )
+        return self._assembly_analyser
 
     def _get_camsol_bridge(self):
         if self._camsol_bridge is None:
@@ -693,6 +828,13 @@ class ToolRouter:
             status["mutation_scan"] = "active (depends on rosetta)"
         except ImportError:
             status["mutation_scan"] = "module not found"
+
+        # assembly_analyser
+        try:
+            __import__("assembly_analyser")
+            status["assembly_analyser"] = "active"
+        except ImportError:
+            status["assembly_analyser"] = "module not found"
 
         return status
 
