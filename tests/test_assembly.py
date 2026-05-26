@@ -100,18 +100,51 @@ def mock_bridge():
 
 @pytest.fixture
 def hsg_assembly_data():
-    """Canned RCSB assembly API response for 1HSG (homodimer)."""
+    """
+    Canned RCSB assembly API response for 1HSG (homodimer).
+
+    Reflects the real RCSB payload:
+      - asym_id_list includes ALL 5 asym units (A/B=protein, C=MK1 ligand, D/E=water)
+      - rcsb_assembly_info.stoichiometry is absent (not returned by live RCSB for 1HSG)
+      - rcsb_struct_symmetry.clusters contain only protein chains A and B
+      - oligomeric_details is "dimeric" (generic), not "homodimer"
+
+    The parser must use rcsb_struct_symmetry to produce the correct "homodimer"
+    label and chain list ["A", "B"].
+    """
     return {
         "rcsb_assembly_info": {
+            "polymer_entity_instance_count":         2,
             "polymer_entity_instance_count_protein": 2,
-            "stoichiometry": "A2",
+            "nonpolymer_entity_instance_count":      1,
+            "solvent_entity_instance_count":         2,
+            # NOTE: stoichiometry is intentionally absent — matches live RCSB
         },
         "pdbx_struct_assembly": {
-            "oligomeric_details": "homodimer",
+            "oligomeric_details": "dimeric",   # live RCSB returns "dimeric", not "homodimer"
             "oligomeric_count":   2,
         },
         "pdbx_struct_assembly_gen": [
-            {"asym_id_list": ["A", "B"]},
+            # Full asym_id_list: A+B=protein, C=MK1, D+E=water
+            {"asym_id_list": ["A", "B", "C", "D", "E"], "oper_expression": "1", "ordinal": 1},
+        ],
+        "rcsb_struct_symmetry": [
+            {
+                "kind":            "Global Symmetry",
+                "oligomeric_state": "Homo 2-mer",
+                "stoichiometry":   ["A2"],
+                "symbol":          "C2",
+                "type":            "Cyclic",
+                "clusters": [
+                    {
+                        "members": [
+                            {"asym_id": "A", "pdbx_struct_oper_list_ids": ["1"]},
+                            {"asym_id": "B", "pdbx_struct_oper_list_ids": ["1"]},
+                        ],
+                        "avg_rmsd": 0.4003,
+                    }
+                ],
+            }
         ],
     }
 
@@ -121,7 +154,15 @@ def hsg_assembly_data():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_fetch_assembly_info_homodimer(hsg_assembly_data):
-    """fetch_assembly_info correctly identifies 1HSG as a homodimer."""
+    """
+    fetch_assembly_info correctly identifies 1HSG as a homodimer with chains A+B.
+
+    Uses the realistic fixture (asym_id_list has A/B/C/D/E; stoichiometry absent;
+    rcsb_struct_symmetry carries the "A2" stoich and protein-only cluster members).
+    Verifies that:
+      - assembly_type resolves to "homodimer" (not "dimeric")
+      - chains is exactly ["A", "B"] (not ["A","B","C","D","E"])
+    """
     with patch("assembly_analyser._requests") as mock_req:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -131,11 +172,14 @@ def test_fetch_assembly_info_homodimer(hsg_assembly_data):
         result = fetch_assembly_info("1HSG")
 
     assert result["pdb_id"] == "1HSG"
-    assert result["assembly_type"] in ("homodimer", "homo-2mer", "A2"), (
-        f"Expected homodimer description, got: {result['assembly_type']}"
+    assert result["assembly_type"] == "homodimer", (
+        f"Expected 'homodimer', got: {result['assembly_type']!r}"
     )
     assert result["n_subunits"] == 2
-    assert "A" in result["chains"] or "B" in result["chains"]
+    # Chains must be ONLY the protein chains A and B — not ligand/water asym IDs
+    assert result["chains"] == ["A", "B"], (
+        f"Expected ['A', 'B'] (protein chains only), got: {result['chains']}"
+    )
     assert result["error"] is None
 
 

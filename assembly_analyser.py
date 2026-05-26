@@ -142,30 +142,61 @@ def fetch_assembly_info(pdb_id: str) -> Dict[str, Any]:
         return result
 
     # ── Parse assembly info ───────────────────────────────────────────────────
-    rcsb_info = data.get("rcsb_assembly_info", {}) or {}
+    rcsb_info   = data.get("rcsb_assembly_info", {}) or {}
     pdbx_struct = data.get("pdbx_struct_assembly", {}) or {}
 
-    stoich = rcsb_info.get("polymer_entity_instance_count_protein") or \
-             rcsb_info.get("selected_polymer_entity_types")
-
-    # Preferred: pdbx_struct_assembly.oligomeric_details
-    oligo_detail  = pdbx_struct.get("oligomeric_details", "") or ""
-    oligo_count   = pdbx_struct.get("oligomeric_count")
-    assembly_name = pdbx_struct.get("details", "")
+    # Preferred: pdbx_struct_assembly.oligomeric_details (may be "dimeric", not "homodimer")
+    oligo_detail = pdbx_struct.get("oligomeric_details", "") or ""
+    oligo_count  = pdbx_struct.get("oligomeric_count")
 
     # n_subunits from RCSB
     n_polymer = rcsb_info.get("polymer_entity_instance_count")
     n_protein = rcsb_info.get("polymer_entity_instance_count_protein")
-    n_sub = n_protein or n_polymer or oligo_count
+    n_sub     = n_protein or n_polymer or oligo_count
 
-    # Stoichiometry string
-    stoich_str = rcsb_info.get("stoichiometry") or ""
+    # ── rcsb_struct_symmetry — most reliable source for both stoich and chains ─
+    #
+    # pdbx_struct_assembly_gen.asym_id_list includes ALL asymmetric units:
+    # proteins, ligands, and water molecules.  rcsb_struct_symmetry.clusters
+    # contains ONLY polymer (protein/nucleic acid) chain members, making it
+    # the correct source for the biological chain list.
+    #
+    # rcsb_assembly_info.stoichiometry may be absent; rcsb_struct_symmetry
+    # always carries a stoichiometry array (e.g. ["A2"]) for resolved structures.
+    sym_list: List[Dict] = data.get("rcsb_struct_symmetry") or []
+    sym_polymer_chains: List[str] = []
+    sym_stoich:         str       = ""
+    sym_oligo_state:    str       = ""
+    for sym_entry in sym_list:
+        if not sym_stoich:
+            stoich_list = sym_entry.get("stoichiometry") or []
+            if stoich_list:
+                sym_stoich = stoich_list[0]  # e.g. "A2"
+        if not sym_oligo_state:
+            sym_oligo_state = sym_entry.get("oligomeric_state") or ""
+        for cluster in (sym_entry.get("clusters") or []):
+            for member in (cluster.get("members") or []):
+                asym = member.get("asym_id", "")
+                if asym and asym.isalpha():
+                    sym_polymer_chains.append(asym)
 
-    # Determine assembly type label
+    # ── Stoichiometry string: rcsb_assembly_info first, then symmetry ─────────
+    stoich_str = rcsb_info.get("stoichiometry") or sym_stoich or ""
+
+    # ── Assembly type label ────────────────────────────────────────────────────
     if stoich_str:
         asm_type = _stoichiometry_label(stoich_str, n_sub or 1)
     elif oligo_detail:
         asm_type = oligo_detail.lower()
+    elif sym_oligo_state:
+        # e.g. "Homo 2-mer" → normalise to "homodimer"
+        state = sym_oligo_state.lower()
+        if "homo" in state and "2" in state:
+            asm_type = "homodimer"
+        elif "mono" in state:
+            asm_type = "monomer"
+        else:
+            asm_type = state.replace("-", "").replace(" ", "")
     elif n_sub == 1:
         asm_type = "monomer"
     elif n_sub:
@@ -173,23 +204,36 @@ def fetch_assembly_info(pdb_id: str) -> Dict[str, Any]:
     else:
         asm_type = "unknown"
 
-    # Chain IDs in the assembly
-    chains: List[str] = []
-    for gen in (data.get("pdbx_struct_assembly_gen") or []):
-        asym_ids = gen.get("asym_id_list") or []
-        chains.extend(asym_ids)
+    # ── Polymer chain IDs ──────────────────────────────────────────────────────
+    #
+    # Primary: symmetry cluster members — protein/nucleic-acid chains only.
+    # Fallback: asym_id_list trimmed to the known polymer count so that ligands
+    # and water chains (which fill the tail of the sorted list) are excluded.
+    if sym_polymer_chains:
+        chains: List[str] = sorted(set(sym_polymer_chains))
+    else:
+        all_asym: List[str] = []
+        for gen in (data.get("pdbx_struct_assembly_gen") or []):
+            all_asym.extend(gen.get("asym_id_list") or [])
+        all_asym = sorted(set(all_asym))
+        # If we know how many protein chains there are, trim the list.
+        # In mmCIF convention, protein chains are ordered before ligands/waters,
+        # so taking the first n_protein entries is a reasonable heuristic.
+        if n_protein and len(all_asym) > n_protein:
+            chains = all_asym[:n_protein]
+        else:
+            chains = all_asym
 
-    # Is this an obligate complex? (RCSB flags some as "author_and_software_defined_assembly")
-    assembly_class = pdbx_struct.get("rcsb_candidate_assembly") or ""
-    is_obligate    = "homo" in asm_type or n_sub and n_sub > 1
+    # ── Obligate complex? ──────────────────────────────────────────────────────
+    is_obligate = bool("homo" in asm_type or (n_sub and n_sub > 1))
 
     result.update({
-        "assembly_type":   asm_type,
-        "stoichiometry":   stoich_str,
-        "n_subunits":      n_sub,
-        "chains":          sorted(set(chains)),
-        "oligomeric_state": oligo_detail or str(n_sub) if n_sub else None,
-        "is_obligate":     bool(is_obligate),
+        "assembly_type":    asm_type,
+        "stoichiometry":    stoich_str,
+        "n_subunits":       n_sub,
+        "chains":           chains,
+        "oligomeric_state": oligo_detail or sym_oligo_state or (str(n_sub) if n_sub else None),
+        "is_obligate":      is_obligate,
     })
     return result
 
