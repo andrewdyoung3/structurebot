@@ -504,16 +504,31 @@ class AssemblyAnalyser:
 
     def _get_model_chains(self, model_id: str) -> List[str]:
         """
-        Return the chain IDs present in a loaded model.
+        Return the protein chain IDs present in a loaded model.
 
-        Priority:
-          1. session.structures[model_id]["metadata"]["chains"] — set during
-             add_structure() via parse_pdb_header() or fetch_rcsb_metadata()
-          2. Empty list → caller skips interface detection
+        Priority
+        --------
+        1. session.structures[model_id]["metadata"]["chains"]
+           Set during add_structure() via parse_pdb_header() or
+           fetch_rcsb_metadata().  May be absent if the RCSB entry endpoint
+           had not yet been queried.
 
-        Only single-letter alphabetic chain IDs are returned (excludes any
-        multi-character auth_asym IDs that can appear in mmCIF files).
+        2. session.assembly_info[pdb_id]["chains"]
+           Populated by fetch_assembly_info() (assembly endpoint + symmetry
+           clusters) which is always correct.  This is the reliable fallback
+           when the entry-level chain list is missing.
+
+        3. ChimeraX ``info chains #{model_id}``
+           Queries the running ChimeraX instance directly.  Returns only the
+           protein/nucleic-acid chain IDs in the author convention (A, B, …),
+           not ligand or water asym IDs.  Output format:
+               chain id /A chain_id A
+               chain id /B chain_id B
+
+        Only single-letter alphabetic chain IDs are returned.
+        Returns [] if none of the sources produce results.
         """
+        # ── Priority 1: session structure metadata ────────────────────────────
         info = self.session.get_structure(model_id)
         if info:
             meta   = info.get("metadata", {})
@@ -521,6 +536,26 @@ class AssemblyAnalyser:
             single = [c for c in chains if len(c) == 1 and c.isalpha()]
             if single:
                 return sorted(set(single))
+
+            # ── Priority 2: assembly_info already in session ──────────────────
+            name = info.get("name", "")
+            if re.match(r"^[A-Za-z0-9]{4}$", name):
+                asm_info = self.session.get_assembly_info(name.upper())
+                if asm_info:
+                    asm_chains = asm_info.get("chains") or []
+                    single = [c for c in asm_chains if len(c) == 1 and c.isalpha()]
+                    if single:
+                        return sorted(set(single))
+
+        # ── Priority 3: ask ChimeraX directly ─────────────────────────────────
+        if self.bridge and self.bridge.is_running():
+            res = self.bridge.run_command(f"info chains #{model_id}")
+            if not res.get("error") and res.get("value"):
+                # Output: "chain id /A chain_id A\nchain id /B chain_id B"
+                found = re.findall(r"chain_id\s+([A-Za-z])\b", res["value"])
+                if found:
+                    return sorted(set(found))
+
         return []
 
     # ── Visualization commands ─────────────────────────────────────────────────

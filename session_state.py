@@ -154,14 +154,26 @@ def fetch_rcsb_metadata(pdb_id: str) -> Dict[str, Any]:
         meta["ligands"]      = ligands         # list of 3-letter codes, e.g. ["MK1"]
         meta["ligand_codes"] = ligands
 
-    # Polymer chains
-    polymer = data.get("polymer_entities") or []
+    # Polymer chains — the entry endpoint does NOT include polymer_entity_instances.
+    # Query /rest/v1/core/polymer_entity/{pdb_id}/{entity_id} for each polymer entity
+    # and collect auth_asym_ids (author chain IDs, e.g. "A", "B").
+    ids_data = data.get("rcsb_entry_container_identifiers") or {}
+    polymer_entity_ids = ids_data.get("polymer_entity_ids") or []
     chains: set = set()
-    for ent in polymer:
-        for inst in (ent.get("polymer_entity_instances") or []):
-            ch = (inst.get("rcsb_polymer_entity_instance_container_identifiers") or {}).get("auth_asym_id")
-            if ch:
-                chains.add(ch)
+    for entity_id in polymer_entity_ids:
+        try:
+            ent_url  = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.upper()}/{entity_id}"
+            ent_resp = req.get(ent_url, timeout=8)
+            if ent_resp.status_code == 200:
+                ent_data  = ent_resp.json()
+                container = ent_data.get("rcsb_polymer_entity_container_identifiers") or {}
+                # auth_asym_ids is the list of author chain IDs for this entity's instances
+                auth_ids  = container.get("auth_asym_ids") or container.get("asym_ids") or []
+                for ch in auth_ids:
+                    if ch and len(ch) == 1 and ch.isalpha():
+                        chains.add(ch)
+        except Exception:
+            pass
     if chains:
         meta["chains"] = sorted(chains)
 
