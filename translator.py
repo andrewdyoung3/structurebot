@@ -574,6 +574,13 @@ class CommandTranslator:
             },
         ]
 
+        # Short-circuit for requests that bypass the API entirely
+        pre = self._pre_screen(user_input)
+        if pre is not None:
+            self._history.append({"role": "user",      "content": user_input})
+            self._history.append({"role": "assistant",  "content": "{}"}  )  # placeholder
+            return pre
+
         self._history.append({"role": "user", "content": user_input})
         raw = self._call_api(system_blocks)
         self._history.append({"role": "assistant", "content": raw})
@@ -632,6 +639,42 @@ class CommandTranslator:
 
     # ── Internals ──────────────────────────────────────────────────────────────
 
+    # Keywords that unambiguously signal a de novo backbone design request.
+    # Checked case-insensitively before the API call so we never hit a content
+    # filter on "binder" / "protein design" phrasing.
+    _RFD_KEYWORDS: tuple = (
+        "rfdiffusion", "rf diffusion",
+        "design a binder", "binder design", "protein binder",
+        "de novo backbone", "de-novo backbone",
+        "scaffold a motif", "motif scaffold",
+        "design symmetric oligomer", "partial diffusion",
+        "backbone generation", "backbone design",
+    )
+
+    def _pre_screen(self, user_input: str) -> Optional[Dict[str, Any]]:
+        """
+        Intercept requests that are known to route to unconfigured tools —
+        return a direct routing result without calling the API.
+
+        Currently handles: RFdiffusion (de novo backbone design).
+        Avoids empty/refused API responses when safety filters trigger on
+        "design a binder" or similar biology phrasing.
+
+        Returns a result dict (same shape as translate()), or None to proceed
+        normally through the API.
+        """
+        lower = user_input.lower()
+        if any(kw in lower for kw in self._RFD_KEYWORDS):
+            return {
+                "commands":     [],
+                "explanations": [],
+                "warnings":     [],
+                "confidence":   "high",
+                "tools_needed": ["rfdiffusion"],
+                "tool_inputs":  {"rfdiffusion": {"mode": "binder"}},
+            }
+        return None
+
     def _call_api(self, system_blocks: list) -> str:
         response = self.client.messages.create(
             model      = self.model,
@@ -639,6 +682,13 @@ class CommandTranslator:
             system     = system_blocks,
             messages   = self._history,
         )
+        if not response.content:
+            stop = getattr(response, "stop_reason", "unknown")
+            raise ValueError(
+                f"API returned empty response (stop_reason={stop!r}). "
+                "The prompt may have triggered a safety filter or the "
+                "request was malformed."
+            )
         return response.content[0].text.strip()
 
     @staticmethod
