@@ -80,11 +80,23 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import config as _cfg
 from tool_router import ToolStepResult
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_PROTEINMPNN_DIR = os.environ.get("PROTEINMPNN_DIR", "").strip()
+_PROTEINMPNN_DIR = _cfg.PROTEINMPNN_DIR.strip()
+
+# Use venv312 python (has PyTorch) for subprocess inference.
+# Falls back to sys.executable if venv312 is missing.
+_PYTHON_EXE: str = (
+    _cfg.VENV312_PYTHON
+    if Path(_cfg.VENV312_PYTHON).is_file()
+    else sys.executable
+)
+
+# Windows: CREATE_NO_WINDOW prevents child process from corrupting parent console
+_CREATE_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 _INSTALL_INSTRUCTIONS = """\
 ProteinMPNN is not yet configured.
@@ -380,7 +392,7 @@ class ProteinMPNNBridge:
                 fh.write(json.dumps(fixed_data) + "\n")
 
         cmd = [
-            sys.executable,
+            _PYTHON_EXE,
             str(self._script),
             "--pdb_path", pdb_path,
             "--out_folder", str(out_path),
@@ -391,7 +403,11 @@ class ProteinMPNNBridge:
         if fixed_json_path:
             cmd += ["--fixed_positions_jsonl", fixed_json_path]
 
-        subprocess.run(cmd, check=True, capture_output=True, cwd=str(self._dir))
+        subprocess.run(
+            cmd, check=True, capture_output=True,
+            stdin=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW,
+            cwd=str(self._dir),
+        )
 
         # Parse output FASTA
         fa_path = seqs_dir / f"{pdb_stem}.fa"
@@ -415,7 +431,7 @@ class ProteinMPNNBridge:
         LigandMPNN writes results to {out_path}/seqs/{pdb_stem}.fa
         """
         cmd = [
-            sys.executable,
+            _PYTHON_EXE,
             str(self._script),
             "--pdb_path", pdb_path,
             "--out_folder", str(out_path),
@@ -424,7 +440,11 @@ class ProteinMPNNBridge:
             "--chains_to_design", chain_id,
         ]
 
-        subprocess.run(cmd, check=True, capture_output=True, cwd=str(self._dir))
+        subprocess.run(
+            cmd, check=True, capture_output=True,
+            stdin=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW,
+            cwd=str(self._dir),
+        )
 
         pdb_stem = Path(pdb_path).stem
         seqs_dir = out_path / "seqs"

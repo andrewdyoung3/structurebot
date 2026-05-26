@@ -106,6 +106,14 @@ VENV312_PYTHON: str = os.environ.get(
     str(Path(__file__).parent / "venv312" / "Scripts" / "python.exe"),
 )
 
+# Path to ProteinMPNN repo directory.  Must contain protein_mpnn_run.py and
+# vanilla_model_weights/.  Override with PROTEINMPNN_DIR env var.
+# Default: <structurebot>/ProteinMPNN (if cloned alongside the project).
+PROTEINMPNN_DIR: str = os.environ.get(
+    "PROTEINMPNN_DIR",
+    str(Path(__file__).parent / "ProteinMPNN"),
+)
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable

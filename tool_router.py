@@ -7,7 +7,8 @@ Dispatcher for the StructureBot tool pipeline:
   chimerax     -> ChimeraXBridge  (visualization — always handled by main.py)
   camsol       -> CamsolBridge    (per-residue solubility scoring)
   esm          -> EsmBridge       (evolutionary conservation via ESM-2)
-  proteinmpnn  -> ProteinMPNNBridge (sequence redesign — stub)
+  proteinmpnn  -> ProteinMPNNBridge (fixed-backbone sequence redesign)
+  rfdiffusion  -> RFdiffusionBridge (de novo backbone diffusion — stub)
 
 The translator emits a 'tools_needed' list such as:
   ["chimerax"]                      - visualization only (default)
@@ -110,6 +111,7 @@ class ToolRouter:
         "camsol":            "💧",
         "esm":               "🧬",
         "proteinmpnn":       "🔬",
+        "rfdiffusion":       "🌀",
         "rosetta":           "⚗️",
         "mutation_scan":     "🔬⚗️",
         "assembly_analyser": "🔗",
@@ -128,6 +130,7 @@ class ToolRouter:
         self._camsol_bridge:        Optional[Any] = None
         self._esm_bridge:           Optional[Any] = None
         self._proteinmpnn_bridge:   Optional[Any] = None
+        self._rfdiffusion_bridge:   Optional[Any] = None
         self._rosetta_bridge:       Optional[Any] = None
         self._mutation_scanner:     Optional[Any] = None
         self._assembly_analyser:    Optional[Any] = None
@@ -183,7 +186,11 @@ class ToolRouter:
             mid = inp.get("model_id") or self._first_model_id()
             return f"ESM-2 evolutionary conservation — #{mid}"
         if tool == "proteinmpnn":
-            return "ProteinMPNN sequence redesign (stub)"
+            return "ProteinMPNN fixed-backbone sequence redesign"
+        if tool == "rfdiffusion":
+            inp  = tool_inputs.get("rfdiffusion", {})
+            mode = inp.get("mode", "binder")
+            return f"RFdiffusion de novo backbone generation (mode: {mode})"
         if tool == "rosetta":
             inp  = tool_inputs.get("rosetta", {})
             mid  = inp.get("model_id") or self._first_model_id()
@@ -303,6 +310,8 @@ class ToolRouter:
                 return self._run_esm(inputs)
             if tool == "proteinmpnn":
                 return self._run_proteinmpnn(inputs)
+            if tool == "rfdiffusion":
+                return self._run_rfdiffusion(inputs)
             if tool == "rosetta":
                 return self._run_rosetta(inputs)
             if tool == "mutation_scan":
@@ -315,7 +324,7 @@ class ToolRouter:
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
-                    "Available: chimerax, camsol, esm, proteinmpnn, "
+                    "Available: chimerax, camsol, esm, proteinmpnn, rfdiffusion, "
                     "rosetta, mutation_scan, assembly_analyser, disulfide."
                 ),
             )
@@ -412,6 +421,10 @@ class ToolRouter:
 
     def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
         bridge = self._get_proteinmpnn_bridge()
+        return bridge.analyze(inputs, session=self.session)
+
+    def _run_rfdiffusion(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        bridge = self._get_rfdiffusion_bridge()
         return bridge.analyze(inputs, session=self.session)
 
     def _run_rosetta(self, inputs: Dict[str, Any]) -> ToolStepResult:
@@ -687,6 +700,12 @@ class ToolRouter:
             self._proteinmpnn_bridge = ProteinMPNNBridge()
         return self._proteinmpnn_bridge
 
+    def _get_rfdiffusion_bridge(self):
+        if self._rfdiffusion_bridge is None:
+            from rfdiffusion_bridge import RFdiffusionBridge
+            self._rfdiffusion_bridge = RFdiffusionBridge()
+        return self._rfdiffusion_bridge
+
     def _get_rosetta_bridge(self):
         if self._rosetta_bridge is None:
             from rosetta_bridge import RosettaBridge
@@ -871,7 +890,25 @@ class ToolRouter:
             except ImportError:
                 status[name.replace("_bridge", "")] = "module not found"
 
-        status["proteinmpnn"] = "stub — set PROTEINMPNN_DIR to enable"
+        try:
+            from proteinmpnn_bridge import ProteinMPNNBridge
+            _b = ProteinMPNNBridge()
+            status["proteinmpnn"] = (
+                f"{_b._backend} — {_b._dir}" if _b._available
+                else "not configured (set PROTEINMPNN_DIR)"
+            )
+        except ImportError:
+            status["proteinmpnn"] = "module not found"
+
+        try:
+            from rfdiffusion_bridge import RFdiffusionBridge
+            _rfd = RFdiffusionBridge()
+            status["rfdiffusion"] = (
+                f"rfdiffusion — {_rfd._dir}" if _rfd._available
+                else "not configured (set RFDIFFUSION_DIR)"
+            )
+        except ImportError:
+            status["rfdiffusion"] = "module not found"
 
         # Rosetta: report which backend is configured
         try:

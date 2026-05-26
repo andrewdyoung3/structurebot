@@ -107,7 +107,8 @@ tools_needed values (list — may contain one or more):
   "chimerax"          — visualization only (ALWAYS include by default)
   "camsol"            — per-residue solubility scoring
   "esm"               — evolutionary conservation via ESM-2
-  "proteinmpnn"       — sequence redesign (stub)
+  "proteinmpnn"       — fixed-backbone sequence redesign via ProteinMPNN
+  "rfdiffusion"       — de novo backbone generation (binder design, motif scaffolding)
   "rosetta"           — single-mutation or batch ddG calculation
   "mutation_scan"     — full CamSol + ESM + Rosetta engineering pipeline
   "assembly_analyser" — biological assembly detection, interface mapping
@@ -174,7 +175,8 @@ AVAILABLE TOOLS
 chimerax         : visualization, selection, measurement, image export  [ACTIVE]
 camsol           : per-residue solubility / aggregation-prone scoring  [ACTIVE]
 esm              : evolutionary conservation via ESM-2 language model  [ACTIVE]
-proteinmpnn      : fixed-backbone sequence redesign                    [STUB — set PROTEINMPNN_DIR]
+proteinmpnn      : fixed-backbone sequence redesign                    [ACTIVE — ProteinMPNN/venv312]
+rfdiffusion      : de novo backbone diffusion (binder/scaffold/symmetric)[STUB — set RFDIFFUSION_DIR]
 rosetta          : stability prediction, ddG calculation               [ACTIVE — DynaMut2 or local]
 mutation_scan    : full CamSol + ESM + Rosetta engineering pipeline   [ACTIVE]
 assembly_analyser: biological assembly detection, interface mapping    [ACTIVE]
@@ -203,9 +205,22 @@ CONSERVATION / EVOLUTIONARY requests:
   → commands: [] or setup commands only
 
 SEQUENCE DESIGN requests:
-  "ProteinMPNN", "design sequences", "sequence redesign"
+  "ProteinMPNN", "design sequences", "sequence redesign", "design alternative sequences"
   → tools_needed: ["proteinmpnn"]
   → tool_inputs: {{"proteinmpnn": {{"model_id": "1", "chain": "A"}}}}
+
+DE NOVO BACKBONE DESIGN requests:
+  "design a binder", "RFdiffusion", "binder design", "scaffold a motif",
+  "design symmetric oligomer", "partial diffusion", "diversify backbone"
+  → tools_needed: ["rfdiffusion"]
+  → tool_inputs: {{"rfdiffusion": {{
+       "mode":     "binder",          # or "motif_scaffold" | "symmetric" | "partial_diffusion"
+       "model_id": "1",
+       "chain_id": "A",
+       "hotspot_residues": [82, 83, 119, 120],  # for binder mode
+       "num_designs": 4
+     }}}}
+  → commands: [] or setup commands only
 
 STABILITY / DDG requests (single mutation or small list):
   "calculate ddG", "how stable", "how destabilising", "mutation V82A",
