@@ -267,13 +267,25 @@ class ProteinMPNNBridge:
 
         try:
             return self._run_inference(
-                pdb_path        = str(pdb_path),
+                pdb_path        = Path(pdb_path).resolve().as_posix(),  # absolute + POSIX
                 chain_id        = chain_id,
                 fixed_positions = fixed_positions,
                 num_sequences   = num_sequences,
                 temperature     = temperature,
                 session         = session,
                 model_id        = str(inputs.get("model_id", "1")),
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+            stdout = (exc.stdout or b"").decode("utf-8", errors="replace").strip()
+            detail = stderr or stdout or "(no output captured)"
+            return ToolStepResult(
+                tool    = "proteinmpnn",
+                success = False,
+                error   = (
+                    f"ProteinMPNN subprocess failed (exit {exc.returncode}):\n"
+                    f"{detail}"
+                ),
             )
         except Exception as exc:
             return ToolStepResult(
@@ -376,6 +388,10 @@ class ProteinMPNNBridge:
 
         ProteinMPNN writes results to {out_path}/seqs/{pdb_stem}.fa
         """
+        # Resolve to absolute, then convert to POSIX forward-slash form.
+        # ProteinMPNN uses rfind("/") to extract the stem; on Windows its path
+        # detection breaks unless forward slashes are used throughout.
+        pdb_path  = Path(pdb_path).resolve().as_posix()
         pdb_stem  = Path(pdb_path).stem
         seqs_dir  = out_path / "seqs"
         seqs_dir.mkdir(parents=True, exist_ok=True)
@@ -385,20 +401,26 @@ class ProteinMPNNBridge:
         if fixed_positions:
             # ProteinMPNN format: {"pdb_stem": {"chain": [pos1, pos2, ...]}}
             fixed_data = {
-                pdb_stem: {chain_id: [str(p) for p in fixed_positions]}
+                pdb_stem: {chain_id: [int(p) for p in fixed_positions]}
             }
-            fixed_json_path = str(out_path / "fixed_positions.jsonl")
+            fixed_json_path = (out_path / "fixed_positions.jsonl").as_posix()
             with open(fixed_json_path, "w") as fh:
                 fh.write(json.dumps(fixed_data) + "\n")
+
+        # ProteinMPNN auto-detects weights via rfind("/") which fails on Windows
+        # (backslash paths → rfind returns -1 → truncates filename).
+        # Supply --path_to_model_weights explicitly, with a trailing slash.
+        weights_dir = (self._dir / "vanilla_model_weights").as_posix() + "/"
 
         cmd = [
             _PYTHON_EXE,
             str(self._script),
-            "--pdb_path", pdb_path,
-            "--out_folder", str(out_path),
-            "--num_seq_per_target", str(num_sequences),
-            "--sampling_temp", str(temperature),
-            "--chains_to_design", chain_id,
+            "--pdb_path",              pdb_path,
+            "--out_folder",            out_path.as_posix(),
+            "--num_seq_per_target",    str(num_sequences),
+            "--sampling_temp",         str(temperature),
+            "--pdb_path_chains",       chain_id,   # ProteinMPNN flag (not --chains_to_design)
+            "--path_to_model_weights", weights_dir,
         ]
         if fixed_json_path:
             cmd += ["--fixed_positions_jsonl", fixed_json_path]

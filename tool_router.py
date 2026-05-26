@@ -420,8 +420,44 @@ class ToolRouter:
         return bridge.analyze(sequence, model_id=model_id, session=self.session)
 
     def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
-        bridge = self._get_proteinmpnn_bridge()
-        return bridge.analyze(inputs, session=self.session)
+        """Run ProteinMPNN fixed-backbone sequence redesign."""
+        bridge   = self._get_proteinmpnn_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain_id = inputs.get("chain_id") or inputs.get("chain", "A")
+
+        # ── Resolve PDB path ──────────────────────────────────────────────────
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool    = "proteinmpnn",
+                success = False,
+                error   = (
+                    "ProteinMPNN requires a local PDB file.\n"
+                    "  Load the structure from a local .pdb file, or ensure\n"
+                    "  internet access so StructureBot can download it from RCSB."
+                ),
+            )
+
+        # ── Fixed positions: explicit > session interface residues ─────────────
+        fixed_positions: List[int] = inputs.get("fixed_positions") or []
+        if not fixed_positions:
+            # Use interface / active-site residues cached by the assembly analyser
+            interface_data = self.session.get_interface_residues(model_id)
+            if interface_data:
+                fixed_positions = (
+                    self.session.get_protected_residues_for_chain(model_id, chain_id)
+                    or []
+                )
+
+        full_inputs: Dict[str, Any] = {
+            "model_id":        model_id,
+            "pdb_path":        pdb_path,
+            "chain_id":        chain_id,
+            "fixed_positions": fixed_positions,
+            "num_sequences":   int(inputs.get("num_sequences", 8)),
+            "temperature":     float(inputs.get("temperature", 0.1)),
+        }
+        return bridge.analyze(full_inputs, session=self.session)
 
     def _run_rfdiffusion(self, inputs: Dict[str, Any]) -> ToolStepResult:
         bridge = self._get_rfdiffusion_bridge()
