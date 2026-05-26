@@ -16,10 +16,16 @@ homotetramer, etc.) and reports it in the analysis header.
 
 Interface detection
 -------------------
-Uses the ChimeraX contacts command to identify inter-chain contacts:
-  contacts #1 distance 5.0 interSubmodel true
-Parses residue pairs at the interface and groups them by chain pair.
-Interface residues are stored in session_state for downstream use.
+Uses ChimeraX zone-selection to find inter-chain contacts:
+  select #{model}/{chainA}@CA & (#{model}/{chainB} :< 5.0); info selection
+
+The ChimeraX `contacts` command only returns a summary count ("N distances")
+via the REST API — it does not return parseable residue data.  Zone-selection
+with CA atoms is used instead: it returns one hit per protein residue, cleanly
+excluding waters and ligands, and the output format is stable across versions.
+
+For each chain pair the command is run twice (A-near-B and B-near-A) and the
+residue numbers are merged.  Interface residues are stored in session_state.
 """
 
 from __future__ import annotations
@@ -396,27 +402,82 @@ class AssemblyAnalyser:
         contact_distance: float = 5.0,
     ) -> Dict[Tuple[str, str], List[int]]:
         """
-        Use ChimeraX `contacts` command to find inter-chain contacts.
+        Find inter-chain contacts using ChimeraX zone-selection on CA atoms.
 
-        Returns {(chain1, chain2): [residue_numbers_at_interface]}.
-        Returns {} if ChimeraX is not running or no contacts are found.
+        Why not `contacts`? The ChimeraX REST API returns only a summary count
+        ("N distances") for the contacts command — not parseable residue data.
+
+        Strategy
+        --------
+        For each ordered pair of chains (c1, c2):
+          select #{model}/{c1}@CA & (#{model}/{c2} :< dist); info selection
+        and again with c1/c2 swapped.  Parse ``atom id /X:RESNO@CA`` lines to
+        extract residue numbers.  @CA ensures only protein residues are hit
+        (waters and ligands have no alpha-carbon).
+
+        Returns {(chain1, chain2): sorted([resno, ...])} for each chain pair
+        that has at least one contact.  Keys are in sorted order: ("A","B").
+        Returns {} if ChimeraX is not running or no chains are found.
         """
         if not self.bridge.is_running():
             return {}
 
-        cmd = f"contacts #{model_id} distance {contact_distance} interSubmodel true"
-        res = self.bridge.run_command(cmd)
-
-        if res.get("error"):
-            # Try simpler contacts command if the interSubmodel flag fails
-            cmd_simple = f"contacts #{model_id} distance {contact_distance}"
-            res = self.bridge.run_command(cmd_simple)
-
-        text = res.get("value") or ""
-        if not text:
+        chains = self._get_model_chains(model_id)
+        if len(chains) < 2:
             return {}
 
-        return parse_contacts_output(text)
+        pat: re.Pattern = re.compile(r"atom id /([A-Za-z\d]+):(\d+)@CA")
+        interfaces: Dict[Tuple[str, str], set] = {}
+
+        for i, c1 in enumerate(chains):
+            for c2 in chains[i + 1:]:
+                pair: Tuple[str, str] = tuple(sorted([c1, c2]))  # type: ignore[assignment]
+                resnos: set = set()
+
+                # Collect CA atoms from each chain that are near the other
+                for sel_chain, near_chain in ((c1, c2), (c2, c1)):
+                    cmd = (
+                        f"select #{model_id}/{sel_chain}@CA"
+                        f" & (#{model_id}/{near_chain} :< {contact_distance})"
+                        f"; info selection"
+                    )
+                    res = self.bridge.run_command(cmd)
+                    if res.get("error"):
+                        continue
+                    text = res.get("value") or ""
+                    for line in text.splitlines():
+                        m = pat.search(line)
+                        if m:
+                            resnos.add(int(m.group(2)))
+
+                if resnos:
+                    interfaces[pair] = resnos
+
+        # Clear selection so we don't leave residues highlighted
+        self.bridge.run_command("select clear")
+
+        return {pair: sorted(resnos) for pair, resnos in interfaces.items()}
+
+    def _get_model_chains(self, model_id: str) -> List[str]:
+        """
+        Return the chain IDs present in a loaded model.
+
+        Priority:
+          1. session.structures[model_id]["metadata"]["chains"] — set during
+             add_structure() via parse_pdb_header() or fetch_rcsb_metadata()
+          2. Empty list → caller skips interface detection
+
+        Only single-letter alphabetic chain IDs are returned (excludes any
+        multi-character auth_asym IDs that can appear in mmCIF files).
+        """
+        info = self.session.get_structure(model_id)
+        if info:
+            meta   = info.get("metadata", {})
+            chains = meta.get("chains") or []
+            single = [c for c in chains if len(c) == 1 and c.isalpha()]
+            if single:
+                return sorted(set(single))
+        return []
 
     # ── Visualization commands ─────────────────────────────────────────────────
 

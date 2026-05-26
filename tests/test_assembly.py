@@ -49,23 +49,52 @@ def mock_session():
     return session
 
 
+def _zone_selection_output(chain: str, resnos: List[int]) -> str:
+    """
+    Build a canned `info selection` response in the format ChimeraX 1.11.1
+    returns for zone-selection on CA atoms:
+      atom id /CHAIN:RESNO@CA idatm_type C3
+    """
+    n = len(resnos)
+    lines = [f"{n} atoms, 0 bonds, 0 pseudobonds, {n} residues, 1 models selected"]
+    for r in resnos:
+        lines.append(f"atom id /{chain}:{r}@CA idatm_type C3")
+    return "\n".join(lines)
+
+
 @pytest.fixture
 def mock_bridge():
-    """A mock ChimeraXBridge that returns canned contacts output."""
+    """
+    A mock ChimeraXBridge that returns zone-selection output.
+
+    detect_interfaces() calls run_command() for each chain direction:
+      - select #1/A@CA & (#1/B :< 5.0); info selection  → A residues near B
+      - select #1/B@CA & (#1/A :< 5.0); info selection  → B residues near A
+      - select clear                                      → cleanup
+    """
     bridge = MagicMock()
     bridge.is_running.return_value = True
-    # Return a realistic contacts output for 1HSG chains A and B
-    contacts_text = (
-        "#1/A:25 GLY <-> #1/B:99 PRO  dist 4.2\n"
-        "#1/A:26 ASP <-> #1/B:98 ALA  dist 3.9\n"
-        "#1/A:27 THR <-> #1/B:97 GLY  dist 4.8\n"
-        "#1/A:50 ILE <-> #1/B:50 ILE  dist 3.1\n"
-        "#1/A:51 GLY <-> #1/B:51 GLY  dist 2.8\n"
-        "#1/A:52 GLY <-> #1/B:52 GLY  dist 3.0\n"
-        "#1/A:76 THR <-> #1/B:24 THR  dist 4.5\n"
-        "#1/A:99 PRO <-> #1/B:25 GLY  dist 4.2\n"
-    )
-    bridge.run_command.return_value = {"value": contacts_text, "error": None}
+
+    # Canned interface residues (subset of real 1HSG A/B interface)
+    _a_near_b = [25, 26, 27, 50, 51, 52, 76, 99]
+    _b_near_a = [24, 25, 50, 51, 52, 97, 98, 99]
+
+    _responses = {
+        "A": _zone_selection_output("A", _a_near_b),
+        "B": _zone_selection_output("B", _b_near_a),
+    }
+
+    def _run_command(cmd: str):
+        if "select clear" in cmd:
+            return {"value": "", "error": None}
+        # Which chain is being selected?
+        for chain in ("A", "B"):
+            if f"/{chain}@CA" in cmd:
+                return {"value": _responses[chain], "error": None}
+        # Fallback (shouldn't be reached in tests)
+        return {"value": "", "error": None}
+
+    bridge.run_command.side_effect = _run_command
     return bridge
 
 
