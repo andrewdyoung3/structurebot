@@ -811,6 +811,74 @@ def test_full_pipeline_missing_chain() -> None:
             pass
 
 
+# ── I. _generate_summary tests ────────────────────────────────────────────────
+
+def _make_candidate(
+    ra: int = 10, rb: int = 15,
+    aa_a: str = "L", aa_b: str = "V",
+    dist: float = 3.8, dih: Optional[float] = 90.0,
+    ddg_a: float = -0.2, ddg_b: float = 0.1,
+    tol_a: float = 0.7, tol_b: float = 0.6,
+    score: float = 0.75,
+) -> Dict[str, Any]:
+    return {
+        "chain_a_residue":  ra,
+        "chain_b_residue":  rb,
+        "chain_a_aa":       aa_a,
+        "chain_b_aa":       aa_b,
+        "cb_distance":      dist,
+        "dihedral_angle":   dih,
+        "esm_tolerance_a":  tol_a,
+        "esm_tolerance_b":  tol_b,
+        "ddg_a":            ddg_a,
+        "ddg_b":            ddg_b,
+        "combined_score":   score,
+        "recommendation":   "Test candidate",
+    }
+
+
+def test_generate_summary_returns_string() -> None:
+    print("\n=== I. _generate_summary ===")
+    cands = [_make_candidate()]
+    result = DisulfideBridge._generate_summary(cands, "A", "B")
+    _assert(isinstance(result, str) and len(result) > 0,
+            "generate_summary returns non-empty string")
+    _assert("\n" in result,
+            "generate_summary returns multi-line string")
+
+
+def test_generate_summary_mentions_candidate() -> None:
+    """Summary mentions the top candidate residue numbers and chains."""
+    cands = [_make_candidate(ra=42, rb=17, aa_a="L", aa_b="V")]
+    result = DisulfideBridge._generate_summary(cands, "A", "B")
+    _assert("42" in result,
+            "summary mentions chain A residue 42")
+    _assert("17" in result,
+            "summary mentions chain B residue 17")
+
+
+def test_generate_summary_mentions_next_steps() -> None:
+    """Summary includes recommended next steps."""
+    cands = [_make_candidate()]
+    result = DisulfideBridge._generate_summary(cands, "A", "B").lower()
+    has_steps = (
+        "next step" in result
+        or "recommend" in result
+        or "esmfold" in result
+        or "alphafold" in result
+        or "synthesis" in result
+    )
+    _assert(has_steps,
+            "summary mentions next steps or ESMFold/AlphaFold")
+
+
+def test_generate_summary_empty_candidates() -> None:
+    """Empty candidates list returns a short fallback string."""
+    result = DisulfideBridge._generate_summary([], "A", "B")
+    _assert(isinstance(result, str) and len(result) > 0,
+            "empty candidates: summary is non-empty fallback string")
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -860,6 +928,12 @@ def main() -> int:
     test_full_pipeline_mock()
     test_full_pipeline_missing_pdb()
     test_full_pipeline_missing_chain()
+
+    # I. _generate_summary
+    test_generate_summary_returns_string()
+    test_generate_summary_mentions_candidate()
+    test_generate_summary_mentions_next_steps()
+    test_generate_summary_empty_candidates()
 
     print()
     print("=" * 60)

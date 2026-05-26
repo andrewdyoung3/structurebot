@@ -22,7 +22,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -398,6 +398,81 @@ def test_full_pipeline_mock() -> None:
             f"summary: {result.summary!r}")
 
 
+# -- G. _generate_summary tests -----------------------------------------------
+
+def _make_seq(score: float = -1.2, recovery: float = 0.85,
+              mutations: Optional[List[str]] = None) -> Dict[str, Any]:
+    return {
+        "sequence":  "ACDEFGHIK",
+        "score":     score,
+        "recovery":  recovery,
+        "mutations": mutations or ["A1V", "C2G"],
+    }
+
+
+def test_generate_summary_returns_string() -> None:
+    print("\n=== G. _generate_summary ===")
+    seqs = [_make_seq()]
+    result = ProteinMPNNBridge._generate_summary(
+        sequences=seqs, wt_seq="VCDEFGHIK",
+        fixed_positions=[], backend="proteinmpnn",
+    )
+    _assert(isinstance(result, str) and len(result) > 0,
+            "generate_summary returns non-empty string")
+    _assert("\n" in result,
+            "generate_summary returns multi-line string")
+
+
+def test_generate_summary_mentions_mpnn() -> None:
+    """Summary mentions ProteinMPNN or MPNN."""
+    seqs = [_make_seq()]
+    result = ProteinMPNNBridge._generate_summary(
+        sequences=seqs, wt_seq="VCDEFGHIK",
+        fixed_positions=[], backend="proteinmpnn",
+    )
+    _assert("MPNN" in result or "mpnn" in result.lower(),
+            "summary mentions MPNN")
+
+
+def test_generate_summary_mentions_next_steps() -> None:
+    """Summary includes recommended next steps."""
+    seqs = [_make_seq()]
+    result = ProteinMPNNBridge._generate_summary(
+        sequences=seqs, wt_seq="VCDEFGHIK",
+        fixed_positions=[5, 10], backend="proteinmpnn",
+    ).lower()
+    has_steps = (
+        "next step" in result
+        or "esmfold" in result
+        or "screen" in result
+        or "expression" in result
+    )
+    _assert(has_steps,
+            "summary mentions next steps or ESMFold/screening")
+
+
+def test_generate_summary_empty_sequences() -> None:
+    """Empty sequences list returns a short fallback string."""
+    result = ProteinMPNNBridge._generate_summary(
+        sequences=[], wt_seq="", fixed_positions=[], backend="proteinmpnn",
+    )
+    _assert(isinstance(result, str) and len(result) > 0,
+            "empty sequences: summary is non-empty fallback string")
+    _assert("No sequences" in result or "no sequences" in result.lower(),
+            "fallback mentions no sequences")
+
+
+def test_generate_summary_fixed_positions() -> None:
+    """Summary mentions fixed positions when they are set."""
+    seqs = [_make_seq()]
+    result = ProteinMPNNBridge._generate_summary(
+        sequences=seqs, wt_seq="VCDEFGHIK",
+        fixed_positions=[3, 7, 12], backend="proteinmpnn",
+    )
+    _assert("Fixed" in result or "fixed" in result,
+            "summary mentions fixed positions")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -437,6 +512,13 @@ def main() -> int:
 
     # F. Full pipeline
     test_full_pipeline_mock()
+
+    # G. _generate_summary
+    test_generate_summary_returns_string()
+    test_generate_summary_mentions_mpnn()
+    test_generate_summary_mentions_next_steps()
+    test_generate_summary_empty_sequences()
+    test_generate_summary_fixed_positions()
 
     print()
     print("=" * 60)

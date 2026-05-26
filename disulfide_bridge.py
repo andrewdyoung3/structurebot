@@ -735,6 +735,11 @@ class DisulfideBridge:
             except AttributeError:
                 pass  # session_state may be an older version
 
+        # Generate detailed summary for panel display
+        detailed_summary = self._generate_summary(
+            candidates, chain_a, chain_b, atoms
+        )
+
         return ToolStepResult(
             tool             = "disulfide",
             success          = True,
@@ -747,8 +752,83 @@ class DisulfideBridge:
             },
             viz_commands     = viz_cmds,
             viz_explanations = viz_exps,
-            summary          = summary,
+            summary          = detailed_summary,
         )
+
+    # ── Summary generation ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _generate_summary(
+        candidates: List[Dict[str, Any]],
+        chain_a:    str,
+        chain_b:    str,
+        atoms:      Optional[Dict[str, Dict[int, Dict]]] = None,
+    ) -> str:
+        """
+        Generate a multi-line actionable summary for disulfide candidates.
+        Returns a fallback one-liner if candidates is empty.
+        """
+        if not candidates:
+            return (
+                f"Disulfide analysis {chain_a}/{chain_b}: "
+                "no candidates passed all filters."
+            )
+
+        lines: List[str] = []
+        top = candidates[0]
+
+        ra    = top.get("chain_a_residue", "?")
+        rb    = top.get("chain_b_residue", "?")
+        aa_a  = top.get("chain_a_aa", "?")
+        aa_b  = top.get("chain_b_aa", "?")
+        dist  = top.get("cb_distance", 0.0)
+        dih   = top.get("dihedral_angle")
+        dih_s = f"{dih:.1f} deg" if dih is not None else "N/A (Gly)"
+        ddg_a = top.get("ddg_a", 0.0)
+        ddg_b = top.get("ddg_b", 0.0)
+        tol_a = top.get("esm_tolerance_a", 0.5)
+        tol_b = top.get("esm_tolerance_b", 0.5)
+        score = top.get("combined_score", 0.0)
+
+        lines.append(f"Top disulfide candidate  ({len(candidates)} total):")
+        lines.append("-" * 48)
+        lines.append(
+            f"  {chain_a}{ra} ({aa_a}->C)  /  {chain_b}{rb} ({aa_b}->C)"
+            f"   score={score:.2f}"
+        )
+        lines.append(f"  Cb-Cb distance:   {dist:.2f} A   dihedral: {dih_s}")
+        lines.append(
+            f"  ddG {chain_a}{ra}->C: {ddg_a:+.2f} kcal/mol   "
+            f"ddG {chain_b}{rb}->C: {ddg_b:+.2f} kcal/mol"
+        )
+        lines.append(
+            f"  ESM tolerance:    {chain_a}={tol_a:.2f}   {chain_b}={tol_b:.2f}"
+        )
+
+        # Check for existing Cys in the structure
+        cys_note = ""
+        if atoms is not None:
+            existing_cys: List[str] = []
+            for ch in (chain_a, chain_b):
+                for resno, info in (atoms.get(ch) or {}).items():
+                    if _three_to_one(info.get("resname", "UNK")) == "C":
+                        existing_cys.append(f"{ch}{resno}")
+            if existing_cys:
+                cys_note = f"Existing Cys in structure: {', '.join(existing_cys[:5])}"
+
+        lines.append("")
+        lines.append("Engineering notes:")
+        if cys_note:
+            lines.append(f"  - {cys_note}")
+        lines.append("  - Requires oxidising conditions for bond formation in vivo")
+        lines.append("  - Validate with DSP crosslinker or non-reducing SDS-PAGE")
+        lines.append("")
+        lines.append("Suggested next steps:")
+        lines.append("  1. Order gene synthesis for double Cys mutant")
+        lines.append("  2. ESMFold/AlphaFold2 to confirm geometry post-mutation")
+
+        lines = lines[:15]
+        return "\n".join(lines)
 
     # ── ESM tolerance scoring ─────────────────────────────────────────────────
 

@@ -711,6 +711,53 @@ class MutationScanner:
         print(f"[MutationScanner] Error: {msg}", flush=True)
         return []
 
+    @staticmethod
+    def _generate_summary(candidates: List[Dict[str, Any]]) -> str:
+        """
+        Generate a multi-line actionable summary string for the top candidates.
+
+        Designed to be displayed in a Rich Panel after a mutation scan.
+        Returns a fallback one-liner if candidates is empty or data is missing.
+        """
+        if not candidates:
+            return "No candidates found. Try relaxing CamSol or ESM thresholds."
+
+        lines: List[str] = []
+        top3 = candidates[:3]
+
+        lines.append(f"Ranked candidates  ({len(candidates)} total):")
+        lines.append("-" * 48)
+
+        for rank, c in enumerate(top3, 1):
+            pos     = c.get("position", "?")
+            chain   = c.get("chain", "A")
+            from_aa = c.get("from_aa", "?")
+            to_aa   = c.get("to_aa", "?")
+            score   = c.get("combined_score", 0.0)
+            ddg     = c.get("ddg", 0.0)
+            sol     = c.get("solubility_delta", 0.0)
+            tol     = c.get("esm_tolerance", 0.0)
+            lines.append(
+                f"  #{rank}  {chain}{pos}: {from_aa} -> {to_aa}  "
+                f"score={score:+.2f}  ddG={ddg:+.2f} kcal/mol  "
+                f"solubility+={sol:+.2f}  ESM_tol={tol:.2f}"
+            )
+
+        if len(candidates) > 5:
+            extra = len(candidates) - 3
+            lines.append(f"  ... +{extra} more candidates (see scan results)")
+
+        lines.append("")
+        lines.append("Suggested next steps:")
+        lines.append("  1. Validate top candidate with ESMFold structural prediction")
+        lines.append("  2. Explore double-mutant combinations for additive effects")
+        lines.append("  3. Run ProteinMPNN for global sequence redesign context")
+        lines.append("  4. Order gene synthesis for top 1-3 candidates")
+
+        # Enforce max 15 lines
+        lines = lines[:15]
+        return "\n".join(lines)
+
     def __repr__(self) -> str:
         return (
             f"<MutationScanner model_id={self.model_id!r} "

@@ -9,6 +9,7 @@ Also provides:
   - fetch_rcsb_metadata() — live RCSB PDB REST API lookup (for PDB IDs)
 """
 
+import copy
 import json
 import os
 import re
@@ -730,3 +731,44 @@ class SessionState:
             f"structures={list(self.structures.keys())} "
             f"history={len(self.command_history)} entries>"
         )
+
+    # ── Snapshot / restore ────────────────────────────────────────────────────
+
+    def snapshot(self) -> Dict[str, Any]:
+        """
+        Return a deep-copy snapshot of all mutable state fields.
+        Use restore(snap) to revert to this snapshot.
+        """
+        return copy.deepcopy({
+            "structures":           self.structures,
+            "named_selections":     self.named_selections,
+            "applied_styles":       self.applied_styles,
+            "command_history":      self.command_history,
+            "tool_results":         self.tool_results,
+            "rosetta_jobs":         self.rosetta_jobs,
+            "scan_results":         self.scan_results,
+            "assembly_info":        self.assembly_info,
+            "analysis_mode":        self.analysis_mode,
+            "interface_residues":   self.interface_residues,
+            "proteinmpnn_results":  self.proteinmpnn_results,
+            "disulfide_candidates": self.disulfide_candidates,
+            "rosetta_relax_cache":  self.rosetta_relax_cache,
+        })
+
+    def restore(self, snap: Dict[str, Any]) -> None:
+        """
+        Restore all mutable state fields from a snapshot produced by snapshot().
+        """
+        self.structures           = copy.deepcopy(snap.get("structures",           {}))
+        self.named_selections     = copy.deepcopy(snap.get("named_selections",     {}))
+        self.applied_styles       = copy.deepcopy(snap.get("applied_styles",       []))
+        self.command_history      = copy.deepcopy(snap.get("command_history",      []))
+        self.tool_results         = copy.deepcopy(snap.get("tool_results",         {}))
+        self.rosetta_jobs         = copy.deepcopy(snap.get("rosetta_jobs",         {}))
+        self.scan_results         = copy.deepcopy(snap.get("scan_results",         {}))
+        self.assembly_info        = copy.deepcopy(snap.get("assembly_info",        {}))
+        self.analysis_mode        = copy.deepcopy(snap.get("analysis_mode",        {}))
+        self.interface_residues   = copy.deepcopy(snap.get("interface_residues",   {}))
+        self.proteinmpnn_results  = copy.deepcopy(snap.get("proteinmpnn_results",  {}))
+        self.disulfide_candidates = copy.deepcopy(snap.get("disulfide_candidates", {}))
+        self.rosetta_relax_cache  = copy.deepcopy(snap.get("rosetta_relax_cache",  {}))

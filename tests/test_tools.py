@@ -536,6 +536,51 @@ def test_session_context_summary_shows_tools() -> None:
             "context summary mentions camsol results")
 
 
+def test_session_snapshot_restore_roundtrip() -> None:
+    """snapshot/restore: adding a tool result then restoring removes it."""
+    session = SessionState()
+    session.add_structure("1", "1HSG")
+
+    snap = session.snapshot()
+
+    # Modify state after snapshot
+    session.add_tool_result("esm", "1", {"conservation": {1: 0.9}})
+    session.add_structure("2", "2HHB")
+    _assert(session.get_tool_result("esm", "1") is not None,
+            "esm result present before restore")
+    _assert("2" in session.structures,
+            "structure #2 present before restore")
+
+    # Restore
+    session.restore(snap)
+
+    _assert("1" in session.structures,
+            "structure #1 still present after restore")
+    _assert("2" not in session.structures,
+            "structure #2 gone after restore")
+    _assert(session.get_tool_result("esm", "1") is None,
+            "esm result gone after restore")
+
+
+def test_session_snapshot_independence() -> None:
+    """Modifying session after snapshot does not affect the snapshot."""
+    session = SessionState()
+    session.add_structure("1", "1HSG")
+
+    snap = session.snapshot()
+
+    # Mutate the session after taking snapshot
+    session.structures["1"]["name"] = "MUTATED"
+    session.add_tool_result("camsol", "1", {"scores": {1: 9.99}})
+
+    # Snapshot should be unaffected
+    snap_structs = snap["structures"]
+    _assert(snap_structs["1"]["name"] == "1HSG",
+            "snapshot structure name unchanged after session mutation")
+    _assert("camsol" not in snap.get("tool_results", {}),
+            "snapshot has no camsol result after post-snapshot mutation")
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════════
@@ -573,6 +618,8 @@ def run_all(groups: list) -> None:
         test_session_tool_results_persistence()
         test_session_clear_tool_results()
         test_session_context_summary_shows_tools()
+        test_session_snapshot_restore_roundtrip()
+        test_session_snapshot_independence()
 
 
 def main() -> None:

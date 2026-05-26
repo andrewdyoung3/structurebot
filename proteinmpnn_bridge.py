@@ -356,12 +356,11 @@ class ProteinMPNNBridge:
             top_seq = sequences[0]["sequence"]
             viz_cmds, viz_exps = _build_recovery_viz(wt_seq, top_seq, model_id, chain_id)
 
-        summary = (
-            f"{self._backend.replace('mpnn', 'MPNN')}: "
-            f"{n_seqs} sequence(s) designed. "
-            f"Mean WT recovery {mean_rec:.2f}. "
-            f"Top score {sequences[0]['score']:.3f}." if sequences else
-            f"{self._backend}: No sequences generated."
+        detailed_summary = self._generate_summary(
+            sequences       = sequences,
+            wt_seq          = wt_seq,
+            fixed_positions = fixed_positions,
+            backend         = self._backend or "proteinmpnn",
         )
 
         return ToolStepResult(
@@ -370,9 +369,63 @@ class ProteinMPNNBridge:
             data             = result_data,
             viz_commands     = viz_cmds,
             viz_explanations = viz_exps,
-            summary          = summary,
+            summary          = detailed_summary,
             elapsed_ms       = elapsed_ms,
         )
+
+    @staticmethod
+    def _generate_summary(
+        sequences:       List[Dict[str, Any]],
+        wt_seq:          str,
+        fixed_positions: List[int],
+        backend:         str = "proteinmpnn",
+    ) -> str:
+        """
+        Generate a multi-line actionable summary for ProteinMPNN results.
+        Returns a fallback one-liner if no sequences were generated.
+        """
+        backend_label = backend.replace("proteinmpnn", "ProteinMPNN").replace("ligandmpnn", "LigandMPNN")
+
+        if not sequences:
+            return f"{backend_label}: No sequences generated."
+
+        n_seqs   = len(sequences)
+        mean_rec = sum(s.get("recovery", 0.0) for s in sequences) / n_seqs
+        top      = sequences[0]
+        top_score = top.get("score", 0.0)
+        top_rec   = top.get("recovery", 0.0)
+        top_muts  = top.get("mutations", [])
+        n_redesigned = len(top_muts)
+
+        lines: List[str] = []
+        lines.append(f"{backend_label} redesign results  ({n_seqs} sequences):")
+        lines.append("-" * 48)
+        lines.append(
+            f"  Mean WT recovery:   {mean_rec:.2f}  "
+            f"(top sequence: {top_rec:.2f})"
+        )
+        lines.append(f"  Top log-likelihood: {top_score:.3f}  (lower = better)")
+        lines.append(
+            f"  Redesigned positions in top sequence: {n_redesigned}"
+        )
+        if fixed_positions:
+            lines.append(
+                f"  Fixed positions held: {len(fixed_positions)} residue(s)"
+            )
+        if top_muts:
+            mut_str = ", ".join(top_muts[:8])
+            if len(top_muts) > 8:
+                mut_str += f" (+{len(top_muts) - 8} more)"
+            lines.append(f"  Top mutations: {mut_str}")
+
+        lines.append("")
+        lines.append("Suggested next steps:")
+        lines.append("  1. ESMFold top 2-3 sequences to assess structural integrity")
+        lines.append("  2. Screen for expression and solubility in E. coli")
+        lines.append("  3. Combine with solubility mutations from CamSol/ESM scan")
+
+        lines = lines[:15]
+        return "\n".join(lines)
 
     def _run_proteinmpnn(
         self,
