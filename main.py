@@ -26,20 +26,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# ── Force write-through on stdout (real-time output on Windows PowerShell) ────
-# write_through=True: every TextIOWrapper.write() call immediately passes bytes
-# to the underlying WindowsConsoleIO / WriteConsole() without accumulating in
-# the TextIOWrapper pending-bytes queue.  This gives the same real-time display
-# as line_buffering=True while avoiding the line_buffering flush-on-newline code
-# path that caused Python's input() to block indefinitely waiting for ReadConsole()
-# on Python 3.14/Windows — making the "You:" Prompt.ask() appear unresponsive.
-# stdin is never touched; msvcrt / Prompt.ask() work normally.
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(write_through=True)
-    except Exception:
-        pass  # non-critical; _ElapsedTicker already uses print(..., flush=True)
-
 # ── Windows-only keyboard polling ─────────────────────────────────────────────
 if sys.platform == "win32":
     import msvcrt
@@ -187,7 +173,7 @@ class _ElapsedTicker:
     Designed for long-running computational tool phases.
 
     Usage::
-        with _ElapsedTicker("🔬⚗️ Running mutation_scan", interval=30):
+        with _ElapsedTicker("Running mutation_scan", interval=30):
             results = scanner.scan(...)
     """
 
@@ -481,7 +467,7 @@ class StructureBot:
             _long_tools = {"mutation_scan", "disulfide", "rosetta"}
             _needs_timer = bool(set(tools_needed) & _long_tools)
             _ticker_label = (
-                "🔬⚗️ Running " + "/".join(
+                "Running " + "/".join(
                     t for t in tools_needed if t in _long_tools
                 )
             )
