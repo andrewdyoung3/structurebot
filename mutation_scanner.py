@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -201,6 +202,7 @@ class MutationScanner:
         filters:            Optional[Dict[str, Any]] = None,
         protected_residues: Optional[List[int]] = None,
         analysis_mode:      str = "monomer",
+        scan_timeout:       int = 600,      # overall wall-clock budget (seconds)
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -230,6 +232,9 @@ class MutationScanner:
         solubility_delta, esm_tolerance, combined_score, recommendation,
         and optionally interface_proximal (bool).
         """
+        _scan_start    = time.perf_counter()
+        _scan_deadline = _scan_start + scan_timeout
+
         filt               = filters or {}
         camsol_thr         = filt.get("camsol_threshold",   -0.5)
         esm_thr            = filt.get("esm_threshold",       0.3)
@@ -246,16 +251,20 @@ class MutationScanner:
         self._analysis_mode = analysis_mode
 
         # ── Step 1: Fetch / compute CamSol scores ─────────────────────────────
-        self._progress("💧 Step 1/4: CamSol solubility scoring…")
+        self._progress("Step 1/4: CamSol solubility scoring...")
+        _t0 = time.perf_counter()
         camsol_scores = self._get_or_run_camsol(sequence, chain_id)
         if not camsol_scores:
             return self._error_result("CamSol scores unavailable.")
+        self._progress(f"  CamSol: complete ({time.perf_counter() - _t0:.1f}s)")
 
         # ── Step 2: Fetch / compute ESM conservation scores ───────────────────
-        self._progress("🧬 Step 2/4: ESM-2 conservation scoring…")
+        self._progress("Step 2/4: ESM-2 conservation scoring...")
+        _t0 = time.perf_counter()
         esm_scores = self._get_or_run_esm(sequence, chain_id)
         if not esm_scores:
             return self._error_result("ESM-2 scores unavailable.")
+        self._progress(f"  ESM-2: complete ({time.perf_counter() - _t0:.1f}s)")
 
         # Retrieve actual sequence if not passed in
         if sequence is None:
@@ -264,25 +273,26 @@ class MutationScanner:
             return self._error_result("No amino-acid sequence available.")
 
         # ── Step 3: Identify candidates ───────────────────────────────────────
-        self._progress("🔬 Step 3/4: Identifying candidate positions…")
+        self._progress("Step 3/4: Identifying candidate positions...")
+        _t0 = time.perf_counter()
 
         # Report interface exclusions in multimer mode
         if _interface_protected:
             self._progress(
-                f"  ⛔ {len(_interface_protected)} position(s) excluded — "
+                f"  {len(_interface_protected)} position(s) excluded — "
                 f"at chain interface (multimer mode)."
             )
 
         raw_candidates = self._identify_candidates(
-            sequence       = sequence,
-            camsol_scores  = camsol_scores,
-            esm_scores     = esm_scores,
-            camsol_thr     = camsol_thr,
-            esm_thr        = esm_thr,
-            protected      = protected,
-            cands_per_pos  = cands_per_pos,
-            max_candidates = max_candidates,
-            chain_id       = chain_id,
+            sequence           = sequence,
+            camsol_scores      = camsol_scores,
+            esm_scores         = esm_scores,
+            camsol_thr         = camsol_thr,
+            esm_thr            = esm_thr,
+            protected          = protected,
+            cands_per_pos      = cands_per_pos,
+            max_candidates     = max_candidates,
+            chain_id           = chain_id,
             interface_residues = _interface_protected,
         )
 
@@ -293,16 +303,32 @@ class MutationScanner:
             )
             return []
 
+        n_positions = len({c["position"] for c in raw_candidates})
         self._progress(
-            f"  {len(raw_candidates)} candidate mutations at "
-            f"{len({c['position'] for c in raw_candidates})} positions."
+            f"  {len(raw_candidates)} candidate mutations at {n_positions} positions."
+        )
+        self._progress(
+            f"  Generating candidates: complete ({time.perf_counter() - _t0:.1f}s)"
         )
 
         # ── Step 4: Rosetta ddG scoring ───────────────────────────────────────
-        self._progress(
-            f"⚗️  Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations…"
-        )
-        ddg_scores = self._run_rosetta_batch(pdb_path, raw_candidates, chain_id)
+        _remaining = _scan_deadline - time.perf_counter()
+        if _remaining <= 30:
+            self._progress(
+                f"  Overall scan timeout ({scan_timeout}s) reached before ddG scoring. "
+                "Candidates ranked by CamSol + ESM only (ddG = 0.0)."
+            )
+            ddg_scores: Dict[str, float] = {}
+        else:
+            self._progress(
+                f"Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations..."
+            )
+            _t0 = time.perf_counter()
+            ddg_scores = self._run_rosetta_batch(
+                pdb_path, raw_candidates, chain_id,
+                scan_deadline=_scan_deadline,
+            )
+            self._progress(f"  DynaMut2: complete ({time.perf_counter() - _t0:.1f}s)")
 
         # ── Assemble and rank ─────────────────────────────────────────────────
         results: List[Dict[str, Any]] = []
@@ -600,20 +626,25 @@ class MutationScanner:
 
     def _run_rosetta_batch(
         self,
-        pdb_path:   str,
-        candidates: List[Dict[str, Any]],
-        chain_id:   Optional[str],
+        pdb_path:      str,
+        candidates:    List[Dict[str, Any]],
+        chain_id:      Optional[str],
+        scan_deadline: Optional[float] = None,
     ) -> Dict[str, float]:
         """
         Run Rosetta ddG for all candidate mutations in one batch call.
 
         Returns {mutation_key: ddg_kcal_mol}.
-        If Rosetta is unavailable, returns zeros so the pipeline can still rank
-        by CamSol + ESM alone (with a user-visible warning).
+        If Rosetta is unavailable, returns empty dict so the pipeline can still
+        rank by CamSol + ESM alone (with a user-visible warning).
+
+        scan_deadline : time.perf_counter() deadline for the overall scan.
+                        Forwarded to RosettaBridge so DynaMut2 can switch to
+                        empirical fallback before the budget is exhausted.
         """
         if not Path(pdb_path).is_file():
             self._progress(
-                "  ⚠ PDB file not found — skipping Rosetta (ddG will be 0.0)."
+                "  PDB file not found — skipping Rosetta (ddG will be 0.0)."
             )
             return {}
 
@@ -638,6 +669,7 @@ class MutationScanner:
             model_id          = self.model_id,
             chain             = chain_id,
             progress_callback = self._progress,
+            scan_deadline     = scan_deadline,
         )
 
         if result.success:
@@ -645,7 +677,7 @@ class MutationScanner:
 
         # Rosetta failed — warn and continue with zeros
         self._progress(
-            f"  ⚠ Rosetta ddG unavailable: {(result.error or '')[:100]}\n"
+            f"  Rosetta ddG unavailable: {(result.error or '')[:100]}\n"
             "    Candidates ranked by CamSol + ESM only (ddG = 0.0)."
         )
         return {}

@@ -97,11 +97,12 @@ _DYNAMUT2_BASE         = "https://biosig.lab.uq.edu.au/dynamut2/api"
 _DYNAMUT2_SUBMIT_URL   = f"{_DYNAMUT2_BASE}/prediction_single"
 _DYNAMUT2_RESULT_URL   = f"{_DYNAMUT2_BASE}/prediction_single"   # GET with ?job_id=
 
-_DYNAMUT2_TIMEOUT      = 30    # seconds per HTTP request
-_DYNAMUT2_POLL_INTERVAL = 5    # seconds between result polls
-_DYNAMUT2_MAX_POLLS    = 60    # 60 × 5 s = 5-minute timeout per mutation
-_DYNAMUT2_MAX_RETRIES  = 3
-_DYNAMUT2_RETRY_DELAYS = (5, 15, 30)  # backoff delays on submit failure (seconds)
+_DYNAMUT2_TIMEOUT         = 15    # seconds per HTTP request (connect + read)
+_DYNAMUT2_POLL_INTERVAL   = 5     # seconds between result polls
+_DYNAMUT2_MAX_POLLS       = 12    # 12 × 5s = 60s max polling per mutation (was 300s)
+_DYNAMUT2_RETRY_DELAYS    = (3, 8) # 2 submit retries with short delays (was (5,15,30))
+_DYNAMUT2_PER_MUT_TIMEOUT = 60    # wall-clock seconds budget per mutation
+_DYNAMUT2_CIRCUIT_BREAKER = 2     # consecutive failures before switching to empirical
 
 # ── BLOSUM62 substitution matrix (Henikoff & Henikoff 1992) ───────────────────
 # Used by the empirical fallback backend.
@@ -318,6 +319,7 @@ class RosettaBridge:
         model_id:          str = "1",
         chain:             Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
+        scan_deadline:     Optional[float] = None,
     ) -> ToolStepResult:
         """
         Calculate ddG for one or more mutations.
@@ -356,7 +358,8 @@ class RosettaBridge:
                 self._run_rosetta_local(pdb_path, mutations)  # always raises
             else:
                 return self._run_dynamut2(
-                    pdb_path, mutations, model_id, chain, session, progress_callback
+                    pdb_path, mutations, model_id, chain, session,
+                    progress_callback, scan_deadline,
                 )
         except NotImplementedError as exc:
             return ToolStepResult(
@@ -395,10 +398,22 @@ class RosettaBridge:
         chain:     Optional[str],
         session:   Any,
         progress_callback: Optional[Callable[[str], None]],
+        scan_deadline: Optional[float] = None,
     ) -> ToolStepResult:
         """
         Query DynaMut2 for each mutation (synchronous, one POST per mutation).
         Mutations that fail fall through to the empirical estimator.
+
+        Timeouts and guards
+        -------------------
+        scan_deadline        : time.perf_counter() deadline for the overall scan.
+                               Mutations beyond the deadline are scored empirically
+                               immediately rather than waiting for DynaMut2.
+        _DYNAMUT2_PER_MUT_TIMEOUT : wall-clock seconds budget per mutation.
+                               If a single mutation exceeds this, it falls back to
+                               empirical without burning the remaining budget.
+        _DYNAMUT2_CIRCUIT_BREAKER : consecutive submit failures before skipping
+                               all remaining DynaMut2 attempts (e.g. no network).
         """
 
         def _progress(msg: str) -> None:
@@ -407,29 +422,82 @@ class RosettaBridge:
             else:
                 _safe_print(msg)
 
-        _progress(f"⚗️  Querying DynaMut2 for {len(mutations)} mutation(s)…")
+        _progress(f"  Querying DynaMut2 for {len(mutations)} mutation(s)...")
 
-        ddg_scores:         Dict[str, float] = {}
-        warnings:           List[str]        = []
-        empirical_fallbacks: List[str]       = []
+        ddg_scores:          Dict[str, float] = {}
+        warnings:            List[str]        = []
+        empirical_fallbacks: List[str]        = []
+        _consecutive_failures: int            = 0
 
-        for mut in mutations:
+        for idx, mut in enumerate(mutations):
             key = _mutation_key(mut)
+
+            # ── Overall scan deadline ─────────────────────────────────────────
+            if scan_deadline is not None and time.perf_counter() >= scan_deadline:
+                remaining = mutations[idx:]
+                _progress(
+                    f"  Overall scan timeout: scoring remaining "
+                    f"{len(remaining)} mutation(s) with empirical fallback."
+                )
+                for rm in remaining:
+                    rk = _mutation_key(rm)
+                    ddg_scores[rk] = _empirical_ddg_single(rm, pdb_path)
+                    empirical_fallbacks.append(rk)
+                warnings.append(
+                    f"Scan timeout: {len(remaining)} mutation(s) scored empirically."
+                )
+                break
+
+            # ── Circuit breaker: stop hammering an unreachable server ─────────
+            if _consecutive_failures >= _DYNAMUT2_CIRCUIT_BREAKER:
+                remaining = mutations[idx:]
+                _progress(
+                    f"  DynaMut2 circuit breaker ({_consecutive_failures} consecutive "
+                    f"failures) — scoring remaining {len(remaining)} mutation(s) "
+                    "with empirical fallback."
+                )
+                for rm in remaining:
+                    rk = _mutation_key(rm)
+                    ddg_scores[rk] = _empirical_ddg_single(rm, pdb_path)
+                    empirical_fallbacks.append(rk)
+                warnings.append(
+                    f"DynaMut2 unreachable ({_consecutive_failures} consecutive "
+                    "failures). Empirical fallback used for remaining mutations."
+                )
+                break
+
+            # ── Per-mutation deadline ─────────────────────────────────────────
+            _mut_start         = time.perf_counter()
+            per_mut_deadline   = _mut_start + _DYNAMUT2_PER_MUT_TIMEOUT
+
+            _progress(
+                f"  DynaMut2: scoring mutation {idx + 1}/{len(mutations)} ({key})..."
+            )
+
             try:
-                ddg = self._query_dynamut2_single(pdb_path, mut, _progress)
+                ddg = self._query_dynamut2_single(
+                    pdb_path, mut, _progress, per_mut_deadline
+                )
+                _elapsed = time.perf_counter() - _mut_start
                 ddg_scores[key] = ddg
-                _progress(f"  ✓ {key}: ΔΔG = {ddg:+.2f} kcal/mol (DynaMut2)")
+                _consecutive_failures = 0           # reset on success
+                _progress(
+                    f"  + {key}: ddG = {ddg:+.2f} kcal/mol "
+                    f"({_elapsed:.1f}s, DynaMut2)"
+                )
             except Exception as exc:
+                _elapsed = time.perf_counter() - _mut_start
+                _consecutive_failures += 1
                 warnings.append(
                     f"DynaMut2 failed for {key} ({exc}). "
                     "Using empirical BLOSUM62 estimate."
                 )
-                ddg_emp          = _empirical_ddg_single(mut, pdb_path)
-                ddg_scores[key]  = ddg_emp
+                ddg_emp         = _empirical_ddg_single(mut, pdb_path)
+                ddg_scores[key] = ddg_emp
                 empirical_fallbacks.append(key)
                 _progress(
-                    f"  ⚠ {key}: DynaMut2 unavailable — "
-                    f"empirical estimate {ddg_emp:+.2f} kcal/mol"
+                    f"  ! {key}: empirical estimate {ddg_emp:+.2f} kcal/mol "
+                    f"({_elapsed:.1f}s — {str(exc)[:80]})"
                 )
 
         # ── Confidence and method note ─────────────────────────────────────────
@@ -521,9 +589,10 @@ class RosettaBridge:
 
     def _query_dynamut2_single(
         self,
-        pdb_path:  str,
-        mut:       Dict[str, Any],
-        progress:  Callable[[str], None],
+        pdb_path:            str,
+        mut:                 Dict[str, Any],
+        progress:            Callable[[str], None],
+        per_mutation_deadline: Optional[float] = None,
     ) -> float:
         """
         Submit one mutation to DynaMut2 and poll for the result.
@@ -538,6 +607,10 @@ class RosettaBridge:
           Response while running: {"message": "RUNNING"}
           Response when done: {"prediction": <float>, ...}
 
+        per_mutation_deadline : time.perf_counter() deadline.  Checked before
+          each retry/poll so the overall-scan budget is never exceeded by a
+          single mutation.
+
         Returns ΔΔG in kcal/mol (positive = destabilising).
         Raises on submission failure (after retries) or poll timeout.
         """
@@ -546,12 +619,23 @@ class RosettaBridge:
         mutation_str = f"{mut['from_aa']}{mut['position']}{mut['to_aa']}"
         chain_id     = mut.get("chain", "A")
 
+        def _over_deadline() -> bool:
+            return (
+                per_mutation_deadline is not None
+                and time.perf_counter() >= per_mutation_deadline
+            )
+
         # ── Step 1: Submit with retry ──────────────────────────────────────────
-        job_id: Optional[str] = None
+        job_id:   Optional[str]       = None
         last_exc: Optional[Exception] = None
 
         delays = list(_DYNAMUT2_RETRY_DELAYS) + [None]
         for attempt, delay in enumerate(delays):
+            if _over_deadline():
+                raise TimeoutError(
+                    f"Per-mutation timeout ({_DYNAMUT2_PER_MUT_TIMEOUT}s) "
+                    f"exceeded during submit for {mutation_str}"
+                )
             try:
                 with open(pdb_path, "rb") as fh:
                     resp = requests.post(
@@ -562,7 +646,7 @@ class RosettaBridge:
                     )
 
                 if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", delay or 60))
+                    retry_after = int(resp.headers.get("Retry-After", delay or 30))
                     if delay is not None:
                         progress(
                             f"  DynaMut2 rate-limited (attempt {attempt + 1}); "
@@ -574,21 +658,21 @@ class RosettaBridge:
                         )
                         continue
                     raise RuntimeError(
-                        f"DynaMut2 rate limit exceeded after {_DYNAMUT2_MAX_RETRIES} retries"
+                        "DynaMut2 rate limit exceeded — no more retries"
                     )
 
                 if resp.status_code != 200:
                     raise RuntimeError(
-                        f"DynaMut2 submit HTTP {resp.status_code}: {resp.text[:300]}"
+                        f"DynaMut2 submit HTTP {resp.status_code}: {resp.text[:200]}"
                     )
 
-                body = resp.json()
+                body   = resp.json()
                 job_id = str(body.get("job_id", ""))
                 if not job_id:
                     raise RuntimeError(
                         f"DynaMut2 submit response missing job_id. Body: {body}"
                     )
-                break   # success
+                break   # submit succeeded
 
             except requests.exceptions.Timeout:
                 last_exc = TimeoutError(
@@ -615,7 +699,13 @@ class RosettaBridge:
 
         # ── Step 2: Poll for result ────────────────────────────────────────────
         for poll_n in range(_DYNAMUT2_MAX_POLLS):
+            if _over_deadline():
+                raise TimeoutError(
+                    f"Per-mutation timeout during polling for {mutation_str}"
+                )
+
             time.sleep(_DYNAMUT2_POLL_INTERVAL)
+
             try:
                 r = requests.get(
                     _DYNAMUT2_RESULT_URL,
@@ -624,43 +714,46 @@ class RosettaBridge:
                 )
                 r.raise_for_status()
                 data = r.json()
+            except requests.exceptions.Timeout:
+                progress(f"  DynaMut2 poll {poll_n + 1} timeout; retrying...")
+                continue
             except Exception as exc:
-                progress(
-                    f"  DynaMut2 poll {poll_n + 1} error ({exc}); retrying..."
-                )
+                progress(f"  DynaMut2 poll {poll_n + 1} error ({exc}); retrying...")
                 continue
 
-            # Determine if the job is still running.
-            # DynaMut2 API uses several "still running" response formats:
-            #   {"message": "RUNNING"}                         (older format)
-            #   {"status": "running",  "job_id": "..."}        (newer format)
-            #   {"status": "pending",  "job_id": "..."}
-            #   {"status": "queued",   "job_id": "..."}
-            #   {"status": "processing", "job_id": "..."}
-            # Ready when "prediction" key is present.
-
+            # Result ready?
             if "prediction" in data:
                 return _parse_dynamut2_result(data, mutation_str)
 
+            # Explicit server-side error — don't keep polling
             msg    = str(data.get("message", "")).upper()
             status = str(data.get("status",  "")).lower()
+            if (status in ("error", "failed", "failure")
+                    or "error" in str(data.get("error", "")).lower()):
+                raise RuntimeError(
+                    f"DynaMut2 job failed for {mutation_str}: "
+                    f"{data.get('message') or data.get('error') or status!r}"
+                )
+
+            # Still running?
             still_running = (
                 msg in ("RUNNING", "PENDING", "QUEUED")
                 or status in ("running", "pending", "queued", "processing",
                               "submitted", "waiting")
-                or (msg == "" and status == "" and "error" not in data)
+                or (not msg and not status and "prediction" not in data
+                    and "error" not in data)
             )
 
             if still_running:
                 if poll_n % 6 == 0:   # log every ~30s
                     progress(
-                        f"  DynaMut2 {mutation_str}: waiting... "
-                        f"(~{(poll_n + 1) * _DYNAMUT2_POLL_INTERVAL}s, "
-                        f"status={status or msg or 'unknown'})"
+                        f"  DynaMut2 {mutation_str}: waiting "
+                        f"({(poll_n + 1) * _DYNAMUT2_POLL_INTERVAL}s elapsed, "
+                        f"status={status or msg or 'unknown'})..."
                     )
                 continue
 
-            # Unrecognised status — try to parse; will raise if no "prediction"
+            # Unrecognised non-error response — attempt to extract prediction
             return _parse_dynamut2_result(data, mutation_str)
 
         raise TimeoutError(
