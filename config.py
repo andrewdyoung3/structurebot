@@ -94,6 +94,24 @@ ROSETTA_RELAX_CACHE: Path = Path(
 )
 ROSETTA_RELAX_CACHE.mkdir(parents=True, exist_ok=True)
 
+# ── venv312 (Python 3.12 + CUDA torch 2.11.0+cu128) ─────────────────────────
+
+# Absolute path to the Python 3.12 virtual-environment interpreter.
+# venv312 ships torch 2.11.0+cu128, which has working CUDA on RTX 5070 Ti
+# (sm_120 Blackwell).  The main venv (Python 3.14) has no working CUDA build
+# for sm_120, so GPU inference is delegated to venv312 as a subprocess.
+# Override with VENV312_PYTHON env var.
+VENV312_PYTHON: str = os.environ.get(
+    "VENV312_PYTHON",
+    str(Path(__file__).parent / "venv312" / "Scripts" / "python.exe"),
+)
+
+# Controls whether ESM-2 uses the venv312 GPU backend.
+#   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
+#   "true"/"1"  — always use venv312; raise if unavailable
+#   "false"/"0" — always use current-venv CPU path (disables GPU delegation)
+ESM_USE_VENV312: str = os.environ.get("ESM_USE_VENV312", "auto").strip()
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 

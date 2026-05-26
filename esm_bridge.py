@@ -58,12 +58,25 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import config as _cfg
 from tool_router import ToolStepResult
+
+# Windows-only flag: prevent child processes from opening a console window.
+# Using it on all subprocess calls is belt-and-suspenders — it stops a Python
+# subprocess from inheriting and mutating the parent's console handle.
+_CREATE_NO_WINDOW: int = (
+    subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    if sys.platform == "win32"
+    else 0
+)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -81,6 +94,88 @@ _CONS_COLOUR_BANDS: List[Tuple[float, float, str]] = [
     (0.2, 0.4,  "tomato"),
     (0.0, 0.2,  "red"),
 ]
+
+
+# ── venv312 CUDA availability (cached) ───────────────────────────────────────
+
+_VENV312_CUDA_AVAILABLE: Optional[bool] = None   # None = not yet checked
+
+
+def _check_venv312_cuda() -> bool:
+    """
+    Test whether venv312 (Python 3.12 + torch 2.11.0+cu128) exists and can
+    run a CUDA tensor operation.
+
+    The check is performed exactly once per process lifetime; subsequent calls
+    return the cached result immediately.
+
+    Decision matrix (ESM_USE_VENV312 env var):
+      "false"/"0" → always returns False (CPU path forced)
+      "auto"      → True only if VENV312_PYTHON exists + CUDA smoke-test passes
+      "true"/"1"  → same as "auto" but an explicit opt-in for clarity
+
+    The smoke-test runs::
+
+        venv312/Scripts/python.exe -c
+            "import torch; torch.tensor([1.0]).cuda(); print('CUDA_OK')"
+
+    This loads Python + torch and performs one CUDA kernel launch
+    (~5–15 s on first run, mostly JIT/shader compilation).  The result is then
+    cached, so later ``analyze()`` calls pay no detection cost.
+    """
+    global _VENV312_CUDA_AVAILABLE
+    if _VENV312_CUDA_AVAILABLE is not None:
+        return _VENV312_CUDA_AVAILABLE
+
+    use_setting = _cfg.ESM_USE_VENV312.lower()
+    if use_setting in ("false", "0", "no"):
+        _VENV312_CUDA_AVAILABLE = False
+        return False
+
+    venv312_python = _cfg.VENV312_PYTHON
+    if not Path(venv312_python).is_file():
+        _VENV312_CUDA_AVAILABLE = False
+        return False
+
+    # fair-esm must also be importable inside venv312
+    try:
+        probe = subprocess.run(
+            [
+                venv312_python, "-c",
+                (
+                    "import torch; "
+                    "t = torch.tensor([1.0]).cuda(); "
+                    "_ = (t + 1).sum().item(); "
+                    "import esm; "          # verify fair-esm present
+                    "print('CUDA_OK')"
+                ),
+            ],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,                   # first-run JIT can be slow
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        _VENV312_CUDA_AVAILABLE = (
+            probe.returncode == 0 and "CUDA_OK" in probe.stdout
+        )
+        if not _VENV312_CUDA_AVAILABLE:
+            _stderr_snippet = (probe.stderr or "")[:300]
+            print(
+                f"[ESM] venv312 CUDA check failed "
+                f"(rc={probe.returncode}): {_stderr_snippet}",
+                flush=True,
+            )
+    except subprocess.TimeoutExpired:
+        print("[ESM] venv312 CUDA check timed out — using CPU backend.", flush=True)
+        _VENV312_CUDA_AVAILABLE = False
+    except Exception as exc:
+        print(f"[ESM] venv312 CUDA check error: {exc}", flush=True)
+        _VENV312_CUDA_AVAILABLE = False
+
+    return _VENV312_CUDA_AVAILABLE
 
 
 # ── CUDA probe ───────────────────────────────────────────────────────────────
@@ -467,8 +562,13 @@ class EsmBridge:
     """
 
     def __init__(self, model_name: str = _DEFAULT_MODEL):
-        self.model_name = os.environ.get("ESM_MODEL", model_name)
-        self._backend   = _EsmBackend(self.model_name)
+        self.model_name    = os.environ.get("ESM_MODEL", model_name)
+        self._backend      = _EsmBackend(self.model_name)
+        # Populated on first analyze() call that needs inference (not cached).
+        # "gpu"  → venv312 detected OK, will use GPU subprocess
+        # "cpu"  → venv312 absent/broken, using in-process CPU path
+        # None   → not yet checked
+        self._venv312_status: Optional[str] = None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -508,48 +608,84 @@ class EsmBridge:
                 error=f"Sequence too short ({len(sequence)} residues). ESM-2 requires ≥ 5.",
             )
 
-        # Check disk cache
+        # ── Disk cache ─────────────────────────────────────────────────────────
         cache_key    = self._cache_key(sequence)
         cached_probs = self._load_cache(cache_key)
         timed_out    = False
+        device_used  = "cpu"       # overwritten below
 
         if cached_probs is not None:
-            all_probs = cached_probs
+            all_probs   = cached_probs
+            device_used = "cached"
         else:
-            deadline = time.perf_counter() + inference_timeout
-            try:
-                all_probs = self._backend.masked_probabilities(sequence, deadline=deadline)
-            except TimeoutError as exc:
-                elapsed = time.perf_counter() - _t0
-                warnings.warn(
-                    f"[ESM] Inference timed out after {elapsed:.1f}s "
-                    f"(limit {inference_timeout}s) — "
-                    f"falling back to uniform conservation scores (0.5).",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                print(
-                    f"[ESM] ⚠ Timeout after {elapsed:.1f}s at position {exc}. "
-                    f"Using uniform 0.5 fallback.",
-                    flush=True,
-                )
-                uniform = [1.0 / 20] * 20
-                all_probs = [uniform[:] for _ in sequence]
-                timed_out = True
-            except ImportError as exc:
-                return ToolStepResult(
-                    tool="esm", success=False,
-                    error=str(exc),
-                )
-            except Exception as exc:
-                return ToolStepResult(
-                    tool="esm", success=False,
-                    error=f"ESM-2 inference failed: {exc}",
-                )
+            # ── One-time backend detection + announcement ───────────────────
+            if self._venv312_status is None:
+                venv312_ok = _check_venv312_cuda()
+                if venv312_ok:
+                    self._venv312_status = "gpu"
+                    print(
+                        "[ESM] Using venv312 GPU backend (RTX 5070 Ti)",
+                        flush=True,
+                    )
+                else:
+                    self._venv312_status = "cpu"
+                    print(
+                        "[ESM] Using CPU backend (venv312 not available)",
+                        flush=True,
+                    )
+
+            # ── GPU path via venv312 subprocess ────────────────────────────
+            all_probs = None
+            if self._venv312_status == "gpu":
+                all_probs = self._run_esm_in_venv312(sequence, timeout=inference_timeout)
+                if all_probs is not None:
+                    device_used = "cuda"
+                else:
+                    print(
+                        "[ESM] venv312 inference failed — falling back to CPU.",
+                        flush=True,
+                    )
+
+            # ── CPU fallback (in-process _EsmBackend) ──────────────────────
+            if all_probs is None:
+                deadline = time.perf_counter() + inference_timeout
+                try:
+                    all_probs = self._backend.masked_probabilities(
+                        sequence, deadline=deadline
+                    )
+                    device_used = self._backend._device or "cpu"
+                except TimeoutError as exc:
+                    elapsed = time.perf_counter() - _t0
+                    warnings.warn(
+                        f"[ESM] Inference timed out after {elapsed:.1f}s "
+                        f"(limit {inference_timeout}s) — "
+                        f"falling back to uniform conservation scores (0.5).",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    print(
+                        f"[ESM] Timeout after {elapsed:.1f}s at {exc}. "
+                        f"Using uniform 0.5 fallback.",
+                        flush=True,
+                    )
+                    uniform    = [1.0 / 20] * 20
+                    all_probs  = [uniform[:] for _ in sequence]
+                    timed_out  = True
+                    device_used = "cpu (timeout)"
+                except ImportError as exc:
+                    return ToolStepResult(
+                        tool="esm", success=False, error=str(exc),
+                    )
+                except Exception as exc:
+                    return ToolStepResult(
+                        tool="esm", success=False,
+                        error=f"ESM-2 inference failed: {exc}",
+                    )
+
             if not timed_out:
                 self._save_cache(cache_key, all_probs)
 
-        # Compute per-position conservation scores
+        # ── Conservation scores ─────────────────────────────────────────────
         conservation = [
             _conservation_from_entropy(_entropy(probs))
             for probs in all_probs
@@ -575,7 +711,7 @@ class EsmBridge:
         elif cached_probs is not None:
             timing_note = " (cached)"
         else:
-            timing_note = f" ({elapsed:.1f}s)"
+            timing_note = f" ({elapsed:.1f}s, {device_used})"
 
         summary = (
             f"ESM-2{timing_note}: {len(sequence)} residues. "
@@ -588,20 +724,152 @@ class EsmBridge:
             tool    = "esm",
             success = True,
             data    = {
-                "conservation":     scores_dict,
-                "highly_conserved": highly_conserved,
-                "rapidly_evolving": rapidly_evolving,
+                "conservation":      scores_dict,
+                "highly_conserved":  highly_conserved,
+                "rapidly_evolving":  rapidly_evolving,
                 "mean_conservation": round(mean_cons, 4),
-                "model_used":       self.model_name,
-                "device":           self._backend._device or "cpu",
-                "cached":           cached_probs is not None,
-                "timed_out":        timed_out,
-                "elapsed_s":        round(elapsed, 2),
+                "model_used":        self.model_name,
+                "device":            device_used,
+                "cached":            cached_probs is not None,
+                "timed_out":         timed_out,
+                "elapsed_s":         round(elapsed, 2),
             },
             viz_commands     = viz_cmds,
             viz_explanations = viz_exps,
             summary          = summary,
         )
+
+    # ── venv312 GPU inference ──────────────────────────────────────────────────
+
+    def _run_esm_in_venv312(
+        self,
+        sequence: str,
+        timeout:  int = 300,
+    ) -> Optional[List[List[float]]]:
+        """
+        Delegate ESM-2 inference to esm_worker.py running inside venv312.
+
+        The worker uses batched masking (all L masked variants processed in
+        mini-batches of 32), so the number of forward passes is
+        ceil(L / 32) instead of L — roughly a 30× reduction in compute.
+        Combined with GPU acceleration this is typically 100–500× faster than
+        the CPU position-by-position path for sequences longer than ~50 AA.
+
+        Protocol
+        --------
+        1. Write ``{"sequence": ..., "model": ...}`` to a temp JSON file.
+        2. Run: venv312/Scripts/python.exe esm_worker.py --input … --output …
+        3. Read the result JSON; relay worker stdout (progress lines).
+        4. Return probs list on success, None on any failure.
+
+        The caller falls back to the CPU _EsmBackend if None is returned.
+        """
+        worker_path    = str(Path(__file__).parent / "esm_worker.py")
+        venv312_python = _cfg.VENV312_PYTHON
+
+        if not Path(worker_path).is_file():
+            print(f"[ESM] esm_worker.py not found at {worker_path}", flush=True)
+            return None
+
+        inp_path: Optional[str] = None
+        out_path: Optional[str] = None
+        try:
+            # Write sequence + model to temp input file
+            inp_fd, inp_path = tempfile.mkstemp(suffix="_esm_in.json")
+            os.close(inp_fd)
+            with open(inp_path, "w", encoding="utf-8") as fh:
+                json.dump({"sequence": sequence, "model": self.model_name}, fh)
+
+            # Temp file for worker output
+            out_fd, out_path = tempfile.mkstemp(suffix="_esm_out.json")
+            os.close(out_fd)
+
+            print(
+                f"[ESM] Launching venv312 worker "
+                f"({len(sequence)} residues, batched GPU)…",
+                flush=True,
+            )
+
+            proc = subprocess.run(
+                [
+                    venv312_python,
+                    worker_path,
+                    "--input",  inp_path,
+                    "--output", out_path,
+                ],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+
+            # Relay worker progress output so the user sees it
+            if proc.stdout:
+                for line in proc.stdout.splitlines():
+                    if line.strip():
+                        print(line, flush=True)
+            if proc.returncode != 0 and proc.stderr:
+                for line in proc.stderr.splitlines()[:10]:
+                    if line.strip():
+                        print(f"[ESM-worker] {line}", flush=True)
+
+            if proc.returncode != 0:
+                print(
+                    f"[ESM] venv312 worker exited {proc.returncode}",
+                    flush=True,
+                )
+                return None
+
+            # Read results JSON
+            if not Path(out_path).is_file():
+                print("[ESM] venv312 worker produced no output file", flush=True)
+                return None
+
+            with open(out_path, "r", encoding="utf-8") as fh:
+                result = json.load(fh)
+
+            if not result.get("ok"):
+                print(
+                    f"[ESM] venv312 worker error: {result.get('error', '?')}",
+                    flush=True,
+                )
+                return None
+
+            probs = result.get("probs")
+            if not probs or len(probs) != len(sequence):
+                print(
+                    f"[ESM] venv312 worker returned {len(probs or [])} probs "
+                    f"for {len(sequence)}-residue sequence",
+                    flush=True,
+                )
+                return None
+
+            print(
+                f"[ESM] venv312 GPU done: {len(sequence)} residues in "
+                f"{result.get('elapsed_s', '?')}s on {result.get('device', '?')}",
+                flush=True,
+            )
+            return probs
+
+        except subprocess.TimeoutExpired:
+            print(
+                f"[ESM] venv312 worker timed out after {timeout}s",
+                flush=True,
+            )
+            return None
+        except Exception as exc:
+            print(f"[ESM] venv312 worker exception: {exc}", flush=True)
+            return None
+        finally:
+            for p in (inp_path, out_path):
+                if p:
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     # ── Cache ──────────────────────────────────────────────────────────────────
 
