@@ -60,11 +60,13 @@ def _check_wsl_availability() -> bool:
         result = subprocess.run(
             ["wsl.exe", "--list", "--verbose"],
             capture_output=True,
-            timeout=10,
-            text=True,
-            encoding="utf-16-le",   # wsl.exe outputs UTF-16 LE on Windows
-            errors="replace",
-        )
+            stdin=subprocess.DEVNULL,          # do NOT inherit the parent console's
+            creationflags=subprocess.CREATE_NO_WINDOW,  # stdin handle; wsl.exe is a
+            timeout=10,                        # Windows console app that calls
+            text=True,                         # SetConsoleMode() on inherited handles
+            encoding="utf-16-le",              # and may not restore them, which
+            errors="replace",                  # silently disables ReadConsole() input
+        )                                      # for the rest of the process lifetime.
         if result.returncode != 0:
             _WSL_AVAILABLE_CACHE = False
             return False
@@ -174,6 +176,8 @@ class WSLBridge:
             proc = subprocess.run(
                 wsl_args,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
