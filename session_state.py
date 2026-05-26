@@ -218,6 +218,14 @@ class SessionState:
         self.interface_residues: Dict[str, Dict[str, List[int]]] = {}
         # ProteinMPNN redesign results per model: model_id → result list
         self.proteinmpnn_results: Dict[str, Dict[str, Any]] = {}
+        # Disulfide candidates: model_id → {chain_pair_key: [candidate_dicts]}
+        # e.g. {"1": {"A:B": [...]}}
+        self.disulfide_candidates: Dict[str, Dict[str, Any]] = {}
+        # Rosetta relax cache: pdb_hash → relaxed_pdb_path
+        # Tracks which PDB files have been FastRelax'd in WSL2.
+        self.rosetta_relax_cache: Dict[str, str] = {}
+        # WSL2 availability flag (set at startup by main.py)
+        self.wsl_available: bool = False
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -465,6 +473,49 @@ class SessionState:
         entry = self.proteinmpnn_results.get(str(model_id))
         return entry.get("data") if entry else None
 
+    # ── Disulfide candidate tracking ──────────────────────────────────────────
+
+    def set_disulfide_candidates(
+        self,
+        model_id:   str,
+        chain_a:    str,
+        chain_b:    str,
+        candidates: List[Dict[str, Any]],
+    ) -> None:
+        """Store disulfide prediction results for a (model, chain pair)."""
+        mid = str(model_id)
+        if mid not in self.disulfide_candidates:
+            self.disulfide_candidates[mid] = {}
+        key = f"{chain_a}:{chain_b}"
+        self.disulfide_candidates[mid][key] = {
+            "candidates": candidates,
+            "timestamp":  datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def get_disulfide_candidates(
+        self,
+        model_id: str,
+        chain_a:  str,
+        chain_b:  str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return stored disulfide candidates for a (model, chain pair), or None."""
+        entry = (
+            self.disulfide_candidates
+            .get(str(model_id), {})
+            .get(f"{chain_a}:{chain_b}")
+        )
+        return entry["candidates"] if entry else None
+
+    # ── Rosetta relax cache tracking ──────────────────────────────────────────
+
+    def set_relax_cache(self, pdb_hash: str, relaxed_path: str) -> None:
+        """Record that a PDB (identified by MD5 hash) has been FastRelax'd."""
+        self.rosetta_relax_cache[pdb_hash] = relaxed_path
+
+    def get_relax_cache(self, pdb_hash: str) -> Optional[str]:
+        """Return the path to a cached relaxed PDB, or None."""
+        return self.rosetta_relax_cache.get(pdb_hash)
+
     # ── Selection tracking ────────────────────────────────────────────────────
 
     def save_selection(self, label: str, spec: str) -> None:
@@ -630,19 +681,21 @@ class SessionState:
 
     def save(self, path: str = "session.json") -> None:
         data = {
-            "session_start":      self.session_start,
-            "working_dir":        self.working_dir,
-            "structures":         self.structures,
-            "named_selections":   self.named_selections,
-            "applied_styles":     self.applied_styles,
-            "command_history":    self.command_history,
-            "tool_results":       self.tool_results,
-            "rosetta_jobs":       self.rosetta_jobs,
-            "scan_results":       self.scan_results,
-            "assembly_info":      self.assembly_info,
-            "analysis_mode":      self.analysis_mode,
-            "interface_residues": self.interface_residues,
-            "proteinmpnn_results": self.proteinmpnn_results,
+            "session_start":        self.session_start,
+            "working_dir":          self.working_dir,
+            "structures":           self.structures,
+            "named_selections":     self.named_selections,
+            "applied_styles":       self.applied_styles,
+            "command_history":      self.command_history,
+            "tool_results":         self.tool_results,
+            "rosetta_jobs":         self.rosetta_jobs,
+            "scan_results":         self.scan_results,
+            "assembly_info":        self.assembly_info,
+            "analysis_mode":        self.analysis_mode,
+            "interface_residues":   self.interface_residues,
+            "proteinmpnn_results":  self.proteinmpnn_results,
+            "disulfide_candidates": self.disulfide_candidates,
+            "rosetta_relax_cache":  self.rosetta_relax_cache,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -665,8 +718,10 @@ class SessionState:
         state.scan_results        = data.get("scan_results",  {})
         state.assembly_info       = data.get("assembly_info", {})
         state.analysis_mode       = data.get("analysis_mode", {})
-        state.interface_residues  = data.get("interface_residues", {})
-        state.proteinmpnn_results = data.get("proteinmpnn_results", {})
+        state.interface_residues   = data.get("interface_residues", {})
+        state.proteinmpnn_results  = data.get("proteinmpnn_results", {})
+        state.disulfide_candidates = data.get("disulfide_candidates", {})
+        state.rosetta_relax_cache  = data.get("rosetta_relax_cache", {})
         return state
 
     def __repr__(self) -> str:

@@ -224,6 +224,85 @@ def test_empirical_backend_forced() -> None:
         Path(pdb_path).unlink(missing_ok=True)
 
 
+def test_local_backend_wsl_not_installed() -> None:
+    """
+    ROSETTA_BACKEND=local when WSL2 is not installed must return
+    a helpful error explaining how to install WSL2.
+    """
+    from rosetta_bridge import RosettaBridge
+
+    pdb_path = _write_temp_pdb()
+    try:
+        os.environ["ROSETTA_BACKEND"] = "local"
+
+        with patch("wsl_bridge.WSLBridge.is_available", return_value=False):
+            bridge = RosettaBridge()
+            result = bridge.analyze(
+                pdb_path  = pdb_path,
+                mutations = [{"chain": "A", "position": 1, "from_aa": "P", "to_aa": "K"}],
+            )
+
+        _assert(not result.success, "local backend without WSL2 -> success=False")
+        err = (result.error or "").lower()
+        _assert(
+            "wsl" in err or "ubuntu" in err or "not installed" in err,
+            "error mentions WSL2 installation",
+            repr((result.error or "")[:120]),
+        )
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_local_backend_wsl_no_pyrosetta() -> None:
+    """
+    ROSETTA_BACKEND=local with WSL2 available but PyRosetta absent
+    must return an error explaining how to install PyRosetta.
+    """
+    from rosetta_bridge import RosettaBridge
+
+    pdb_path = _write_temp_pdb()
+    try:
+        os.environ["ROSETTA_BACKEND"] = "local"
+
+        with patch("wsl_bridge.WSLBridge.is_available",   return_value=True), \
+             patch("wsl_bridge.WSLBridge.check_pyrosetta", return_value=False):
+            bridge = RosettaBridge()
+            result = bridge.analyze(
+                pdb_path  = pdb_path,
+                mutations = [{"chain": "A", "position": 1, "from_aa": "P", "to_aa": "K"}],
+            )
+
+        _assert(not result.success, "local backend without PyRosetta -> success=False")
+        err = (result.error or "").lower()
+        _assert(
+            "pyrosetta" in err,
+            "error mentions PyRosetta installation",
+            repr((result.error or "")[:120]),
+        )
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_backend_status_local_no_wsl() -> None:
+    """backend_status() for local backend without WSL2 mentions WSL2 install."""
+    from rosetta_bridge import RosettaBridge
+
+    os.environ["ROSETTA_BACKEND"] = "local"
+    try:
+        with patch("wsl_bridge.WSLBridge.is_available", return_value=False):
+            bridge  = RosettaBridge()
+            status  = bridge.backend_status().lower()
+        _assert(
+            "wsl" in status or "not installed" in status,
+            "backend_status mentions WSL2 when unavailable",
+            f"got: {bridge.backend_status()!r}",
+        )
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
+
+
 def test_missing_pdb_error() -> None:
     """Non-existent PDB path must produce a clear error before any API call."""
     from rosetta_bridge import RosettaBridge
@@ -955,6 +1034,9 @@ def run_all(groups: List[str]) -> None:
         test_backend_detection()
         test_pyrosetta_stub_error()
         test_empirical_backend_forced()
+        test_local_backend_wsl_not_installed()
+        test_local_backend_wsl_no_pyrosetta()
+        test_backend_status_local_no_wsl()
         test_missing_pdb_error()
 
     if run_mock:

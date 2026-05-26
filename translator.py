@@ -111,6 +111,7 @@ tools_needed values (list — may contain one or more):
   "rosetta"           — single-mutation or batch ddG calculation
   "mutation_scan"     — full CamSol + ESM + Rosetta engineering pipeline
   "assembly_analyser" — biological assembly detection, interface mapping
+  "disulfide"         — interchain disulfide bond candidate prediction
 
 tool_inputs: dict of tool-specific parameters, e.g.:
   {{"camsol": {{"model_id": "1", "chain": "A"}}}}
@@ -174,9 +175,11 @@ chimerax         : visualization, selection, measurement, image export  [ACTIVE]
 camsol           : per-residue solubility / aggregation-prone scoring  [ACTIVE]
 esm              : evolutionary conservation via ESM-2 language model  [ACTIVE]
 proteinmpnn      : fixed-backbone sequence redesign                    [STUB — set PROTEINMPNN_DIR]
-rosetta          : stability prediction, ddG calculation               [ACTIVE — PyRosetta or Robetta]
+rosetta          : stability prediction, ddG calculation               [ACTIVE — DynaMut2 or local]
 mutation_scan    : full CamSol + ESM + Rosetta engineering pipeline   [ACTIVE]
 assembly_analyser: biological assembly detection, interface mapping    [ACTIVE]
+disulfide        : interchain disulfide bond candidate prediction      [ACTIVE]
+rosetta_local    : publication-quality ddG via PyRosetta/WSL2         [ACTIVE if WSL2 configured]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TOOL ROUTING RULES
@@ -249,6 +252,31 @@ ASSEMBLY / INTERFACE requests:
        "assembly_analyser": {{"model_id": "1", "mode": "multimer"}},
        "chimerax": {{}}
      }}
+
+DISULFIDE BOND requests:
+  "suggest disulfide bonds", "find disulfide candidates", "stabilise the interface",
+  "engineer disulfide", "cross-link chains", "predict disulfide",
+  "disulfide bridge candidates", "disulfide positions"
+  → tools_needed: ["disulfide"]
+  → tool_inputs: {{
+       "disulfide": {{
+         "model_id": "1",
+         "chain_a": "A",
+         "chain_b": "B"
+       }}
+     }}
+
+  "improve dimer stability" or "stabilise the complex" (when a multimer is loaded)
+  → tools_needed: ["disulfide", "mutation_scan"]
+  → tool_inputs: {{
+       "disulfide": {{"model_id": "1", "chain_a": "A", "chain_b": "B"}},
+       "mutation_scan": {{"model_id": "1", "chain": "A", "focus": "solubility",
+                         "analysis_mode": "multimer"}}
+     }}
+
+  Chain specification: if the user names chains, use those:
+    "suggest disulfides between chain A and chain B"
+    → chain_a: "A", chain_b: "B"
 
 PURE VISUALIZATION (default — no extra tools):
   All other requests → tools_needed: ["chimerax"], tool_inputs: {{}}
@@ -394,6 +422,60 @@ EXAMPLE — "Show me the interface between chains A and B":
       "mode": "multimer",
       "chain_id": "A",
       "visualize": true
+    }}
+  }}
+}}
+
+EXAMPLE — "Suggest disulfide bonds to stabilise the dimer interface":
+{{
+  "commands":     [],
+  "explanations": [],
+  "warnings":     ["Disulfide prediction scores geometry, ESM tolerance, and DynaMut2 stability for each candidate pair"],
+  "clarification_needed": null,
+  "confidence":   "high",
+  "tools_needed": ["disulfide"],
+  "tool_inputs":  {{
+    "disulfide": {{
+      "model_id": "1",
+      "chain_a": "A",
+      "chain_b": "B"
+    }}
+  }}
+}}
+
+EXAMPLE — "Find disulfide candidates between chain A and chain B":
+{{
+  "commands":     [],
+  "explanations": [],
+  "warnings":     [],
+  "clarification_needed": null,
+  "confidence":   "high",
+  "tools_needed": ["disulfide"],
+  "tool_inputs":  {{
+    "disulfide": {{
+      "model_id": "1",
+      "chain_a": "A",
+      "chain_b": "B"
+    }}
+  }}
+}}
+
+EXAMPLE — "Improve the stability of the 1HSG dimer":
+{{
+  "commands":     [],
+  "explanations": [],
+  "warnings":     ["Multimer analysis will run disulfide prediction and mutation scan"],
+  "clarification_needed": null,
+  "confidence":   "high",
+  "tools_needed": ["disulfide", "assembly_analyser", "mutation_scan"],
+  "tool_inputs":  {{
+    "disulfide": {{"model_id": "1", "chain_a": "A", "chain_b": "B"}},
+    "assembly_analyser": {{"model_id": "1", "mode": "multimer", "chain_id": "A"}},
+    "mutation_scan": {{
+      "model_id": "1",
+      "chain": "A",
+      "focus": "solubility",
+      "analysis_mode": "multimer"
     }}
   }}
 }}

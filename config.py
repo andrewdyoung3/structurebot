@@ -79,6 +79,21 @@ PYROSETTA_AVAILABLE: bool = (
     in ("1", "true", "yes")
 )
 
+# ── WSL2 ──────────────────────────────────────────────────────────────────────
+
+# Name of the WSL2 distribution to use for PyRosetta.
+# Override with WSL_DISTRIBUTION env var.
+WSL_DISTRIBUTION: str = os.environ.get("WSL_DISTRIBUTION", "Ubuntu-22.04").strip()
+
+# ── Rosetta relax cache ────────────────────────────────────────────────────────
+
+# Directory where FastRelax'd PDB structures are cached to avoid re-relaxing.
+# Keyed by MD5 hash of the PDB content.  Populated by the local Rosetta backend.
+ROSETTA_RELAX_CACHE: Path = Path(
+    os.environ.get("ROSETTA_RELAX_CACHE", str(_BASE / "cache" / "rosetta_relaxed"))
+)
+ROSETTA_RELAX_CACHE.mkdir(parents=True, exist_ok=True)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 

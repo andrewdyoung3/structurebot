@@ -113,6 +113,7 @@ class ToolRouter:
         "rosetta":           "⚗️",
         "mutation_scan":     "🔬⚗️",
         "assembly_analyser": "🔗",
+        "disulfide":         "🔗⚗️",
     }
 
     def __init__(
@@ -130,6 +131,7 @@ class ToolRouter:
         self._rosetta_bridge:       Optional[Any] = None
         self._mutation_scanner:     Optional[Any] = None
         self._assembly_analyser:    Optional[Any] = None
+        self._disulfide_bridge:     Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -206,6 +208,15 @@ class ToolRouter:
             return (
                 f"Assembly analysis — #{mid} [{mode} mode]"
                 + (f", chain {ch}" if ch else "")
+            )
+        if tool == "disulfide":
+            inp  = tool_inputs.get("disulfide", {})
+            mid  = inp.get("model_id") or self._first_model_id()
+            ca   = inp.get("chain_a", "A")
+            cb   = inp.get("chain_b", "B")
+            return (
+                f"Disulfide candidate prediction — #{mid} chains {ca}/{cb} "
+                "(geometry + ESM + DynaMut2)"
             )
         return f"Unknown tool: {tool}"
 
@@ -298,12 +309,14 @@ class ToolRouter:
                 return self._run_mutation_scan(inputs)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
+            if tool == "disulfide":
+                return self._run_disulfide(inputs)
             return ToolStepResult(
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
                     "Available: chimerax, camsol, esm, proteinmpnn, "
-                    "rosetta, mutation_scan, assembly_analyser."
+                    "rosetta, mutation_scan, assembly_analyser, disulfide."
                 ),
             )
         except Exception as exc:
@@ -312,6 +325,53 @@ class ToolRouter:
                 tool=tool, success=False,
                 error=f"{tool} raised an unexpected error: {exc}",
             )
+
+    def _run_disulfide(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run interchain disulfide bond candidate prediction."""
+        bridge   = self._get_disulfide_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain_a  = inputs.get("chain_a", "A")
+        chain_b  = inputs.get("chain_b", "B")
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="disulfide", success=False,
+                error=(
+                    "Disulfide prediction requires a local PDB file.\n"
+                    "  Load the structure from a local .pdb file, or ensure\n"
+                    "  internet access so StructureBot can download it from RCSB."
+                ),
+            )
+
+        # Pull any interface residues the assembly analyser already found
+        binding_site: Optional[List[int]] = None
+        interface_data = self.session.get_interface_residues(model_id)
+        if interface_data:
+            # Collect binding-site residues for chain_a
+            binding_site = self.session.get_protected_residues_for_chain(
+                model_id, chain_a
+            ) or None
+
+        import time as _time
+        t0 = _time.perf_counter()
+
+        result = bridge.analyze(
+            pdb_path              = pdb_path,
+            chain_a               = chain_a,
+            chain_b               = chain_b,
+            session               = self.session,
+            model_id              = model_id,
+            binding_site_residues = binding_site,
+        )
+        result.elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if result.success and result.data.get("candidates"):
+            self.session.set_disulfide_candidates(
+                model_id, chain_a, chain_b, result.data["candidates"]
+            )
+
+        return result
 
     def _run_camsol(self, inputs: Dict[str, Any]) -> ToolStepResult:
         bridge   = self._get_camsol_bridge()
@@ -603,6 +663,12 @@ class ToolRouter:
             )
         return self._assembly_analyser
 
+    def _get_disulfide_bridge(self):
+        if self._disulfide_bridge is None:
+            from disulfide_bridge import DisulfideBridge
+            self._disulfide_bridge = DisulfideBridge(chimerax_bridge=self.bridge)
+        return self._disulfide_bridge
+
     def _get_camsol_bridge(self):
         if self._camsol_bridge is None:
             from camsol_bridge import CamsolBridge
@@ -835,6 +901,27 @@ class ToolRouter:
             status["assembly_analyser"] = "active"
         except ImportError:
             status["assembly_analyser"] = "module not found"
+
+        # disulfide
+        try:
+            __import__("disulfide_bridge")
+            status["disulfide"] = "active (geometry + ESM + DynaMut2)"
+        except ImportError:
+            status["disulfide"] = "module not found"
+
+        # rosetta_local via WSL2
+        try:
+            from wsl_bridge import WSLBridge
+            wsl = WSLBridge()
+            if wsl.is_available():
+                if wsl.check_pyrosetta():
+                    status["rosetta_local"] = "active (PyRosetta via WSL2)"
+                else:
+                    status["rosetta_local"] = "WSL2 available — PyRosetta not installed"
+            else:
+                status["rosetta_local"] = "WSL2 not installed"
+        except ImportError:
+            status["rosetta_local"] = "wsl_bridge module not found"
 
         return status
 

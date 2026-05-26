@@ -20,13 +20,25 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# ── Force line-buffered stdout (real-time output on Windows PowerShell) ───────
-sys.stdout.reconfigure(line_buffering=True)
+# ── Force write-through on stdout (real-time output on Windows PowerShell) ────
+# write_through=True: every TextIOWrapper.write() call immediately passes bytes
+# to the underlying WindowsConsoleIO / WriteConsole() without accumulating in
+# the TextIOWrapper pending-bytes queue.  This gives the same real-time display
+# as line_buffering=True while avoiding the line_buffering flush-on-newline code
+# path that caused Python's input() to block indefinitely waiting for ReadConsole()
+# on Python 3.14/Windows — making the "You:" Prompt.ask() appear unresponsive.
+# stdin is never touched; msvcrt / Prompt.ask() work normally.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(write_through=True)
+    except Exception:
+        pass  # non-critical; _ElapsedTicker already uses print(..., flush=True)
 
 # ── Windows-only keyboard polling ─────────────────────────────────────────────
 if sys.platform == "win32":
@@ -92,6 +104,7 @@ BANNER = """\
     [cyan]Suggest mutations to improve solubility of chain A[/cyan]
     [cyan]Suggest mutations avoiding chain interfaces[/cyan]
     [cyan]Show me the interface between chains A and B[/cyan]
+    [cyan]Suggest disulfide bonds to stabilise the dimer[/cyan]
 
   [dim]Type [bold]help[/bold] for more examples or [bold]quit[/bold] to exit.[/dim]
 """
@@ -146,6 +159,12 @@ HELP_TEXT = """
   what is the biological assembly of this structure?
   find all inter-chain contacts within 5 angstroms
 
+[bold]Disulfide engineering[/bold]
+  suggest disulfide bonds to stabilise the dimer
+  find disulfide candidates between chains A and B
+  engineer a disulfide to cross-link the interface
+  improve dimer stability with disulfide bonds
+
 [bold]Special commands[/bold]
   [cmd]history[/cmd]           show last 15 commands
   [cmd]state[/cmd]             dump current session state
@@ -158,6 +177,50 @@ HELP_TEXT = """
   [cmd]help[/cmd]              show this help
   [cmd]quit[/cmd] / [cmd]exit[/cmd]          save & exit
 """
+
+
+# ── Elapsed-time progress ticker ──────────────────────────────────────────────
+
+class _ElapsedTicker:
+    """
+    Background thread that prints an elapsed-time message every *interval* seconds.
+    Designed for long-running computational tool phases.
+
+    Usage::
+        with _ElapsedTicker("🔬⚗️ Running mutation_scan", interval=30):
+            results = scanner.scan(...)
+    """
+
+    def __init__(self, prefix: str, interval: int = 30):
+        self._prefix   = prefix
+        self._interval = interval
+        self._start    = time.time()
+        self._stop     = threading.Event()
+        self._thread   = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "_ElapsedTicker":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.wait(timeout=self._interval):
+            elapsed = int(time.time() - self._start)
+            mins, secs = divmod(elapsed, 60)
+            msg = f"  {self._prefix}... ({mins:02d}:{secs:02d} elapsed)"
+            try:
+                print(msg, flush=True)
+            except Exception:
+                pass
+
+    def __enter__(self) -> "_ElapsedTicker":
+        return self.start()
+
+    def __exit__(self, *_) -> None:
+        self.stop()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -254,7 +317,33 @@ class StructureBot:
         else:
             console.print(f"[warn]Ping failed: {ping['result'].get('error')}[/warn]")
 
-        # 5. Resume info
+        # 5. WSL2 status
+        try:
+            from wsl_bridge import WSLBridge
+            wsl = WSLBridge()
+            if wsl.is_available():
+                has_py = wsl.check_pyrosetta()
+                if has_py:
+                    console.print(
+                        "[ok]✓[/ok] Rosetta: local (PyRosetta via WSL2) — publication quality"
+                    )
+                else:
+                    console.print(
+                        "[warn]⚠[/warn] WSL2 available — PyRosetta not installed "
+                        "(run pyrosetta_installer in WSL2 to enable local Rosetta)"
+                    )
+                self.session.wsl_available = True
+            else:
+                console.print(
+                    "[dim]✓ Rosetta: DynaMut2 (screening quality) — "
+                    "WSL2 not installed (run `wsl --install -d Ubuntu-22.04` "
+                    "as Administrator to enable local Rosetta)[/dim]"
+                )
+                self.session.wsl_available = False
+        except Exception:
+            pass  # WSL2 status is informational only
+
+        # 6. Resume info
         if self.session.command_history:
             console.print(
                 f"[dim]Resumed session: {len(self.session.structures)} structure(s), "
@@ -388,8 +477,27 @@ class StructureBot:
             def _status(msg: str) -> None:
                 console.print(f"  [info]{msg}[/info]")
 
-            with console.status("[cyan]Running computational tools…[/cyan]"):
-                result = self.router.execute(result, status_callback=_status)
+            # For long-running pipelines, show elapsed time every 30s
+            _long_tools = {"mutation_scan", "disulfide", "rosetta"}
+            _needs_timer = bool(set(tools_needed) & _long_tools)
+            _ticker_label = (
+                "🔬⚗️ Running " + "/".join(
+                    t for t in tools_needed if t in _long_tools
+                )
+            )
+
+            if _needs_timer:
+                _ticker = _ElapsedTicker(_ticker_label, interval=30)
+                _ticker.start()
+            else:
+                _ticker = None
+
+            try:
+                with console.status("[cyan]Running computational tools…[/cyan]"):
+                    result = self.router.execute(result, status_callback=_status)
+            finally:
+                if _ticker is not None:
+                    _ticker.stop()
 
             # Show assembly interface summary (before other summaries)
             self._show_interface_summary(result)
