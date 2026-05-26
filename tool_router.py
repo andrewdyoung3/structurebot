@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import re
 import time
+import traceback
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -291,6 +293,7 @@ class ToolRouter:
                 ),
             )
         except Exception as exc:
+            traceback.print_exc()
             return ToolStepResult(
                 tool=tool, success=False,
                 error=f"{tool} raised an unexpected error: {exc}",
