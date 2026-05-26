@@ -21,6 +21,8 @@ These are the most common mistakes. Always apply these first.
 | "remove/delete a structure" | `close #N` | `delete #N`, `remove #N` |
 | "reset the view" | `view` | `reset`, `center` |
 | "show the surface" | `surface #N` | `show surface`, `solvent surface` |
+| "show a single atom as a sphere" | `show #1/A:49 atoms` then `style #1/A:49@CB sphere` | `show #1/A:49@CB sphere` (sphere is not a valid 'what' keyword for show — gives "Expected a collection of one of atoms, bonds, cartoons" error) |
+| "measure Cβ-Cβ distance between two residues" | `distance #1/A:49@CB #1/B:50@CB` | `distance #1/A:49 #1/B:50` (ambiguous — ChimeraX needs exactly two atoms, not residues) |
 
 **`color by*` UNIVERSAL RULE**: The selector ALWAYS comes before the `by*` keyword.
 `color <selector> by<keyword>` ✓ — `color by<keyword> <selector>` ✗ (gives "Expected a collection" error).
@@ -319,6 +321,25 @@ view
 ```
 surface #1
 coulombic #1 surfaces True
+view
+```
+
+### Disulfide bond candidate visualization
+
+Highlight two Cβ atoms as spheres with a distance measurement between them.
+Note the two-step show+style: `show` only accepts `atoms|bonds|cartoons`, not `sphere`.
+
+```
+# Highlight residue A:49 and B:50 as gold spheres with a distance label
+show #1/A:49 atoms
+style #1/A:49@CB sphere
+color #1/A:49 gold
+show #1/B:50 atoms
+style #1/B:50@CB sphere
+color #1/B:50 gold
+distance #1/A:49@CB #1/B:50@CB
+label #1/A:49 text "SS#1: A49/C" height 2
+label #1/B:50 text "B50/C score=0.85" height 2
 view
 ```
 

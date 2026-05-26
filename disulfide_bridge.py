@@ -438,20 +438,24 @@ def generate_chimerax_commands(
         spec_b = f"#{model_id}/{chain_b}:{resno_b}"
 
         cmds += [
-            f"show {spec_a}@CB sphere",
+            f"show {spec_a} atoms",
+            f"style {spec_a}@CB sphere",
             f"color {spec_a} {colour}",
-            f"show {spec_b}@CB sphere",
+            f"show {spec_b} atoms",
+            f"style {spec_b}@CB sphere",
             f"color {spec_b} {colour}",
             f"distance {spec_a}@CB {spec_b}@CB",
             f"label {spec_a} text \"SS#{i+1}: {chain_a}{resno_a}{aa_a}/C\" height 2",
             f"label {spec_b} text \"{chain_b}{resno_b}{aa_b}/C score={score:.2f}\" height 2",
         ]
         exps += [
-            f"Show Cβ of {chain_a}{resno_a} ({aa_a}) as sphere",
+            f"Show atoms of {chain_a}{resno_a} ({aa_a})",
+            f"Style Cb of {chain_a}{resno_a} ({aa_a}) as sphere",
             f"Color {chain_a}{resno_a} {colour}",
-            f"Show Cβ of {chain_b}{resno_b} ({aa_b}) as sphere",
+            f"Show atoms of {chain_b}{resno_b} ({aa_b})",
+            f"Style Cb of {chain_b}{resno_b} ({aa_b}) as sphere",
             f"Color {chain_b}{resno_b} {colour}",
-            f"Measure Cβ-Cβ distance ({dist:.1f} Å)",
+            f"Measure Cb-Cb distance ({dist:.1f} Angstrom)",
             f"Label disulfide candidate #{i+1} at {chain_a}{resno_a}",
             f"Label {chain_b}{resno_b} with combined score={score:.2f}",
         ]
