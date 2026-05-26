@@ -8,6 +8,16 @@ Model used by default: esm2_t6_8M_UR50D  (~30 MB download on first use)
   — For higher accuracy at the cost of speed, set ESM_MODEL env var to
     "esm2_t12_35M_UR50D", "esm2_t30_150M_UR50D", etc.
 
+CUDA acceleration
+-----------------
+The model is automatically placed on the GPU when torch.cuda.is_available()
+(e.g. RTX 5070 Ti).  CPU is used as fallback.  Force a device with:
+  ESM_DEVICE=cpu   — always use CPU (for reproducibility / debugging)
+  ESM_DEVICE=cuda  — always use CUDA (fails if no GPU is present)
+GPU inference is typically 10–50× faster than CPU for ESM-2, depending on
+sequence length and GPU generation.  The speedup is most noticeable on long
+sequences (>200 residues) where the per-position masking loop dominates.
+
 Library priority
 ----------------
 1. fair-esm   (pip install fair-esm)        — Meta's official package
@@ -164,6 +174,7 @@ class _EsmBackend:
         self._alphabet  = None
         self._backend   = None    # "fair_esm" | "transformers"
         self._tokenizer = None
+        self._device: Optional[str] = None
 
     def _load(self) -> None:
         if self._model is not None:
@@ -236,8 +247,14 @@ class _EsmBackend:
                         raise AttributeError(f"Unknown model: {self.model_name}")
                     self._model, self._alphabet = loader()
                 self._model.eval()
+                import torch as _torch
+                _env_dev = os.environ.get("ESM_DEVICE", "").strip().lower()
+                self._device = _env_dev if _env_dev in ("cuda", "cpu") else (
+                    "cuda" if _torch.cuda.is_available() else "cpu"
+                )
+                self._model = self._model.to(self._device)
                 self._backend = "fair_esm"
-                print("[ESM] Model loaded (fair-esm).")
+                print(f"[ESM] Model loaded (fair-esm) on {self._device}.")
                 return
             except ImportError:
                 pass
@@ -256,8 +273,14 @@ class _EsmBackend:
                 self._tokenizer = EsmTokenizer.from_pretrained(hf_name)
                 self._model     = EsmForMaskedLM.from_pretrained(hf_name)
                 self._model.eval()
+                import torch as _torch
+                _env_dev = os.environ.get("ESM_DEVICE", "").strip().lower()
+                self._device = _env_dev if _env_dev in ("cuda", "cpu") else (
+                    "cuda" if _torch.cuda.is_available() else "cpu"
+                )
+                self._model = self._model.to(self._device)
                 self._backend   = "transformers"
-                print("[ESM] Model loaded (transformers).")
+                print(f"[ESM] Model loaded (transformers) on {self._device}.")
                 return
             except ImportError:
                 pass
@@ -295,6 +318,7 @@ class _EsmBackend:
         batch_converter = self._alphabet.get_batch_converter()
         data = [("query", sequence)]
         _, _, tokens = batch_converter(data)
+        tokens = tokens.to(self._device)
 
         all_probs: List[List[float]] = []
         with torch.no_grad():
@@ -304,8 +328,8 @@ class _EsmBackend:
                 logits = self._model(masked)["logits"]
                 # Shape: (1, seq_len+2, vocab_size)
                 pos_logits = logits[0, i + 1]
-                # Softmax over vocab
-                probs_full = torch.softmax(pos_logits, dim=-1).numpy()
+                # Softmax over vocab; .cpu() ensures numpy() works on CUDA tensors
+                probs_full = torch.softmax(pos_logits, dim=-1).cpu().numpy()
                 # Extract only the 20 standard amino acids
                 aa_probs = [
                     float(probs_full[self._alphabet.get_idx(aa)])
@@ -334,10 +358,12 @@ class _EsmBackend:
                 continue
             mask_idx = mask_pos[0].item()
 
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
             with torch.no_grad():
                 outputs = self._model(**inputs)
             logits   = outputs.logits[0, mask_idx]
-            probs_full = torch.softmax(logits, dim=-1).numpy()
+            # .cpu() ensures numpy() works on CUDA tensors
+            probs_full = torch.softmax(logits, dim=-1).cpu().numpy()
             aa_probs = [
                 float(probs_full[self._tokenizer.convert_tokens_to_ids(aa)])
                 for aa in _STANDARD_AA
@@ -450,6 +476,7 @@ class EsmBridge:
                 "rapidly_evolving": rapidly_evolving,
                 "mean_conservation": round(mean_cons, 4),
                 "model_used":       self.model_name,
+                "device":           self._backend._device or "cpu",
                 "cached":           cached_probs is not None,
             },
             viz_commands     = viz_cmds,
