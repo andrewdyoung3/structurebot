@@ -110,6 +110,7 @@ class ToolRouter:
         "chimerax":          "🎨",
         "camsol":            "💧",
         "esm":               "🧬",
+        "esmfold":           "🔮",
         "proteinmpnn":       "🔬",
         "rfdiffusion":       "🌀",
         "rosetta":           "⚗️",
@@ -129,6 +130,7 @@ class ToolRouter:
         # Bridges are instantiated lazily on first use
         self._camsol_bridge:        Optional[Any] = None
         self._esm_bridge:           Optional[Any] = None
+        self._esmfold_bridge:       Optional[Any] = None
         self._proteinmpnn_bridge:   Optional[Any] = None
         self._rfdiffusion_bridge:   Optional[Any] = None
         self._rosetta_bridge:       Optional[Any] = None
@@ -185,6 +187,10 @@ class ToolRouter:
             inp = tool_inputs.get("esm", {})
             mid = inp.get("model_id") or self._first_model_id()
             return f"ESM-2 evolutionary conservation — #{mid}"
+        if tool == "esmfold":
+            inp = tool_inputs.get("esmfold", {})
+            mid = inp.get("model_id") or self._first_model_id()
+            return f"ESMFold foldability prediction — #{mid} (ESM Atlas API)"
         if tool == "proteinmpnn":
             return "ProteinMPNN fixed-backbone sequence redesign"
         if tool == "rfdiffusion":
@@ -308,6 +314,8 @@ class ToolRouter:
                 return self._run_camsol(inputs)
             if tool == "esm":
                 return self._run_esm(inputs)
+            if tool == "esmfold":
+                return self._run_esmfold(inputs)
             if tool == "proteinmpnn":
                 return self._run_proteinmpnn(inputs)
             if tool == "rfdiffusion":
@@ -324,8 +332,8 @@ class ToolRouter:
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
-                    "Available: chimerax, camsol, esm, proteinmpnn, rfdiffusion, "
-                    "rosetta, mutation_scan, assembly_analyser, disulfide."
+                    "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
+                    "rfdiffusion, rosetta, mutation_scan, assembly_analyser, disulfide."
                 ),
             )
         except Exception as exc:
@@ -418,6 +426,108 @@ class ToolRouter:
                 ),
             )
         return bridge.analyze(sequence, model_id=model_id, session=self.session)
+
+    def _run_esmfold(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run ESMFold foldability prediction via ESM Atlas API."""
+        import time as _time
+        bridge   = self._get_esmfold_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+
+        # Resolve sequence
+        sequence = inputs.get("sequence") or self._fetch_sequence(
+            model_id, inputs.get("chain")
+        )
+        if not sequence:
+            return ToolStepResult(
+                tool="esmfold", success=False,
+                error=(
+                    "ESMFold requires an amino-acid sequence. "
+                    "Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+
+        mutation_positions: List[int] = inputs.get("mutation_positions") or []
+
+        t0 = _time.perf_counter()
+        if mutation_positions:
+            # Compare wildtype vs mutant sequences at specified positions
+            mut_sequence = inputs.get("mut_sequence", "")
+            if not mut_sequence:
+                # Single-sequence foldability prediction (no mutant provided)
+                result = bridge.predict(sequence, label=f"#{model_id}")
+                elapsed_ms = (_time.perf_counter() - t0) * 1000
+                if not result["success"]:
+                    return ToolStepResult(
+                        tool="esmfold", success=False,
+                        error=f"ESMFold prediction failed: {result.get('error')}",
+                        elapsed_ms=elapsed_ms,
+                    )
+                mean_plddt = result["mean_plddt"]
+                summary = (
+                    f"ESMFold: model #{model_id} — mean pLDDT {mean_plddt:.1f} "
+                    f"({'high' if mean_plddt > 70 else 'low'} confidence)."
+                )
+                return ToolStepResult(
+                    tool="esmfold", success=True,
+                    data={
+                        "mean_plddt":  mean_plddt,
+                        "plddt":       result["plddt"],
+                        "length":      result["length"],
+                        "source":      result.get("source"),
+                    },
+                    summary=summary,
+                    elapsed_ms=elapsed_ms,
+                )
+            else:
+                cmp = bridge.compare_to_wildtype(sequence, mut_sequence, mutation_positions)
+                elapsed_ms = (_time.perf_counter() - t0) * 1000
+                if not cmp["success"]:
+                    return ToolStepResult(
+                        tool="esmfold", success=False,
+                        error=f"ESMFold comparison failed: {cmp.get('error')}",
+                        elapsed_ms=elapsed_ms,
+                    )
+                risk = cmp["foldability_risk"]
+                drop = cmp["plddt_drop"]
+                summary = (
+                    f"ESMFold: foldability risk = {risk} "
+                    f"(mean pLDDT drop {drop:.1f} at mutation positions)."
+                )
+                if cmp.get("warning"):
+                    summary += f"\n  {cmp['warning']}"
+                return ToolStepResult(
+                    tool="esmfold", success=True,
+                    data=cmp,
+                    summary=summary,
+                    elapsed_ms=elapsed_ms,
+                )
+        else:
+            # Plain foldability check — no mutation comparison
+            result = bridge.predict(sequence, label=f"#{model_id}")
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            if not result["success"]:
+                return ToolStepResult(
+                    tool="esmfold", success=False,
+                    error=f"ESMFold prediction failed: {result.get('error')}",
+                    elapsed_ms=elapsed_ms,
+                )
+            mean_plddt = result["mean_plddt"]
+            conf       = "high" if mean_plddt > 70 else "medium" if mean_plddt > 50 else "low"
+            summary    = (
+                f"ESMFold: model #{model_id} — mean pLDDT {mean_plddt:.1f} "
+                f"({conf} confidence, {result['length']} residues)."
+            )
+            return ToolStepResult(
+                tool="esmfold", success=True,
+                data={
+                    "mean_plddt": mean_plddt,
+                    "plddt":      result["plddt"],
+                    "length":     result["length"],
+                    "source":     result.get("source"),
+                },
+                summary=summary,
+                elapsed_ms=elapsed_ms,
+            )
 
     def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
         """Run ProteinMPNN fixed-backbone sequence redesign."""
@@ -732,6 +842,12 @@ class ToolRouter:
             self._esm_bridge = EsmBridge()
         return self._esm_bridge
 
+    def _get_esmfold_bridge(self):
+        if self._esmfold_bridge is None:
+            from esmfold_bridge import ESMFoldBridge
+            self._esmfold_bridge = ESMFoldBridge()
+        return self._esmfold_bridge
+
     def _get_proteinmpnn_bridge(self):
         if self._proteinmpnn_bridge is None:
             from proteinmpnn_bridge import ProteinMPNNBridge
@@ -983,6 +1099,13 @@ class ToolRouter:
             status["disulfide"] = "active (geometry + ESM + DynaMut2)"
         except ImportError:
             status["disulfide"] = "module not found"
+
+        # esmfold
+        try:
+            __import__("esmfold_bridge")
+            status["esmfold"] = "active (ESM Atlas API — free, no auth)"
+        except ImportError:
+            status["esmfold"] = "module not found"
 
         # rosetta_local via WSL2
         try:

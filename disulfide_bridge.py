@@ -88,6 +88,44 @@ def _three_to_one(resname: str) -> str:
     return _THREE_TO_ONE.get(resname.strip().upper(), "X")
 
 
+# ── SSBOND record parsing ─────────────────────────────────────────────────────
+
+def _parse_ssbond_residues(pdb_path: str) -> set:
+    """
+    Parse SSBOND records from a PDB file.
+
+    SSBOND format (columns 0-indexed):
+        SSBOND   1 CYS A   11    CYS A   97
+        col 15   : chain1
+        col 17-20: resno1 (right-justified)
+        col 29   : chain2
+        col 31-35: resno2 (right-justified)
+
+    Returns a set of (chain_id, resno:int) tuples that are known disulfide-bonded.
+    Returns empty set on any parse error.
+    """
+    bonded: set = set()
+    try:
+        with open(pdb_path, "r", errors="replace") as fh:
+            for line in fh:
+                if not line.startswith("SSBOND"):
+                    continue
+                if len(line) < 36:
+                    continue
+                try:
+                    chain1 = line[15]
+                    resno1 = int(line[17:21].strip())
+                    chain2 = line[29]
+                    resno2 = int(line[31:35].strip())
+                    bonded.add((chain1, resno1))
+                    bonded.add((chain2, resno2))
+                except (ValueError, IndexError):
+                    continue
+    except Exception:
+        pass
+    return bonded
+
+
 # ── PDB atom parsing ──────────────────────────────────────────────────────────
 
 def parse_pdb_atoms(pdb_path: str) -> Dict[str, Dict[int, Dict]]:
@@ -737,7 +775,7 @@ class DisulfideBridge:
 
         # Generate detailed summary for panel display
         detailed_summary = self._generate_summary(
-            candidates, chain_a, chain_b, atoms
+            candidates, chain_a, chain_b, atoms, pdb_path=pdb_path
         )
 
         return ToolStepResult(
@@ -758,15 +796,18 @@ class DisulfideBridge:
     # ── Summary generation ────────────────────────────────────────────────────
 
     @staticmethod
+    @staticmethod
     def _generate_summary(
         candidates: List[Dict[str, Any]],
         chain_a:    str,
         chain_b:    str,
         atoms:      Optional[Dict[str, Dict[int, Dict]]] = None,
+        pdb_path:   Optional[str] = None,
     ) -> str:
         """
         Generate a multi-line actionable summary for disulfide candidates.
         Returns a fallback one-liner if candidates is empty.
+        Includes per-chain Cys misparing audit (SSBOND-aware).
         """
         if not candidates:
             return (
@@ -805,21 +846,62 @@ class DisulfideBridge:
             f"  ESM tolerance:    {chain_a}={tol_a:.2f}   {chain_b}={tol_b:.2f}"
         )
 
-        # Check for existing Cys in the structure
-        cys_note = ""
+        # ── Cys misparing audit (per-chain, SSBOND-aware) ─────────────────────
+        lines.append("")
+        lines.append("Cys misparing audit:")
+
+        # Parse SSBOND records if pdb_path is available
+        bonded_cys: set = set()
+        if pdb_path:
+            try:
+                bonded_cys = _parse_ssbond_residues(pdb_path)
+            except Exception:
+                pass
+
+        # Target positions (the ones being engineered to Cys)
+        target_positions = {
+            chain_a: ra if isinstance(ra, int) else None,
+            chain_b: rb if isinstance(rb, int) else None,
+        }
+
         if atoms is not None:
-            existing_cys: List[str] = []
-            for ch in (chain_a, chain_b):
-                for resno, info in (atoms.get(ch) or {}).items():
-                    if _three_to_one(info.get("resname", "UNK")) == "C":
-                        existing_cys.append(f"{ch}{resno}")
-            if existing_cys:
-                cys_note = f"Existing Cys in structure: {', '.join(existing_cys[:5])}"
+            for ch, target_pos in [
+                (chain_a, target_positions.get(chain_a)),
+                (chain_b, target_positions.get(chain_b)),
+            ]:
+                # Collect all Cys in this chain, excluding the target position
+                all_cys = sorted(
+                    resno for resno, info in (atoms.get(ch) or {}).items()
+                    if _three_to_one(info.get("resname", "UNK")) == "C"
+                    and resno != target_pos
+                )
+                # Split into bonded (in SSBOND record) and potentially free
+                bonded   = [r for r in all_cys if (ch, r) in bonded_cys]
+                free_cys = [r for r in all_cys if (ch, r) not in bonded_cys]
+
+                if free_cys:
+                    pos_str = ", ".join(str(r) for r in free_cys[:4])
+                    extra   = f" +{len(free_cys)-4} more" if len(free_cys) > 4 else ""
+                    lines.append(
+                        f"  Warn chain {ch}: {len(free_cys)} other Cys "
+                        f"(pos {pos_str}{extra}). Verify bonded/buried to avoid "
+                        f"misparing with engineered Cys{target_pos}."
+                    )
+                elif bonded:
+                    pos_str = ", ".join(str(r) for r in bonded[:4])
+                    lines.append(
+                        f"  OK chain {ch}: {len(bonded)} Cys all in SSBOND records "
+                        f"(pos {pos_str}) — low misparing risk."
+                    )
+                else:
+                    lines.append(
+                        f"  OK chain {ch}: no other Cys — no misparing risk."
+                    )
+        else:
+            lines.append("  (Cys audit unavailable — no atom data)")
 
         lines.append("")
         lines.append("Engineering notes:")
-        if cys_note:
-            lines.append(f"  - {cys_note}")
         lines.append("  - Requires oxidising conditions for bond formation in vivo")
         lines.append("  - Validate with DSP crosslinker or non-reducing SDS-PAGE")
         lines.append("")

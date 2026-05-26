@@ -582,15 +582,160 @@ def test_session_snapshot_independence() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# F. Log analyser
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_parse_logs_empty_dir() -> None:
+    """parse_logs on an empty directory returns zero sessions and requests."""
+    print("\n=== F. Log analyser ===")
+    import tempfile
+    from log_analyser import parse_logs
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data = parse_logs(Path(tmpdir))
+
+    _assert(data["n_sessions"] == 0, "n_sessions=0 for empty dir",
+            f"got {data['n_sessions']}")
+    _assert(data["n_requests"] == 0, "n_requests=0 for empty dir",
+            f"got {data['n_requests']}")
+
+
+def test_parse_logs_basic_entries() -> None:
+    """parse_logs counts requests, successes, and PDB IDs from mock log files."""
+    import json as _json, tempfile
+    from log_analyser import parse_logs
+
+    entries = [
+        {"timestamp": "2026-05-27T10:00:00", "user_input": "open 1HSG",
+         "commands": ["open 1HSG"], "success": True, "error": None},
+        {"timestamp": "2026-05-27T10:01:00", "user_input": "suggest mutations to improve solubility",
+         "commands": [], "success": True, "error": None},
+        {"timestamp": "2026-05-27T10:02:00", "user_input": "open 2HHB",
+         "commands": ["open 2HHB"], "success": False, "error": "timeout"},
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "session_20260527_100000.jsonl"
+        with open(log_path, "w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(_json.dumps(e) + "\n")
+        data = parse_logs(Path(tmpdir))
+
+    _assert(data["n_sessions"] == 1, "n_sessions=1",  f"got {data['n_sessions']}")
+    _assert(data["n_requests"] == 3, "n_requests=3",  f"got {data['n_requests']}")
+    _assert(data["n_success"]  == 2, "n_success=2",   f"got {data['n_success']}")
+    _assert("1HSG" in data["pdb_id_counts"],  "1HSG in pdb_id_counts")
+    _assert("2HHB" in data["pdb_id_counts"],  "2HHB in pdb_id_counts")
+
+
+def test_parse_logs_tool_counts() -> None:
+    """parse_logs counts scan requests from user_input keywords."""
+    import json as _json, tempfile
+    from log_analyser import parse_logs
+
+    entries = [
+        {"timestamp": "2026-05-27T10:00:00",
+         "user_input": "suggest mutations to improve solubility of chain A",
+         "commands": [], "success": True, "error": None},
+        {"timestamp": "2026-05-27T10:05:00",
+         "user_input": "suggest disulfide bonds to stabilise the dimer",
+         "commands": [], "success": True, "error": None},
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "session_20260527_100000.jsonl"
+        with open(log_path, "w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(_json.dumps(e) + "\n")
+        data = parse_logs(Path(tmpdir))
+
+    _assert("mutation_scan" in data["tool_counts"],
+            "mutation_scan detected from 'suggest mutations'",
+            f"tool_counts={data['tool_counts']}")
+    _assert("disulfide" in data["tool_counts"],
+            "disulfide detected from 'disulfide bonds'",
+            f"tool_counts={data['tool_counts']}")
+
+
+def test_parse_logs_enhanced_tool_steps() -> None:
+    """parse_logs extracts timing and top_candidate from enhanced log entries."""
+    import json as _json, tempfile
+    from log_analyser import parse_logs
+
+    entry = {
+        "timestamp": "2026-05-27T10:00:00",
+        "user_input": "suggest mutations",
+        "commands": [],
+        "success": True,
+        "error": None,
+        "tool_steps": [
+            {
+                "tool": "mutation_scan",
+                "elapsed_ms": 92340.0,
+                "success": True,
+                "n_candidates": 5,
+                "top_candidate": "I64E",
+                "top_ddg": -3.53,
+                "backend": "dynamut2",
+            }
+        ],
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log_path = Path(tmpdir) / "session_20260527_100000.jsonl"
+        with open(log_path, "w", encoding="utf-8") as fh:
+            fh.write(_json.dumps(entry) + "\n")
+        data = parse_logs(Path(tmpdir))
+
+    _assert("mutation_scan" in data["tool_timings"],
+            "mutation_scan timing recorded",
+            f"tool_timings keys: {list(data['tool_timings'].keys())}")
+    timings = data["tool_timings"].get("mutation_scan", [])
+    _assert(len(timings) == 1 and abs(timings[0] - 92.34) < 0.1,
+            "elapsed_ms converted to seconds",
+            f"got {timings}")
+    _assert("I64E" in data["top_candidates"],
+            "top_candidate I64E recorded",
+            f"top_candidates={data['top_candidates']}")
+    _assert("dynamut2" in data["backends_used"],
+            "backend dynamut2 recorded",
+            f"backends={data['backends_used']}")
+
+
+def test_generate_stats_report_non_empty() -> None:
+    """generate_stats_report returns a non-empty renderable for non-zero data."""
+    from log_analyser import generate_stats_report
+
+    data = {
+        "n_sessions": 5,
+        "n_requests": 42,
+        "n_success":  38,
+        "pdb_id_counts":  {"1HSG": 10, "2HHB": 5},
+        "tool_counts":    {"mutation_scan": 20, "disulfide": 8},
+        "tool_timings":   {"mutation_scan": [92.3, 88.5, 95.1]},
+        "top_candidates": {"I64E": 8, "L63K": 3},
+        "backends_used":  {"dynamut2": 25, "empirical": 5},
+        "log_files":      [],
+    }
+
+    report = generate_stats_report(data)
+    report_str = str(report)
+    _assert("42" in report_str or "Sessions" in report_str,
+            "report contains request count or 'Sessions'",
+            f"report: {report_str[:120]}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════════
 
 def run_all(groups: list) -> None:
-    run_camsol     = "camsol"     in groups or "all" in groups
-    run_esm        = "esm"        in groups or "all" in groups
-    run_router     = "router"     in groups or "all" in groups
+    run_camsol      = "camsol"     in groups or "all" in groups
+    run_esm         = "esm"        in groups or "all" in groups
+    run_router      = "router"     in groups or "all" in groups
     run_proteinmpnn = "proteinmpnn" in groups or "all" in groups
-    run_session    = "session"    in groups or "all" in groups
+    run_session     = "session"    in groups or "all" in groups
+    run_log         = "log"        in groups or "all" in groups
 
     if run_camsol:
         test_camsol_score_basic()
@@ -621,6 +766,13 @@ def run_all(groups: list) -> None:
         test_session_snapshot_restore_roundtrip()
         test_session_snapshot_independence()
 
+    if run_log:
+        test_parse_logs_empty_dir()
+        test_parse_logs_basic_entries()
+        test_parse_logs_tool_counts()
+        test_parse_logs_enhanced_tool_steps()
+        test_generate_stats_report_non_empty()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="StructureBot tool expansion tests")
@@ -629,6 +781,7 @@ def main() -> None:
     parser.add_argument("--router",      action="store_true")
     parser.add_argument("--proteinmpnn", action="store_true")
     parser.add_argument("--session",     action="store_true")
+    parser.add_argument("--log",         action="store_true")
     args = parser.parse_args()
 
     groups = []
@@ -637,6 +790,7 @@ def main() -> None:
     if args.router:      groups.append("router")
     if args.proteinmpnn: groups.append("proteinmpnn")
     if args.session:     groups.append("session")
+    if args.log:         groups.append("log")
     if not groups:
         groups = ["all"]
 

@@ -84,11 +84,14 @@ DynaMut2 API details
 from __future__ import annotations
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import config as _cfg
 from tool_router import ToolStepResult
 
 # ── DynaMut2 API constants ─────────────────────────────────────────────────────
@@ -417,19 +420,14 @@ class RosettaBridge:
         scan_deadline: Optional[float] = None,
     ) -> ToolStepResult:
         """
-        Query DynaMut2 for each mutation (synchronous, one POST per mutation).
-        Mutations that fail fall through to the empirical estimator.
+        Query DynaMut2 for each mutation.
+        Dispatches to parallel or sequential based on config.DYNAMUT2_MAX_WORKERS.
 
         Timeouts and guards
         -------------------
-        scan_deadline        : time.perf_counter() deadline for the overall scan.
-                               Mutations beyond the deadline are scored empirically
-                               immediately rather than waiting for DynaMut2.
+        scan_deadline             : time.perf_counter() deadline for the overall scan.
         _DYNAMUT2_PER_MUT_TIMEOUT : wall-clock seconds budget per mutation.
-                               If a single mutation exceeds this, it falls back to
-                               empirical without burning the remaining budget.
-        _DYNAMUT2_CIRCUIT_BREAKER : consecutive submit failures before skipping
-                               all remaining DynaMut2 attempts (e.g. no network).
+        _DYNAMUT2_CIRCUIT_BREAKER : consecutive failures before empirical fallback.
         """
 
         def _progress(msg: str) -> None:
@@ -438,83 +436,17 @@ class RosettaBridge:
             else:
                 _safe_print(msg)
 
-        _progress(f"  Querying DynaMut2 for {len(mutations)} mutation(s)...")
+        max_workers = getattr(_cfg, "DYNAMUT2_MAX_WORKERS", 4)
 
-        ddg_scores:          Dict[str, float] = {}
-        warnings:            List[str]        = []
-        empirical_fallbacks: List[str]        = []
-        _consecutive_failures: int            = 0
-
-        for idx, mut in enumerate(mutations):
-            key = _mutation_key(mut)
-
-            # ── Overall scan deadline ─────────────────────────────────────────
-            if scan_deadline is not None and time.perf_counter() >= scan_deadline:
-                remaining = mutations[idx:]
-                _progress(
-                    f"  Overall scan timeout: scoring remaining "
-                    f"{len(remaining)} mutation(s) with empirical fallback."
-                )
-                for rm in remaining:
-                    rk = _mutation_key(rm)
-                    ddg_scores[rk] = _empirical_ddg_single(rm, pdb_path)
-                    empirical_fallbacks.append(rk)
-                warnings.append(
-                    f"Scan timeout: {len(remaining)} mutation(s) scored empirically."
-                )
-                break
-
-            # ── Circuit breaker: stop hammering an unreachable server ─────────
-            if _consecutive_failures >= _DYNAMUT2_CIRCUIT_BREAKER:
-                remaining = mutations[idx:]
-                _progress(
-                    f"  DynaMut2 circuit breaker ({_consecutive_failures} consecutive "
-                    f"failures) — scoring remaining {len(remaining)} mutation(s) "
-                    "with empirical fallback."
-                )
-                for rm in remaining:
-                    rk = _mutation_key(rm)
-                    ddg_scores[rk] = _empirical_ddg_single(rm, pdb_path)
-                    empirical_fallbacks.append(rk)
-                warnings.append(
-                    f"DynaMut2 unreachable ({_consecutive_failures} consecutive "
-                    "failures). Empirical fallback used for remaining mutations."
-                )
-                break
-
-            # ── Per-mutation deadline ─────────────────────────────────────────
-            _mut_start         = time.perf_counter()
-            per_mut_deadline   = _mut_start + _DYNAMUT2_PER_MUT_TIMEOUT
-
-            _progress(
-                f"  DynaMut2: scoring mutation {idx + 1}/{len(mutations)} ({key})..."
+        # Use parallel execution when there are multiple mutations and workers > 1
+        if max_workers > 1 and len(mutations) > 1:
+            ddg_scores, empirical_fallbacks, warnings = self._score_mutations_parallel(
+                pdb_path, mutations, max_workers, scan_deadline, _progress
             )
-
-            try:
-                ddg = self._query_dynamut2_single(
-                    pdb_path, mut, _progress, per_mut_deadline
-                )
-                _elapsed = time.perf_counter() - _mut_start
-                ddg_scores[key] = ddg
-                _consecutive_failures = 0           # reset on success
-                _progress(
-                    f"  + {key}: ddG = {ddg:+.2f} kcal/mol "
-                    f"({_elapsed:.1f}s, DynaMut2)"
-                )
-            except Exception as exc:
-                _elapsed = time.perf_counter() - _mut_start
-                _consecutive_failures += 1
-                warnings.append(
-                    f"DynaMut2 failed for {key} ({exc}). "
-                    "Using empirical BLOSUM62 estimate."
-                )
-                ddg_emp         = _empirical_ddg_single(mut, pdb_path)
-                ddg_scores[key] = ddg_emp
-                empirical_fallbacks.append(key)
-                _progress(
-                    f"  ! {key}: empirical estimate {ddg_emp:+.2f} kcal/mol "
-                    f"({_elapsed:.1f}s — {str(exc)[:80]})"
-                )
+        else:
+            ddg_scores, empirical_fallbacks, warnings = self._score_mutations_sequential(
+                pdb_path, mutations, scan_deadline, _progress
+            )
 
         # ── Confidence and method note ─────────────────────────────────────────
         n_dynamut2 = len(mutations) - len(empirical_fallbacks)
@@ -602,6 +534,216 @@ class RosettaBridge:
             viz_explanations = viz_exps,
             summary          = summary,
         )
+
+    # ── Sequential scoring loop ────────────────────────────────────────────────
+
+    def _score_mutations_sequential(
+        self,
+        pdb_path:     str,
+        mutations:    List[Dict[str, Any]],
+        scan_deadline: Optional[float],
+        progress:     Callable[[str], None],
+    ) -> Tuple[Dict[str, float], List[str], List[str]]:
+        """Score mutations one at a time (original behaviour)."""
+        ddg_scores:          Dict[str, float] = {}
+        empirical_fallbacks: List[str]        = []
+        warnings:            List[str]        = []
+        consecutive_failures: int             = 0
+
+        progress(f"  Querying DynaMut2 for {len(mutations)} mutation(s)...")
+
+        for idx, mut in enumerate(mutations):
+            key = _mutation_key(mut)
+
+            if scan_deadline is not None and time.perf_counter() >= scan_deadline:
+                remaining = mutations[idx:]
+                progress(
+                    f"  Overall scan timeout: scoring remaining "
+                    f"{len(remaining)} mutation(s) with empirical fallback."
+                )
+                for rm in remaining:
+                    rk = _mutation_key(rm)
+                    ddg_scores[rk] = _empirical_ddg_single(rm, pdb_path)
+                    empirical_fallbacks.append(rk)
+                warnings.append(
+                    f"Scan timeout: {len(remaining)} mutation(s) scored empirically."
+                )
+                break
+
+            if consecutive_failures >= _DYNAMUT2_CIRCUIT_BREAKER:
+                remaining = mutations[idx:]
+                progress(
+                    f"  DynaMut2 circuit breaker ({consecutive_failures} consecutive "
+                    f"failures) — scoring remaining {len(remaining)} mutation(s) "
+                    "with empirical fallback."
+                )
+                for rm in remaining:
+                    rk = _mutation_key(rm)
+                    ddg_scores[rk] = _empirical_ddg_single(rm, pdb_path)
+                    empirical_fallbacks.append(rk)
+                warnings.append(
+                    f"DynaMut2 unreachable ({consecutive_failures} consecutive "
+                    "failures). Empirical fallback used for remaining mutations."
+                )
+                break
+
+            mut_start        = time.perf_counter()
+            per_mut_deadline = mut_start + _DYNAMUT2_PER_MUT_TIMEOUT
+            progress(
+                f"  DynaMut2: scoring mutation {idx + 1}/{len(mutations)} ({key})..."
+            )
+
+            try:
+                ddg = self._query_dynamut2_single(
+                    pdb_path, mut, progress, per_mut_deadline
+                )
+                elapsed = time.perf_counter() - mut_start
+                ddg_scores[key] = ddg
+                consecutive_failures = 0
+                progress(
+                    f"  + {key}: ddG = {ddg:+.2f} kcal/mol ({elapsed:.1f}s, DynaMut2)"
+                )
+            except Exception as exc:
+                elapsed = time.perf_counter() - mut_start
+                consecutive_failures += 1
+                warnings.append(
+                    f"DynaMut2 failed for {key} ({exc}). "
+                    "Using empirical BLOSUM62 estimate."
+                )
+                ddg_emp = _empirical_ddg_single(mut, pdb_path)
+                ddg_scores[key] = ddg_emp
+                empirical_fallbacks.append(key)
+                progress(
+                    f"  ! {key}: empirical estimate {ddg_emp:+.2f} kcal/mol "
+                    f"({elapsed:.1f}s — {str(exc)[:80]})"
+                )
+
+        return ddg_scores, empirical_fallbacks, warnings
+
+    # ── Parallel scoring ────────────────────────────────────────────────────────
+
+    def _score_mutations_parallel(
+        self,
+        pdb_path:     str,
+        mutations:    List[Dict[str, Any]],
+        max_workers:  int,
+        scan_deadline: Optional[float],
+        progress:     Callable[[str], None],
+    ) -> Tuple[Dict[str, float], List[str], List[str]]:
+        """
+        Score all mutations concurrently using a thread pool.
+
+        Thread safety
+        -------------
+        - Circuit breaker counter protected by _cb_lock (threading.Lock).
+        - _circuit_broken (threading.Event) signals remaining workers to skip DynaMut2.
+        - Progress output collected per-future in the main thread (no interleaving).
+        - _query_dynamut2_single uses only local variables — no shared mutable state.
+        - Each worker gets its own per-mutation deadline based on start time.
+        """
+        ddg_scores:          Dict[str, float] = {}
+        empirical_fallbacks: List[str]        = []
+        warnings:            List[str]        = []
+
+        _cb_lock        = threading.Lock()
+        _consec_fail    = [0]          # list so inner closure can mutate
+        _circuit_broken = threading.Event()
+
+        batch_start = time.perf_counter()
+        progress(
+            f"  DynaMut2: scoring {len(mutations)} mutation(s) "
+            f"concurrently (max_workers={max_workers})..."
+        )
+
+        def _score_one(mut: Dict[str, Any]) -> Tuple[str, float, str, float]:
+            """Worker function — returns (key, ddg, source, elapsed_s)."""
+            key = _mutation_key(mut)
+
+            # Fast exits: circuit broken or scan deadline already passed
+            if _circuit_broken.is_set():
+                return key, _empirical_ddg_single(mut, pdb_path), "circuit_breaker", 0.0
+
+            if scan_deadline is not None and time.perf_counter() >= scan_deadline:
+                return key, _empirical_ddg_single(mut, pdb_path), "deadline", 0.0
+
+            per_mut_deadline = time.perf_counter() + _DYNAMUT2_PER_MUT_TIMEOUT
+            start = time.perf_counter()
+
+            try:
+                # Pass a silent no-op for progress; completion reported by main thread
+                ddg = self._query_dynamut2_single(
+                    pdb_path, mut, lambda _: None, per_mut_deadline
+                )
+                with _cb_lock:
+                    _consec_fail[0] = 0   # reset on success
+                return key, ddg, "dynamut2", time.perf_counter() - start
+            except Exception as exc:
+                with _cb_lock:
+                    _consec_fail[0] += 1
+                    if _consec_fail[0] >= _DYNAMUT2_CIRCUIT_BREAKER:
+                        _circuit_broken.set()
+                elapsed = time.perf_counter() - start
+                return key, _empirical_ddg_single(mut, pdb_path), str(exc), elapsed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_mut = {
+                executor.submit(_score_one, mut): mut
+                for mut in mutations
+            }
+            for future in as_completed(future_to_mut):
+                mut = future_to_mut[future]
+                key = _mutation_key(mut)
+                try:
+                    r_key, ddg, source, elapsed = future.result()
+                    ddg_scores[r_key] = ddg
+                    if source == "dynamut2":
+                        progress(
+                            f"  + {r_key}: ddG = {ddg:+.2f} kcal/mol "
+                            f"({elapsed:.1f}s, DynaMut2)"
+                        )
+                    elif source == "circuit_breaker":
+                        empirical_fallbacks.append(r_key)
+                        progress(
+                            f"  ! {r_key}: circuit breaker "
+                            f"(empirical {ddg:+.2f} kcal/mol)"
+                        )
+                    elif source == "deadline":
+                        empirical_fallbacks.append(r_key)
+                        progress(
+                            f"  ! {r_key}: scan deadline "
+                            f"(empirical {ddg:+.2f} kcal/mol)"
+                        )
+                    else:
+                        empirical_fallbacks.append(r_key)
+                        warnings.append(
+                            f"DynaMut2 failed for {r_key} ({source}). "
+                            "Using empirical BLOSUM62 estimate."
+                        )
+                        progress(
+                            f"  ! {r_key}: empirical {ddg:+.2f} kcal/mol "
+                            f"({source[:60]})"
+                        )
+                except Exception as exc:
+                    # Future itself raised (shouldn't happen; guard anyway)
+                    ddg = _empirical_ddg_single(mut, pdb_path)
+                    ddg_scores[key] = ddg
+                    empirical_fallbacks.append(key)
+                    progress(f"  ! {key}: unexpected error (empirical {ddg:+.2f})")
+
+        wall = time.perf_counter() - batch_start
+        progress(
+            f"  DynaMut2: batch complete "
+            f"({wall:.1f}s wall, {max_workers} concurrent)"
+        )
+
+        if _circuit_broken.is_set():
+            warnings.append(
+                f"DynaMut2 circuit breaker tripped after "
+                f"{_DYNAMUT2_CIRCUIT_BREAKER} consecutive failures. "
+                "Remaining mutations used empirical BLOSUM62 estimates."
+            )
+
+        return ddg_scores, empirical_fallbacks, warnings
 
     def _query_dynamut2_single(
         self,

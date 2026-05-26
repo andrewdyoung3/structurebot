@@ -879,6 +879,149 @@ def test_generate_summary_empty_candidates() -> None:
             "empty candidates: summary is non-empty fallback string")
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# J. Cys misparing audit in _generate_summary
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _make_atoms_with_cys(chain: str, resno: int, extra_cys: list) -> dict:
+    """
+    Build a minimal atoms dict with a CA at *resno* and extra Cys at extra_cys.
+    Used to test the Cys misparing logic in _generate_summary.
+    """
+    atoms = {chain: {}}
+    atoms[chain][resno] = {"resname": "ALA", "CA": (1.0, 1.0, 1.0), "CB": (2.0, 1.0, 1.0)}
+    for r in extra_cys:
+        atoms[chain][r] = {"resname": "CYS", "CA": (float(r), 1.0, 1.0)}
+    return atoms
+
+
+def _make_top_candidate(chain_a: str, chain_b: str, ra: int, rb: int) -> dict:
+    return {
+        "chain_a_residue": ra,
+        "chain_b_residue": rb,
+        "chain_a_aa": "A",
+        "chain_b_aa": "A",
+        "cb_distance": 3.8,
+        "dihedral_angle": 90.0,
+        "ddg_a": -0.5,
+        "ddg_b": -0.3,
+        "esm_tolerance_a": 0.7,
+        "esm_tolerance_b": 0.6,
+        "combined_score": 0.75,
+    }
+
+
+def test_cys_misparing_warning_when_free_cys() -> None:
+    """_generate_summary warns when chain has extra free Cys (no SSBOND)."""
+    print("\n=== J. Cys misparing audit ===")
+    from disulfide_bridge import DisulfideBridge
+
+    candidate = _make_top_candidate("A", "B", 10, 50)
+    atoms = _make_atoms_with_cys("A", 10, extra_cys=[67, 95])
+    atoms["B"] = {50: {"resname": "ALA", "CA": (5.0, 5.0, 5.0)}}
+
+    summary = DisulfideBridge._generate_summary([candidate], "A", "B", atoms=atoms)
+
+    # Should contain a warning about chain A having extra Cys
+    lower = summary.lower()
+    _assert(
+        "warn" in lower or "cys" in lower,
+        "summary mentions Cys warning for chain A",
+        f"summary = {summary!r}",
+    )
+    _assert(
+        "67" in summary or "95" in summary,
+        "summary mentions position 67 or 95",
+        f"summary = {summary!r}",
+    )
+
+
+def test_no_misparing_confirmation_when_no_free_cys() -> None:
+    """_generate_summary confirms no misparing risk when chain has no other Cys."""
+    from disulfide_bridge import DisulfideBridge
+
+    candidate = _make_top_candidate("A", "B", 10, 50)
+    # Chain A: target at 10, no other Cys; chain B: target at 50, no other Cys
+    atoms = {
+        "A": {10: {"resname": "ALA", "CA": (1.0, 1.0, 1.0)}},
+        "B": {50: {"resname": "ALA", "CA": (5.0, 5.0, 5.0)}},
+    }
+
+    summary = DisulfideBridge._generate_summary([candidate], "A", "B", atoms=atoms)
+
+    lower = summary.lower()
+    _assert(
+        "no misparing" in lower or "ok" in lower or "no other cys" in lower,
+        "summary confirms no misparing risk",
+        f"summary = {summary!r}",
+    )
+
+
+def test_ssbond_cys_shows_low_risk() -> None:
+    """_generate_summary reports bonded Cys as low risk when SSBOND record present."""
+    import tempfile, textwrap as _tw
+    from disulfide_bridge import DisulfideBridge
+
+    # PDB with SSBOND for chain A residue 67
+    pdb_content = _tw.dedent("""\
+        SSBOND   1 CYS A   67    CYS A   95
+        ATOM      1  CA  ALA A  10       1.000   1.000   1.000  1.00 20.00           C
+        ATOM      2  CA  CYS A  67       7.000   7.000   7.000  1.00 20.00           C
+        ATOM      3  CA  CYS A  95      10.000  10.000  10.000  1.00 20.00           C
+        ATOM      4  CA  ALA B  50       5.000   5.000   5.000  1.00 20.00           C
+        END
+    """)
+    pdb_file = Path(tempfile.mktemp(suffix=".pdb"))
+    pdb_file.write_text(pdb_content, encoding="utf-8")
+
+    candidate = _make_top_candidate("A", "B", 10, 50)
+    atoms = {
+        "A": {
+            10: {"resname": "ALA", "CA": (1.0, 1.0, 1.0)},
+            67: {"resname": "CYS", "CA": (7.0, 7.0, 7.0)},
+            95: {"resname": "CYS", "CA": (10.0, 10.0, 10.0)},
+        },
+        "B": {50: {"resname": "ALA", "CA": (5.0, 5.0, 5.0)}},
+    }
+
+    summary = DisulfideBridge._generate_summary(
+        [candidate], "A", "B", atoms=atoms, pdb_path=str(pdb_file)
+    )
+    pdb_file.unlink(missing_ok=True)
+
+    lower = summary.lower()
+    # Should report bonded / low misparing risk (not a "warn" for A)
+    _assert(
+        "ssbond" in lower or "bonded" in lower or "low misparing" in lower or "ok" in lower,
+        "SSBOND Cys reported as bonded / low risk",
+        f"summary = {summary!r}",
+    )
+
+
+def test_cys_audit_in_summary_without_pdb_path() -> None:
+    """_generate_summary runs without pdb_path (no SSBOND parsing)."""
+    from disulfide_bridge import DisulfideBridge
+
+    candidate = _make_top_candidate("A", "B", 10, 50)
+    atoms = {
+        "A": {
+            10: {"resname": "ALA", "CA": (1.0, 1.0, 1.0)},
+            67: {"resname": "CYS", "CA": (7.0, 7.0, 7.0)},
+        },
+        "B": {50: {"resname": "ALA", "CA": (5.0, 5.0, 5.0)}},
+    }
+
+    # Should not raise even without pdb_path
+    try:
+        summary = DisulfideBridge._generate_summary(
+            [candidate], "A", "B", atoms=atoms
+        )
+        _assert(isinstance(summary, str) and len(summary) > 0,
+                "summary without pdb_path is non-empty string")
+    except Exception as exc:
+        _fail("no exception without pdb_path", str(exc))
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -934,6 +1077,12 @@ def main() -> int:
     test_generate_summary_mentions_candidate()
     test_generate_summary_mentions_next_steps()
     test_generate_summary_empty_candidates()
+
+    # J. Cys misparing audit
+    test_cys_misparing_warning_when_free_cys()
+    test_no_misparing_confirmation_when_no_free_cys()
+    test_ssbond_cys_shows_low_risk()
+    test_cys_audit_in_summary_without_pdb_path()
 
     print()
     print("=" * 60)

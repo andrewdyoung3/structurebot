@@ -113,6 +113,7 @@ tools_needed values (list — may contain one or more):
   "mutation_scan"     — full CamSol + ESM + Rosetta engineering pipeline
   "assembly_analyser" — biological assembly detection, interface mapping
   "disulfide"         — interchain disulfide bond candidate prediction
+  "esmfold"           — ESMFold mutant foldability prediction via ESM Atlas API
 
 tool_inputs: dict of tool-specific parameters, e.g.:
   {{"camsol": {{"model_id": "1", "chain": "A"}}}}
@@ -181,6 +182,7 @@ rosetta          : stability prediction, ddG calculation               [ACTIVE �
 mutation_scan    : full CamSol + ESM + Rosetta engineering pipeline   [ACTIVE]
 assembly_analyser: biological assembly detection, interface mapping    [ACTIVE]
 disulfide        : interchain disulfide bond candidate prediction      [ACTIVE]
+esmfold          : mutant foldability via ESM Atlas API (free)        [ACTIVE]
 rosetta_local    : publication-quality ddG via PyRosetta/WSL2         [ACTIVE if WSL2 configured]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -292,6 +294,18 @@ DISULFIDE BOND requests:
   Chain specification: if the user names chains, use those:
     "suggest disulfides between chain A and chain B"
     → chain_a: "A", chain_b: "B"
+
+FOLDABILITY / STRUCTURE VALIDATION requests:
+  "will this mutation fold", "check foldability", "validate design",
+  "foldability prediction", "does the mutant fold", "pLDDT", "ESMFold"
+  → tools_needed: ["esmfold"]
+  → tool_inputs: {{
+       "esmfold": {{
+         "model_id": "1",
+         "sequence": "",         # leave blank — router fetches from session
+         "mutation_positions": []
+       }}
+     }}
 
 PURE VISUALIZATION (default — no extra tools):
   All other requests → tools_needed: ["chimerax"], tool_inputs: {{}}

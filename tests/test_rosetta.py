@@ -1020,6 +1020,183 @@ def test_dynamut2_empirical_fallback_per_mutation() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# I. Parallel DynaMut2 scoring
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _make_parallel_pdb() -> str:
+    """Write a minimal PDB to a temp file; return path string."""
+    import tempfile
+    pdb = textwrap.dedent("""\
+        ATOM      1  CA  ILE A  64       1.000   1.000   1.000  1.00 20.00           C
+        ATOM      2  CA  GLY A  73       2.000   2.000   2.000  1.00 30.00           C
+        ATOM      3  CA  LEU A  63       3.000   3.000   3.000  1.00 25.00           C
+        ATOM      4  CA  THR A  74       4.000   4.000   4.000  1.00 35.00           C
+        END
+    """)
+    tf = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w")
+    tf.write(pdb)
+    tf.close()
+    return tf.name
+
+
+def _mock_post_factory(ddg_map: Dict[str, float]):
+    """
+    Build a requests.post mock that returns DynaMut2 results from ddg_map.
+    Submit step: returns {"job_id": "job-<mut>"}
+    Poll step:   returns {"prediction": ddg_map[mut]}
+    """
+    call_log: List[str] = []
+
+    def _mock_post(url, files=None, data=None, params=None, timeout=None, **kw):
+        resp = MagicMock()
+        resp.status_code = 200
+        if files is not None:
+            # Submit step
+            mut_str = data.get("mutation", "X1Y") if data else "X1Y"
+            resp.json.return_value = {"job_id": f"job-{mut_str}"}
+            call_log.append(("submit", mut_str))
+        else:
+            # Poll step (GET via requests.post shouldn't happen — handle via get)
+            resp.json.return_value = {"prediction": 0.0}
+        return resp
+
+    def _mock_get(url, params=None, timeout=None, **kw):
+        resp = MagicMock()
+        resp.status_code = 200
+        job_id = (params or {}).get("job_id", "job-X1Y")
+        # Extract mutation from job_id: "job-V82A" -> "V82A"
+        mut = job_id.replace("job-", "")
+        ddg = ddg_map.get(mut, 0.0)
+        resp.json.return_value = {"prediction": ddg}
+        call_log.append(("poll", mut))
+        return resp
+
+    return _mock_post, _mock_get, call_log
+
+
+def test_parallel_all_mutations_scored() -> None:
+    """_score_mutations_parallel returns a score for every mutation submitted."""
+    print("\n=== I. Parallel DynaMut2 ===")
+    pdb = _make_parallel_pdb()
+    mutations = [
+        {"chain": "A", "position": 64, "from_aa": "I", "to_aa": "E"},
+        {"chain": "A", "position": 73, "from_aa": "G", "to_aa": "K"},
+        {"chain": "A", "position": 63, "from_aa": "L", "to_aa": "K"},
+        {"chain": "A", "position": 74, "from_aa": "T", "to_aa": "R"},
+    ]
+    ddg_map = {"I64E": -3.53, "G73K": -0.82, "L63K": -1.12, "T74R": 0.23}
+    mock_post, mock_get, call_log = _mock_post_factory(ddg_map)
+
+    from rosetta_bridge import RosettaBridge
+    bridge = RosettaBridge.__new__(RosettaBridge)
+    bridge._backend = "dynamut2"
+
+    with patch("requests.post", mock_post), patch("requests.get", mock_get):
+        ddg_scores, fallbacks, warnings = bridge._score_mutations_parallel(
+            pdb, mutations, max_workers=4,
+            scan_deadline=None, progress=lambda _: None
+        )
+
+    import os as _os
+    _os.unlink(pdb)
+
+    _assert(len(ddg_scores) == 4, "4 mutations all scored",
+            f"got {len(ddg_scores)}: {ddg_scores}")
+    for mut in mutations:
+        key = f"{mut['from_aa']}{mut['position']}{mut['to_aa']}"
+        _assert(key in ddg_scores,
+                f"score present for {key}",
+                f"missing from {list(ddg_scores.keys())}")
+
+
+def test_parallel_circuit_breaker_uses_empirical() -> None:
+    """Parallel scoring: circuit breaker trips -> remaining mutations use empirical."""
+    pdb = _make_parallel_pdb()
+    mutations = [
+        {"chain": "A", "position": 64, "from_aa": "I", "to_aa": "E"},
+        {"chain": "A", "position": 73, "from_aa": "G", "to_aa": "K"},
+        {"chain": "A", "position": 63, "from_aa": "L", "to_aa": "K"},
+    ]
+
+    from rosetta_bridge import RosettaBridge, _DYNAMUT2_CIRCUIT_BREAKER
+    bridge = RosettaBridge.__new__(RosettaBridge)
+    bridge._backend = "dynamut2"
+
+    # _query_dynamut2_single always raises -> circuit breaker trips
+    with patch.object(bridge, "_query_dynamut2_single",
+                      side_effect=ConnectionError("server down")):
+        ddg_scores, fallbacks, warnings = bridge._score_mutations_parallel(
+            pdb, mutations, max_workers=4,
+            scan_deadline=None, progress=lambda _: None
+        )
+
+    import os as _os
+    _os.unlink(pdb)
+
+    _assert(len(ddg_scores) == 3, "all 3 mutations have a score (empirical)",
+            f"got {len(ddg_scores)}")
+    _assert(len(fallbacks) == 3, "all 3 mutations in empirical_fallbacks",
+            f"got {len(fallbacks)}")
+    _assert(any("circuit" in w.lower() for w in warnings),
+            "circuit breaker warning present",
+            f"got warnings: {warnings}")
+
+
+def test_parallel_wall_time_faster_than_sequential() -> None:
+    """
+    Parallel scoring (4 workers) completes faster than sequential for 4 mutations
+    when each mutation takes ~0.1s.
+
+    Uses a mock that sleeps briefly to simulate real latency.
+    """
+    import time
+
+    pdb = _make_parallel_pdb()
+    mutations = [
+        {"chain": "A", "position": 64, "from_aa": "I", "to_aa": "E"},
+        {"chain": "A", "position": 73, "from_aa": "G", "to_aa": "K"},
+        {"chain": "A", "position": 63, "from_aa": "L", "to_aa": "K"},
+        {"chain": "A", "position": 74, "from_aa": "T", "to_aa": "R"},
+    ]
+
+    def _slow_mock(pdb_path, mut, progress_fn, deadline):
+        time.sleep(0.10)   # simulate 100ms DynaMut2 latency
+        return -1.0
+
+    from rosetta_bridge import RosettaBridge
+    bridge = RosettaBridge.__new__(RosettaBridge)
+    bridge._backend = "dynamut2"
+
+    with patch.object(bridge, "_query_dynamut2_single", side_effect=_slow_mock):
+        t0 = time.perf_counter()
+        scores_par, _, _ = bridge._score_mutations_parallel(
+            pdb, mutations, max_workers=4,
+            scan_deadline=None, progress=lambda _: None
+        )
+        wall_par = time.perf_counter() - t0
+
+    with patch.object(bridge, "_query_dynamut2_single", side_effect=_slow_mock):
+        t0 = time.perf_counter()
+        scores_seq, _, _ = bridge._score_mutations_sequential(
+            pdb, mutations,
+            scan_deadline=None, progress=lambda _: None
+        )
+        wall_seq = time.perf_counter() - t0
+
+    import os as _os
+    _os.unlink(pdb)
+
+    _assert(len(scores_par) == 4, "parallel: 4 mutations scored",
+            f"got {len(scores_par)}")
+    _assert(len(scores_seq) == 4, "sequential: 4 mutations scored",
+            f"got {len(scores_seq)}")
+    # Parallel should be noticeably faster (>1.5x) — 4x ideal, allow generous margin
+    speedup = wall_seq / wall_par if wall_par > 0 else 1.0
+    _assert(speedup >= 1.5, f"parallel speedup >= 1.5x (got {speedup:.1f}x)",
+            f"parallel={wall_par:.2f}s  sequential={wall_seq:.2f}s")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -1029,6 +1206,7 @@ def run_all(groups: List[str]) -> None:
     run_scanner   = "scanner"   in groups or "all" in groups
     run_session   = "session"   in groups or "all" in groups
     run_router    = "router"    in groups or "all" in groups
+    run_parallel  = "parallel"  in groups or "all" in groups
 
     if run_detection:
         test_backend_detection()
@@ -1064,6 +1242,11 @@ def run_all(groups: List[str]) -> None:
         test_router_route_mutation_scan()
         test_router_rosetta_no_mutations_error()
 
+    if run_parallel:
+        test_parallel_all_mutations_scored()
+        test_parallel_circuit_breaker_uses_empirical()
+        test_parallel_wall_time_faster_than_sequential()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1074,6 +1257,7 @@ def main() -> None:
     parser.add_argument("--scanner",   action="store_true", help="C+D+E: scanner tests")
     parser.add_argument("--session",   action="store_true", help="F: session persistence")
     parser.add_argument("--router",    action="store_true", help="G: router wiring")
+    parser.add_argument("--parallel",  action="store_true", help="I: parallel DynaMut2")
     args = parser.parse_args()
 
     groups: List[str] = []

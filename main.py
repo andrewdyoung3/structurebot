@@ -155,6 +155,7 @@ HELP_TEXT = """
   [cmd]history[/cmd]           show last 15 commands
   [cmd]state[/cmd]             dump current session state
   [cmd]jobs[/cmd]              show status of pending Robetta ddG jobs
+  [cmd]stats[/cmd]             show usage statistics across all sessions
   [cmd]undo[/cmd]              undo the last ChimeraX action
   [cmd]clear[/cmd]             close all models, reset session
   [cmd]save session NAME[/cmd] save ChimeraX session + state to sessions/NAME
@@ -371,6 +372,8 @@ class StructureBot:
                 self._cmd_help()
             elif lower == "jobs":
                 self._cmd_jobs()
+            elif lower == "stats":
+                self._cmd_stats()
             elif re.match(r"^save session\b", lower):
                 name = user_input.split(maxsplit=2)[2] if len(user_input.split()) > 2 else "default"
                 self._cmd_save_session(name)
@@ -562,7 +565,34 @@ class StructureBot:
         self.session.add_to_history(user_input, all_commands, success=success, error=error_msg)
         self._maybe_update_structure_state(all_commands)
         self.translator.trim_history()
-        self._log_exchange(user_input, all_commands, success, error_msg)
+
+        # Build enhanced tool-step log entries from tool pipeline results
+        _tool_steps: List[dict] = []
+        for step in result.get("tool_step_results", []):
+            if step.get("skipped"):
+                continue
+            tool  = step.get("tool", "")
+            data  = step.get("data", {})
+            entry: dict = {
+                "tool":       tool,
+                "elapsed_ms": step.get("elapsed_ms", 0),
+                "success":    step.get("success", False),
+            }
+            # Tool-specific enrichment
+            if tool == "mutation_scan":
+                cands = data.get("candidates", [])
+                entry["n_candidates"]  = len(cands)
+                entry["top_candidate"] = cands[0].get("mutation_key", "") if cands else ""
+                entry["top_ddg"]       = cands[0].get("ddg", None)        if cands else None
+                entry["backend"]       = cands[0].get("backend", "")      if cands else ""
+            elif tool == "disulfide":
+                entry["n_candidates"] = data.get("count", 0)
+            elif tool in ("camsol", "esm", "proteinmpnn", "rfdiffusion"):
+                pass  # no extra enrichment needed
+            _tool_steps.append(entry)
+
+        self._log_exchange(user_input, all_commands, success, error_msg,
+                           tool_steps=_tool_steps if _tool_steps else None)
 
     def _show_tool_pipeline(self, result: dict) -> None:
         """Display the tool pipeline before the ChimeraX command preview."""
@@ -794,14 +824,17 @@ class StructureBot:
         commands:   List[str],
         success:    bool,
         error:      Optional[str],
+        tool_steps: Optional[List[dict]] = None,
     ) -> None:
-        entry = {
+        entry: dict = {
             "timestamp":  datetime.now().isoformat(timespec="seconds"),
             "user_input": user_input,
             "commands":   commands,
             "success":    success,
             "error":      error,
         }
+        if tool_steps:
+            entry["tool_steps"] = tool_steps
         try:
             with open(self.log_file, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -971,6 +1004,14 @@ class StructureBot:
                         f"    [{colour}]{escape(mut_key)}[/{colour}]  "
                         f"ΔΔG = {ddg:+.3f} kcal/mol"
                     )
+
+    def _cmd_stats(self) -> None:
+        """Show usage statistics from session log files."""
+        try:
+            from log_analyser import display_stats
+            display_stats(console)
+        except Exception as exc:
+            console.print(f"[err]Stats unavailable: {escape(str(exc))}[/err]")
 
     def _cmd_help(self) -> None:
         console.print(HELP_TEXT)

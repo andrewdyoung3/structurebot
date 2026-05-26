@@ -120,6 +120,28 @@ PROTEINMPNN_DIR: str = os.environ.get(
 #   "false"/"0" — always use current-venv CPU path (disables GPU delegation)
 ESM_USE_VENV312: str = os.environ.get("ESM_USE_VENV312", "auto").strip()
 
+# ── Parallel DynaMut2 ─────────────────────────────────────────────────────────
+
+# Maximum concurrent DynaMut2 requests.
+# 4 is conservative — server handles up to ~5.  Set to 1 to disable parallelism.
+DYNAMUT2_MAX_WORKERS: int = int(os.environ.get("DYNAMUT2_MAX_WORKERS", "4"))
+
+# ── ESMFold ───────────────────────────────────────────────────────────────────
+
+# Enable ESMFold foldability checking on top mutation/disulfide candidates.
+ESMFOLD_ENABLED: bool = (
+    os.environ.get("ESMFOLD_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes")
+)
+
+# How many top candidates to check with ESMFold after a mutation scan.
+ESMFOLD_TOP_N: int = int(os.environ.get("ESMFOLD_TOP_N", "3"))
+
+# Mean pLDDT drop (at mutation positions) above which we issue a warning.
+ESMFOLD_PLDDT_WARNING_THRESHOLD: float = float(
+    os.environ.get("ESMFOLD_PLDDT_WARNING_THRESHOLD", "10.0")
+)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 
