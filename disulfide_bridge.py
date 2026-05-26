@@ -20,8 +20,8 @@ Output schema (each candidate dict)
   "chain_b_residue":  int,
   "chain_a_aa":       str,   # one-letter code of wild-type AA in chain A
   "chain_b_aa":       str,
-  "cb_distance":      float, # Å
-  "dihedral_angle":   float, # degrees (Cα1-Cβ1-Cβ2-Cα2)
+  "cb_distance":      float,          # Å
+  "dihedral_angle":   float | None,   # degrees (Cα1-Cβ1-Cβ2-Cα2); None for Gly
   "distance_score":   float, # 0–1 Gaussian centred at 3.8 Å
   "dihedral_score":   float, # 0–1 Gaussian centred at ±90°
   "geometry_score":   float, # 0.5×dist_score + 0.5×dihedral_score
@@ -55,8 +55,8 @@ _CB_DIST_IDEAL  = 3.8    # Å  — Gaussian centre
 _CB_DIST_SIGMA  = 0.4    # Å  — Gaussian sigma
 
 # Ideal Cα-Cβ-Cβ-Cα dihedral (absolute value)
-_DIHEDRAL_IDEAL = 90.0   # degrees
-_DIHEDRAL_SIGMA = 30.0   # degrees
+_DIHEDRAL_IDEAL  = 90.0   # degrees
+_DIHEDRAL_CUTOFF = 135.0  # degrees — deviation beyond which score is hard-zero
 
 # Hard filters
 _MIN_ESM_TOLERANCE    = 0.3    # positions below this are excluded
@@ -189,56 +189,92 @@ def calc_dihedral(
     a2: Tuple[float, float, float],
 ) -> float:
     """
-    Dihedral angle Cα1-Cβ1-Cβ2-Cα2 in degrees, range [-180, 180].
-    Returns 0.0 if any bond has near-zero length.
+    Dihedral angle a1-b1-b2-a2 in degrees, range [-180, 180].
+
+    Uses the atan2 formula:
+        v1 = b1 - a1,  v2 = b2 - b1,  v3 = a2 - b2
+        n1 = v1 x v2,  n2 = v2 x v3
+        angle = atan2( (v2/|v2| x n1) . n2,  n1 . n2 )
+
+    Returns 0.0 for degenerate geometries where any three atoms
+    are collinear (cross-product is near-zero).  Callers that need to
+    distinguish a genuine 0 degree dihedral from a degenerate case
+    should check whether the residue has a real CB atom beforehand.
     """
-    def _sub(v, w):  return tuple(a - b for a, b in zip(v, w))
-    def _dot(v, w):  return sum(a * b for a, b in zip(v, w))
-    def _cross(v, w):
-        return (
-            v[1]*w[2] - v[2]*w[1],
-            v[2]*w[0] - v[0]*w[2],
-            v[0]*w[1] - v[1]*w[0],
-        )
-    def _norm(v):
-        mag = math.sqrt(_dot(v, v))
-        return tuple(x / mag for x in v) if mag > 1e-9 else v
+    def _sub(u, v):
+        return (u[0]-v[0], u[1]-v[1], u[2]-v[2])
+    def _dot(u, v):
+        return u[0]*v[0] + u[1]*v[1] + u[2]*v[2]
+    def _cross(u, v):
+        return (u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0])
 
-    b1_ = _sub(b1, a1)
-    b2_ = _sub(b2, b1)
-    b3_ = _sub(a2, b2)
+    v1 = _sub(b1, a1)   # CA1 → CB1
+    v2 = _sub(b2, b1)   # CB1 → CB2
+    v3 = _sub(a2, b2)   # CB2 → CA2
 
-    n1 = _cross(b1_, b2_)
-    n2 = _cross(b2_, b3_)
+    n1 = _cross(v1, v2)
+    n2 = _cross(v2, v3)
 
-    if _dot(n1, n1) < 1e-18 or _dot(n2, n2) < 1e-18:
+    if _dot(n1, n1) < 1e-10 or _dot(n2, n2) < 1e-10:
+        return 0.0      # degenerate: atoms are collinear
+
+    v2_mag = math.sqrt(_dot(v2, v2))
+    if v2_mag < 1e-10:
         return 0.0
 
-    m1 = _cross(n1, _norm(b2_))
-    x  = _dot(n1, n2)
-    y  = _dot(m1, n2)
+    inv_v2 = 1.0 / v2_mag
+    v2_hat = (v2[0]*inv_v2, v2[1]*inv_v2, v2[2]*inv_v2)
+    m1 = _cross(v2_hat, n1)     # (v2/|v2|) x n1
+
+    x = _dot(n1, n2)
+    y = _dot(m1, n2)
     return math.degrees(math.atan2(y, x))
 
 
 def geometry_score(
-    cb_distance: float,
-    dihedral_deg: float,
+    cb_distance:  float,
+    dihedral_deg: Optional[float],
 ) -> Tuple[float, float, float]:
     """
     Score distance and dihedral independently; return (dist_score, dihed_score, geo_score).
     All scores are in [0, 1]; 1.0 = ideal disulfide geometry.
 
-    Distance score: Gaussian centred at 3.8 Å, σ = 0.4 Å.
-    Dihedral score: Gaussian centred at |dihedral| = 90°, σ = 30°.
+    Distance score
+    --------------
+    Gaussian centred at 3.8 Å, σ = 0.4 Å.
+
+    Dihedral score
+    --------------
+    Raised-cosine centred at ±90°:
+
+        dev = min(|theta - 90|, |theta + 90|)   in [0, 90]
+        score = (1 + cos(dev * pi / 180)) / 2
+
+    Property table:
+        ±90°   → dev = 0   → score = 1.0  (ideal disulfide)
+        0°/±180° → dev = 90  → score = 0.5  (eclipsed / anti — neutral)
+        dev > 135° → score = 0.0  (hard floor; unreachable for [-180,180])
+
+    If dihedral_deg is None (residue is Glycine — no real Cβ — so the
+    Cα-Cβ-Cβ-Cα dihedral is undefined), dihed_score = 0.5 (neutral).
+
     geometry_score = 0.5 × dist_score + 0.5 × dihed_score
     """
     dist_score = math.exp(
         -((cb_distance - _CB_DIST_IDEAL) ** 2) / (2 * _CB_DIST_SIGMA ** 2)
     )
 
-    # Distance to nearest ideal: ±90° → |dihedral| - 90°
-    dev = min(abs(abs(dihedral_deg) - 90.0), abs(abs(dihedral_deg) - 270.0))
-    dihed_score = math.exp(-(dev ** 2) / (2 * _DIHEDRAL_SIGMA ** 2))
+    if dihedral_deg is None:
+        # Gly pseudo-CB: dihedral undefined; use neutral score
+        dihed_score = 0.5
+    else:
+        dev = min(abs(dihedral_deg - _DIHEDRAL_IDEAL),
+                  abs(dihedral_deg + _DIHEDRAL_IDEAL))
+        if dev >= _DIHEDRAL_CUTOFF:
+            dihed_score = 0.0
+        else:
+            # raised cosine: 1.0 at dev=0 (±90°), 0.5 at dev=90 (0°/180°)
+            dihed_score = (1.0 + math.cos(dev * math.pi / 180.0)) / 2.0
 
     geo = 0.5 * dist_score + 0.5 * dihed_score
     return round(dist_score, 4), round(dihed_score, 4), round(geo, 4)
@@ -271,6 +307,7 @@ def find_cb_pairs(
             continue
         cb_a = info_a.get("CB") or info_a.get("CA")
         ca_a = info_a.get("CA")
+        has_real_cb_a = "CB" in info_a   # False for Gly
         if cb_a is None:
             continue
 
@@ -280,6 +317,7 @@ def find_cb_pairs(
                 continue
             cb_b = info_b.get("CB") or info_b.get("CA")
             ca_b = info_b.get("CA")
+            has_real_cb_b = "CB" in info_b   # False for Gly
             if cb_b is None:
                 continue
 
@@ -287,13 +325,16 @@ def find_cb_pairs(
             if dist > max_dist:
                 continue
 
-            # Dihedral angle (0 if CA not available)
-            dihedral = 0.0
-            if ca_a and ca_b:
+            # Dihedral: None when either residue is Gly (no real Cβ).
+            # Using CA as pseudo-Cβ makes the cross-product degenerate
+            # (v1 = Cβ-Cα = 0), so we explicitly skip it and carry
+            # None through to geometry_score() → neutral 0.5 score.
+            dihedral: Optional[float] = None
+            if ca_a and ca_b and has_real_cb_a and has_real_cb_b:
                 try:
                     dihedral = calc_dihedral(ca_a, cb_a, cb_b, ca_b)
                 except Exception:
-                    dihedral = 0.0
+                    dihedral = None
 
             dist_sc, dihed_sc, geo_sc = geometry_score(dist, dihedral)
 
@@ -303,7 +344,7 @@ def find_cb_pairs(
                 "chain_a_aa":      aa_a,
                 "chain_b_aa":      aa_b,
                 "cb_distance":     round(dist, 3),
-                "dihedral_angle":  round(dihedral, 1),
+                "dihedral_angle":  round(dihedral, 1) if dihedral is not None else None,
                 "distance_score":  dist_sc,
                 "dihedral_score":  dihed_sc,
                 "geometry_score":  geo_sc,

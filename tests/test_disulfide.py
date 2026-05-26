@@ -178,16 +178,53 @@ def test_geometry_score_off_ideal() -> None:
 
 
 def test_geometry_score_range() -> None:
-    """All geometry scores are in [0, 1]."""
+    """All geometry scores are in [0, 1] for float and None dihedrals."""
     for dist in (2.0, 3.5, 3.8, 4.0, 4.5, 6.0):
-        for angle in (0.0, 45.0, 90.0, 135.0, 180.0):
+        for angle in (0.0, 45.0, 90.0, 135.0, 180.0, None):
             ds, hs, gs = geometry_score(dist, angle)
             ok = 0.0 <= ds <= 1.0 and 0.0 <= hs <= 1.0 and 0.0 <= gs <= 1.0
             if not ok:
                 _fail(f"geometry_score in range (d={dist}, θ={angle})",
                       f"ds={ds}, hs={hs}, gs={gs}")
                 return
-    _ok("geometry_score always in [0, 1]")
+    _ok("geometry_score always in [0, 1] (including None dihedral)")
+
+
+def test_geometry_score_gly_neutral() -> None:
+    """geometry_score with dihedral=None (Gly) gives dihed_sc=0.5 (neutral)."""
+    dist_sc, dihed_sc, geo_sc = geometry_score(_CB_DIST_IDEAL, None)
+    _assert(
+        _approx_eq(dihed_sc, 0.5, tol=0.001),
+        "Gly dihedral=None gives dihed_sc=0.5",
+        f"got {dihed_sc:.4f}",
+    )
+    _assert(
+        0.0 <= geo_sc <= 1.0,
+        "Gly geometry_score in [0,1]",
+        f"got {geo_sc:.4f}",
+    )
+    # At ideal distance, geo = 0.5*1.0 + 0.5*0.5 = 0.75
+    _assert(
+        _approx_eq(geo_sc, 0.75, tol=0.01),
+        "Gly geo_sc at ideal dist = 0.75",
+        f"got {geo_sc:.4f}",
+    )
+
+
+def test_geometry_score_negative_dihedral() -> None:
+    """geometry_score is symmetric: score(-90°) == score(+90°) == 1.0."""
+    _, dihed_pos, _ = geometry_score(3.8, 90.0)
+    _, dihed_neg, _ = geometry_score(3.8, -90.0)
+    _assert(
+        _approx_eq(dihed_pos, dihed_neg, tol=0.001),
+        "dihedral_score symmetric at +/-90°",
+        f"+90={dihed_pos:.4f}, -90={dihed_neg:.4f}",
+    )
+    _assert(
+        _approx_eq(dihed_pos, 1.0, tol=0.01),
+        "dihedral_score=1.0 at ±90°",
+        f"got {dihed_pos:.4f}",
+    )
 
 
 # ── B. PDB parsing ─────────────────────────────────────────────────────────────
@@ -313,6 +350,32 @@ def test_find_cb_pairs_excludes_cys() -> None:
     _assert((11, 10) not in resno_pairs, "LEU-CYS pair A11/B10 excluded (B is CYS)")
     # LEU-LEU should remain
     _assert((11, 11) in resno_pairs, "LEU-LEU pair A11/B11 included")
+
+
+def test_find_cb_pairs_gly_dihedral_none() -> None:
+    """Gly residues (no CB) get dihedral_angle=None in find_cb_pairs output."""
+    atoms = {
+        "A": {
+            1: {"resname": "GLY", "CA": (0.0, 0.0, 0.0)},          # no CB
+        },
+        "B": {
+            1: {"resname": "LEU", "CA": (5.0, 0.0, 0.0), "CB": (4.5, 0.0, 0.0)},
+        },
+    }
+    candidates = find_cb_pairs(atoms, "A", "B", max_dist=10.0)
+    _assert(len(candidates) >= 1, "GLY-LEU pair found")
+    c = candidates[0]
+    _assert(
+        c["dihedral_angle"] is None,
+        "dihedral_angle=None for GLY residue",
+        f"got {c['dihedral_angle']!r}",
+    )
+    # Dihedral score should be neutral 0.5
+    _assert(
+        _approx_eq(c["dihedral_score"], 0.5, tol=0.001),
+        "dihedral_score=0.5 for GLY (neutral)",
+        f"got {c['dihedral_score']}",
+    )
 
 
 def test_find_cb_pairs_distance_filter() -> None:
@@ -762,6 +825,8 @@ def main() -> int:
     test_geometry_score_ideal()
     test_geometry_score_off_ideal()
     test_geometry_score_range()
+    test_geometry_score_gly_neutral()
+    test_geometry_score_negative_dihedral()
 
     # B. PDB parsing
     test_parse_pdb_atoms_basic()
@@ -771,6 +836,7 @@ def main() -> int:
     # C. Candidate finding
     test_find_cb_pairs_basic()
     test_find_cb_pairs_excludes_cys()
+    test_find_cb_pairs_gly_dihedral_none()
     test_find_cb_pairs_distance_filter()
 
     # D. ESM tolerance
