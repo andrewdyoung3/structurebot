@@ -25,6 +25,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# ── Force line-buffered stdout (real-time output on Windows PowerShell) ───────
+sys.stdout.reconfigure(line_buffering=True)
+
 # ── Windows-only keyboard polling ─────────────────────────────────────────────
 if sys.platform == "win32":
     import msvcrt

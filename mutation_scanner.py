@@ -186,9 +186,9 @@ class MutationScanner:
         self.model_id = model_id
         def _safe_print(msg: str) -> None:
             try:
-                print(msg)
+                print(msg, flush=True)
             except UnicodeEncodeError:
-                print(msg.encode("ascii", errors="replace").decode("ascii"))
+                print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
         self._progress = progress_callback or _safe_print
 
@@ -708,7 +708,7 @@ class MutationScanner:
     @staticmethod
     def _error_result(msg: str) -> List[Dict[str, Any]]:
         """Return an empty list with a print; callers check for empty."""
-        print(f"[MutationScanner] Error: {msg}")
+        print(f"[MutationScanner] Error: {msg}", flush=True)
         return []
 
     def __repr__(self) -> str:

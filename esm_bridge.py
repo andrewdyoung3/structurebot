@@ -109,7 +109,8 @@ def _probe_cuda_device(preferred: str = "cuda") -> str:
             "[ESM] CUDA device detected but kernel execution failed "
             "(compute capability mismatch). Falling back to CPU.\n"
             "      RTX 5070 Ti (sm_120 Blackwell) requires PyTorch cu130 "
-            "with CUDA 13 support."
+            "with CUDA 13 support.",
+            flush=True,
         )
         return "cpu"
 
@@ -272,7 +273,8 @@ class _EsmBackend:
                 import esm as esm_lib
                 print(
                     f"\n[ESM] Loading {self.model_name} via fair-esm "
-                    f"(~30 MB download on first use)…"
+                    f"(~30 MB download on first use)…",
+                    flush=True,
                 )
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
@@ -290,12 +292,12 @@ class _EsmBackend:
                 self._device = _probe_cuda_device(preferred)
                 self._model = self._model.to(self._device)
                 self._backend = "fair_esm"
-                print(f"[ESM] Model loaded (fair-esm) on {self._device} ({time.perf_counter() - _load_t0:.1f}s).")
+                print(f"[ESM] Model loaded (fair-esm) on {self._device} ({time.perf_counter() - _load_t0:.1f}s).", flush=True)
                 return
             except ImportError:
                 pass
             except Exception as exc:
-                print(f"[ESM] fair-esm load failed: {exc}. Trying transformers…")
+                print(f"[ESM] fair-esm load failed: {exc}. Trying transformers…", flush=True)
 
         # ── Try transformers (HuggingFace) ────────────────────────────────────
         if importlib.util.find_spec("transformers") is not None:
@@ -304,7 +306,8 @@ class _EsmBackend:
                 hf_name = f"facebook/{self.model_name}"
                 print(
                     f"\n[ESM] Loading {hf_name} via transformers "
-                    f"(~30 MB download on first use)…"
+                    f"(~30 MB download on first use)…",
+                    flush=True,
                 )
                 self._tokenizer = EsmTokenizer.from_pretrained(hf_name)
                 self._model     = EsmForMaskedLM.from_pretrained(hf_name)
@@ -318,12 +321,12 @@ class _EsmBackend:
                 self._device = _probe_cuda_device(preferred)
                 self._model = self._model.to(self._device)
                 self._backend   = "transformers"
-                print(f"[ESM] Model loaded (transformers) on {self._device} ({time.perf_counter() - _load_t0:.1f}s).")
+                print(f"[ESM] Model loaded (transformers) on {self._device} ({time.perf_counter() - _load_t0:.1f}s).", flush=True)
                 return
             except ImportError:
                 pass
             except Exception as exc:
-                print(f"[ESM] transformers load failed: {exc}.")
+                print(f"[ESM] transformers load failed: {exc}.", flush=True)
 
         raise ImportError(
             "ESM-2 requires either 'fair-esm' or 'transformers'.\n"

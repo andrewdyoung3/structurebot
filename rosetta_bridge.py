@@ -138,9 +138,9 @@ _STANDARD_AA = list("ACDEFGHIKLMNPQRSTVWY")
 def _safe_print(msg: str) -> None:
     """Print with ASCII fallback for narrow terminal encodings (Windows cp1252)."""
     try:
-        print(msg)
+        print(msg, flush=True)
     except UnicodeEncodeError:
-        print(msg.encode("ascii", errors="replace").decode("ascii"))
+        print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
