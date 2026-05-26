@@ -715,12 +715,14 @@ class DisulfideBridge:
         )
         if candidates:
             top = candidates[0]
+            _dih = top['dihedral_angle']
+            _dih_str = f"{_dih:.1f}°" if _dih is not None else "N/A (Gly)"
             summary += (
                 f" Top: {chain_a}{top['chain_a_residue']}{top['chain_a_aa']}→C / "
                 f"{chain_b}{top['chain_b_residue']}{top['chain_b_aa']}→C "
                 f"(score={top['combined_score']:.2f}, "
                 f"Cβ-Cβ={top['cb_distance']:.1f} Å, "
-                f"dihedral={top['dihedral_angle']:.1f}°)"
+                f"dihedral={_dih_str})"
             )
         _prog(f"🔗 {summary}")
 
