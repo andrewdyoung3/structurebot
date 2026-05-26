@@ -58,9 +58,10 @@ import json
 import math
 import os
 import re
+import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tool_router import ToolStepResult
 
@@ -211,6 +212,8 @@ class _EsmBackend:
         if self._model is not None:
             return
 
+        _load_t0 = time.perf_counter()
+
         import importlib.util
         import sys
         from pathlib import Path
@@ -287,7 +290,7 @@ class _EsmBackend:
                 self._device = _probe_cuda_device(preferred)
                 self._model = self._model.to(self._device)
                 self._backend = "fair_esm"
-                print(f"[ESM] Model loaded (fair-esm) on {self._device}.")
+                print(f"[ESM] Model loaded (fair-esm) on {self._device} ({time.perf_counter() - _load_t0:.1f}s).")
                 return
             except ImportError:
                 pass
@@ -315,7 +318,7 @@ class _EsmBackend:
                 self._device = _probe_cuda_device(preferred)
                 self._model = self._model.to(self._device)
                 self._backend   = "transformers"
-                print(f"[ESM] Model loaded (transformers) on {self._device}.")
+                print(f"[ESM] Model loaded (transformers) on {self._device} ({time.perf_counter() - _load_t0:.1f}s).")
                 return
             except ImportError:
                 pass
@@ -328,25 +331,39 @@ class _EsmBackend:
             "  Or:           pip install transformers torch"
         )
 
-    def masked_probabilities(self, sequence: str) -> List[List[float]]:
+    def masked_probabilities(
+        self,
+        sequence: str,
+        deadline: Optional[float] = None,
+    ) -> List[List[float]]:
         """
         Compute per-position amino-acid probability distributions.
 
         For each position i, masks that position and runs a forward pass,
         returning the softmax probabilities over the 20 standard amino acids.
 
+        Parameters
+        ----------
+        sequence : single-letter AA string
+        deadline : optional ``time.perf_counter()`` value; if the wall clock
+                   passes this value mid-loop a ``TimeoutError`` is raised.
+
         Returns: list[list[float]], shape (seq_len, 20)
         """
         self._load()
 
         if self._backend == "fair_esm":
-            return self._masked_probs_fair_esm(sequence)
+            return self._masked_probs_fair_esm(sequence, deadline=deadline)
         elif self._backend == "transformers":
-            return self._masked_probs_transformers(sequence)
+            return self._masked_probs_transformers(sequence, deadline=deadline)
         else:
             raise RuntimeError("No ESM backend available.")
 
-    def _masked_probs_fair_esm(self, sequence: str) -> List[List[float]]:
+    def _masked_probs_fair_esm(
+        self,
+        sequence: str,
+        deadline: Optional[float] = None,
+    ) -> List[List[float]]:
         """Per-position masked probabilities using the fair-esm library."""
         import torch
 
@@ -355,9 +372,16 @@ class _EsmBackend:
         _, _, tokens = batch_converter(data)
         tokens = tokens.to(self._device)
 
+        _inf_start = time.perf_counter()
         all_probs: List[List[float]] = []
         with torch.no_grad():
             for i in range(len(sequence)):
+                if deadline is not None and time.perf_counter() >= deadline:
+                    elapsed = time.perf_counter() - _inf_start
+                    raise TimeoutError(
+                        f"ESM-2 inference timed out after {elapsed:.1f}s "
+                        f"at position {i + 1}/{len(sequence)}"
+                    )
                 masked = tokens.clone()
                 masked[0, i + 1] = self._alphabet.mask_idx  # +1 for <cls>
                 logits = self._model(masked)["logits"]
@@ -373,14 +397,29 @@ class _EsmBackend:
                 total = sum(aa_probs)
                 all_probs.append([p / total for p in aa_probs] if total > 0 else aa_probs)
 
+                if (i + 1) % 10 == 0 or (i + 1) == len(sequence):
+                    elapsed = time.perf_counter() - _inf_start
+                    print(f"[ESM] {i + 1}/{len(sequence)} residues ({elapsed:.1f}s)…", flush=True)
+
         return all_probs
 
-    def _masked_probs_transformers(self, sequence: str) -> List[List[float]]:
+    def _masked_probs_transformers(
+        self,
+        sequence: str,
+        deadline: Optional[float] = None,
+    ) -> List[List[float]]:
         """Per-position masked probabilities using the transformers library."""
         import torch
 
+        _inf_start = time.perf_counter()
         all_probs: List[List[float]] = []
         for i in range(len(sequence)):
+            if deadline is not None and time.perf_counter() >= deadline:
+                elapsed = time.perf_counter() - _inf_start
+                raise TimeoutError(
+                    f"ESM-2 inference timed out after {elapsed:.1f}s "
+                    f"at position {i + 1}/{len(sequence)}"
+                )
             masked_seq = sequence[:i] + "<mask>" + sequence[i+1:]
             inputs = self._tokenizer(
                 masked_seq,
@@ -390,6 +429,9 @@ class _EsmBackend:
             mask_pos = (inputs["input_ids"][0] == self._tokenizer.mask_token_id).nonzero(as_tuple=True)[0]
             if len(mask_pos) == 0:
                 all_probs.append([1.0 / 20] * 20)
+                if (i + 1) % 10 == 0 or (i + 1) == len(sequence):
+                    elapsed = time.perf_counter() - _inf_start
+                    print(f"[ESM] {i + 1}/{len(sequence)} residues ({elapsed:.1f}s)…", flush=True)
                 continue
             mask_idx = mask_pos[0].item()
 
@@ -405,6 +447,10 @@ class _EsmBackend:
             ]
             total = sum(aa_probs)
             all_probs.append([p / total for p in aa_probs] if total > 0 else aa_probs)
+
+            if (i + 1) % 10 == 0 or (i + 1) == len(sequence):
+                elapsed = time.perf_counter() - _inf_start
+                print(f"[ESM] {i + 1}/{len(sequence)} residues ({elapsed:.1f}s)…", flush=True)
 
         return all_probs
 
@@ -425,28 +471,33 @@ class EsmBridge:
 
     def analyze(
         self,
-        sequence:    str,
-        model_id:    str  = "1",
-        chain:       Optional[str] = None,
-        session:     Any  = None,
-        start_resno: int  = 1,
+        sequence:          str,
+        model_id:          str  = "1",
+        chain:             Optional[str] = None,
+        session:           Any  = None,
+        start_resno:       int  = 1,
+        inference_timeout: int  = 120,
     ) -> ToolStepResult:
         """
         Compute ESM-2 conservation scores for *sequence*.
 
         Parameters
         ----------
-        sequence    : single-letter AA string (standard letters only)
-        model_id    : ChimeraX model number
-        chain       : chain ID or None
-        session     : SessionState (unused here, reserved for caching)
-        start_resno : first residue number (default 1)
+        sequence          : single-letter AA string (standard letters only)
+        model_id          : ChimeraX model number
+        chain             : chain ID or None
+        session           : SessionState (unused here, reserved for caching)
+        start_resno       : first residue number (default 1)
+        inference_timeout : seconds before inference is aborted and uniform
+                            0.5 fallback scores are used (default 120)
 
         Returns
         -------
         ToolStepResult with data["conservation"] = {resno: score (0–1)}
         and viz_commands for ChimeraX colouring.
         """
+        _t0 = time.perf_counter()
+
         sequence = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", sequence.upper())
         if len(sequence) < 5:
             return ToolStepResult(
@@ -457,13 +508,31 @@ class EsmBridge:
         # Check disk cache
         cache_key    = self._cache_key(sequence)
         cached_probs = self._load_cache(cache_key)
+        timed_out    = False
 
         if cached_probs is not None:
             all_probs = cached_probs
         else:
-            # Warn about potential model download
+            deadline = time.perf_counter() + inference_timeout
             try:
-                all_probs = self._backend.masked_probabilities(sequence)
+                all_probs = self._backend.masked_probabilities(sequence, deadline=deadline)
+            except TimeoutError as exc:
+                elapsed = time.perf_counter() - _t0
+                warnings.warn(
+                    f"[ESM] Inference timed out after {elapsed:.1f}s "
+                    f"(limit {inference_timeout}s) — "
+                    f"falling back to uniform conservation scores (0.5).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                print(
+                    f"[ESM] ⚠ Timeout after {elapsed:.1f}s at position {exc}. "
+                    f"Using uniform 0.5 fallback.",
+                    flush=True,
+                )
+                uniform = [1.0 / 20] * 20
+                all_probs = [uniform[:] for _ in sequence]
+                timed_out = True
             except ImportError as exc:
                 return ToolStepResult(
                     tool="esm", success=False,
@@ -474,7 +543,8 @@ class EsmBridge:
                     tool="esm", success=False,
                     error=f"ESM-2 inference failed: {exc}",
                 )
-            self._save_cache(cache_key, all_probs)
+            if not timed_out:
+                self._save_cache(cache_key, all_probs)
 
         # Compute per-position conservation scores
         conservation = [
@@ -495,8 +565,17 @@ class EsmBridge:
         )
 
         mean_cons = sum(conservation) / len(conservation) if conservation else 0
+        elapsed   = time.perf_counter() - _t0
+
+        if timed_out:
+            timing_note = f" (timed out {elapsed:.1f}s, uniform fallback)"
+        elif cached_probs is not None:
+            timing_note = " (cached)"
+        else:
+            timing_note = f" ({elapsed:.1f}s)"
+
         summary = (
-            f"ESM-2: {len(sequence)} residues. "
+            f"ESM-2{timing_note}: {len(sequence)} residues. "
             f"Mean conservation {mean_cons:.2f}. "
             f"{len(highly_conserved)} highly conserved, "
             f"{len(rapidly_evolving)} rapidly evolving."
@@ -513,6 +592,8 @@ class EsmBridge:
                 "model_used":       self.model_name,
                 "device":           self._backend._device or "cpu",
                 "cached":           cached_probs is not None,
+                "timed_out":        timed_out,
+                "elapsed_s":        round(elapsed, 2),
             },
             viz_commands     = viz_cmds,
             viz_explanations = viz_exps,

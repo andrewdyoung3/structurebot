@@ -261,7 +261,7 @@ class MutationScanner:
         # ── Step 2: Fetch / compute ESM conservation scores ───────────────────
         self._progress("Step 2/4: ESM-2 conservation scoring...")
         _t0 = time.perf_counter()
-        esm_scores = self._get_or_run_esm(sequence, chain_id)
+        esm_scores = self._get_or_run_esm(sequence, chain_id, deadline=_scan_deadline)
         if not esm_scores:
             return self._error_result("ESM-2 scores unavailable.")
         self._progress(f"  ESM-2: complete ({time.perf_counter() - _t0:.1f}s)")
@@ -493,9 +493,17 @@ class MutationScanner:
         self,
         sequence: Optional[str],
         chain_id: Optional[str],
+        deadline: Optional[float] = None,
     ) -> Optional[Dict[int, float]]:
         """
         Return ESM conservation scores {resno: score} from cache or by running.
+
+        Parameters
+        ----------
+        deadline : optional ``time.perf_counter()`` value; if set, the
+                   remaining seconds are used as the ESM inference timeout
+                   (capped at 120 s).  If the scan deadline has already
+                   passed the step is skipped immediately.
         """
         cached = None
         try:
@@ -510,9 +518,24 @@ class MutationScanner:
         if not seq:
             return None
 
+        # Compute per-sequence timeout from the overall scan deadline
+        if deadline is not None:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 5:
+                # No time left — skip ESM entirely
+                return None
+            inference_timeout = max(10, min(120, int(remaining)))
+        else:
+            inference_timeout = 120
+
         from esm_bridge import EsmBridge
         bridge = EsmBridge()
-        result = bridge.analyze(seq, model_id=self.model_id, session=self.session)
+        result = bridge.analyze(
+            seq,
+            model_id          = self.model_id,
+            session           = self.session,
+            inference_timeout = inference_timeout,
+        )
         if result.success:
             try:
                 self.session.add_tool_result("esm", self.model_id, result.data)
