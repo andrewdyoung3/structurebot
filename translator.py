@@ -16,8 +16,56 @@ Block 2 (DYNAMIC, UNCACHED): current session state — changes every turn.
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# ── Ensure venv site-packages takes priority over any global install ──────────
+#
+# On Windows, pip install --user drops packages into
+#   %APPDATA%\Python\PythonXYZ\site-packages
+# which may appear on sys.path *before* the venv's site-packages, causing the
+# wrong (user-installed, possibly outdated) copy of anthropic to be loaded.
+#
+# We locate the venv relative to this file and, if any AppData path precedes
+# the venv on sys.path, move the venv to position 0.  We also evict any
+# already-cached anthropic.* modules so the corrected path takes effect.
+
+def _ensure_venv_priority() -> None:
+    _project_root   = Path(__file__).resolve().parent
+    _venv_site_pkgs = _project_root / "venv" / "Lib" / "site-packages"
+    _appdata_marker = str(Path.home() / "AppData" / "Roaming" / "Python")
+
+    if not _venv_site_pkgs.is_dir():
+        return
+
+    _venv_idx = next(
+        (i for i, p in enumerate(sys.path)
+         if Path(p).resolve() == _venv_site_pkgs),
+        None,
+    )
+    _appdata_idxs = [
+        i for i, p in enumerate(sys.path)
+        if _appdata_marker.lower() in p.lower()
+    ]
+
+    _needs_fix = (
+        _venv_idx is None
+        or (_appdata_idxs and min(_appdata_idxs) < _venv_idx)
+    )
+
+    if _needs_fix:
+        _venv_str = str(_venv_site_pkgs)
+        if _venv_idx is not None:
+            sys.path.pop(_venv_idx)
+        sys.path.insert(0, _venv_str)
+
+        # Evict cached anthropic modules so re-import resolves against venv
+        for _mod in [m for m in list(sys.modules)
+                     if m == "anthropic" or m.startswith("anthropic.")]:
+            del sys.modules[_mod]
+
+_ensure_venv_priority()
 
 import anthropic
 
