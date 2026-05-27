@@ -228,6 +228,9 @@ class SessionState:
         # N-glycosylation site scan results: model_id → {chain_key: result_dict}
         # e.g. {"1": {"A": {"native_sequons": [...], "engineered_candidates": [...]}}}
         self.glycan_results: Dict[str, Dict[str, Any]] = {}
+        # ProteinMPNN + ESMFold combined validation results: model_id → {result, timestamp}
+        # validated_designs[*]["pdb_str"] is present in memory but stripped on save().
+        self.mpnn_esmfold_results: Dict[str, Dict[str, Any]] = {}
         # Rosetta relax cache: pdb_hash → relaxed_pdb_path
         # Tracks which PDB files have been FastRelax'd in WSL2.
         self.rosetta_relax_cache: Dict[str, str] = {}
@@ -571,6 +574,36 @@ class SessionState:
         entry = self.glycan_results.get(str(model_id), {}).get(chain)
         return entry["result"] if entry else None
 
+    # ── MPNN + ESMFold validation result tracking ─────────────────────────────
+
+    def set_mpnn_esmfold_results(
+        self,
+        model_id: str,
+        result:   Dict[str, Any],
+    ) -> None:
+        """
+        Store ProteinMPNN + ESMFold validation results for a model.
+
+        The full result (including ``pdb_str`` in each validated design) is
+        kept in memory.  ``pdb_str`` is stripped when the session is saved
+        to disk (regeneratable by re-running ESMFold).
+        """
+        from datetime import datetime as _dt
+        self.mpnn_esmfold_results[str(model_id)] = {
+            "result":    result,
+            "timestamp": _dt.now().isoformat(timespec="seconds"),
+        }
+
+    def get_mpnn_esmfold_results(
+        self,
+        model_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the MPNN + ESMFold validation result for a model, or None.
+        """
+        entry = self.mpnn_esmfold_results.get(str(model_id))
+        return entry["result"] if entry else None
+
     # ── Functional / active-site residue tracking ────────────────────────────
 
     def set_functional_residues(self, residues: set) -> None:
@@ -768,6 +801,16 @@ class SessionState:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, path: str = "session.json") -> None:
+        # Strip pdb_str from mpnn_esmfold_results before writing to disk.
+        # pdb_str can be several MB per design and is easily regeneratable.
+        mpnn_esmfold_to_save: Dict[str, Dict[str, Any]] = {}
+        for mid, entry in self.mpnn_esmfold_results.items():
+            entry_copy  = copy.deepcopy(entry)
+            result_data = entry_copy.get("result", {})
+            for design in result_data.get("validated_designs", []):
+                design.pop("pdb_str", None)
+            mpnn_esmfold_to_save[mid] = entry_copy
+
         data = {
             "session_start":        self.session_start,
             "working_dir":          self.working_dir,
@@ -785,6 +828,7 @@ class SessionState:
             "disulfide_candidates": self.disulfide_candidates,
             "proline_results":      self.proline_results,
             "glycan_results":       self.glycan_results,
+            "mpnn_esmfold_results": mpnn_esmfold_to_save,
             "rosetta_relax_cache":  self.rosetta_relax_cache,
             # sets are not JSON-serialisable; store as sorted list
             "functional_residues":  sorted(self.functional_residues),
@@ -815,6 +859,7 @@ class SessionState:
         state.disulfide_candidates = data.get("disulfide_candidates", {})
         state.proline_results      = data.get("proline_results", {})
         state.glycan_results       = data.get("glycan_results", {})
+        state.mpnn_esmfold_results = data.get("mpnn_esmfold_results", {})
         state.rosetta_relax_cache  = data.get("rosetta_relax_cache", {})
         state.functional_residues  = set(data.get("functional_residues", []))
         return state
@@ -834,41 +879,43 @@ class SessionState:
         Use restore(snap) to revert to this snapshot.
         """
         return copy.deepcopy({
-            "structures":           self.structures,
-            "named_selections":     self.named_selections,
-            "applied_styles":       self.applied_styles,
-            "command_history":      self.command_history,
-            "tool_results":         self.tool_results,
-            "rosetta_jobs":         self.rosetta_jobs,
-            "scan_results":         self.scan_results,
-            "assembly_info":        self.assembly_info,
-            "analysis_mode":        self.analysis_mode,
-            "interface_residues":   self.interface_residues,
-            "proteinmpnn_results":  self.proteinmpnn_results,
-            "disulfide_candidates": self.disulfide_candidates,
-            "proline_results":      self.proline_results,
-            "glycan_results":       self.glycan_results,
-            "rosetta_relax_cache":  self.rosetta_relax_cache,
-            "functional_residues":  set(self.functional_residues),
+            "structures":            self.structures,
+            "named_selections":      self.named_selections,
+            "applied_styles":        self.applied_styles,
+            "command_history":       self.command_history,
+            "tool_results":          self.tool_results,
+            "rosetta_jobs":          self.rosetta_jobs,
+            "scan_results":          self.scan_results,
+            "assembly_info":         self.assembly_info,
+            "analysis_mode":         self.analysis_mode,
+            "interface_residues":    self.interface_residues,
+            "proteinmpnn_results":   self.proteinmpnn_results,
+            "disulfide_candidates":  self.disulfide_candidates,
+            "proline_results":       self.proline_results,
+            "glycan_results":        self.glycan_results,
+            "mpnn_esmfold_results":  self.mpnn_esmfold_results,
+            "rosetta_relax_cache":   self.rosetta_relax_cache,
+            "functional_residues":   set(self.functional_residues),
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
         """
         Restore all mutable state fields from a snapshot produced by snapshot().
         """
-        self.structures           = copy.deepcopy(snap.get("structures",           {}))
-        self.named_selections     = copy.deepcopy(snap.get("named_selections",     {}))
-        self.applied_styles       = copy.deepcopy(snap.get("applied_styles",       []))
-        self.command_history      = copy.deepcopy(snap.get("command_history",      []))
-        self.tool_results         = copy.deepcopy(snap.get("tool_results",         {}))
-        self.rosetta_jobs         = copy.deepcopy(snap.get("rosetta_jobs",         {}))
-        self.scan_results         = copy.deepcopy(snap.get("scan_results",         {}))
-        self.assembly_info        = copy.deepcopy(snap.get("assembly_info",        {}))
-        self.analysis_mode        = copy.deepcopy(snap.get("analysis_mode",        {}))
-        self.interface_residues   = copy.deepcopy(snap.get("interface_residues",   {}))
-        self.proteinmpnn_results  = copy.deepcopy(snap.get("proteinmpnn_results",  {}))
-        self.disulfide_candidates = copy.deepcopy(snap.get("disulfide_candidates", {}))
-        self.proline_results      = copy.deepcopy(snap.get("proline_results",      {}))
-        self.glycan_results       = copy.deepcopy(snap.get("glycan_results",       {}))
-        self.rosetta_relax_cache  = copy.deepcopy(snap.get("rosetta_relax_cache",  {}))
-        self.functional_residues  = set(snap.get("functional_residues",  set()))
+        self.structures            = copy.deepcopy(snap.get("structures",            {}))
+        self.named_selections      = copy.deepcopy(snap.get("named_selections",      {}))
+        self.applied_styles        = copy.deepcopy(snap.get("applied_styles",        []))
+        self.command_history       = copy.deepcopy(snap.get("command_history",       []))
+        self.tool_results          = copy.deepcopy(snap.get("tool_results",          {}))
+        self.rosetta_jobs          = copy.deepcopy(snap.get("rosetta_jobs",          {}))
+        self.scan_results          = copy.deepcopy(snap.get("scan_results",          {}))
+        self.assembly_info         = copy.deepcopy(snap.get("assembly_info",         {}))
+        self.analysis_mode         = copy.deepcopy(snap.get("analysis_mode",         {}))
+        self.interface_residues    = copy.deepcopy(snap.get("interface_residues",    {}))
+        self.proteinmpnn_results   = copy.deepcopy(snap.get("proteinmpnn_results",   {}))
+        self.disulfide_candidates  = copy.deepcopy(snap.get("disulfide_candidates",  {}))
+        self.proline_results       = copy.deepcopy(snap.get("proline_results",       {}))
+        self.glycan_results        = copy.deepcopy(snap.get("glycan_results",        {}))
+        self.mpnn_esmfold_results  = copy.deepcopy(snap.get("mpnn_esmfold_results",  {}))
+        self.rosetta_relax_cache   = copy.deepcopy(snap.get("rosetta_relax_cache",   {}))
+        self.functional_residues   = set(snap.get("functional_residues",   set()))

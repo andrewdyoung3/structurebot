@@ -112,6 +112,7 @@ class ToolRouter:
         "esm":               "🧬",
         "esmfold":           "🔮",
         "proteinmpnn":       "🔬",
+        "mpnn_esmfold":      "🔬🔮",
         "rfdiffusion":       "🌀",
         "rosetta":           "⚗️",
         "mutation_scan":     "🔬⚗️",
@@ -120,6 +121,21 @@ class ToolRouter:
         "proline":           "🧪",
         "glycan":            "🍬",
     }
+
+    # Keywords that signal a ProteinMPNN + ESMFold validation request.
+    # Checked case-insensitively; any match replaces 'proteinmpnn' in the pipeline.
+    _MPNN_ESMFOLD_KEYWORDS: tuple = (
+        "validate mpnn",
+        "validate design",
+        "fold design",
+        "esmfold mpnn",
+        "esmfold design",
+        "check foldabilit",   # "check foldability"
+        "fold redesign",
+        "validate redesign",
+        "mpnn esmfold",
+        "mpnn+esmfold",
+    )
 
     # Keywords that signal a proline substitution scan request.
     # Checked case-insensitively; any match overrides generic mutation_scan routing.
@@ -145,17 +161,18 @@ class ToolRouter:
         self.session = session
 
         # Bridges are instantiated lazily on first use
-        self._camsol_bridge:        Optional[Any] = None
-        self._esm_bridge:           Optional[Any] = None
-        self._esmfold_bridge:       Optional[Any] = None
-        self._proteinmpnn_bridge:   Optional[Any] = None
-        self._rfdiffusion_bridge:   Optional[Any] = None
-        self._rosetta_bridge:       Optional[Any] = None
-        self._mutation_scanner:     Optional[Any] = None
-        self._assembly_analyser:    Optional[Any] = None
-        self._disulfide_bridge:     Optional[Any] = None
-        self._proline_bridge:       Optional[Any] = None
-        self._glycan_bridge:        Optional[Any] = None
+        self._camsol_bridge:           Optional[Any] = None
+        self._esm_bridge:              Optional[Any] = None
+        self._esmfold_bridge:          Optional[Any] = None
+        self._proteinmpnn_bridge:      Optional[Any] = None
+        self._mpnn_esmfold_pipeline:   Optional[Any] = None
+        self._rfdiffusion_bridge:      Optional[Any] = None
+        self._rosetta_bridge:          Optional[Any] = None
+        self._mutation_scanner:        Optional[Any] = None
+        self._assembly_analyser:       Optional[Any] = None
+        self._disulfide_bridge:        Optional[Any] = None
+        self._proline_bridge:          Optional[Any] = None
+        self._glycan_bridge:           Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -209,6 +226,52 @@ class ToolRouter:
 
         return new_tools, new_inputs
 
+    # ── MPNN+ESMFold intent helpers ───────────────────────────────────────────
+
+    @classmethod
+    def _detect_mpnn_esmfold_intent(cls, text: str) -> bool:
+        """Return True if *text* signals a ProteinMPNN + ESMFold validation request."""
+        lower = text.lower()
+        return any(kw in lower for kw in cls._MPNN_ESMFOLD_KEYWORDS)
+
+    def _rewrite_as_mpnn_esmfold(
+        self,
+        tools_needed: List[str],
+        tool_inputs:  Dict[str, Any],
+    ) -> tuple:
+        """
+        Replace ``'proteinmpnn'`` with ``'mpnn_esmfold'`` in the tool pipeline.
+
+        Builds mpnn_esmfold tool_inputs from the proteinmpnn inputs so that
+        model_id and chain are preserved.  Other tools are kept unchanged.
+
+        Returns (new_tools_needed, new_tool_inputs).
+        """
+        new_tools  = []
+        new_inputs = dict(tool_inputs)
+
+        for tool in tools_needed:
+            if tool == "proteinmpnn":
+                new_tools.append("mpnn_esmfold")
+                pi = tool_inputs.get("proteinmpnn", {})
+                new_inputs["mpnn_esmfold"] = {
+                    "model_id": pi.get("model_id") or self._first_model_id(),
+                    "chain_id": pi.get("chain_id") or pi.get("chain", "A"),
+                }
+                new_inputs.pop("proteinmpnn", None)
+            else:
+                new_tools.append(tool)
+
+        # If proteinmpnn was not in the list, still add mpnn_esmfold
+        if "mpnn_esmfold" not in new_tools:
+            new_tools.append("mpnn_esmfold")
+            new_inputs["mpnn_esmfold"] = {
+                "model_id": self._first_model_id(),
+                "chain_id": "A",
+            }
+
+        return new_tools, new_inputs
+
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
     def route(
@@ -236,6 +299,13 @@ class ToolRouter:
         if user_input and self._detect_proline_intent(user_input):
             if "mutation_scan" in tools_needed:
                 tools_needed, tool_inputs = self._rewrite_as_proline(
+                    tools_needed, tool_inputs
+                )
+
+        # ── MPNN+ESMFold intent override ───────────────────────────────────────
+        if user_input and self._detect_mpnn_esmfold_intent(user_input):
+            if "proteinmpnn" in tools_needed:
+                tools_needed, tool_inputs = self._rewrite_as_mpnn_esmfold(
                     tools_needed, tool_inputs
                 )
 
@@ -281,6 +351,14 @@ class ToolRouter:
             return f"ESMFold foldability prediction — #{mid} (ESM Atlas API)"
         if tool == "proteinmpnn":
             return "ProteinMPNN fixed-backbone sequence redesign"
+        if tool == "mpnn_esmfold":
+            inp   = tool_inputs.get("mpnn_esmfold", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            top_n = inp.get("top_n", 3)
+            return (
+                f"MPNN + ESMFold validation — #{mid} "
+                f"top {top_n} design(s) (pLDDT confidence)"
+            )
         if tool == "rfdiffusion":
             inp  = tool_inputs.get("rfdiffusion", {})
             mode = inp.get("mode", "binder")
@@ -431,6 +509,8 @@ class ToolRouter:
                 return self._run_esmfold(inputs)
             if tool == "proteinmpnn":
                 return self._run_proteinmpnn(inputs)
+            if tool == "mpnn_esmfold":
+                return self._run_mpnn_esmfold(inputs)
             if tool == "rfdiffusion":
                 return self._run_rfdiffusion(inputs)
             if tool == "rosetta":
@@ -461,8 +541,8 @@ class ToolRouter:
                 error=(
                     f"Unknown tool '{tool}'. "
                     "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
-                    "rfdiffusion, rosetta, mutation_scan, assembly_analyser, "
-                    "disulfide, proline, glycan."
+                    "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
+                    "assembly_analyser, disulfide, proline, glycan."
                 ),
             )
         except Exception as exc:
@@ -884,6 +964,67 @@ class ToolRouter:
         }
         return bridge.analyze(full_inputs, session=self.session)
 
+    def _run_mpnn_esmfold(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run ProteinMPNN + ESMFold combined redesign and validation pipeline."""
+        import time as _time
+        import config as _cfg
+
+        pipeline  = self._get_mpnn_esmfold_pipeline()
+        model_id  = inputs.get("model_id") or self._first_model_id()
+        chain_id  = inputs.get("chain_id") or inputs.get("chain", "A")
+        top_n     = int(inputs.get("top_n", _cfg.MPNN_ESMFOLD_TOP_N))
+        include_wt = bool(inputs.get("include_wildtype", _cfg.MPNN_ESMFOLD_INCLUDE_WT))
+        plddt_threshold = float(inputs.get("plddt_threshold", 70.0))
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+
+        t0 = _time.perf_counter()
+        try:
+            result = pipeline.run(
+                model_id         = model_id,
+                pdb_path         = pdb_path,
+                chain_id         = chain_id,
+                session          = self.session,
+                top_n            = top_n,
+                plddt_threshold  = plddt_threshold,
+                include_wildtype = include_wt,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return ToolStepResult(
+                tool    = "mpnn_esmfold",
+                success = False,
+                error   = f"MPNN+ESMFold pipeline failed: {exc}",
+            )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if not result.get("success"):
+            return ToolStepResult(
+                tool       = "mpnn_esmfold",
+                success    = False,
+                error      = result.get("error", "Pipeline failed"),
+                elapsed_ms = elapsed_ms,
+            )
+
+        # Store in session (pdb_str is stripped automatically on save)
+        self.session.set_mpnn_esmfold_results(model_id, result)
+
+        cx_cmds = result.get("chimerax_commands", [])
+        cx_exps = result.get("chimerax_explanations", [])
+
+        return ToolStepResult(
+            tool             = "mpnn_esmfold",
+            success          = True,
+            data             = {
+                k: v for k, v in result.items()
+                if k not in ("chimerax_commands", "chimerax_explanations", "summary")
+            },
+            viz_commands     = cx_cmds,
+            viz_explanations = cx_exps,
+            summary          = result.get("summary", "MPNN+ESMFold validation complete."),
+            elapsed_ms       = elapsed_ms,
+        )
+
     def _run_rfdiffusion(self, inputs: Dict[str, Any]) -> ToolStepResult:
         bridge = self._get_rfdiffusion_bridge()
         return bridge.analyze(inputs, session=self.session)
@@ -1180,6 +1321,12 @@ class ToolRouter:
             from proteinmpnn_bridge import ProteinMPNNBridge
             self._proteinmpnn_bridge = ProteinMPNNBridge()
         return self._proteinmpnn_bridge
+
+    def _get_mpnn_esmfold_pipeline(self):
+        if self._mpnn_esmfold_pipeline is None:
+            from mpnn_esmfold_pipeline import MPNNESMFoldPipeline
+            self._mpnn_esmfold_pipeline = MPNNESMFoldPipeline()
+        return self._mpnn_esmfold_pipeline
 
     def _get_rfdiffusion_bridge(self):
         if self._rfdiffusion_bridge is None:
@@ -1502,6 +1649,13 @@ class ToolRouter:
             status["glycan"] = "active (NXS/T sequon detection + SASA/SS/ESM scoring)"
         except ImportError:
             status["glycan"] = "module not found"
+
+        # mpnn_esmfold
+        try:
+            __import__("mpnn_esmfold_pipeline")
+            status["mpnn_esmfold"] = "active (ProteinMPNN + ESMFold combined validation)"
+        except ImportError:
+            status["mpnn_esmfold"] = "module not found"
 
         # rosetta_local via WSL2
         try:

@@ -175,6 +175,17 @@ ESMFOLD_FORCE_COLD_TIMEOUT: bool = (
     in ("1", "true", "yes")
 )
 
+# ── ProteinMPNN + ESMFold validation pipeline ─────────────────────────────────
+
+# How many top ProteinMPNN designs to validate with ESMFold.
+MPNN_ESMFOLD_TOP_N: int = int(os.environ.get("MPNN_ESMFOLD_TOP_N", "3"))
+
+# Whether to include the wildtype sequence as a baseline in ESMFold validation.
+MPNN_ESMFOLD_INCLUDE_WT: bool = (
+    os.environ.get("MPNN_ESMFOLD_INCLUDE_WT", "true").strip().lower()
+    not in ("0", "false", "no")
+)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 
