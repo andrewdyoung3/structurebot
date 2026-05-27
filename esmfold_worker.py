@@ -54,6 +54,7 @@ import argparse
 import json
 import sys
 import time
+import traceback as _traceback
 
 
 def _select_device() -> str:
@@ -117,58 +118,73 @@ def _run_inference(sequence: str, label: str, model_name: str) -> dict:
         flush=True,
     )
 
-    # ── Tokenise ──────────────────────────────────────────────────────────────
-    tokenized = tokenizer(
-        [sequence], return_tensors="pt", add_special_tokens=False
-    )
-    tokenized = {k: v.to(device) for k, v in tokenized.items()}
-
-    # ── Inference ─────────────────────────────────────────────────────────────
-    print("ESMFold: running inference...", flush=True)
-    t_inf = time.perf_counter()
-    with torch.no_grad():
-        outputs = model(**tokenized)
-    print(
-        f"ESMFold: inference done ({time.perf_counter() - t_inf:.1f}s)",
-        flush=True,
-    )
-
-    # ── Extract pLDDT ─────────────────────────────────────────────────────────
-    # outputs.plddt: (1, seq_len, 37) — 37 atom types per residue, 0-1 scale
-    plddt_tensor = outputs.plddt                               # (1, seq_len, 37)
-    plddt_per_res = plddt_tensor[0].mean(dim=-1)               # (seq_len,)
-    plddt_per_res = plddt_per_res.cpu().float().numpy() * 100  # 0-100 scale
-
-    # 1-based residue dict  (keys are strings for JSON compatibility)
-    plddt_dict = {
-        str(i + 1): round(float(v), 2)
-        for i, v in enumerate(plddt_per_res)
-    }
-    mean_plddt = round(float(plddt_per_res.mean()), 2) if len(plddt_per_res) else 0.0
-
-    # ── PDB conversion ────────────────────────────────────────────────────────
-    pdb_str = ""
+    # ── Tokenise + Inference + pLDDT extraction ───────────────────────────────
+    # Any exception here (dtype mismatch, CUDA OOM, shape error, etc.) is
+    # caught and returned as a structured failure dict.  The caller (main)
+    # writes this to the output JSON and exits 0 so the bridge always has
+    # a parseable result — it never sees a silent exit-code-1 failure.
     try:
-        pdb_strings = model.output_to_pdb(outputs)
-        pdb_str = pdb_strings[0] if pdb_strings else ""
+        tokenized = tokenizer(
+            [sequence], return_tensors="pt", add_special_tokens=False
+        )
+        tokenized = {k: v.to(device) for k, v in tokenized.items()}
+
+        print("ESMFold: running inference...", flush=True)
+        t_inf = time.perf_counter()
+        with torch.no_grad():
+            outputs = model(**tokenized)
+        print(
+            f"ESMFold: inference done ({time.perf_counter() - t_inf:.1f}s)",
+            flush=True,
+        )
+
+        # outputs.plddt: (1, seq_len, 37) — 37 atom types per residue, 0-1 scale
+        plddt_tensor  = outputs.plddt                               # (1, seq_len, 37)
+        plddt_per_res = plddt_tensor[0].mean(dim=-1)                # (seq_len,)
+        plddt_per_res = plddt_per_res.cpu().float().numpy() * 100   # 0-100 scale
+
+        # 1-based residue dict (string keys for JSON compatibility)
+        plddt_dict = {
+            str(i + 1): round(float(v), 2)
+            for i, v in enumerate(plddt_per_res)
+        }
+        mean_plddt = round(float(plddt_per_res.mean()), 2) if len(plddt_per_res) else 0.0
+
+        # PDB conversion (best-effort — non-fatal if it fails)
+        pdb_str = ""
+        try:
+            pdb_strings = model.output_to_pdb(outputs)
+            pdb_str = pdb_strings[0] if pdb_strings else ""
+        except Exception as exc:
+            print(f"ESMFold: PDB conversion failed ({exc}); pdb_str will be empty.", flush=True)
+
+        elapsed = time.perf_counter() - t0
+        print("ESMFold: done.", flush=True)
+
+        return {
+            "success":    True,
+            "label":      label,
+            "plddt":      plddt_dict,
+            "mean_plddt": mean_plddt,
+            "pdb_str":    pdb_str,
+            "length":     len(sequence),
+            "error":      None,
+            "elapsed_s":  round(elapsed, 3),
+            "device":     device,
+            "dtype":      "float16" if device == "cuda" else "float32",
+        }
+
     except Exception as exc:
-        print(f"ESMFold: PDB conversion failed ({exc}); pdb_str will be empty.", flush=True)
-
-    elapsed = time.perf_counter() - t0
-    print("ESMFold: done.", flush=True)
-
-    return {
-        "success":    True,
-        "label":      label,
-        "plddt":      plddt_dict,
-        "mean_plddt": mean_plddt,
-        "pdb_str":    pdb_str,
-        "length":     len(sequence),
-        "error":      None,
-        "elapsed_s":  round(elapsed, 3),
-        "device":     device,
-        "dtype":      "float16" if device == "cuda" else "float32",
-    }
+        print(
+            f"ESMFold: inference exception: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return {
+            "success": False,
+            "label":   label,
+            "error":   f"{type(exc).__name__}: {exc}",
+            "trace":   _traceback.format_exc(),
+        }
 
 
 def main() -> None:
@@ -187,7 +203,8 @@ def main() -> None:
         result: dict = {"success": False, "error": f"Failed to read input: {exc}"}
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(result, fh)
-        sys.exit(1)
+        print(f"ESMFold worker FAILED: {result['error']}", flush=True)
+        sys.exit(0)  # exit cleanly — bridge reads the error JSON
 
     sequence   = inp.get("sequence", "")
     label      = inp.get("label",    "query")
@@ -197,17 +214,20 @@ def main() -> None:
         result = {"success": False, "error": "Input JSON missing 'sequence' key"}
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(result, fh)
-        sys.exit(1)
+        print(f"ESMFold worker FAILED: {result['error']}", flush=True)
+        sys.exit(0)  # exit cleanly — bridge reads the error JSON
 
     # ── Run inference ─────────────────────────────────────────────────────────
+    # _run_inference catches all internal exceptions and returns a failure dict;
+    # this outer try is a last-resort guard for anything that slips through.
     try:
         result = _run_inference(sequence, label, model_name)
     except Exception as exc:
-        import traceback
         result = {
             "success": False,
             "error":   f"{type(exc).__name__}: {exc}",
-            "trace":   traceback.format_exc(),
+            "trace":   _traceback.format_exc(),
+            "label":   label,
         }
 
     # ── Write output ──────────────────────────────────────────────────────────
@@ -215,12 +235,13 @@ def main() -> None:
         json.dump(result, fh)
 
     if not result.get("success"):
+        # Print to stdout (captured by bridge via capture_output=True)
+        # so the error is always surfaced regardless of exit code.
         print(
             f"ESMFold worker FAILED: {result.get('error', '?')}",
-            file=sys.stderr,
             flush=True,
         )
-        sys.exit(1)
+        sys.exit(0)  # exit cleanly — bridge reads success=False from the JSON
 
     print(
         f"ESMFold: {result.get('length', '?')} residues, "

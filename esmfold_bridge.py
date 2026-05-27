@@ -589,19 +589,21 @@ class ESMFoldBridge:
                     if line.strip():
                         _pprint(line)
 
-            # Relay stderr on failure
-            if proc.returncode != 0 and proc.stderr:
-                for line in proc.stderr.splitlines()[:10]:
-                    if line.strip():
-                        _pprint(f"  [ESMFold-worker] {line}")
-
             if proc.returncode != 0:
+                # Non-zero exit = catastrophic worker crash (OOM, import error,
+                # Python hard crash) — no output JSON was written.
+                # Surface every line of stderr so the actual traceback is visible.
+                # (capture_output=True already sets stderr=PIPE; text=True gives str)
                 _pprint(
                     f"  ESMFold: venv312 worker exited {proc.returncode}"
                 )
+                if proc.stderr:
+                    for line in proc.stderr.splitlines():
+                        if line.strip():
+                            _pprint(f"  [ESMFold-worker-stderr] {line}")
                 return None
 
-            # Read result JSON
+            # Read result JSON (worker always exits 0 and writes this on any error)
             if not Path(out_path).is_file():
                 _pprint("  ESMFold: venv312 worker produced no output file")
                 return None
@@ -613,6 +615,12 @@ class ESMFoldBridge:
                 _pprint(
                     f"  ESMFold: venv312 worker error: {result.get('error', '?')}"
                 )
+                # Surface full traceback if the worker wrote one
+                trace = result.get("trace", "")
+                if trace:
+                    for line in trace.splitlines():
+                        if line.strip():
+                            _pprint(f"  [ESMFold-worker-trace] {line}")
                 return None
 
             # ── pLDDT scale guard ─────────────────────────────────────────────

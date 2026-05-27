@@ -749,6 +749,149 @@ def test_sub2_plddt_returns_error_not_success() -> None:
         f"error={result.get('error')!r}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# I. Stderr surfacing + worker exception JSON
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_worker_stderr_surfaced_on_failure() -> None:
+    """
+    When the worker subprocess exits non-zero, its full stderr is printed via
+    _pprint with the [ESMFold-worker-stderr] prefix — no line cap.
+
+    This ensures the actual Python traceback from a catastrophic worker crash
+    (e.g. import error, OOM kill) is always visible to the user.
+    """
+    import requests as _req
+
+    print("\n=== I. Stderr surfacing + worker exception JSON ===")
+    bridge = _make_bridge()
+
+    def _fake_run_crash(cmd, **kwargs):
+        """Simulate a worker that crashes before writing any output JSON."""
+        mock = MagicMock()
+        mock.returncode = 1
+        mock.stdout     = ""
+        mock.stderr     = (
+            "Traceback (most recent call last):\n"
+            '  File "esmfold_worker.py", line 99, in _run_inference\n'
+            "    model = EsmForProteinFolding.from_pretrained(...)\n"
+            "RuntimeError: CUDA error: device-side assert triggered"
+        )
+        return mock
+
+    printed: list[str] = []
+
+    with patch("esmfold_bridge.subprocess.run", side_effect=_fake_run_crash):
+        with patch.object(_cfg, "ESMFOLD_USE_LOCAL", True):
+            with patch("esmfold_bridge._is_model_cached", return_value=True):
+                with patch("esmfold_bridge._pprint", side_effect=printed.append):
+                    # Patch Atlas so we don't make real network calls on fallback
+                    with patch(
+                        "requests.post",
+                        side_effect=_req.exceptions.ConnectionError("offline"),
+                    ):
+                        bridge._local_available = lambda: True
+                        result = bridge.predict("MA", label="stderr_test")
+
+    all_output = "\n".join(printed)
+    _assert(
+        "[ESMFold-worker-stderr]" in all_output,
+        "stderr prefix [ESMFold-worker-stderr] appears in output",
+        f"got:\n{all_output}",
+    )
+    _assert(
+        "RuntimeError" in all_output,
+        "RuntimeError from worker stderr is surfaced",
+        f"got:\n{all_output}",
+    )
+    # All 4 lines of the traceback should appear (no 10-line cap)
+    _assert(
+        "CUDA error: device-side assert triggered" in all_output,
+        "full error message (not truncated) is surfaced",
+        f"got:\n{all_output}",
+    )
+
+
+def test_worker_exception_written_to_json() -> None:
+    """
+    When _run_inference raises, main() catches it, writes success=False JSON,
+    and exits 0 — not 1.  The bridge then reads the JSON and surfaces the error.
+
+    This is the critical invariant: the worker must NEVER exit 1 after writing
+    a JSON, because the bridge ignores the output file on non-zero exit.
+    """
+    import tempfile
+    import esmfold_worker
+
+    bridge = _make_bridge()
+
+    # Temp files for the worker protocol
+    inp_fd, inp_path = tempfile.mkstemp(suffix="_esmfold_in.json")
+    out_fd, out_path = tempfile.mkstemp(suffix="_esmfold_out.json")
+    import os as _os
+    _os.close(inp_fd)
+    _os.close(out_fd)
+
+    try:
+        with open(inp_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"sequence": "MAGLK", "label": "exc_test", "model": "fake/model"},
+                fh,
+            )
+
+        # Patch _run_inference to raise — simulates a dtype mismatch or OOM
+        def _raise_runtime(*args, **kwargs):
+            raise RuntimeError("CUDA error: out of memory (simulated)")
+
+        exit_code_seen: list[int] = []
+
+        def _fake_exit(code=0):
+            exit_code_seen.append(code)
+            raise SystemExit(code)
+
+        with patch.object(esmfold_worker, "_run_inference", side_effect=_raise_runtime):
+            with patch.object(sys, "argv",
+                              ["esmfold_worker.py",
+                               "--input",  inp_path,
+                               "--output", out_path]):
+                with patch.object(sys, "exit", side_effect=_fake_exit):
+                    try:
+                        esmfold_worker.main()
+                    except SystemExit:
+                        pass
+
+        # ── Verify exit code is 0 ────────────────────────────────────────────
+        _assert(
+            exit_code_seen and exit_code_seen[0] == 0,
+            "worker exits 0 when inference raises (JSON written first)",
+            f"got exit codes: {exit_code_seen}",
+        )
+
+        # ── Verify output JSON has success=False + traceback ─────────────────
+        with open(out_path, "r", encoding="utf-8") as fh:
+            written = json.load(fh)
+
+        _assert(
+            not written.get("success"),
+            "output JSON has success=False",
+            f"got: {written}",
+        )
+        _assert(
+            "RuntimeError" in (written.get("error") or ""),
+            "output JSON error contains 'RuntimeError'",
+            f"got error: {written.get('error')!r}",
+        )
+        _assert(
+            written.get("trace") is not None,
+            "output JSON includes a traceback string",
+            f"got trace: {written.get('trace')!r}",
+        )
+
+    finally:
+        Path(inp_path).unlink(missing_ok=True)
+        Path(out_path).unlink(missing_ok=True)
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -786,6 +929,9 @@ def main() -> int:
     test_warm_start_uses_short_timeout()
     test_force_cold_timeout_overrides_cache()
     test_sub2_plddt_returns_error_not_success()
+
+    test_worker_stderr_surfaced_on_failure()
+    test_worker_exception_written_to_json()
 
     print()
     print("=" * 60)
