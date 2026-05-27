@@ -381,7 +381,12 @@ class StructureBot:
                 name = user_input.split(maxsplit=2)[2] if len(user_input.split()) > 2 else "default"
                 self._cmd_load_session(name)
             else:
-                self._handle_request(user_input)
+                # Check for active-site management before hitting the LLM
+                msg = self.router.handle_active_site_command(user_input)
+                if msg:
+                    console.print(f"[ok]✓[/ok] {escape(msg)}")
+                else:
+                    self._handle_request(user_input)
 
     # ── Natural language pipeline ─────────────────────────────────────────────
 
@@ -391,7 +396,7 @@ class StructureBot:
             result = self.translator.translate(user_input, self.session)
 
         # 2. Route (augment with tool pipeline info; no execution yet)
-        result = self.router.route(result)
+        result = self.router.route(result, user_input=user_input)
 
         # 3. Clarification loop (max 2 rounds)
         for _ in range(2):
@@ -406,7 +411,7 @@ class StructureBot:
             self.translator.add_clarification(answer)
             with console.status("[cyan]Retranslating…[/cyan]"):
                 result = self.translator.translate(answer, self.session)
-            result = self.router.route(result)
+            result = self.router.route(result, user_input=user_input)
 
         if result.get("clarification_needed"):
             console.print("[warn]Still ambiguous — please rephrase.[/warn]")

@@ -10,6 +10,7 @@
 - Cavity detection (pyCAST)
 - Duration estimation (pre-scan time estimate)
 - Session log analysis improvements (timing data pipeline)
+- Glycan bridge: full SASA-based surface exposure scoring (current stub uses ESM only)
 
 ## Future
 - RFdiffusion activation (~20GB weights)
@@ -26,3 +27,6 @@
 - S7: Dihedral fix + ProteinMPNN + RFdiffusion + QoL
 - S8A: Parallel DynaMut2 + ESMFold bridge (Atlas) + log analyser + Cys audit
 - S8B: ESMFold local GPU inference (venv312 + transformers, 184 tests)
+- S9A: proline_bridge (backbone φ/ψ scanner, 27 tests) + glycan_bridge stub + session_state/tool_router hooks (215 tests total)
+- S9B: esmfold_bridge cold/warm timeout + Atlas demotion + pLDDT guard (218 tests total)
+- S9C: proline routing fix — _PROLINE_KEYWORDS + route() override + _dispatch_tool guard + exclusion counts + φ labels (230 tests total)
