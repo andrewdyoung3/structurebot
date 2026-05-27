@@ -33,6 +33,9 @@ def _make_router() -> ToolRouter:
     mock_bridge  = MagicMock()
     mock_session = MagicMock()
     mock_session.structures = {"1": {"name": "1HSG", "path": None}}
+    # Default: no ProteinMPNN results in session.  Tests that need results
+    # must override this via _make_router_with_mpnn_session() below.
+    mock_session.get_proteinmpnn_result.return_value = None
     return ToolRouter(bridge=mock_bridge, session=mock_session)
 
 
@@ -352,3 +355,274 @@ def test_solubility_mutation_scan_unaffected_by_glycan_routing(user_input):
         f"Phrase {user_input!r} should NOT trigger glycan routing; "
         f"got {routed['tools_needed']}"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 8. MPNN+ESMFold routing — session-aware esmfold → mpnn_esmfold redirect
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _esmfold_translator_result(chain: str = "A") -> Dict[str, Any]:
+    """Fake translator result when the LLM emits 'esmfold' (single tool)."""
+    return {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "high",
+        "tools_needed":         ["esmfold"],
+        "tool_inputs":          {
+            "esmfold": {"model_id": "1", "chain": chain},
+        },
+    }
+
+
+def _proteinmpnn_translator_result(chain: str = "A") -> Dict[str, Any]:
+    """Fake translator result when the LLM emits 'proteinmpnn'."""
+    return {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "high",
+        "tools_needed":         ["proteinmpnn"],
+        "tool_inputs":          {
+            "proteinmpnn": {"model_id": "1", "chain_id": chain},
+        },
+    }
+
+
+def _make_router_with_mpnn_session() -> "ToolRouter":
+    """
+    Return a ToolRouter whose session already contains a ProteinMPNN result
+    for model '1' (simulates having run a redesign earlier in the session).
+
+    We set get_proteinmpnn_result.return_value directly because
+    add_proteinmpnn_result on a MagicMock is a no-op (it doesn't persist data).
+    """
+    _mpnn_data = {
+        "sequences": [
+            {"sequence": "ACDE", "score": -1.2, "recovery": 0.9, "mutations": ["L2A"]},
+        ],
+        "wildtype_sequence": "ACLE",
+        "fixed_positions":   [],
+        "backend":           "local",
+    }
+    router = _make_router()
+    router.session.get_proteinmpnn_result.return_value = _mpnn_data
+    return router
+
+
+def test_esmfold_phrase_with_mpnn_session_routes_to_mpnn_esmfold():
+    """
+    "ESMFold top 2-3 sequences to assess structural integrity" should route to
+    mpnn_esmfold (not plain esmfold) when the session has ProteinMPNN results.
+    """
+    router       = _make_router_with_mpnn_session()
+    translator_r = _esmfold_translator_result()
+    user_input   = "ESMFold top 2-3 sequences to assess structural integrity"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mpnn_esmfold" in routed["tools_needed"], (
+        f"Expected mpnn_esmfold; got {routed['tools_needed']}"
+    )
+    assert "esmfold" not in routed["tools_needed"], (
+        f"'esmfold' should be replaced; got {routed['tools_needed']}"
+    )
+
+
+def test_esmfold_phrase_without_mpnn_session_stays_esmfold():
+    """
+    The same ESMFold phrase should NOT redirect to mpnn_esmfold when the
+    session has no ProteinMPNN results (no prior redesign run).
+    """
+    router       = _make_router()          # empty session
+    translator_r = _esmfold_translator_result()
+    user_input   = "ESMFold top 2-3 sequences to assess structural integrity"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "esmfold" in routed["tools_needed"], (
+        f"Without MPNN session, esmfold should be kept; got {routed['tools_needed']}"
+    )
+    assert "mpnn_esmfold" not in routed["tools_needed"], (
+        f"mpnn_esmfold should NOT appear without MPNN session; got {routed['tools_needed']}"
+    )
+
+
+def test_structural_integrity_phrase_routes_to_mpnn_esmfold():
+    """
+    'assess structural integrity of designed sequences' with an MPNN session
+    must route to mpnn_esmfold even when translator emits 'esmfold'.
+    """
+    router       = _make_router_with_mpnn_session()
+    translator_r = _esmfold_translator_result()
+    user_input   = "assess structural integrity of designed sequences"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mpnn_esmfold" in routed["tools_needed"], (
+        f"Expected mpnn_esmfold; got {routed['tools_needed']}"
+    )
+
+
+def test_validate_design_routes_to_mpnn_esmfold():
+    """
+    'validate design' with proteinmpnn in translator output must always rewrite
+    to mpnn_esmfold (session not required for 'proteinmpnn' rewriting).
+    """
+    router       = _make_router()          # no MPNN results in session
+    translator_r = _proteinmpnn_translator_result()
+    user_input   = "validate design by folding with ESMFold"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mpnn_esmfold" in routed["tools_needed"], (
+        f"'proteinmpnn' should always rewrite to mpnn_esmfold; got {routed['tools_needed']}"
+    )
+    assert "proteinmpnn" not in routed["tools_needed"]
+
+
+def test_check_fold_without_mpnn_session_stays_esmfold():
+    """
+    'check fold' is an MPNN_ESMFOLD keyword, but without MPNN session results,
+    an 'esmfold' tool should NOT be rewritten to mpnn_esmfold.
+    """
+    router       = _make_router()
+    translator_r = _esmfold_translator_result()
+    user_input   = "check fold quality of the current structure"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "esmfold" in routed["tools_needed"], (
+        f"Without MPNN session, 'check fold' should keep esmfold; got {routed['tools_needed']}"
+    )
+    assert "mpnn_esmfold" not in routed["tools_needed"]
+
+
+def test_rewrite_as_mpnn_esmfold_handles_esmfold_in_tools():
+    """
+    _rewrite_as_mpnn_esmfold(['esmfold'], ...) must produce ['mpnn_esmfold'],
+    not ['esmfold', 'mpnn_esmfold'].
+    """
+    router     = _make_router()
+    tools_in   = ["esmfold"]
+    inputs_in  = {"esmfold": {"model_id": "1", "chain": "A"}}
+
+    new_tools, new_inputs = router._rewrite_as_mpnn_esmfold(tools_in, inputs_in)
+
+    assert new_tools == ["mpnn_esmfold"], f"Expected ['mpnn_esmfold'], got {new_tools}"
+    assert "esmfold" not in new_inputs,   "esmfold key should be removed from tool_inputs"
+    assert "mpnn_esmfold" in new_inputs,  "mpnn_esmfold key should be added to tool_inputs"
+    assert new_inputs["mpnn_esmfold"]["model_id"] == "1"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 9. Dispatch-level guard: 'esmfold' tool redirects to mpnn_esmfold when appropriate
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_dispatch_esmfold_redirects_to_mpnn_esmfold_with_session():
+    """
+    _dispatch_tool('esmfold', ...) must redirect to _run_mpnn_esmfold when
+    (a) user_input has MPNN keywords, AND (b) session has MPNN results.
+    """
+    router = _make_router_with_mpnn_session()
+
+    mock_mpnn_esmfold = MagicMock(return_value=_ok_scan_result())
+    mock_esmfold      = MagicMock(return_value=_ok_scan_result())
+    router._run_mpnn_esmfold = mock_mpnn_esmfold
+    router._run_esmfold      = mock_esmfold
+
+    inputs     = {"model_id": "1", "chain": "A"}
+    user_input = "ESMFold top sequences to assess structural integrity"
+
+    router._dispatch_tool("esmfold", inputs, user_input=user_input)
+
+    assert mock_mpnn_esmfold.called, "_run_mpnn_esmfold should have been called"
+    assert not mock_esmfold.called,  "_run_esmfold should NOT have been called"
+
+
+def test_dispatch_esmfold_no_redirect_without_session():
+    """
+    _dispatch_tool('esmfold', ...) must NOT redirect when session is empty,
+    even with MPNN/ESMFold keywords present.
+    """
+    router = _make_router()   # empty session — no MPNN results
+
+    mock_mpnn_esmfold = MagicMock(return_value=_ok_scan_result())
+    mock_esmfold      = MagicMock(return_value=_ok_scan_result())
+    router._run_mpnn_esmfold = mock_mpnn_esmfold
+    router._run_esmfold      = mock_esmfold
+
+    inputs     = {"model_id": "1", "chain": "A"}
+    user_input = "ESMFold top sequences to assess structural integrity"
+
+    router._dispatch_tool("esmfold", inputs, user_input=user_input)
+
+    assert mock_esmfold.called,          "_run_esmfold should have been called"
+    assert not mock_mpnn_esmfold.called, "_run_mpnn_esmfold should NOT be called without MPNN session"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 10. handle_sequence_display_command / _show_designed_sequences
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_handle_sequence_display_returns_none_without_session():
+    """
+    handle_sequence_display_command must return None when the session has
+    no ProteinMPNN results, even if the phrase matches.
+    """
+    router = _make_router()
+    result = router.handle_sequence_display_command("show designed sequences")
+    assert result is None, (
+        "Should return None (no MPNN results) so the LLM handles the request"
+    )
+
+
+def test_handle_sequence_display_returns_none_for_non_display_phrase():
+    """
+    Non-display phrases must return None regardless of session state.
+    """
+    router = _make_router_with_mpnn_session()
+    result = router.handle_sequence_display_command("run a mutation scan on chain A")
+    assert result is None
+
+
+def test_handle_sequence_display_with_session_returns_string():
+    """
+    When the session has MPNN results and user_input matches a display
+    keyword, handle_sequence_display_command must return a non-empty string.
+    """
+    router = _make_router_with_mpnn_session()
+    result = router.handle_sequence_display_command("show designed sequences")
+    assert result is not None, "Should return a display string when session has results"
+    assert isinstance(result, str)
+    assert len(result) > 10
+
+
+def test_show_designed_sequences_format():
+    """
+    _show_designed_sequences() must include model_id, score, recovery,
+    mutation count, and the sequence (possibly truncated).
+    """
+    router = _make_router_with_mpnn_session()
+    output = router._show_designed_sequences()
+
+    assert "model #1" in output or "#1" in output, "model_id should appear"
+    assert "Score" in output
+    assert "Recovery" in output
+    assert "Mutations" in output
+    assert "Sequence" in output
+    # The single design stored by _make_router_with_mpnn_session has mutation L2A
+    assert "L2A" in output or "1" in output   # mutation or count
+
+
+def test_show_designed_sequences_no_results():
+    """
+    _show_designed_sequences() when no MPNN results in session returns an
+    informative error message (not an exception).
+    """
+    router = _make_router()
+    output = router._show_designed_sequences()
+    assert isinstance(output, str)
+    assert "No ProteinMPNN results" in output

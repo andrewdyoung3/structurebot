@@ -386,7 +386,12 @@ class StructureBot:
                 if msg:
                     console.print(f"[ok]✓[/ok] {escape(msg)}")
                 else:
-                    self._handle_request(user_input)
+                    # Check for sequence display command before hitting the LLM
+                    seq_msg = self.router.handle_sequence_display_command(user_input)
+                    if seq_msg:
+                        console.print(seq_msg)
+                    else:
+                        self._handle_request(user_input)
 
     # ── Natural language pipeline ─────────────────────────────────────────────
 

@@ -123,18 +123,52 @@ class ToolRouter:
     }
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
-    # Checked case-insensitively; any match replaces 'proteinmpnn' in the pipeline.
+    # Checked case-insensitively; any match replaces 'proteinmpnn' (or 'esmfold'
+    # when session has MPNN results) in the pipeline.
     _MPNN_ESMFOLD_KEYWORDS: tuple = (
-        "validate mpnn",
         "validate design",
+        "validate sequence",
         "fold design",
+        "fold sequence",
         "esmfold mpnn",
-        "esmfold design",
-        "check foldabilit",   # "check foldability"
-        "fold redesign",
-        "validate redesign",
+        "esmfold proteinmpnn",
         "mpnn esmfold",
-        "mpnn+esmfold",
+        "proteinmpnn esmfold",
+        "fold redesign",
+        "structural integrity",
+        "assess fold",
+        "check fold",
+        "validate mpnn",
+        "esmfold top",
+        "fold top",
+        "sequences to assess",
+        "designed sequences",
+        "redesigned sequences",
+    )
+
+    # Contextual keywords: when present alongside a session with MPNN results,
+    # an 'esmfold' dispatch is redirected to _run_mpnn_esmfold().
+    _MPNN_CONTEXT_KEYWORDS: tuple = (
+        "sequence",
+        "design",
+        "top",
+        "integrity",
+        "redesign",
+    )
+
+    # Keywords that trigger the "show designed sequences" fast-path handler
+    # (bypasses LLM when session already has ProteinMPNN results).
+    _SEQUENCE_DISPLAY_KEYWORDS: tuple = (
+        "show designed sequences",
+        "show design sequences",
+        "list designed sequences",
+        "list sequences",
+        "print designed sequences",
+        "display designed sequences",
+        "what are the designed sequences",
+        "show mpnn sequences",
+        "what sequences did",
+        "show me the sequences",
     )
 
     # Keywords that signal an N-glycosylation site scan request.
@@ -322,10 +356,20 @@ class ToolRouter:
                     "chain_id": pi.get("chain_id") or pi.get("chain", "A"),
                 }
                 new_inputs.pop("proteinmpnn", None)
+            elif tool == "esmfold":
+                # Redirect standalone ESMFold → mpnn_esmfold when session has
+                # MPNN results (route() gate already checked this condition).
+                new_tools.append("mpnn_esmfold")
+                ei = tool_inputs.get("esmfold", {})
+                new_inputs["mpnn_esmfold"] = {
+                    "model_id": ei.get("model_id") or self._first_model_id(),
+                    "chain_id": ei.get("chain_id") or ei.get("chain", "A"),
+                }
+                new_inputs.pop("esmfold", None)
             else:
                 new_tools.append(tool)
 
-        # If proteinmpnn was not in the list, still add mpnn_esmfold
+        # If neither proteinmpnn nor esmfold was in the list, still add mpnn_esmfold
         if "mpnn_esmfold" not in new_tools:
             new_tools.append("mpnn_esmfold")
             new_inputs["mpnn_esmfold"] = {
@@ -366,8 +410,17 @@ class ToolRouter:
                 )
 
         # ── MPNN+ESMFold intent override ───────────────────────────────────────
+        # Always rewrite if 'proteinmpnn' is in the pipeline.
+        # Only rewrite 'esmfold' → 'mpnn_esmfold' when the session already holds
+        # ProteinMPNN results (prevents "check fold mutation I64E" from hijacking
+        # a plain ESMFold foldability request on a structure with no designs).
         if user_input and self._detect_mpnn_esmfold_intent(user_input):
-            if "proteinmpnn" in tools_needed:
+            _session_has_mpnn = (
+                self.session.get_proteinmpnn_result(self._first_model_id()) is not None
+            )
+            if "proteinmpnn" in tools_needed or (
+                _session_has_mpnn and "esmfold" in tools_needed
+            ):
                 tools_needed, tool_inputs = self._rewrite_as_mpnn_esmfold(
                     tools_needed, tool_inputs
                 )
@@ -590,6 +643,23 @@ class ToolRouter:
             if tool == "esm":
                 return self._run_esm(inputs)
             if tool == "esmfold":
+                # ── MPNN+ESMFold guard (secondary safety net) ────────────────
+                # If the user's request contains MPNN/ESMFold validation keywords
+                # *or* general context keywords (design, sequence, top, …) and
+                # the session already holds ProteinMPNN results, redirect to the
+                # combined pipeline instead of the bare ESMFold tool.
+                if user_input:
+                    _lower_ui         = user_input.lower()
+                    _has_mpnn_kw      = self._detect_mpnn_esmfold_intent(user_input)
+                    _has_ctx_kw       = any(kw in _lower_ui for kw in self._MPNN_CONTEXT_KEYWORDS)
+                    _session_has_mpnn = (
+                        self.session.get_proteinmpnn_result(self._first_model_id()) is not None
+                    )
+                    if (_has_mpnn_kw or _has_ctx_kw) and _session_has_mpnn:
+                        return self._run_mpnn_esmfold({
+                            "model_id": inputs.get("model_id") or self._first_model_id(),
+                            "chain_id": inputs.get("chain_id") or inputs.get("chain", "A"),
+                        })
                 return self._run_esmfold(inputs)
             if tool == "proteinmpnn":
                 return self._run_proteinmpnn(inputs)
@@ -1647,6 +1717,92 @@ class ToolRouter:
             return "No active-site residues declared (SASA auto-detection will be used)."
 
         return None   # not an active-site command
+
+    # ── Sequence display command handler ──────────────────────────────────────
+
+    def handle_sequence_display_command(self, user_input: str) -> Optional[str]:
+        """
+        Handle "show designed sequences" and similar commands without LLM translation.
+
+        Returns a human-readable string if BOTH conditions hold:
+          1. *user_input* contains a sequence-display keyword, AND
+          2. The session already holds ProteinMPNN results.
+
+        Returns None if either condition is false — the caller should fall through
+        to LLM translation so the model can answer naturally.
+        """
+        lower = user_input.lower().strip()
+        if not any(kw in lower for kw in self._SEQUENCE_DISPLAY_KEYWORDS):
+            return None
+
+        model_id = self._first_model_id()
+        if self.session.get_proteinmpnn_result(model_id) is None:
+            return None   # no results yet — let the LLM respond
+
+        return self._show_designed_sequences()
+
+    def _show_designed_sequences(self) -> str:
+        """
+        Build a human-readable display of ProteinMPNN designed sequences
+        from the current session.
+
+        Returns a multi-line string ready for console.print(), or an
+        informative error message if no MPNN results are in the session.
+        """
+        model_id  = self._first_model_id()
+        mpnn_data = self.session.get_proteinmpnn_result(model_id)
+        if not mpnn_data:
+            return (
+                "No ProteinMPNN results in session. "
+                "Run a sequence redesign first "
+                "(e.g. 'redesign chain A with ProteinMPNN')."
+            )
+
+        sequences   = mpnn_data.get("sequences", [])
+        wildtype    = mpnn_data.get("wildtype_sequence", "")
+        backend     = mpnn_data.get("backend", "unknown")
+        n_sequences = len(sequences)
+
+        if not sequences:
+            return "ProteinMPNN ran but produced no designed sequences."
+
+        lines = [
+            f"ProteinMPNN Designed Sequences — model #{model_id} ({backend})",
+            f"  Wildtype length: {len(wildtype)} residues",
+            f"  Designs: {n_sequences}",
+            "",
+        ]
+
+        for i, seq_entry in enumerate(sequences, 1):
+            seq       = seq_entry.get("sequence", "")
+            score     = seq_entry.get("score", 0.0)
+            recovery  = seq_entry.get("recovery", 0.0)
+            mutations = list(seq_entry.get("mutations") or [])
+
+            # Compute mutations from diff if not stored
+            if not mutations and wildtype and seq:
+                try:
+                    from mpnn_esmfold_pipeline import _diff_sequences
+                    mutations = _diff_sequences(wildtype, seq)
+                except ImportError:
+                    pass
+
+            n_muts      = len(mutations)
+            mut_display = ", ".join(mutations[:8])
+            if n_muts > 8:
+                mut_display += f" (+{n_muts - 8} more)"
+
+            lines.append(f"  Design {i}/{n_sequences}")
+            lines.append(f"    Score:     {score:.3f}")
+            lines.append(f"    Recovery:  {recovery:.1%}")
+            lines.append(
+                f"    Mutations: {n_muts} — {mut_display if mut_display else 'none (identical to WT)'}"
+            )
+            seq_display = seq[:80] + ("…" if len(seq) > 80 else "")
+            lines.append(f"    Sequence:  {seq_display}")
+            lines.append("")
+
+        return "\n".join(lines)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
