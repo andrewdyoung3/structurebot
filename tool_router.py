@@ -144,6 +144,13 @@ class ToolRouter:
         "sequences to assess",
         "designed sequences",
         "redesigned sequences",
+        # Phrases that arise when the user refers to "top N sequences" after redesign
+        "top 2-3 sequences",
+        "top 2–3 sequences",   # en-dash variant (U+2013)
+        "top 3 sequences",
+        "top sequences",
+        "assess structural integrity",
+        "structural fidelity",
     )
 
     # Contextual keywords: when present alongside a session with MPNN results,
@@ -161,14 +168,27 @@ class ToolRouter:
     _SEQUENCE_DISPLAY_KEYWORDS: tuple = (
         "show designed sequences",
         "show design sequences",
+        "show sequences",
         "list designed sequences",
         "list sequences",
         "print designed sequences",
+        "print sequences",
         "display designed sequences",
+        "display sequences",
+        "output sequences",
+        "output the sequences",
         "what are the designed sequences",
+        "what are the sequences",
         "show mpnn sequences",
         "what sequences did",
         "show me the sequences",
+        "sequences for the redesigns",
+        "redesign sequences",
+    )
+
+    # Verbs used in fuzzy sequence-display matching (see handle_sequence_display_command).
+    _SEQUENCE_DISPLAY_VERBS: tuple = (
+        "show", "output", "print", "list", "display", "what",
     )
 
     # Keywords that signal an N-glycosylation site scan request.
@@ -255,8 +275,11 @@ class ToolRouter:
             if tool == "mutation_scan":
                 new_tools.append("proline")
                 ms = tool_inputs.get("mutation_scan", {})
+                # Always target the primary (crystal) structure — not a
+                # secondary ESMFold prediction that the translator may have
+                # guessed because it was the active model in ChimeraX.
                 new_inputs["proline"] = {
-                    "model_id": ms.get("model_id") or self._first_model_id(),
+                    "model_id": self._primary_model_id(),
                     "chain":    ms.get("chain", "A"),
                     "pdb_path": ms.get("pdb_path"),
                     "top_n":    5,
@@ -269,7 +292,7 @@ class ToolRouter:
         if "proline" not in new_tools:
             new_tools.append("proline")
             new_inputs["proline"] = {
-                "model_id": self._first_model_id(),
+                "model_id": self._primary_model_id(),
                 "chain":    "A",
                 "top_n":    5,
             }
@@ -675,7 +698,7 @@ class ToolRouter:
                 # (e.g. user_input was not passed to route()), redirect here.
                 if user_input and self._detect_proline_intent(user_input):
                     proline_inputs = {
-                        "model_id": inputs.get("model_id") or self._first_model_id(),
+                        "model_id": self._primary_model_id(),
                         "chain":    inputs.get("chain", "A"),
                         "pdb_path": inputs.get("pdb_path"),
                         "top_n":    5,
@@ -1235,6 +1258,20 @@ class ToolRouter:
         t0 = _time.perf_counter()
 
         model_id = inputs.get("model_id") or self._first_model_id()
+
+        # Guard: when multiple models are loaded (e.g. original structure #1 +
+        # ESMFold prediction #2), the translator may target #2 because it is
+        # the most recently opened / currently active model.  Interface analysis
+        # must always run on the original crystal structure (#1).
+        _n_models = len(self.session.structures)
+        if _n_models > 1 and model_id != "1" and "1" in self.session.structures:
+            print(
+                f"  [WARN] Multiple models loaded -- interface analysis targeting #1 "
+                f"(original structure), not #{model_id}",
+                flush=True,
+            )
+            model_id = "1"
+
         mode     = inputs.get("mode", "multimer")
         chain_id = inputs.get("chain_id") or inputs.get("chain")
         visualize= inputs.get("visualize", False)
@@ -1725,17 +1762,33 @@ class ToolRouter:
         Handle "show designed sequences" and similar commands without LLM translation.
 
         Returns a human-readable string if BOTH conditions hold:
-          1. *user_input* contains a sequence-display keyword, AND
+          1. *user_input* matches a display keyword OR fuzzy rule (see below), AND
           2. The session already holds ProteinMPNN results.
 
         Returns None if either condition is false — the caller should fall through
         to LLM translation so the model can answer naturally.
+
+        Fuzzy rule: plural "sequences" + any display verb ("show", "output",
+        "print", "list", "display", "what") also triggers the handler when the
+        session has MPNN results, catching natural phrasings like
+        "can you output the sequences" that aren't covered by explicit keywords.
         """
         lower = user_input.lower().strip()
-        if not any(kw in lower for kw in self._SEQUENCE_DISPLAY_KEYWORDS):
+
+        # 1. Exact keyword match
+        matched = any(kw in lower for kw in self._SEQUENCE_DISPLAY_KEYWORDS)
+
+        # 2. Fuzzy match — plural "sequences" + a display verb
+        if not matched:
+            if "sequences" in lower and any(
+                v in lower for v in self._SEQUENCE_DISPLAY_VERBS
+            ):
+                matched = True
+
+        if not matched:
             return None
 
-        model_id = self._first_model_id()
+        model_id = self._primary_model_id()
         if self.session.get_proteinmpnn_result(model_id) is None:
             return None   # no results yet — let the LLM respond
 
@@ -1811,6 +1864,23 @@ class ToolRouter:
         if self.session.structures:
             return next(iter(self.session.structures))
         return "1"
+
+    def _primary_model_id(self) -> str:
+        """
+        Return the primary (crystal-structure) model ID.
+
+        When multiple models are loaded — e.g. the original structure (#1)
+        alongside an ESMFold prediction (#2) — tools that operate on the
+        crystal structure (proline scan, assembly analysis, …) should always
+        target #1.  This helper returns '1' whenever that model is in the
+        session, falling back to the first loaded model otherwise.
+        """
+        structures = self.session.structures
+        if not structures:
+            return "1"
+        if "1" in structures:
+            return "1"
+        return next(iter(structures))
 
     def available_tools(self) -> Dict[str, str]:
         """Return {tool_name: status_string} for all tools."""

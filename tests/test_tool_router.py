@@ -626,3 +626,174 @@ def test_show_designed_sequences_no_results():
     output = router._show_designed_sequences()
     assert isinstance(output, str)
     assert "No ProteinMPNN results" in output
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 11. Multi-model session fixes (models #1 + #2 loaded simultaneously)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _make_router_with_two_models() -> ToolRouter:
+    """
+    Router with two models loaded: #1 (original crystal structure) and
+    #2 (e.g. an ESMFold predicted structure opened afterwards).
+    No MPNN results in session.
+    """
+    mock_bridge  = MagicMock()
+    mock_session = MagicMock()
+    mock_session.structures = {
+        "1": {"name": "1HSG", "path": None},
+        "2": {"name": "ESMFold_pred", "path": None},
+    }
+    mock_session.get_proteinmpnn_result.return_value = None
+    return ToolRouter(bridge=mock_bridge, session=mock_session)
+
+
+def _make_router_with_two_models_and_mpnn() -> ToolRouter:
+    """
+    Router with two models loaded AND ProteinMPNN results for model #1
+    (simulates: run redesign → ESMFold opens as #2 → user asks about sequences).
+    """
+    _mpnn_data = {
+        "sequences": [
+            {"sequence": "ACDE", "score": -1.2, "recovery": 0.9, "mutations": ["L2A"]},
+        ],
+        "wildtype_sequence": "ACLE",
+        "fixed_positions":   [],
+        "backend":           "local",
+    }
+    router = _make_router_with_two_models()
+    router.session.get_proteinmpnn_result.return_value = _mpnn_data
+    return router
+
+
+def test_mpnn_esmfold_routing_with_second_model_loaded():
+    """
+    "ESMFold top 2-3 sequences to assess structural integrity" with model #2
+    loaded and MPNN results in session must route to mpnn_esmfold, not esmfold.
+    """
+    router       = _make_router_with_two_models_and_mpnn()
+    translator_r = {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "high",
+        "tools_needed":         ["esmfold"],
+        "tool_inputs":          {"esmfold": {"model_id": "2", "chain": "A"}},
+    }
+    user_input = "ESMFold top 2-3 sequences to assess structural integrity"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mpnn_esmfold" in routed["tools_needed"], (
+        f"Expected mpnn_esmfold with 2 models + MPNN session; "
+        f"got {routed['tools_needed']}"
+    )
+    assert "esmfold" not in routed["tools_needed"], (
+        f"'esmfold' should be replaced by mpnn_esmfold; "
+        f"got {routed['tools_needed']}"
+    )
+
+
+def test_assembly_analyser_targets_model_1_with_multiple_models():
+    """
+    When two models are loaded and inputs contain model_id='2', the assembly
+    analyser must redirect to model_id='1' (the original crystal structure).
+    """
+    router = _make_router_with_two_models()
+
+    # Configure mock session so get_structure() returns something parse-able
+    router.session.get_structure.return_value = {"name": "1HSG"}
+
+    # Inject a mock analyser so we can inspect the model_id it was called with
+    mock_analyser = MagicMock()
+    mock_analyser.analyse.return_value = {
+        "mode":               "multimer",
+        "model_id":           "1",
+        "assembly_info":      {},
+        "interfaces":         {},
+        "protected_residues": [],
+        "excluded_count":     0,
+        "header":             "test",
+        "warnings":           [],
+        "interface_summary":  "",
+    }
+    router._assembly_analyser = mock_analyser
+
+    # Call with model_id="2" — guard must redirect to "1"
+    router._run_assembly_analyser({"model_id": "2", "mode": "multimer", "chain_id": "A"})
+
+    call_args = mock_analyser.analyse.call_args
+    called_model_id = (
+        call_args.kwargs.get("model_id")
+        if call_args.kwargs
+        else (call_args.args[0] if call_args.args else None)
+    )
+    assert called_model_id == "1", (
+        f"assembly analyser should target #1; was called with model_id={called_model_id!r}"
+    )
+
+
+def test_proline_routing_with_multiple_models():
+    """
+    "suggest proline mutations to stabilise chain A" with #2 active: the
+    rewritten proline tool_inputs must have model_id='1' (crystal structure),
+    not '2' (ESMFold prediction guessed by the translator).
+    """
+    router = _make_router_with_two_models()
+
+    # Translator guessed model_id="2" (the currently active/visible model)
+    translator_r = {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "high",
+        "tools_needed":         ["mutation_scan"],
+        "tool_inputs":          {
+            "mutation_scan": {
+                "model_id": "2",
+                "chain":    "A",
+                "focus":    "stability",
+            }
+        },
+    }
+    user_input = "suggest proline mutations to stabilise chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "proline" in routed["tools_needed"], (
+        f"Expected proline routing; got {routed['tools_needed']}"
+    )
+    proline_mid = routed["tool_inputs"]["proline"]["model_id"]
+    assert proline_mid == "1", (
+        f"Proline scan must target #1 (crystal structure); got model_id={proline_mid!r}"
+    )
+
+
+def test_sequence_display_output_the_sequences():
+    """
+    'can you output the sequences' with MPNN results in session →
+    handle_sequence_display_command returns a non-empty string.
+    """
+    router = _make_router_with_mpnn_session()
+    result = router.handle_sequence_display_command("can you output the sequences")
+    assert result is not None, (
+        "'output the sequences' should trigger sequence display when session has MPNN results"
+    )
+    assert isinstance(result, str) and len(result) > 10
+
+
+def test_sequence_display_sequences_for_redesigns():
+    """
+    'show me the sequences for the redesigns' with MPNN results in session →
+    handle_sequence_display_command returns a non-empty string.
+    """
+    router = _make_router_with_mpnn_session()
+    result = router.handle_sequence_display_command(
+        "show me the sequences for the redesigns"
+    )
+    assert result is not None, (
+        "'sequences for the redesigns' should trigger sequence display when session has MPNN results"
+    )
+    assert isinstance(result, str) and len(result) > 10
