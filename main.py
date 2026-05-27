@@ -381,17 +381,75 @@ class StructureBot:
                 name = user_input.split(maxsplit=2)[2] if len(user_input.split()) > 2 else "default"
                 self._cmd_load_session(name)
             else:
-                # Check for active-site management before hitting the LLM
-                msg = self.router.handle_active_site_command(user_input)
-                if msg:
-                    console.print(f"[ok]✓[/ok] {escape(msg)}")
-                else:
-                    # Check for sequence display command before hitting the LLM
-                    seq_msg = self.router.handle_sequence_display_command(user_input)
-                    if seq_msg:
-                        console.print(seq_msg)
-                    else:
-                        self._handle_request(user_input)
+                self._dispatch_input(user_input)
+
+    def _dispatch_input(self, user_input: str) -> None:
+        """
+        Process one user input string (from REPL or script).
+
+        Handles in order:
+          1. Semicolon chaining — "cmd1; cmd2" runs both sequentially.
+          2. Active-site management commands (set/clear/show).
+          3. Sequence display fast-path (show designed sequences, etc.).
+          4. Full LLM-backed _handle_request pipeline.
+        """
+        # ── Semicolon chaining ─────────────────────────────────────────────────
+        if ";" in user_input:
+            parts = [p.strip() for p in user_input.split(";") if p.strip()]
+            for part in parts:
+                self._handle_request(part)
+            return
+
+        # ── Active-site management ─────────────────────────────────────────────
+        msg = self.router.handle_active_site_command(user_input)
+        if msg:
+            console.print(f"[ok]✓[/ok] {escape(msg)}")
+            return
+
+        # ── Sequence display fast-path ─────────────────────────────────────────
+        seq_msg = self.router.handle_sequence_display_command(user_input)
+        if seq_msg:
+            console.print(seq_msg)
+            return
+
+        self._handle_request(user_input)
+
+    # ── Script runner ─────────────────────────────────────────────────────────
+
+    def run_script(self, script_path: str) -> None:
+        """
+        Execute commands from a plain-text script file sequentially.
+
+        File format:
+          - One command per line
+          - Lines starting with ``#`` are comments (skipped)
+          - Blank lines are skipped
+
+        Connects to ChimeraX via ``startup()`` before running, saves the session
+        when done, and returns (does NOT call sys.exit so tests can use it cleanly).
+        """
+        path = Path(script_path)
+        if not path.is_file():
+            console.print(f"[err]Error: script file not found: {path}[/err]")
+            import sys as _sys
+            _sys.exit(1)
+
+        self.startup()
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        cmds  = [ln.strip() for ln in lines
+                 if ln.strip() and not ln.strip().startswith("#")]
+
+        console.print(
+            f"[info]Running script: {path.name} "
+            f"({len(cmds)} command(s))[/info]"
+        )
+        for cmd in cmds:
+            console.print(f"\n[dim]── {escape(cmd)} ──[/dim]")
+            self._handle_request(cmd)
+
+        self.session.save(SESSION_FILE)
+        console.print(f"\n[ok]✓[/ok] Script complete — session saved.")
 
     # ── Natural language pipeline ─────────────────────────────────────────────
 
@@ -1090,6 +1148,10 @@ def main() -> None:
                         help=f"REST port (default {config.REST_PORT})")
     parser.add_argument("--no-auto-proceed",  dest="auto_proceed", action="store_false",
                         help="Always require explicit confirmation (disable countdown)")
+    parser.add_argument("--script",           type=str, default=None,
+                        metavar="FILE",
+                        help="Path to a text file of commands to run sequentially "
+                             "(one per line; blank lines and # comments skipped)")
     parser.set_defaults(auto_proceed=True)
     args = parser.parse_args()
 
@@ -1100,7 +1162,11 @@ def main() -> None:
         auto_proceed      = args.auto_proceed,
         auto_proceed_delay= config.AUTO_PROCEED_DELAY,
     )
-    bot.run()
+
+    if args.script:
+        bot.run_script(args.script)
+    else:
+        bot.run()
 
 
 if __name__ == "__main__":

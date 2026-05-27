@@ -373,36 +373,45 @@ class MPNNESMFoldPipeline:
             lines.append("No designed sequences to display.")
             return "\n".join(lines)
 
-        # Column header
-        lines.append(
-            f"{'Rank':<5} {'pLDDT':>6} {'Conf':<8} "
-            f"{'Score':>7} {'Recovery':>9}  {'Mutations':<38} {'Pass'}"
-        )
-        lines.append("─" * 85)
+        # ── Compact column layout (≤ 90 chars wide so Pass stays on same line) ─
+        # Rank  pLDDT  Conf     Score   Rec%   Mutations                Pass
+        # Show at most 3 mutations in the table; full list: "show designed sequences"
+        HDR_FMT  = f"{'Rank':<4}  {'pLDDT':>5}  {'Conf':<7}  {'Score':>6}  {'Rec%':>5}  {'Mutations':<23}  Pass"
+        ROW_FMT  = "{rank:<4}  {plddt:>5}  {conf:<7}  {score:>6}  {rec:>5}  {muts:<23}  {passed}"
+        SEP_LEN  = len(HDR_FMT)
+
+        lines.append(HDR_FMT)
+        lines.append("─" * SEP_LEN)
 
         for d in designs:
-            rank     = str(d.get("rank", "?"))
+            rank = str(d.get("rank", "?"))
             if d.get("error"):
                 plddt_s = "ERROR"
-                conf    = "—"
+                conf    = "-"
             else:
                 plddt_s = f"{d['mean_plddt']:.1f}"
                 conf    = d.get("confidence", "?")
             score    = f"{d.get('mpnn_score', 0.0):.3f}"
             recovery = f"{d.get('recovery', 0.0) * 100:.1f}%"
             muts     = d.get("mutations", [])
-            muts_str = ", ".join(muts[:5])
-            if len(muts) > 5:
-                muts_str += f" +{len(muts) - 5} more"
+            muts_str = ", ".join(muts[:3])
+            if len(muts) > 3:
+                muts_str += f" +{len(muts) - 3} more"
             passed   = "✓" if d.get("pass_threshold") else "✗"
 
-            lines.append(
-                f"{rank:<5} {plddt_s:>6} {conf:<8} "
-                f"{score:>7} {recovery:>9}  {muts_str:<38} {passed}"
-            )
+            lines.append(ROW_FMT.format(
+                rank   = rank,
+                plddt  = plddt_s,
+                conf   = conf,
+                score  = score,
+                rec    = recovery,
+                muts   = muts_str,
+                passed = passed,
+            ))
 
         passed_count = sum(1 for d in designs if d.get("pass_threshold"))
-        lines.append("─" * 85)
-        lines.append(f"{passed_count}/{len(designs)} design(s) passed pLDDT threshold")
+        lines.append("─" * SEP_LEN)
+        lines.append(f"{passed_count}/{len(designs)} design(s) passed pLDDT threshold"
+                     "  (full sequences: 'show designed sequences')")
 
         return "\n".join(lines)

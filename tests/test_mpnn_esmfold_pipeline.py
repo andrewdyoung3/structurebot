@@ -417,6 +417,69 @@ class TestGenerateSummary:
         summary = pipeline.generate_summary(designs, model_id="1")
         assert "1/2" in summary
 
+    def test_mpnn_esmfold_summary_pass_on_same_line(self):
+        """
+        The Pass indicator (✓/✗) must appear on the same line as the
+        rank / pLDDT / mutations — never as a lone character on its own line.
+
+        This was previously broken because the mutations column was wide
+        enough to cause line-wrapping in Rich Panels, leaving ✓ stranded.
+        """
+        pipeline = MPNNESMFoldPipeline()
+        designs = [
+            {
+                "rank":           i,
+                "is_wildtype":    False,
+                # 5 mutations forces truncation to "A,B,C +2 more" form
+                "mutations":      [f"L{i*10}A", f"V{i*10+5}G", f"I{i*10+8}T",
+                                   f"F{i*10+12}Y", f"W{i*10+15}R"],
+                "mpnn_score":     -1.2 + i * 0.01,
+                "recovery":       0.91,
+                "mean_plddt":     76.0 + i * 0.2,
+                "confidence":     "high",
+                "pass_threshold": True,
+                "error":          None,
+            }
+            for i in range(1, 4)
+        ]
+        summary = pipeline.generate_summary(designs, model_id="1")
+
+        for line in summary.splitlines():
+            stripped = line.strip()
+            # A line that IS ONLY the pass indicator is a formatting failure
+            assert stripped not in ("✓", "✗"), (
+                f"Pass/fail indicator appears on its own line: {line!r}\n"
+                f"Full summary:\n{summary}"
+            )
+
+    def test_summary_mutations_truncated_to_three(self):
+        """
+        generate_summary must show at most 3 mutations in the table row,
+        with an '+N more' annotation for the remainder.
+        """
+        pipeline = MPNNESMFoldPipeline()
+        designs = [
+            {
+                "rank":           1,
+                "is_wildtype":    False,
+                "mutations":      ["L10A", "V20G", "I30T", "F40Y", "W50R"],
+                "mpnn_score":     -1.2,
+                "recovery":       0.9,
+                "mean_plddt":     76.4,
+                "confidence":     "high",
+                "pass_threshold": True,
+                "error":          None,
+            }
+        ]
+        summary = pipeline.generate_summary(designs, model_id="1")
+
+        assert "+2 more" in summary, (
+            "Expected '+2 more' when 5 mutations are present and limit is 3"
+        )
+        # Verify F40Y and W50R (4th and 5th) are NOT spelled out in the table
+        assert "F40Y" not in summary
+        assert "W50R" not in summary
+
 
 # ===========================================================================
 # 7. Session state — pdb_str stripped on save
