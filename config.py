@@ -142,6 +142,18 @@ ESMFOLD_PLDDT_WARNING_THRESHOLD: float = float(
     os.environ.get("ESMFOLD_PLDDT_WARNING_THRESHOLD", "10.0")
 )
 
+# Prefer local GPU inference (venv312 subprocess) over the Atlas API.
+# Set ESMFOLD_USE_LOCAL=false to always use the Atlas API.
+ESMFOLD_USE_LOCAL: bool = (
+    os.environ.get("ESMFOLD_USE_LOCAL", "true").strip().lower()
+    not in ("0", "false", "no")
+)
+
+# HuggingFace model ID for local ESMFold inference.
+ESMFOLD_MODEL_NAME: str = os.environ.get(
+    "ESMFOLD_MODEL_NAME", "facebook/esmfold_v1"
+)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 

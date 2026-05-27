@@ -5,14 +5,15 @@ Foldability prediction via ESMFold for validating mutant sequences.
 
 Two prediction paths
 --------------------
-Primary  : ESM Atlas API  (https://esmatlas.com/api/fold)
+Primary  : local GPU inference via venv312 subprocess calling esmfold_worker.py.
+           Uses transformers (facebook/esmfold_v1) on the RTX 5070 Ti through
+           the same venv312 delegation pattern as esm_bridge.py / esm_worker.py.
+           Controlled by config.ESMFOLD_USE_LOCAL (default: True).
+
+Fallback : ESM Atlas API  (https://esmatlas.com/api/fold)
            Free, no auth required.  POST the sequence as form data;
            response is a PDB-format string with B-factor = per-residue pLDDT.
-
-Fallback : local ESMFold via the transformers library in venv312.
-           Activated automatically when the Atlas API is unreachable and
-           transformers + esm are installed in venv312.
-           NOT implemented yet — flag for a future session.
+           Used when ESMFOLD_USE_LOCAL=False, or when the local worker fails.
 
 Usage
 -----
@@ -23,6 +24,7 @@ Usage
     # result["plddt"]       : {1: 87.3, 2: 91.2, ...}  (1-based residue index)
     # result["mean_plddt"]  : float
     # result["pdb_str"]     : PDB-format string
+    # result["source"]      : "local_venv312" | "atlas_api"
 
     # Compare wildtype vs mutant at specific positions
     cmp = bridge.compare_to_wildtype(wt_seq, mut_seq, mutation_positions=[64])
@@ -33,20 +35,12 @@ Usage
     # Quick foldability check for a disulfide Cys pair
     check = bridge.check_disulfide_foldability(pdb_path, chain_a_res=49, chain_b_res=112)
 
-API details
------------
-  POST https://esmatlas.com/api/fold
-  Content-Type: application/x-www-form-urlencoded
-  Body: sequence=<AMINO_ACID_STRING>
-  Response: PDB-format text  (B-factor column holds per-residue pLDDT)
-
-  Note: an alternative endpoint that has been observed in the wild is
-    POST https://api.esmatlas.com/foldSequence/v1/pdb/
-    with the raw sequence as the request body (plain text).
-  ESMFoldBridge tries the primary URL first, then the alternative.
-
-  Timeout: 120 s (ESMFold can be slow for long sequences; atlas servers vary)
-  Rate-limit: 1 request per 5 seconds (conservative; atlas enforces limits)
+Local-path protocol (venv312 subprocess)
+-----------------------------------------
+1. Write {"sequence": ..., "label": ..., "model": ...} to a temp JSON file.
+2. Run: venv312/Scripts/python.exe esmfold_worker.py --input … --output …
+3. Read result JSON; relay worker stdout (progress lines).
+4. Return structured result dict on success, None on any failure.
 
 pLDDT interpretation
 --------------------
@@ -54,6 +48,11 @@ pLDDT interpretation
   70–90   : high confidence
   50–70   : low confidence — treat as rough topology guide
   < 50    : very low confidence — likely disordered
+
+pLDDT scale guard
+-----------------
+  If mean_plddt < 2.0, the worker returned values in 0-1 scale.
+  All values are multiplied by 100 to normalise to the 0-100 range.
 
 Foldability risk thresholds (configurable via config.py)
   pLDDT drop >= ESMFOLD_PLDDT_WARNING_THRESHOLD → "high" risk
@@ -63,20 +62,32 @@ Foldability risk thresholds (configurable via config.py)
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import config as _cfg
 
+# Windows-only: prevent child console windows.
+_CREATE_NO_WINDOW: int = (
+    subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    if sys.platform == "win32"
+    else 0
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _ATLAS_PRIMARY_URL  = "https://esmatlas.com/api/fold"
 _ATLAS_ALT_URL      = "https://api.esmatlas.com/foldSequence/v1/pdb/"
 _DEFAULT_TIMEOUT    = 120    # seconds — ESMFold inference can be slow
-_RATE_LIMIT_DELAY   = 5.0   # seconds between consecutive API calls
+_RATE_LIMIT_DELAY   = 5.0   # seconds between consecutive Atlas API calls
 _MAX_SEQUENCE_LEN   = 400   # Atlas rejects very long sequences; warn above this
+_PLDDT_SCALE_GUARD  = 2.0   # if mean_plddt < this, assume 0-1 scale; multiply ×100
 
 
 # ── Safe print ────────────────────────────────────────────────────────────────
@@ -127,12 +138,12 @@ class ESMFoldBridge:
     """
     ESMFold foldability prediction bridge.
 
-    Tries ESM Atlas API first; gracefully returns an error result if unavailable.
-    No auth required for the Atlas API.
+    Primary:  venv312 subprocess (GPU inference via transformers).
+    Fallback: ESM Atlas API (free, no auth).
     """
 
     def __init__(self) -> None:
-        self._last_request_time: float = 0.0
+        self._last_atlas_time: float = 0.0   # rate-limit tracker for Atlas API
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -145,36 +156,49 @@ class ESMFoldBridge:
         """
         Predict structure of *sequence* using ESMFold.
 
+        Tries local venv312 GPU inference first (if ESMFOLD_USE_LOCAL=True),
+        then falls back to the ESM Atlas API.
+
         Returns
         -------
         {
           "success":     bool,
           "label":       str,
-          "pdb_str":     str,     # PDB-format output from ESMFold
-          "plddt":       {1: 87.3, 2: 91.2, ...},  # per-residue, 1-based
+          "pdb_str":     str,
+          "plddt":       {1: 87.3, 2: 91.2, ...},   # per-residue, 1-based
           "mean_plddt":  float,
           "length":      int,
           "error":       None or str,
-          "source":      "atlas_api" | "error"
+          "source":      "local_venv312" | "atlas_api" | "error"
         }
         """
         if not sequence or not sequence.strip():
             return self._error_result(label, "empty sequence")
 
         sequence = sequence.strip().upper()
+
+        # ── Primary: local venv312 GPU inference ──────────────────────────────
+        use_local = getattr(_cfg, "ESMFOLD_USE_LOCAL", True)
+        if use_local and self._local_available():
+            result = self._run_local(sequence, label, timeout)
+            if result is not None:
+                return result
+            _pprint("  ESMFold: local inference failed — falling back to Atlas API...")
+
+        # ── Fallback: Atlas API ───────────────────────────────────────────────
         if len(sequence) > _MAX_SEQUENCE_LEN:
             _pprint(
                 f"  ESMFold: sequence length {len(sequence)} > {_MAX_SEQUENCE_LEN}; "
                 "prediction may be slow or rejected by the Atlas API."
             )
 
-        # Rate-limit: ensure at least _RATE_LIMIT_DELAY between calls
-        elapsed = time.perf_counter() - self._last_request_time
+        # Rate-limit Atlas API calls
+        elapsed = time.perf_counter() - self._last_atlas_time
         if elapsed < _RATE_LIMIT_DELAY:
             time.sleep(_RATE_LIMIT_DELAY - elapsed)
 
         pdb_str, error = self._call_atlas(sequence, timeout)
-        self._last_request_time = time.perf_counter()
+        self._last_atlas_time = time.perf_counter()
 
         if error or not pdb_str:
             return self._error_result(label, error or "empty response from Atlas API")
@@ -387,7 +411,152 @@ class ESMFoldBridge:
         result["existing_cys_count"] = n_free
         return result
 
-    # ── Internal ───────────────────────────────────────────────────────────────
+    # ── Local venv312 path ─────────────────────────────────────────────────────
+
+    def _local_available(self) -> bool:
+        """True if venv312 python AND esmfold_worker.py both exist on disk."""
+        venv312_python = _cfg.VENV312_PYTHON
+        worker_path    = Path(__file__).parent / "esmfold_worker.py"
+        return (
+            Path(venv312_python).is_file()
+            and worker_path.is_file()
+        )
+
+    def _run_local(
+        self,
+        sequence: str,
+        label:    str,
+        timeout:  int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Delegate inference to esmfold_worker.py running inside venv312.
+
+        Protocol
+        --------
+        1. Write {"sequence": ..., "label": ..., "model": ...} to temp file.
+        2. Run: venv312/Scripts/python.exe esmfold_worker.py --input … --output …
+        3. Read result JSON; relay worker stdout.
+        4. Return result dict on success, None on any failure (caller falls back).
+
+        pLDDT scale guard
+        -----------------
+        If the returned mean_plddt < 2.0, the worker produced 0-1 scale values.
+        All plddt values and mean_plddt are multiplied by 100.
+        """
+        worker_path    = Path(__file__).parent / "esmfold_worker.py"
+        venv312_python = _cfg.VENV312_PYTHON
+        model_name     = getattr(_cfg, "ESMFOLD_MODEL_NAME", "facebook/esmfold_v1")
+
+        inp_path: Optional[str] = None
+        out_path: Optional[str] = None
+        try:
+            # Write input JSON to temp file
+            inp_fd, inp_path = tempfile.mkstemp(suffix="_esmfold_in.json")
+            os.close(inp_fd)
+            with open(inp_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"sequence": sequence, "label": label, "model": model_name},
+                    fh,
+                )
+
+            # Temp file for worker output
+            out_fd, out_path = tempfile.mkstemp(suffix="_esmfold_out.json")
+            os.close(out_fd)
+
+            _pprint(
+                f"  ESMFold: launching venv312 worker "
+                f"({len(sequence)} aa, {model_name})..."
+            )
+
+            proc = subprocess.run(
+                [
+                    venv312_python,
+                    Path(worker_path).as_posix(),
+                    "--input",  Path(inp_path).as_posix(),
+                    "--output", Path(out_path).as_posix(),
+                ],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+
+            # Relay worker stdout so the user sees progress
+            if proc.stdout:
+                for line in proc.stdout.splitlines():
+                    if line.strip():
+                        _pprint(line)
+
+            # Relay stderr on failure
+            if proc.returncode != 0 and proc.stderr:
+                for line in proc.stderr.splitlines()[:10]:
+                    if line.strip():
+                        _pprint(f"  [ESMFold-worker] {line}")
+
+            if proc.returncode != 0:
+                _pprint(
+                    f"  ESMFold: venv312 worker exited {proc.returncode}"
+                )
+                return None
+
+            # Read result JSON
+            if not Path(out_path).is_file():
+                _pprint("  ESMFold: venv312 worker produced no output file")
+                return None
+
+            with open(out_path, "r", encoding="utf-8") as fh:
+                result = json.load(fh)
+
+            if not result.get("success"):
+                _pprint(
+                    f"  ESMFold: venv312 worker error: {result.get('error', '?')}"
+                )
+                return None
+
+            # ── pLDDT scale guard ─────────────────────────────────────────────
+            # Worker should output 0-100, but guard against 0-1 scale output.
+            plddt      = result.get("plddt", {})
+            mean_plddt = result.get("mean_plddt", 0.0)
+            if mean_plddt < _PLDDT_SCALE_GUARD and mean_plddt > 0:
+                _pprint(
+                    f"  ESMFold: scale guard triggered (mean_plddt={mean_plddt:.4f}); "
+                    "multiplying all values by 100."
+                )
+                plddt = {k: round(v * 100, 2) for k, v in plddt.items()}
+                mean_plddt = round(mean_plddt * 100, 2)
+                result["plddt"]      = plddt
+                result["mean_plddt"] = mean_plddt
+
+            # Convert plddt keys from str → int (worker uses str for JSON compat)
+            result["plddt"] = {int(k): v for k, v in plddt.items()}
+            result["source"] = "local_venv312"
+            result.setdefault("error", None)
+
+            _pprint(
+                f"  ESMFold: local done — {len(sequence)} aa, "
+                f"mean pLDDT {mean_plddt}, "
+                f"device={result.get('device', '?')}"
+            )
+            return result
+
+        except subprocess.TimeoutExpired:
+            _pprint(f"  ESMFold: venv312 worker timed out after {timeout}s")
+            return None
+        except Exception as exc:
+            _pprint(f"  ESMFold: venv312 worker exception: {exc}")
+            return None
+        finally:
+            for p in (inp_path, out_path):
+                if p:
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    # ── Atlas API path ─────────────────────────────────────────────────────────
 
     def _call_atlas(
         self,
@@ -475,4 +644,4 @@ class ESMFoldBridge:
         }
 
     def __repr__(self) -> str:
-        return "<ESMFoldBridge atlas_api>"
+        return "<ESMFoldBridge local_venv312+atlas_api>"

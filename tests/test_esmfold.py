@@ -5,12 +5,13 @@ Tests for ESMFoldBridge.
 
 Test sections
 -------------
-  A. API call mock      -- POST format, URL, content-type
+  A. API call mock      -- POST format, URL, content-type (Atlas path)
   B. pLDDT parsing      -- B-factor column extraction from mock PDB
   C. compare_to_wildtype -- mock predictions; risk classification
   D. Foldability risk   -- threshold boundary conditions
   E. Cys misparing      -- disulfide foldability check
   F. Timeout / error    -- unreachable API graceful fallback
+  G. Local venv312 path -- subprocess mock, pLDDT scale guard, fallback
 
 Usage
 -----
@@ -20,6 +21,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import sys
 import textwrap
 from pathlib import Path
@@ -81,7 +83,7 @@ _MOCK_PDB = textwrap.dedent("""\
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# A. API call mock
+# A. API call mock  (ESMFOLD_USE_LOCAL=False to test the Atlas path directly)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_api_post_format() -> None:
@@ -94,8 +96,9 @@ def test_api_post_format() -> None:
     mock_resp.status_code = 200
     mock_resp.text = _MOCK_PDB
 
-    with patch("requests.post", return_value=mock_resp) as mock_post:
-        result = bridge.predict("MAGLK", label="test")
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = bridge.predict("MAGLK", label="test")
 
     _assert(mock_post.called, "requests.post was called")
     call_kwargs = mock_post.call_args
@@ -124,8 +127,9 @@ def test_api_success_returns_pdb_and_plddt() -> None:
     mock_resp.status_code = 200
     mock_resp.text = _MOCK_PDB
 
-    with patch("requests.post", return_value=mock_resp):
-        result = bridge.predict("MAGLK")
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", return_value=mock_resp):
+            result = bridge.predict("MAGLK")
 
     _assert(result["success"],  "result.success is True")
     _assert(len(result["plddt"]) > 0, "plddt dict is non-empty",
@@ -142,9 +146,10 @@ def test_api_http_error_returns_failure() -> None:
     mock_resp.status_code = 500
     mock_resp.text = "Internal Server Error"
 
-    with patch("requests.post", return_value=mock_resp):
-        # Alt URL will also be tried and fail
-        result = bridge.predict("MAGLK")
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", return_value=mock_resp):
+            # Alt URL will also be tried and fail
+            result = bridge.predict("MAGLK")
 
     _assert(not result["success"], "result.success is False on HTTP 500")
     _assert(result["error"] is not None, "error message is set",
@@ -365,7 +370,7 @@ def test_check_disulfide_misparing_detected(tmp_path) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# F. Timeout / error handling
+# F. Timeout / error handling  (ESMFOLD_USE_LOCAL=False for Atlas path tests)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_predict_empty_sequence() -> None:
@@ -382,8 +387,9 @@ def test_predict_connection_error() -> None:
     import requests as _req
     bridge = _make_bridge()
 
-    with patch("requests.post", side_effect=_req.exceptions.ConnectionError("offline")):
-        result = bridge.predict("MAGLK")
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", side_effect=_req.exceptions.ConnectionError("offline")):
+            result = bridge.predict("MAGLK")
 
     _assert(not result["success"], "connection error -> success=False")
     _assert(result["error"] is not None, "error message is set")
@@ -394,11 +400,131 @@ def test_predict_timeout() -> None:
     import requests as _req
     bridge = _make_bridge()
 
-    with patch("requests.post", side_effect=_req.exceptions.Timeout("timed out")):
-        result = bridge.predict("MAGLK")
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", side_effect=_req.exceptions.Timeout("timed out")):
+            result = bridge.predict("MAGLK")
 
     _assert(not result["success"], "timeout -> success=False")
     _assert(result["error"] is not None, "error message is set")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# G. Local venv312 path
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_fake_subprocess(plddt_dict: dict, mean_plddt: float, label: str = "query"):
+    """
+    Return a subprocess.run side_effect that writes a fake ESMFold output JSON
+    to the --output path specified in the command, and returns returncode=0.
+    """
+
+    def _fake_run(cmd, **kwargs):
+        # Find --output path in the command list
+        cmd_list = list(cmd)
+        try:
+            out_idx  = cmd_list.index("--output") + 1
+            out_path = cmd_list[out_idx]
+        except (ValueError, IndexError):
+            out_path = None
+
+        if out_path:
+            fake_output = {
+                "success":    True,
+                "label":      label,
+                "plddt":      plddt_dict,
+                "mean_plddt": mean_plddt,
+                "pdb_str":    _MOCK_PDB,
+                "length":     len(plddt_dict),
+                "error":      None,
+                "elapsed_s":  0.5,
+                "device":     "cuda",
+            }
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(fake_output, fh)
+
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout     = "ESMFold: done."
+        result.stderr     = ""
+        return result
+
+    return _fake_run
+
+
+def test_local_predict_success() -> None:
+    """_run_local: successful subprocess returns result with source='local_venv312'."""
+    print("\n=== G. Local venv312 path ===")
+    bridge = _make_bridge()
+
+    with patch("esmfold_bridge.subprocess.run",
+               side_effect=_make_fake_subprocess(
+                   {"1": 87.3, "2": 91.2, "3": 45.0}, mean_plddt=74.5
+               )):
+        with patch.object(_cfg, "ESMFOLD_USE_LOCAL", True):
+            bridge._local_available = lambda: True
+            result = bridge.predict("MAG", label="test_local")
+
+    _assert(result["success"],
+            "local predict succeeds",
+            f"error={result.get('error')}")
+    _assert(result.get("source") == "local_venv312",
+            "source='local_venv312'",
+            f"got {result.get('source')!r}")
+    _assert(result.get("mean_plddt", 0) > 0,
+            "mean_plddt populated",
+            f"got {result.get('mean_plddt')}")
+    _assert(1 in result.get("plddt", {}),
+            "plddt keys are int (1-based)",
+            f"got keys {list(result.get('plddt', {}).keys())[:3]}")
+
+
+def test_plddt_scale_guard_0_to_1() -> None:
+    """_run_local: worker output in 0-1 scale (mean<2.0) is multiplied by 100."""
+    bridge = _make_bridge()
+
+    # Worker returns 0-1 scale values
+    with patch("esmfold_bridge.subprocess.run",
+               side_effect=_make_fake_subprocess(
+                   {"1": 0.83, "2": 0.87}, mean_plddt=0.85
+               )):
+        with patch.object(_cfg, "ESMFOLD_USE_LOCAL", True):
+            bridge._local_available = lambda: True
+            result = bridge.predict("MA", label="scale_test")
+
+    _assert(result["success"],
+            "scale-guard predict succeeds",
+            f"error={result.get('error')}")
+    # mean_plddt should be ~85.0, not 0.85
+    _assert(result.get("mean_plddt", 0) == pytest_approx(85.0, tol=1.0),
+            "mean_plddt scaled 0.85 -> 85.0",
+            f"got {result.get('mean_plddt')}")
+    # All individual plddt values should be in 0-100 range
+    plddt_vals = list(result.get("plddt", {}).values())
+    all_scaled = all(v > 2.0 for v in plddt_vals)
+    _assert(all_scaled,
+            "all plddt values in 0-100 range after scale guard",
+            f"got {plddt_vals}")
+
+
+def test_local_fallback_to_atlas_when_use_local_false() -> None:
+    """When ESMFOLD_USE_LOCAL=False, predict() uses Atlas API, not subprocess."""
+    bridge = _make_bridge()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = _MOCK_PDB
+
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = bridge.predict("MAGLK", label="fallback_test")
+
+    _assert(result["success"],
+            "fallback predict succeeds",
+            f"error={result.get('error')}")
+    _assert(result.get("source") == "atlas_api",
+            "source='atlas_api' when local disabled",
+            f"got {result.get('source')!r}")
+    _assert(mock_post.called,
+            "requests.post was called (Atlas API used)")
 
 
 # ── Runner ─────────────────────────────────────────────────────────────────────
@@ -429,6 +555,10 @@ def main() -> int:
     test_predict_empty_sequence()
     test_predict_connection_error()
     test_predict_timeout()
+
+    test_local_predict_success()
+    test_plddt_scale_guard_0_to_1()
+    test_local_fallback_to_atlas_when_use_local_false()
 
     print()
     print("=" * 60)

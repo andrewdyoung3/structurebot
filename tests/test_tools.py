@@ -719,10 +719,11 @@ def test_generate_stats_report_non_empty() -> None:
     }
 
     report = generate_stats_report(data)
-    report_str = str(report)
-    _assert("42" in report_str or "Sessions" in report_str,
+    # Rich Panel stores its body in .renderable; plain-string fallback otherwise
+    report_content = getattr(report, "renderable", str(report))
+    _assert("42" in report_content or "Sessions" in report_content,
             "report contains request count or 'Sessions'",
-            f"report: {report_str[:120]}")
+            f"report: {str(report_content)[:120]}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

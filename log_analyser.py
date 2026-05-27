@@ -54,13 +54,18 @@ import config as _cfg
 
 # ── PDB ID extractor ──────────────────────────────────────────────────────────
 
-_PDB_ID_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{3})\b")   # 4-char alphanumeric
+# PDB IDs can start with a digit (e.g. 1HSG, 2HHB) — pattern is
+# [digit-or-letter][any alphanum]{3}.  At least one letter required (heuristic).
+_PDB_ID_RE = re.compile(r"\b([A-Za-z0-9]{4})\b")
 
 
 def _extract_pdb_ids(commands: List[str], user_input: str) -> List[str]:
     """
     Extract PDB IDs from `open XXXX` commands and the user's input.
     Returns a list of uppercase 4-letter PDB IDs.
+
+    PDB IDs may start with a digit (e.g. 1HSG, 2HHB) or a letter (e.g. KRAS).
+    The pattern is any 4-character alphanumeric token with at least one letter.
     """
     ids: List[str] = []
     for cmd in commands:
@@ -69,15 +74,21 @@ def _extract_pdb_ids(commands: List[str], user_input: str) -> List[str]:
             parts = s.split()
             if len(parts) >= 2:
                 candidate = parts[1].strip("'\"")
-                if re.match(r"^[A-Za-z][A-Za-z0-9]{3}$", candidate):
+                # 4 alphanum chars, at least one must be a letter
+                if (re.match(r"^[A-Za-z0-9]{4}$", candidate)
+                        and re.search(r"[A-Za-z]", candidate)):
                     ids.append(candidate.upper())
     # Also scan user input for bare 4-char PDB-like tokens
     for m in _PDB_ID_RE.finditer(user_input):
         tok = m.group(1).upper()
+        # Require at least one letter to avoid pure digit tokens
+        if not re.search(r"[A-Za-z]", tok):
+            continue
         # Exclude common words that happen to be 4 chars (heuristic)
-        if not tok.lower() in {"this", "that", "with", "from", "have", "open",
-                                "show", "load", "make", "view", "find", "list"}:
-            ids.append(tok)
+        if tok.lower() in {"this", "that", "with", "from", "have", "open",
+                           "show", "load", "make", "view", "find", "list"}:
+            continue
+        ids.append(tok)
     return ids
 
 
