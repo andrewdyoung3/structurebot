@@ -408,9 +408,51 @@ class StructureBot:
             if not answer:
                 console.print("[dim]No answer — cancelling.[/dim]")
                 return
+
+            # ── Fast-path: bypass retranslation for known tool intents ─────────
+            # If the original user_input already contains glycan (or other
+            # recognised) keywords, re-routing through translate() would send a
+            # bare short answer ("chain A") to the model with no prior context,
+            # causing a stop_reason='refusal' crash.  Detect the intent here and
+            # dispatch directly instead.
+            if self.router._detect_glycan_intent(user_input):
+                result = self.router.route(
+                    {
+                        "commands":             [],
+                        "explanations":         [],
+                        "warnings":             [],
+                        "clarification_needed": None,
+                        "confidence":           "high",
+                        "tools_needed":         ["glycan"],
+                        "tool_inputs":          {},
+                    },
+                    user_input=user_input,
+                )
+                break
+
             self.translator.add_clarification(answer)
-            with console.status("[cyan]Retranslating…[/cyan]"):
-                result = self.translator.translate(answer, self.session)
+            try:
+                with console.status("[cyan]Retranslating…[/cyan]"):
+                    result = self.translator.translate(answer, self.session)
+            except ValueError as exc:
+                err_str = str(exc)
+                if "refusal" in err_str.lower() or "stop_reason" in err_str.lower():
+                    console.print(
+                        "[warn]Sorry, I couldn't process that answer. "
+                        "Try rephrasing your original request directly, "
+                        "e.g. 'suggest glycosylation sites on chain A'[/warn]"
+                    )
+                else:
+                    console.print(
+                        f"[warn]Translation error: {escape(err_str[:120])}[/warn]"
+                    )
+                return
+            except Exception as exc:
+                console.print(
+                    "[warn]Sorry, I couldn't process that answer. "
+                    "Try rephrasing your original request directly.[/warn]"
+                )
+                return
             result = self.router.route(result, user_input=user_input)
 
         if result.get("clarification_needed"):

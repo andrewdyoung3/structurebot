@@ -137,6 +137,22 @@ class ToolRouter:
         "mpnn+esmfold",
     )
 
+    # Keywords that signal an N-glycosylation site scan request.
+    # Checked case-insensitively; any match rewrites tools_needed to ["glycan"]
+    # and clears any translator clarification_needed flag.
+    _GLYCAN_KEYWORDS: tuple = (
+        "glycan",
+        "glycosylat",        # glycosylation, glycosylated, glycosylate, …
+        "n-linked",
+        "nxs",               # N-X-S sequon notation
+        "nxt",               # N-X-T sequon notation
+        "sequon",
+        "glycoengineering",
+        "glycosylation site",
+        "n-glycan",
+        "sugar",
+    )
+
     # Keywords that signal a proline substitution scan request.
     # Checked case-insensitively; any match overrides generic mutation_scan routing.
     _PROLINE_KEYWORDS: tuple = (
@@ -226,6 +242,53 @@ class ToolRouter:
 
         return new_tools, new_inputs
 
+    # ── Glycan intent helpers ─────────────────────────────────────────────────
+
+    @classmethod
+    def _detect_glycan_intent(cls, text: str) -> bool:
+        """Return True if *text* signals an N-glycosylation site scan request."""
+        lower = text.lower()
+        return any(kw in lower for kw in cls._GLYCAN_KEYWORDS)
+
+    def _rewrite_as_glycan(
+        self,
+        tools_needed: List[str],
+        tool_inputs:  Dict[str, Any],
+    ) -> tuple:
+        """
+        Replace the current tool pipeline with a single 'glycan' step.
+
+        Inherits model_id and chain from any existing tool_inputs so that
+        context set by the translator (chain letter, model number) is preserved.
+        Initial ChimeraX commands in ``result["commands"]`` are unaffected.
+
+        Returns (new_tools_needed, new_tool_inputs).
+        """
+        new_inputs = dict(tool_inputs)
+
+        # Inherit model_id / chain from whatever the translator already parsed
+        model_id: Optional[str] = None
+        chain:    str           = "A"
+        for inp in tool_inputs.values():
+            if isinstance(inp, dict):
+                if inp.get("model_id") and not model_id:
+                    model_id = str(inp["model_id"])
+                if inp.get("chain"):
+                    chain = inp["chain"]
+
+        model_id = model_id or self._first_model_id()
+
+        new_inputs["glycan"] = {
+            "model_id": model_id,
+            "chain":    chain,
+            "top_n":    3,
+        }
+        # Drop other analysis tool inputs; keep chimerax passthrough untouched
+        for drop in ("mutation_scan", "proline", "camsol", "esm"):
+            new_inputs.pop(drop, None)
+
+        return ["glycan"], new_inputs
+
     # ── MPNN+ESMFold intent helpers ───────────────────────────────────────────
 
     @classmethod
@@ -309,10 +372,28 @@ class ToolRouter:
                     tools_needed, tool_inputs
                 )
 
+        # ── Glycan intent override ─────────────────────────────────────────
+        # Fires when glycan keywords are present and the translator did NOT
+        # already emit "glycan" in tools_needed (wrong routing or unclear query).
+        # ALSO clears any clarification_needed flag from the translator — this
+        # prevents the clarification retry loop in main.py from asking the user a
+        # question whose answer would be re-sent to translate(), which crashes with
+        # stop_reason='refusal' when the short answer ("chain A") has no prior
+        # context the model can work with.
+        _glycan_intent = bool(user_input and self._detect_glycan_intent(user_input))
+        if _glycan_intent and "glycan" not in tools_needed:
+            tools_needed, tool_inputs = self._rewrite_as_glycan(
+                tools_needed, tool_inputs
+            )
+
         result = dict(translator_result)
         result["tools_needed"] = tools_needed
         result["tool_inputs"]  = tool_inputs
         result["_user_input"]  = user_input   # passed to execute() for guard
+
+        # Suppress translator clarification when we've resolved the intent ourselves
+        if _glycan_intent:
+            result["clarification_needed"] = None
 
         step_info: List[Dict[str, Any]] = []
         for tool in tools_needed:
@@ -496,9 +577,12 @@ class ToolRouter:
         """
         Route to the correct bridge; return ToolStepResult.
 
-        Proline guard: if tool is 'mutation_scan' but user_input contains proline
-        intent keywords, redirect to _run_proline() so the backbone φ-angle
-        scanner runs instead of the generic CamSol/ESM/Rosetta pipeline.
+        Secondary guards:
+          - Proline: if tool is 'mutation_scan' but user_input contains proline
+            keywords, redirect to _run_proline() (backbone φ-angle scanner).
+          - Glycan: if tool is 'mutation_scan' but user_input contains glycan
+            keywords, redirect to _run_glycan() (N-glycosylation site scan).
+        These guards fire if route() was not called with user_input.
         """
         try:
             if tool == "camsol":
@@ -527,6 +611,16 @@ class ToolRouter:
                         "top_n":    5,
                     }
                     return self._run_proline(proline_inputs)
+                # ── Glycan guard (secondary safety net) ──────────────────────
+                # If the user asked about glycans and route() didn't catch it,
+                # redirect here.
+                if user_input and self._detect_glycan_intent(user_input):
+                    glycan_inputs = {
+                        "model_id": inputs.get("model_id") or self._first_model_id(),
+                        "chain":    inputs.get("chain", "A"),
+                        "top_n":    3,
+                    }
+                    return self._run_glycan(glycan_inputs)
                 return self._run_mutation_scan(inputs)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)

@@ -187,3 +187,168 @@ def test_generic_mutation_scan_not_affected(user_input):
         f"Phrase {user_input!r} should NOT route to proline; "
         f"got {routed['tools_needed']}"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 5. Glycan intent routes directly to the glycan bridge
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _chimerax_translator_result(chain: str = "A") -> Dict[str, Any]:
+    """
+    Fake translator result when the LLM returns only chimerax (no special tool).
+    This represents the typical wrong-routing case for glycan queries.
+    """
+    return {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "medium",
+        "tools_needed":         ["chimerax"],
+        "tool_inputs":          {},
+    }
+
+
+def _clarification_translator_result() -> Dict[str, Any]:
+    """
+    Fake translator result that includes a clarification question.
+    Represents the crash-triggering case: translator is unsure and asks
+    a follow-up whose answer would be re-sent to translate(), causing
+    stop_reason='refusal'.
+    """
+    return {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": "What type of glycosylation analysis would you like?",
+        "confidence":           "low",
+        "tools_needed":         ["chimerax"],
+        "tool_inputs":          {},
+    }
+
+
+def test_glycan_phrase_routes_to_glycan_bridge():
+    """
+    'suggest glycosylation sites on chain A' must route to the glycan tool,
+    not trigger a clarification question.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "suggest glycosylation sites on chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "glycan" in routed["tools_needed"], (
+        f"Expected 'glycan' in tools_needed, got {routed['tools_needed']}"
+    )
+    assert "chimerax" not in routed["tools_needed"], (
+        f"'chimerax' should be replaced by 'glycan', got {routed['tools_needed']}"
+    )
+    # Clarification must be suppressed so main.py never asks the user a question
+    assert routed.get("clarification_needed") is None, (
+        "clarification_needed must be None for glycan intent"
+    )
+    # Glycan tool_inputs must be populated
+    glycan_inp = routed["tool_inputs"].get("glycan", {})
+    assert glycan_inp.get("model_id") is not None
+
+
+def test_glycan_sequon_phrase_routes_correctly():
+    """
+    'identify NXS sequons on chain A' must route to the glycan tool.
+    The translator might emit mutation_scan for this phrase; the glycan
+    guard should redirect it.
+    """
+    router       = _make_router()
+    translator_r = _mutation_scan_translator_result()
+    user_input   = "identify NXS sequons on chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "glycan" in routed["tools_needed"], (
+        f"NXS sequon phrase should route to glycan; got {routed['tools_needed']}"
+    )
+    assert "mutation_scan" not in routed["tools_needed"]
+    assert routed.get("clarification_needed") is None
+
+
+def test_glycan_engineering_phrase_routes_correctly():
+    """
+    'suggest glycoengineering positions on chain A' must route to the
+    glycan tool.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "suggest glycoengineering positions on chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "glycan" in routed["tools_needed"], (
+        f"Glycoengineering phrase should route to glycan; "
+        f"got {routed['tools_needed']}"
+    )
+    assert routed.get("clarification_needed") is None
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 6. Clarification refusal crash is prevented by clearing clarification_needed
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_clarification_refusal_handled_gracefully():
+    """
+    When the translator returns clarification_needed for a glycan phrase,
+    route() must:
+      (a) clear the flag (so main.py never enters the clarification loop), AND
+      (b) rewrite tools_needed to ['glycan'].
+
+    This is the primary safeguard against the stop_reason='refusal' crash:
+    if clarification_needed is None, the retranslation call that raises
+    ValueError("stop_reason='refusal'") is never made.
+    """
+    router       = _make_router()
+    translator_r = _clarification_translator_result()
+    user_input   = "suggest glycosylation sites on chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert routed.get("clarification_needed") is None, (
+        "route() must clear clarification_needed for glycan intent; "
+        "a non-None value triggers the clarification loop, which can crash "
+        "with ValueError(stop_reason='refusal') when the answer is retranslated"
+    )
+    assert "glycan" in routed["tools_needed"], (
+        f"tools_needed must contain 'glycan', got {routed['tools_needed']}"
+    )
+    # Also verify _detect_glycan_intent works for the canonical phrase
+    assert ToolRouter._detect_glycan_intent(user_input), (
+        "_detect_glycan_intent must return True for glycan site suggestions"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 7. Generic solubility mutation scan still unaffected by glycan routing
+# ════════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("user_input", [
+    "suggest mutations to improve solubility of chain A",
+    "what mutations would reduce aggregation?",
+    "run a full mutation scan on chain B",
+])
+def test_solubility_mutation_scan_unaffected_by_glycan_routing(user_input):
+    """
+    'suggest mutations to improve solubility' and similar non-glycan phrases
+    must still route to mutation_scan — glycan detection must not fire.
+    """
+    router       = _make_router()
+    translator_r = _mutation_scan_translator_result()
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mutation_scan" in routed["tools_needed"], (
+        f"Phrase {user_input!r} should route to mutation_scan; "
+        f"got {routed['tools_needed']}"
+    )
+    assert "glycan" not in routed["tools_needed"], (
+        f"Phrase {user_input!r} should NOT trigger glycan routing; "
+        f"got {routed['tools_needed']}"
+    )
