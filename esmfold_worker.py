@@ -94,25 +94,31 @@ def _run_inference(sequence: str, label: str, model_name: str) -> dict:
     t_load = time.perf_counter()
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # Use float16 on CUDA for ~4× faster inference (~30–40 s vs ~150 s).
-        # CPU inference stays float32 — float16 is slower on CPU.
-        load_dtype = torch.float16 if device == "cuda" else torch.float32
+        # Load the full model in float32 first.
+        # We deliberately do NOT pass torch_dtype=float16 here because
+        # the ESMFold folding head (trunk / structure_module / distogram /
+        # compute_tm) has a known float16 precision bug: torch.max on a
+        # float16 logit tensor can produce NaN, causing nonzero() to return
+        # an empty tensor and crashing with:
+        #   IndexError: index 0 is out of bounds for dimension 0 with size 0
+        # The fix is mixed precision — ESM-2 stem in float16 for speed,
+        # folding head kept in float32 for numerical stability.
         model = EsmForProteinFolding.from_pretrained(
             model_name,
             low_cpu_mem_usage=True,
-            torch_dtype=load_dtype,
         )
     except Exception as exc:
         return {"success": False, "error": f"Model load failed: {exc}"}
 
     model = model.to(device)
     model.eval()
-    # The ESM-2 language-model stem (model.esm) can silently remain float32
-    # even when from_pretrained is called with torch_dtype=float16.
-    # Explicitly cast it so the full forward pass runs in float16 on CUDA.
+    # Cast ONLY the ESM-2 language-model stem to float16.
+    # The folding head (trunk, structure_module, distogram, compute_tm)
+    # stays in float32 so pTM computation remains numerically stable.
+    # The float16→float32 boundary is handled internally by the model.
     if device == "cuda":
         model.esm = model.esm.half()
-    dtype_label = "float16" if device == "cuda" else "float32"
+    dtype_label = "mixed_fp16" if device == "cuda" else "float32"
     print(
         f"ESMFold: model loaded ({time.perf_counter() - t_load:.1f}s, dtype={dtype_label})",
         flush=True,
@@ -171,7 +177,7 @@ def _run_inference(sequence: str, label: str, model_name: str) -> dict:
             "error":      None,
             "elapsed_s":  round(elapsed, 3),
             "device":     device,
-            "dtype":      "float16" if device == "cuda" else "float32",
+            "dtype":      dtype_label,
         }
 
     except Exception as exc:

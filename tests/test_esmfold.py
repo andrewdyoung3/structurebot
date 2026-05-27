@@ -839,9 +839,13 @@ def test_worker_exception_written_to_json() -> None:
                 fh,
             )
 
-        # Patch _run_inference to raise — simulates a dtype mismatch or OOM
-        def _raise_runtime(*args, **kwargs):
-            raise RuntimeError("CUDA error: out of memory (simulated)")
+        # Patch _run_inference to raise IndexError — matches the real failure
+        # mode: compute_tm NaN bug causes nonzero() to return an empty tensor
+        # and then "index 0 is out of bounds for dimension 0 with size 0".
+        def _raise_index_error(*args, **kwargs):
+            raise IndexError(
+                "index 0 is out of bounds for dimension 0 with size 0"
+            )
 
         exit_code_seen: list[int] = []
 
@@ -849,7 +853,7 @@ def test_worker_exception_written_to_json() -> None:
             exit_code_seen.append(code)
             raise SystemExit(code)
 
-        with patch.object(esmfold_worker, "_run_inference", side_effect=_raise_runtime):
+        with patch.object(esmfold_worker, "_run_inference", side_effect=_raise_index_error):
             with patch.object(sys, "argv",
                               ["esmfold_worker.py",
                                "--input",  inp_path,
@@ -877,8 +881,8 @@ def test_worker_exception_written_to_json() -> None:
             f"got: {written}",
         )
         _assert(
-            "RuntimeError" in (written.get("error") or ""),
-            "output JSON error contains 'RuntimeError'",
+            "IndexError" in (written.get("error") or ""),
+            "output JSON error contains 'IndexError' (compute_tm NaN failure mode)",
             f"got error: {written.get('error')!r}",
         )
         _assert(
