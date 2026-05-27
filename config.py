@@ -154,6 +154,27 @@ ESMFOLD_MODEL_NAME: str = os.environ.get(
     "ESMFOLD_MODEL_NAME", "facebook/esmfold_v1"
 )
 
+# Worker subprocess timeouts.
+# Cold start (first run, weights not yet downloaded) needs up to 10 minutes
+# to pull ~2.5 GB from HuggingFace.  Warm start (weights already cached)
+# should complete within 2 minutes.  Override via env vars.
+ESMFOLD_WORKER_TIMEOUT_COLD: int = int(
+    os.environ.get("ESMFOLD_WORKER_TIMEOUT_COLD", "600")   # 10 min
+)
+ESMFOLD_WORKER_TIMEOUT_WARM: int = int(
+    os.environ.get("ESMFOLD_WORKER_TIMEOUT_WARM", "120")   # 2 min
+)
+
+# Force the cold (600 s) timeout regardless of cache state.
+# Set True as a one-time override when weights are not yet downloaded but
+# _is_model_cached is returning True (e.g. partial previous download).
+# Default is False — _is_model_cached() correctly detects real weight files
+# (under snapshots/ and blobs/) and ignores HuggingFace .no_exist/ sentinels.
+ESMFOLD_FORCE_COLD_TIMEOUT: bool = (
+    os.environ.get("ESMFOLD_FORCE_COLD_TIMEOUT", "false").strip().lower()
+    in ("1", "true", "yes")
+)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 

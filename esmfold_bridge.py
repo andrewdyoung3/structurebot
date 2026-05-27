@@ -84,10 +84,63 @@ _CREATE_NO_WINDOW: int = (
 
 _ATLAS_PRIMARY_URL  = "https://esmatlas.com/api/fold"
 _ATLAS_ALT_URL      = "https://api.esmatlas.com/foldSequence/v1/pdb/"
-_DEFAULT_TIMEOUT    = 120    # seconds — ESMFold inference can be slow
+_DEFAULT_TIMEOUT    = 120    # seconds — used as Atlas API timeout
 _RATE_LIMIT_DELAY   = 5.0   # seconds between consecutive Atlas API calls
 _MAX_SEQUENCE_LEN   = 400   # Atlas rejects very long sequences; warn above this
 _PLDDT_SCALE_GUARD  = 2.0   # if mean_plddt < this, assume 0-1 scale; multiply ×100
+
+
+# ── HuggingFace cache probe ───────────────────────────────────────────────────
+
+def _get_model_cache_dir(model_name: str) -> Path:
+    """
+    Return the HuggingFace hub cache directory for *model_name*.
+
+    Uses ``HF_HOME`` env var if set, otherwise ``USERPROFILE`` (Windows) or
+    ``Path.home()`` as the home root.  Does NOT check whether the directory
+    exists.
+    """
+    hf_home = os.environ.get("HF_HOME", "")
+    if hf_home:
+        cache_root = Path(hf_home) / "hub"
+    else:
+        home = Path(os.environ.get("USERPROFILE", "")) or Path.home()
+        cache_root = home / ".cache" / "huggingface" / "hub"
+    slug = "models--" + model_name.replace("/", "--")
+    return cache_root / slug
+
+
+def _is_model_cached(model_name: str) -> bool:
+    """
+    Return True if HuggingFace has fully downloaded the model weights.
+
+    Requires at least one non-empty ``.safetensors`` or ``.bin`` weight file
+    under the ``snapshots/`` or ``blobs/`` subdirectory of the model cache dir.
+
+    We deliberately avoid searching ``.no_exist/`` — HuggingFace uses that
+    directory to cache 0-byte sentinel files marking files *absent* from a
+    given revision.  Those sentinels match ``*.safetensors`` globs but are not
+    weight files.  Restricting to ``snapshots/`` and ``blobs/`` and requiring
+    ``st_size > 0`` prevents both false positives (sentinels) and false
+    negatives (incomplete downloads leaving a 0-byte stub).
+
+    Returns False on any error.
+    """
+    try:
+        model_dir = _get_model_cache_dir(model_name)
+        if not model_dir.exists():
+            return False
+        # Only search the subdirs that contain real weight data
+        for subdir in ("snapshots", "blobs"):
+            search_root = model_dir / subdir
+            if not search_root.exists():
+                continue
+            for ext in ("*.safetensors", "*.bin"):
+                if any(f for f in search_root.rglob(ext) if f.stat().st_size > 0):
+                    return True
+        return False
+    except Exception:
+        return False
 
 
 # ── Safe print ────────────────────────────────────────────────────────────────
@@ -180,12 +233,48 @@ class ESMFoldBridge:
         # ── Primary: local venv312 GPU inference ──────────────────────────────
         use_local = getattr(_cfg, "ESMFOLD_USE_LOCAL", True)
         if use_local and self._local_available():
-            result = self._run_local(sequence, label, timeout)
+            model_name = getattr(_cfg, "ESMFOLD_MODEL_NAME", "facebook/esmfold_v1")
+            is_cached  = _is_model_cached(model_name)
+            model_dir  = _get_model_cache_dir(model_name)
+
+            # Manual override: treat as cold (long timeout) even when weights appear cached.
+            # Useful when _is_model_cached returns True for a partial/corrupt download.
+            force_cold = getattr(_cfg, "ESMFOLD_FORCE_COLD_TIMEOUT", False)
+            if force_cold and is_cached:
+                is_cached = False   # honour the override
+
+            _pprint(
+                f"  ESMFold: cache path: {model_dir} — "
+                f"{'cached' if is_cached else 'not cached, using cold timeout'}"
+            )
+
+            worker_timeout = (
+                getattr(_cfg, "ESMFOLD_WORKER_TIMEOUT_WARM", 120)
+                if is_cached
+                else getattr(_cfg, "ESMFOLD_WORKER_TIMEOUT_COLD", 600)
+            )
+            if not is_cached:
+                _pprint(
+                    "  ESMFold: first run — downloading facebook/esmfold_v1 weights "
+                    "(~2.5 GB).\n"
+                    "  This will take several minutes. Subsequent runs will be fast."
+                )
+            result = self._run_local(sequence, label, worker_timeout)
             if result is not None:
                 return result
-            _pprint("  ESMFold: local inference failed — falling back to Atlas API...")
+            _pprint(
+                "  ESMFold: local inference failed — trying ESM Atlas API "
+                "(last resort — permanently unreliable, may return garbage results)..."
+            )
 
-        # ── Fallback: Atlas API ───────────────────────────────────────────────
+        # ── Last resort: Atlas API ────────────────────────────────────────────
+        # The Atlas API is permanently unreliable: it may return nonsense pLDDT
+        # values (< 2.0) or reject long sequences without a useful error.
+        # Always warn so the user knows to treat results with scepticism.
+        _pprint(
+            "  ESMFold: WARNING — ESM Atlas API is a last resort; results may be "
+            "unreliable."
+        )
         if len(sequence) > _MAX_SEQUENCE_LEN:
             _pprint(
                 f"  ESMFold: sequence length {len(sequence)} > {_MAX_SEQUENCE_LEN}; "
@@ -207,6 +296,16 @@ class ESMFoldBridge:
         mean_plddt = (
             round(sum(plddt.values()) / len(plddt), 2) if plddt else 0.0
         )
+
+        # Hard check: Atlas sometimes returns values in 0-1 scale or pure noise.
+        # A mean_plddt below the scale guard after all inference paths is garbage.
+        if mean_plddt < _PLDDT_SCALE_GUARD:
+            return self._error_result(
+                label,
+                f"pLDDT out of range after all inference paths — "
+                f"Atlas API may be down or returning garbage "
+                f"(mean pLDDT = {mean_plddt:.2f})"
+            )
 
         return {
             "success":    True,

@@ -527,6 +527,228 @@ def test_local_fallback_to_atlas_when_use_local_false() -> None:
             "requests.post was called (Atlas API used)")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# H. Cold/warm start timeout selection + Atlas pLDDT guard
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_timeout_capturing_subprocess(plddt_dict: dict, mean_plddt: float):
+    """
+    Like _make_fake_subprocess but also records the `timeout` kwarg passed to
+    subprocess.run.  Returns (side_effect_fn, captured_list) where
+    captured_list is mutated in-place with each timeout value seen.
+    """
+    captured = []
+
+    def _fake_run(cmd, **kwargs):
+        captured.append(kwargs.get("timeout"))
+        cmd_list = list(cmd)
+        try:
+            out_idx  = cmd_list.index("--output") + 1
+            out_path = cmd_list[out_idx]
+        except (ValueError, IndexError):
+            out_path = None
+
+        if out_path:
+            fake_output = {
+                "success":    True,
+                "label":      "test",
+                "plddt":      plddt_dict,
+                "mean_plddt": mean_plddt,
+                "pdb_str":    _MOCK_PDB,
+                "length":     len(plddt_dict),
+                "error":      None,
+                "elapsed_s":  0.1,
+                "device":     "cpu",
+            }
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(fake_output, fh)
+
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout     = "done"
+        result.stderr     = ""
+        return result
+
+    return _fake_run, captured
+
+
+def test_cold_start_uses_long_timeout() -> None:
+    """
+    When the model directory exists but contains NO weight files
+    (.safetensors / .bin), _is_model_cached() must return False and
+    predict() must pass ESMFOLD_WORKER_TIMEOUT_COLD to the subprocess.
+
+    Uses a real temp directory so _is_model_cached() is exercised end-to-end
+    (not mocked).  ESMFOLD_FORCE_COLD_TIMEOUT is patched to False so it does
+    not interfere with the cache-detection logic under test.
+    """
+    import shutil
+    import tempfile
+
+    print("\n=== H. Timeout selection + Atlas guard ===")
+    bridge = _make_bridge()
+    fake_run, captured = _make_timeout_capturing_subprocess(
+        {"1": 87.3, "2": 91.2}, mean_plddt=89.25
+    )
+
+    tmp = tempfile.mkdtemp()
+    try:
+        # Create model dir with only a config file — no weight files
+        model_dir = Path(tmp) / "hub" / "models--facebook--esmfold_v1"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        with patch.dict("os.environ", {"HF_HOME": tmp}):
+            with patch.object(_cfg, "ESMFOLD_FORCE_COLD_TIMEOUT", False):
+                with patch("esmfold_bridge.subprocess.run", side_effect=fake_run):
+                    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", True):
+                        bridge._local_available = lambda: True
+                        bridge.predict("MA", label="cold_test")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert captured, "subprocess.run should have been called"
+    assert captured[0] == _cfg.ESMFOLD_WORKER_TIMEOUT_COLD, (
+        f"Expected COLD timeout {_cfg.ESMFOLD_WORKER_TIMEOUT_COLD}s, "
+        f"got {captured[0]}s"
+    )
+    _ok("cold start uses ESMFOLD_WORKER_TIMEOUT_COLD",
+        f"timeout={captured[0]}s")
+
+
+def test_warm_start_uses_short_timeout() -> None:
+    """
+    When the model directory contains a .safetensors weight file,
+    _is_model_cached() must return True and predict() must pass
+    ESMFOLD_WORKER_TIMEOUT_WARM to the subprocess.
+
+    Uses a real temp directory with a dummy safetensors file so
+    _is_model_cached() is exercised end-to-end.  ESMFOLD_FORCE_COLD_TIMEOUT
+    is patched to False so the manual override does not interfere.
+    """
+    import shutil
+    import tempfile
+
+    bridge = _make_bridge()
+    fake_run, captured = _make_timeout_capturing_subprocess(
+        {"1": 87.3, "2": 91.2}, mean_plddt=89.25
+    )
+
+    tmp = tempfile.mkdtemp()
+    try:
+        # Create a snapshot dir containing a non-empty safetensors file.
+        # _is_model_cached() requires st_size > 0 to count as cached — a 0-byte
+        # file is treated as a HuggingFace .no_exist sentinel and ignored.
+        snapshot_dir = (
+            Path(tmp) / "hub" / "models--facebook--esmfold_v1"
+            / "snapshots" / "abc123"
+        )
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.safetensors").write_bytes(b"FAKE" * 25)  # 100 bytes
+
+        with patch.dict("os.environ", {"HF_HOME": tmp}):
+            with patch.object(_cfg, "ESMFOLD_FORCE_COLD_TIMEOUT", False):
+                with patch("esmfold_bridge.subprocess.run", side_effect=fake_run):
+                    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", True):
+                        bridge._local_available = lambda: True
+                        bridge.predict("MA", label="warm_test")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert captured, "subprocess.run should have been called"
+    assert captured[0] == _cfg.ESMFOLD_WORKER_TIMEOUT_WARM, (
+        f"Expected WARM timeout {_cfg.ESMFOLD_WORKER_TIMEOUT_WARM}s, "
+        f"got {captured[0]}s"
+    )
+    _ok("warm start uses ESMFOLD_WORKER_TIMEOUT_WARM",
+        f"timeout={captured[0]}s")
+
+
+def test_force_cold_timeout_overrides_cache() -> None:
+    """
+    When ESMFOLD_FORCE_COLD_TIMEOUT=True and the weight file IS present,
+    predict() must still pass ESMFOLD_WORKER_TIMEOUT_COLD to the subprocess.
+
+    This is the manual cache-bust mechanism for when _is_model_cached returns
+    True despite a partial / corrupt download.
+    """
+    import shutil
+    import tempfile
+
+    bridge = _make_bridge()
+    fake_run, captured = _make_timeout_capturing_subprocess(
+        {"1": 87.3, "2": 91.2}, mean_plddt=89.25
+    )
+
+    tmp = tempfile.mkdtemp()
+    try:
+        # Weights ARE present (non-empty so _is_model_cached returns True)
+        snapshot_dir = (
+            Path(tmp) / "hub" / "models--facebook--esmfold_v1"
+            / "snapshots" / "abc123"
+        )
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.safetensors").write_bytes(b"FAKE" * 25)  # 100 bytes
+
+        # But force_cold=True should override the warm timeout
+        with patch.dict("os.environ", {"HF_HOME": tmp}):
+            with patch.object(_cfg, "ESMFOLD_FORCE_COLD_TIMEOUT", True):
+                with patch("esmfold_bridge.subprocess.run", side_effect=fake_run):
+                    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", True):
+                        bridge._local_available = lambda: True
+                        bridge.predict("MA", label="force_cold_test")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert captured, "subprocess.run should have been called"
+    assert captured[0] == _cfg.ESMFOLD_WORKER_TIMEOUT_COLD, (
+        f"Expected COLD timeout {_cfg.ESMFOLD_WORKER_TIMEOUT_COLD}s despite cached weights, "
+        f"got {captured[0]}s"
+    )
+    _ok("ESMFOLD_FORCE_COLD_TIMEOUT=True overrides warm cache",
+        f"timeout={captured[0]}s")
+
+
+# Minimal PDB where every CA has B-factor = 0.9 (garbage pLDDT from Atlas)
+_GARBAGE_PLDDT_PDB = textwrap.dedent("""\
+    ATOM      1  N   MET A   1      10.000  10.000  10.000  1.00  0.90           N
+    ATOM      2  CA  MET A   1      11.000  10.000  10.000  1.00  0.90           C
+    ATOM      3  N   ALA A   2      11.000  11.000  10.000  1.00  0.90           N
+    ATOM      4  CA  ALA A   2      12.000  11.000  10.000  1.00  0.90           C
+    END
+""")
+
+
+def test_sub2_plddt_returns_error_not_success() -> None:
+    """
+    When the Atlas API returns a structurally valid PDB response but all
+    pLDDT values are < 2.0 (0-1 scale or pure noise), predict() must return
+    success=False with a descriptive error — not success=True with mean_plddt=0.9.
+    """
+    bridge = _make_bridge()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = _GARBAGE_PLDDT_PDB
+
+    with patch.object(_cfg, "ESMFOLD_USE_LOCAL", False):
+        with patch("requests.post", return_value=mock_resp):
+            result = bridge.predict("MA", label="garbage_test")
+
+    assert not result["success"], (
+        f"Expected success=False when Atlas returns garbage pLDDT=0.9, "
+        f"but got success=True with mean_plddt={result.get('mean_plddt')}"
+    )
+    assert result.get("error") is not None, "error field must be set"
+    # Error message should mention pLDDT and range (or 'out of range')
+    err_lower = (result.get("error") or "").lower()
+    assert "plddt" in err_lower or "range" in err_lower, (
+        f"Error message should mention pLDDT or range; got: {result.get('error')!r}"
+    )
+    _ok("sub-2.0 Atlas pLDDT returns error not success",
+        f"error={result.get('error')!r}")
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -559,6 +781,11 @@ def main() -> int:
     test_local_predict_success()
     test_plddt_scale_guard_0_to_1()
     test_local_fallback_to_atlas_when_use_local_false()
+
+    test_cold_start_uses_long_timeout()
+    test_warm_start_uses_short_timeout()
+    test_force_cold_timeout_overrides_cache()
+    test_sub2_plddt_returns_error_not_success()
 
     print()
     print("=" * 60)
