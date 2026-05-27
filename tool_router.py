@@ -682,13 +682,25 @@ class ToolRouter:
                 elapsed_ms=elapsed_ms,
             )
 
+        cx_cmds = result.get("chimerax_commands", [])
+        cx_exps = result.get("chimerax_explanations", [])
+
+        if not cx_cmds:
+            # Defensive: if analyze() returned nothing, log clearly so it's visible
+            n_native = len(result.get("native_sequons", []))
+            n_eng    = len(result.get("engineered_candidates", []))
+            print(
+                f"  [glycan] WARNING: no ChimeraX commands generated "
+                f"(native={n_native}, engineered={n_eng})"
+            )
+
         return ToolStepResult(
             tool             = "glycan",
             success          = True,
             data             = {k: v for k, v in result.items()
-                                if k not in ("viz_commands", "viz_explanations", "summary")},
-            viz_commands     = result.get("viz_commands", []),
-            viz_explanations = result.get("viz_explanations", []),
+                                if k not in ("chimerax_commands", "chimerax_explanations", "summary")},
+            viz_commands     = cx_cmds,
+            viz_explanations = cx_exps,
             summary          = result.get("summary", "Glycan scan complete."),
             elapsed_ms       = elapsed_ms,
         )

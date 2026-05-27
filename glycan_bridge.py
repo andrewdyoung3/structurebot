@@ -467,35 +467,59 @@ class GlycanBridge:
         if not result.get("success"):
             return {
                 **result,
-                "summary":          f"Glycan scan failed: {result.get('error', '?')}",
-                "viz_commands":     [],
-                "viz_explanations": [],
+                "summary":               f"Glycan scan failed: {result.get('error', '?')}",
+                "chimerax_commands":     [],
+                "chimerax_explanations": [],
             }
 
-        native = result["native_sequons"]
-        eng    = result["engineered_candidates"]
+        native     = result["native_sequons"]
+        eng        = result["engineered_candidates"]
+        all_ranked = result["all_ranked"]   # all sequons, no min_score filter
 
-        # Build a unified candidate list for visualization (no duplicates)
-        native_positions = {s["position"] for s in native}
-        all_viz = native + [c for c in eng if c["position"] not in native_positions]
+        # ── Visualization candidate list ───────────────────────────────────────
+        # Use all_ranked (unfiltered by min_score) so proteins with no
+        # N-glycosylation sequons still show engineered candidates in ChimeraX.
+        # Engineered candidates are added where they don't overlap native sites.
+        ranked_positions = {s["position"] for s in all_ranked}
+        all_viz = all_ranked + [c for c in eng if c["position"] not in ranked_positions]
 
-        viz_cmds, viz_exps = self.generate_chimerax_commands(
+        cx_cmds, cx_exps = self.generate_chimerax_commands(
             all_viz, model_id=model_id, chain=chain
         )
 
-        if not native and not eng:
-            summary = "Glycan scan: no NXS/T sequons detected above threshold."
-        else:
-            parts: List[str] = []
-            if native:
-                top = native[0]
-                parts.append(
-                    f"{len(native)} native sequon(s) "
-                    f"(top: N{top['position']} score={top['composite_score']:.3f})"
+        # ── Multi-line summary (triggers Rich Panel in main.py) ───────────────
+        header = f"Glycan scan — chain {chain}"
+        lines: List[str] = [header, ""]
+        if native:
+            lines.append(f"Native sequons ({len(native)} found):")
+            for s in native[:5]:
+                ss    = s.get("secondary_structure", "L")
+                lines.append(
+                    f"  N{s['position']} {s['sequon']}  {s['confidence']}"
+                    f"  score={s['composite_score']:.3f}  SS={ss}"
                 )
-            if eng:
-                parts.append(f"{len(eng)} engineered candidate(s)")
-            summary = "Glycan scan: " + ", ".join(parts) + "."
+            if len(native) > 5:
+                lines.append(f"  … and {len(native) - 5} more")
+        elif all_ranked:
+            lines.append(
+                f"No native sequons above score threshold "
+                f"({len(all_ranked)} detected total, all below min_score)."
+            )
+        else:
+            lines.append("No native NXS/T sequons detected.")
+
+        if eng:
+            lines.append("")
+            lines.append(f"Engineered candidates ({len(eng)} proposed):")
+            for e in eng:
+                mut = e.get("mutation", "?")
+                seq = e.get("sequon", "")
+                lines.append(
+                    f"  {mut} → {seq}  {e['confidence']}"
+                    f"  score={e['composite_score']:.3f}"
+                )
+
+        summary = "\n".join(lines)
 
         # Persist to session state when a session object is provided
         if session is not None:
@@ -506,9 +530,9 @@ class GlycanBridge:
 
         return {
             **result,
-            "summary":          summary,
-            "viz_commands":     viz_cmds,
-            "viz_explanations": viz_exps,
+            "summary":               summary,
+            "chimerax_commands":     cx_cmds,
+            "chimerax_explanations": cx_exps,
         }
 
     # ── generate_chimerax_commands ─────────────────────────────────────────────

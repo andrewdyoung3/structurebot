@@ -395,13 +395,15 @@ END
 # ════════════════════════════════════════════════════════════════════════════════
 
 def test_analyze_returns_summary(gb):
-    """analyze() must include 'summary', 'viz_commands', 'viz_explanations'."""
+    """analyze() must include 'summary', 'chimerax_commands', 'chimerax_explanations'."""
     result = gb.analyze(sequence="MNASVNATL", chain="A", model_id="1")
-    assert "summary"          in result
-    assert "viz_commands"     in result
-    assert "viz_explanations" in result
-    assert isinstance(result["viz_commands"],     list)
-    assert isinstance(result["viz_explanations"], list)
+    assert "summary"               in result
+    assert "chimerax_commands"     in result
+    assert "chimerax_explanations" in result
+    assert isinstance(result["chimerax_commands"],     list)
+    assert isinstance(result["chimerax_explanations"], list)
+    # Summary must be multi-line so main.py renders the Rich Panel
+    assert "\n" in result["summary"], "summary must contain newlines to trigger the Rich Panel"
 
 
 def test_analyze_calls_set_glycan_results(gb):
@@ -412,7 +414,39 @@ def test_analyze_calls_set_glycan_results(gb):
 
 
 def test_analyze_no_sequons_summary(gb):
-    """When no sequons are found, summary should mention 'no NXS/T'."""
-    # A sequence with no sequons
+    """When no native sequons are found, summary should mention 'no … sequons'."""
+    # A sequence with no NXS/T sequons (all X positions are P)
     result = gb.analyze(sequence="MPPPPPPPPPPPPPP", chain="A", model_id="1")
-    assert "no NXS/T" in result["summary"].lower() or "no" in result["summary"].lower()
+    assert "no" in result["summary"].lower()
+
+
+def test_analyze_viz_commands_non_empty_for_real_sequence(gb):
+    """
+    HIV-1 protease (1HSG chain A, 99 residues) has no native NXS/T sequons.
+    analyze() must still return non-empty chimerax_commands from engineered
+    candidates (single-AA proposals that would create a sequon).
+    """
+    # 1HSG chain A — HIV-1 protease, no native N-glycosylation sequons
+    seq_1hsg = (
+        "PQITLWQRPIVTIKIGGQLKEALLDTGADDTVLEEMSLPGRWKPKMIGGIGGFIKVRQYDQ"
+        "ILIEICGHKAIGTVLVGPTPVNIIGRNLLTQIGCTLNF"
+    )
+    result = gb.analyze(sequence=seq_1hsg, chain="A", model_id="1")
+
+    assert result.get("success") is True, f"analyze() failed: {result.get('error')}"
+    # No native sequons expected for HIV protease
+    assert len(result["native_sequons"]) == 0, (
+        f"Unexpected native sequons: {result['native_sequons']}"
+    )
+    # Engineered candidates must be found for a 99-residue sequence
+    assert len(result["engineered_candidates"]) > 0, (
+        "No engineered candidates found for a 99-residue sequence"
+    )
+    # chimerax_commands must be non-empty (generated from engineered candidates)
+    assert len(result["chimerax_commands"]) > 0, (
+        "chimerax_commands is empty — engineered candidates not reaching visualization"
+    )
+    # Summary must be multi-line (triggers Rich Panel in main.py)
+    assert "\n" in result["summary"], (
+        "summary must contain newlines to trigger the Rich Panel"
+    )
