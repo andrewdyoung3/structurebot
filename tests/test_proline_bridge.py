@@ -410,6 +410,42 @@ class TestGenerateChimeraXCommands:
         for cmd in cmds:
             assert "#2/B:37" in cmd
 
+    def test_chimerax_command_explanations_non_empty(self, bridge):
+        """
+        generate_chimerax_commands() with 2 candidates → all 6 explanation
+        strings are non-empty and each contains the mutation string (e.g. 'L37P').
+        """
+        cands = self._make_cands() + [
+            {
+                "position":        10,
+                "from_aa":         "E",
+                "to_aa":           "P",
+                "phi":             -55.0,
+                "psi":             -38.0,
+                "ss":              "L",
+                "phi_score":       0.80,
+                "loop_bonus":      1.0,
+                "esm_factor":      0.9,
+                "iface_factor":    1.0,
+                "hbond_factor":    1.0,
+                "composite_score": 0.55,
+                "confidence":      "moderate",
+                "near_interface":  False,
+            }
+        ]
+        cmds, exps = bridge.generate_chimerax_commands(cands, model_id="1", chain="A")
+        assert len(cmds) == 6
+        assert len(exps) == 6
+        # All explanations must be non-empty
+        for i, exp in enumerate(exps):
+            assert exp.strip(), f"Explanation #{i} is empty (cmd: {cmds[i]!r})"
+        # Each explanation must contain the mutation string for its candidate
+        # Rows 0-2 belong to L37P, rows 3-5 belong to E10P
+        for exp in exps[:3]:
+            assert "L37P" in exp, f"Expected 'L37P' in {exp!r}"
+        for exp in exps[3:]:
+            assert "E10P" in exp, f"Expected 'E10P' in {exp!r}"
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # 6. Full scan (orchestrator)

@@ -690,6 +690,11 @@ class ProlineBridge:
             "moderate": "#cc6600",
             "low":      "#cccc00",
         }
+        color_name_map = {
+            "#cc00cc": "magenta",
+            "#cc6600": "orange",
+            "#cccc00": "yellow",
+        }
 
         cmds: List[str] = []
         exps: List[str] = []
@@ -701,22 +706,24 @@ class ProlineBridge:
             score      = cand.get("composite_score", 0.0)
             ddg        = cand.get("ddg")
             hex_color  = color_map.get(confidence, "#cc6600")
+            color_name = color_name_map.get(hex_color, "orange")
             phi        = cand.get("phi")
+            mutation   = f"{from_aa}{pos}P"
 
             spec = f"#{model_id}/{chain}:{pos}"
 
             # ── Sphere style for the Cα ───────────────────────────────────────
             cmds.append(f"style {spec} sphere")
-            exps.append("")   # no separate display explanation for style
+            exps.append(f"{mutation} — show as sphere")
 
             # ── Color by confidence band ──────────────────────────────────────
             cmds.append(f"color {spec} {hex_color}")
-            exps.append("")   # no separate display explanation for color
+            exps.append(f"{mutation} — color {confidence} confidence ({color_name})")
 
             # ── Label: "L36P phi=-62" (or "L36P phi=-62 -1.5" with ddG) ──────
             phi_str       = f" phi={phi:+.0f}" if phi is not None else ""
             ddg_str_label = f" {ddg:+.1f}" if ddg is not None else ""
-            label_text    = f"{from_aa}{pos}P{phi_str}{ddg_str_label}"
+            label_text    = f"{mutation}{phi_str}{ddg_str_label}"
             cmds.append(
                 f'label {spec} text "{label_text}" '
                 f'color {hex_color} height 0.8'
@@ -724,7 +731,7 @@ class ProlineBridge:
             ddg_str = f", ddG={ddg:+.2f}" if ddg is not None else ""
             phi_exp = f", phi={phi:+.1f}" if phi is not None else ""
             exps.append(
-                f"{from_aa}{pos}P — {confidence} confidence "
+                f"{mutation} — {confidence} confidence "
                 f"(score={score:.3f}{phi_exp}{ddg_str})"
             )
 
