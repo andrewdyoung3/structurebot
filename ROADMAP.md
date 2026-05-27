@@ -1,9 +1,9 @@
 # StructureBot Roadmap
 
 ## Session 9 (next)
+- ESMFold live validation on real mutation candidates (model weights download)
 - WSL2 install + local Rosetta (PyRosetta via WSL2)
 - Mid-execution ESC (background thread cancellation)
-- ESMFold live validation on real mutation candidates
 
 ## Near term
 - Salt bridge analysis module
@@ -24,4 +24,5 @@
 - S5: Assembly analyser + multimer
 - S6: Disulfide + GPU venv312
 - S7: Dihedral fix + ProteinMPNN + RFdiffusion + QoL
-- S8: Parallel DynaMut2 + ESMFold bridge + log analyser + Cys audit
+- S8A: Parallel DynaMut2 + ESMFold bridge (Atlas) + log analyser + Cys audit
+- S8B: ESMFold local GPU inference (venv312 + transformers, 184 tests)
