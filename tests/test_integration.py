@@ -419,3 +419,144 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Pytest integration tests — glycan + proline bridges
+# (self-contained; no ChimeraX instance required)
+# ════════════════════════════════════════════════════════════════════════════════
+
+import sys
+import textwrap
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def test_glycan_sequon_detection():
+    """
+    GlycanBridge.full_glycan_scan() should detect NXS/T sequons
+    and return results with the correct field structure.
+    """
+    from glycan_bridge import GlycanBridge
+    gb = GlycanBridge()
+    # MNASVNATL: contains NAS (pos 2) and NAT (pos 6 = N-A-T)
+    seq = "MNASVNATL"
+    result = gb.full_glycan_scan(sequence=seq, chain="A")
+    assert isinstance(result, dict)
+    assert result.get("success") is True
+    assert "native_sequons"        in result
+    assert "engineered_candidates" in result
+    assert "all_ranked"            in result
+    # At least one NXS/T sequon should be found (NAS at pos 2, NAT at pos 7)
+    assert len(result["all_ranked"]) >= 1
+    for site in result["all_ranked"]:
+        assert "position"          in site
+        assert "sequon"            in site
+        assert "composite_score"   in site
+        assert "confidence"        in site
+
+
+def test_glycan_chimerax_commands():
+    """
+    GlycanBridge.generate_chimerax_commands() should produce color + label
+    commands with green/cyan/yellow palette (not magenta).
+    """
+    from glycan_bridge import GlycanBridge
+    gb = GlycanBridge()
+    seq = "MNASVNATL"
+    result = gb.full_glycan_scan(sequence=seq, chain="A")
+    # Use all_ranked so we always have candidates to pass
+    candidates = result["all_ranked"]
+    cmds, exps = gb.generate_chimerax_commands(
+        candidates, model_id="1", chain="A"
+    )
+    assert isinstance(cmds, list)
+    assert len(cmds) > 0
+    # Colors must be green/cyan/yellow — not magenta
+    color_cmds = [c for c in cmds if c.startswith("color")]
+    for cmd in color_cmds:
+        assert "#cc00cc" not in cmd, "Glycan used proline's magenta color"
+    # Exactly one explanation per candidate (3 cmds each)
+    assert len(exps) == len(candidates)
+
+
+def test_proline_scan_no_overlap_with_glycan_colors():
+    """
+    ProlineBridge.generate_chimerax_commands() uses magenta/orange/yellow.
+    These must not overlap with the green/cyan used by GlycanBridge.
+    """
+    from proline_bridge import ProlineBridge
+    pb = ProlineBridge()
+    fake_cands = [
+        {
+            "position":        10,
+            "from_aa":         "L",
+            "to_aa":           "P",
+            "phi":             -60.0,
+            "psi":             -40.0,
+            "ss":              "L",
+            "phi_score":       1.0,
+            "loop_bonus":      1.3,
+            "esm_factor":      1.0,
+            "iface_factor":    1.0,
+            "hbond_factor":    1.0,
+            "composite_score": 0.9,
+            "confidence":      "high",
+            "near_interface":  False,
+        }
+    ]
+    cmds, _ = pb.generate_chimerax_commands(fake_cands, model_id="1", chain="A")
+    color_cmds = [c for c in cmds if c.startswith("color")]
+    for cmd in color_cmds:
+        # Proline uses magenta (#cc00cc) for high — not green (#00cc00) or cyan (#00cccc)
+        assert "#00cc00" not in cmd, "Proline used glycan's green"
+        assert "#00cccc" not in cmd, "Proline used glycan's cyan"
+        assert "#cc00cc" in cmd     # magenta for high confidence
+
+
+def test_proline_full_scan_mocked_backbone():
+    """
+    ProlineBridge.full_proline_scan() orchestrator should integrate
+    backbone extraction → candidate scan → result dict correctly
+    when backbone extraction is mocked.
+    """
+    from proline_bridge import ProlineBridge
+    import tempfile, os
+
+    pb = ProlineBridge()
+
+    # 12-residue backbone: positions 1-12, all LEU in loop with ideal φ=-60
+    fake_backbone = {
+        pos: {
+            "phi":     -60.0,
+            "psi":     -40.0,
+            "ss":      "L",
+            "resname": "LEU",
+            "aa":      "L",
+        }
+        for pos in range(1, 13)
+    }
+
+    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w") as fh:
+        fh.write("REMARK fake\nEND\n")
+        pdb_path = fh.name
+
+    try:
+        with patch.object(pb, "extract_backbone_angles", return_value=fake_backbone):
+            result = pb.full_proline_scan(
+                pdb_path = pdb_path,
+                chain    = "A",
+            )
+    finally:
+        os.unlink(pdb_path)
+
+    assert result["count"] > 0
+    assert result["top"] is not None
+    assert result["chain"] == "A"
+    assert result["n_residues_scanned"] == 12
+    # All candidates should be → P
+    for c in result["candidates"]:
+        assert c["to_aa"] == "P"
+        assert c["from_aa"] == "L"

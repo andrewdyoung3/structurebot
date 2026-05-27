@@ -117,7 +117,24 @@ class ToolRouter:
         "mutation_scan":     "🔬⚗️",
         "assembly_analyser": "🔗",
         "disulfide":         "🔗⚗️",
+        "proline":           "🧪",
+        "glycan":            "🍬",
     }
+
+    # Keywords that signal a proline substitution scan request.
+    # Checked case-insensitively; any match overrides generic mutation_scan routing.
+    _PROLINE_KEYWORDS: tuple = (
+        "proline",           # catches "proline mutations", "proline scan", etc.
+        "pro substitut",     # "pro substitution(s)"
+        "pro mutation",      # "pro mutation(s)"
+        "backbone stabili",  # "backbone stabilisation / stabilise"
+        "entropic stabili",  # "entropic stabilisation"
+        "phi angle",         # explicit backbone geometry reference
+        "φ angle",      # φ angle (Unicode phi)
+        "rigidif",           # "rigidify", "rigidification"
+        "proline scan",      # explicit tool name
+        "proline candidate", # explicit candidate language
+    )
 
     def __init__(
         self,
@@ -137,10 +154,68 @@ class ToolRouter:
         self._mutation_scanner:     Optional[Any] = None
         self._assembly_analyser:    Optional[Any] = None
         self._disulfide_bridge:     Optional[Any] = None
+        self._proline_bridge:       Optional[Any] = None
+        self._glycan_bridge:        Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
-    def route(self, translator_result: Dict[str, Any]) -> Dict[str, Any]:
+    # ── Proline intent helpers ────────────────────────────────────────────────
+
+    @classmethod
+    def _detect_proline_intent(cls, text: str) -> bool:
+        """Return True if *text* signals a proline substitution scan request."""
+        lower = text.lower()
+        return any(kw in lower for kw in cls._PROLINE_KEYWORDS)
+
+    def _rewrite_as_proline(
+        self,
+        tools_needed: List[str],
+        tool_inputs:  Dict[str, Any],
+    ) -> tuple:
+        """
+        Replace 'mutation_scan' with 'proline' in the tool pipeline.
+
+        Builds proline tool_inputs from the mutation_scan inputs so model_id
+        and chain are preserved.  Other tools (assembly_analyser, disulfide,
+        chimerax) are kept unchanged.
+
+        Returns (new_tools_needed, new_tool_inputs).
+        """
+        new_tools  = []
+        new_inputs = dict(tool_inputs)
+
+        for tool in tools_needed:
+            if tool == "mutation_scan":
+                new_tools.append("proline")
+                ms = tool_inputs.get("mutation_scan", {})
+                new_inputs["proline"] = {
+                    "model_id": ms.get("model_id") or self._first_model_id(),
+                    "chain":    ms.get("chain", "A"),
+                    "pdb_path": ms.get("pdb_path"),
+                    "top_n":    5,
+                }
+                new_inputs.pop("mutation_scan", None)
+            else:
+                new_tools.append(tool)
+
+        # If mutation_scan wasn't in the list, still ensure proline is added
+        if "proline" not in new_tools:
+            new_tools.append("proline")
+            new_inputs["proline"] = {
+                "model_id": self._first_model_id(),
+                "chain":    "A",
+                "top_n":    5,
+            }
+
+        return new_tools, new_inputs
+
+    # ── Phase 1: Route (no execution) ─────────────────────────────────────────
+
+    def route(
+        self,
+        translator_result: Dict[str, Any],
+        user_input:        str = "",
+    ) -> Dict[str, Any]:
         """
         Augment a translator result with tool routing metadata.
 
@@ -148,13 +223,26 @@ class ToolRouter:
           "tools_needed"    — list of tools from translator (default ["chimerax"])
           "tool_steps_info" — list of {tool, icon, description} for each step
           "has_extra_tools" — True if any non-chimerax tools are present
+          "_user_input"     — original user text, used by execute() for proline guard
+
+        If *user_input* contains proline intent keywords and 'mutation_scan' is
+        in tools_needed, the pipeline is rewritten to use 'proline' instead.
         """
         tools_needed = translator_result.get("tools_needed") or ["chimerax"]
         tool_inputs  = translator_result.get("tool_inputs") or {}
 
+        # ── Proline intent override ────────────────────────────────────────────
+        # Check BEFORE building step_info so the icon/description are correct.
+        if user_input and self._detect_proline_intent(user_input):
+            if "mutation_scan" in tools_needed:
+                tools_needed, tool_inputs = self._rewrite_as_proline(
+                    tools_needed, tool_inputs
+                )
+
         result = dict(translator_result)
         result["tools_needed"] = tools_needed
         result["tool_inputs"]  = tool_inputs
+        result["_user_input"]  = user_input   # passed to execute() for guard
 
         step_info: List[Dict[str, Any]] = []
         for tool in tools_needed:
@@ -231,6 +319,22 @@ class ToolRouter:
                 f"Disulfide candidate prediction — #{mid} chains {ca}/{cb} "
                 "(geometry + ESM + DynaMut2)"
             )
+        if tool == "proline":
+            inp   = tool_inputs.get("proline", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            return (
+                f"Proline substitution scan — #{mid} chain {chain} "
+                "(backbone φ/ψ + ESM tolerance)"
+            )
+        if tool == "glycan":
+            inp   = tool_inputs.get("glycan", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            return (
+                f"N-glycosylation site scan — #{mid} chain {chain} "
+                "(NXS/T sequons, SASA + SS + ESM)"
+            )
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -253,6 +357,8 @@ class ToolRouter:
         """
         tools_needed = routed_result.get("tools_needed") or ["chimerax"]
         tool_inputs  = routed_result.get("tool_inputs") or {}
+        # user_input stored by route() for the proline guard
+        user_input   = routed_result.get("_user_input", "")
 
         step_results:   List[Dict[str, Any]] = []
         all_viz_cmds:   List[str] = []
@@ -275,7 +381,7 @@ class ToolRouter:
                 status_callback(f"{icon} Running {tool}…")
 
             t0   = time.perf_counter()
-            step = self._dispatch_tool(tool, tool_inputs.get(tool) or {})
+            step = self._dispatch_tool(tool, tool_inputs.get(tool) or {}, user_input=user_input)
             step.elapsed_ms = (time.perf_counter() - t0) * 1000
 
             step_results.append(step.to_dict())
@@ -305,10 +411,17 @@ class ToolRouter:
 
     def _dispatch_tool(
         self,
-        tool:   str,
-        inputs: Dict[str, Any],
+        tool:       str,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
     ) -> ToolStepResult:
-        """Route to the correct bridge; return ToolStepResult."""
+        """
+        Route to the correct bridge; return ToolStepResult.
+
+        Proline guard: if tool is 'mutation_scan' but user_input contains proline
+        intent keywords, redirect to _run_proline() so the backbone φ-angle
+        scanner runs instead of the generic CamSol/ESM/Rosetta pipeline.
+        """
         try:
             if tool == "camsol":
                 return self._run_camsol(inputs)
@@ -323,17 +436,33 @@ class ToolRouter:
             if tool == "rosetta":
                 return self._run_rosetta(inputs)
             if tool == "mutation_scan":
+                # ── Proline guard (secondary safety net) ─────────────────────
+                # If the user asked about proline and route() didn't catch it
+                # (e.g. user_input was not passed to route()), redirect here.
+                if user_input and self._detect_proline_intent(user_input):
+                    proline_inputs = {
+                        "model_id": inputs.get("model_id") or self._first_model_id(),
+                        "chain":    inputs.get("chain", "A"),
+                        "pdb_path": inputs.get("pdb_path"),
+                        "top_n":    5,
+                    }
+                    return self._run_proline(proline_inputs)
                 return self._run_mutation_scan(inputs)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
                 return self._run_disulfide(inputs)
+            if tool == "proline":
+                return self._run_proline(inputs)
+            if tool == "glycan":
+                return self._run_glycan(inputs)
             return ToolStepResult(
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
                     "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
-                    "rfdiffusion, rosetta, mutation_scan, assembly_analyser, disulfide."
+                    "rfdiffusion, rosetta, mutation_scan, assembly_analyser, "
+                    "disulfide, proline, glycan."
                 ),
             )
         except Exception as exc:
@@ -389,6 +518,180 @@ class ToolRouter:
             )
 
         return result
+
+    def _run_proline(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run proline substitution scan on a chain."""
+        import time as _time
+        bridge   = self._get_proline_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain", "A")
+        top_n    = int(inputs.get("top_n", 5))
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="proline", success=False,
+                error=(
+                    "Proline scan requires a local PDB file.\n"
+                    "  Load the structure from a local .pdb file, or ensure\n"
+                    "  internet access so StructureBot can download it from RCSB."
+                ),
+            )
+
+        # Pull ESM tolerance scores from session if already computed
+        esm_scores: Optional[Dict[int, float]] = None
+        esm_data = self.session.tool_results.get("esm", {}).get(model_id)
+        if isinstance(esm_data, dict):
+            raw = esm_data.get("per_residue_tolerance") or esm_data.get("scores")
+            if isinstance(raw, dict):
+                esm_scores = {int(k): float(v) for k, v in raw.items()}
+
+        # Pull interface residues from session if already computed
+        iface_set: Optional[set] = None
+        iface_data = self.session.get_interface_residues(model_id)
+        if iface_data:
+            protected = self.session.get_protected_residues_for_chain(model_id, chain)
+            if protected:
+                iface_set = set(protected)
+
+        # Optional DynaMut2 validation
+        dynamut2_bridge: Optional[Any] = None
+        use_dynamut2 = inputs.get("use_dynamut2", False)
+        if use_dynamut2:
+            try:
+                dynamut2_bridge = self._get_rosetta_bridge()
+            except Exception:
+                pass   # proceed without DynaMut2 if unavailable
+
+        # Pull user-declared active-site residues from session
+        # (None → trigger SASA auto-detection in proline_bridge)
+        session_fr = self.session.get_functional_residues()
+        functional_residues: Optional[set] = session_fr if session_fr else None
+
+        t0 = _time.perf_counter()
+        try:
+            result = bridge.full_proline_scan(
+                pdb_path             = pdb_path,
+                chain                = chain,
+                interface_residues   = iface_set,
+                esm_scores           = esm_scores,
+                top_n                = top_n,
+                dynamut2_bridge      = dynamut2_bridge,
+                functional_residues  = functional_residues,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return ToolStepResult(
+                tool="proline", success=False,
+                error=f"Proline scan failed: {exc}",
+            )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        candidates = result.get("candidates", [])
+        if result.get("count", 0) == 0:
+            return ToolStepResult(
+                tool       = "proline",
+                success    = True,
+                data       = result,
+                summary    = f"Proline scan chain {chain}: no candidates found.",
+                elapsed_ms = elapsed_ms,
+            )
+
+        # Store in session
+        self.session.set_proline_results(model_id, chain, result)
+
+        # Visualization
+        viz_cmds, viz_exps = bridge.generate_chimerax_commands(
+            candidates[:top_n], model_id=model_id, chain=chain
+        )
+
+        summary = bridge._generate_summary(result)
+
+        return ToolStepResult(
+            tool             = "proline",
+            success          = True,
+            data             = result,
+            viz_commands     = viz_cmds,
+            viz_explanations = viz_exps,
+            summary          = summary,
+            elapsed_ms       = elapsed_ms,
+        )
+
+    def _run_glycan(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run N-glycosylation site prediction on a chain."""
+        import time as _time
+        bridge   = self._get_glycan_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain", "A")
+        top_n    = int(inputs.get("top_n", 3))
+        min_score= float(inputs.get("min_score", 0.05))
+
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+        if not sequence:
+            return ToolStepResult(
+                tool="glycan", success=False,
+                error=(
+                    "Glycan scan requires an amino-acid sequence. "
+                    "Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+
+        # Pull ESM tolerance scores from session if available
+        esm_scores: Optional[Dict[int, float]] = None
+        esm_entry = self.session.tool_results.get("esm", {}).get(model_id)
+        if isinstance(esm_entry, dict):
+            raw = esm_entry.get("per_residue_tolerance") or esm_entry.get("scores")
+            if isinstance(raw, dict):
+                esm_scores = {int(k): float(v) for k, v in raw.items()}
+
+        # Pull interface residues from session if available
+        interface_residues: Optional[List[int]] = None
+        iface_data = self.session.get_interface_residues(model_id)
+        if iface_data:
+            protected = self.session.get_protected_residues_for_chain(model_id, chain)
+            if protected:
+                interface_residues = protected
+
+        t0 = _time.perf_counter()
+        try:
+            result = bridge.analyze(
+                pdb_path           = pdb_path,
+                chain              = chain,
+                sequence           = sequence,
+                model_id           = model_id,
+                session            = self.session,
+                interface_residues = interface_residues,
+                esm_scores         = esm_scores,
+                min_score          = min_score,
+                top_n              = top_n,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return ToolStepResult(
+                tool="glycan", success=False,
+                error=f"Glycan scan failed: {exc}",
+            )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if not result.get("success"):
+            return ToolStepResult(
+                tool="glycan", success=False,
+                error=result.get("error", "Glycan scan failed"),
+                elapsed_ms=elapsed_ms,
+            )
+
+        return ToolStepResult(
+            tool             = "glycan",
+            success          = True,
+            data             = {k: v for k, v in result.items()
+                                if k not in ("viz_commands", "viz_explanations", "summary")},
+            viz_commands     = result.get("viz_commands", []),
+            viz_explanations = result.get("viz_explanations", []),
+            summary          = result.get("summary", "Glycan scan complete."),
+            elapsed_ms       = elapsed_ms,
+        )
 
     def _run_camsol(self, inputs: Dict[str, Any]) -> ToolStepResult:
         bridge   = self._get_camsol_bridge()
@@ -830,6 +1133,18 @@ class ToolRouter:
             self._disulfide_bridge = DisulfideBridge(chimerax_bridge=self.bridge)
         return self._disulfide_bridge
 
+    def _get_proline_bridge(self):
+        if self._proline_bridge is None:
+            from proline_bridge import ProlineBridge
+            self._proline_bridge = ProlineBridge()
+        return self._proline_bridge
+
+    def _get_glycan_bridge(self):
+        if self._glycan_bridge is None:
+            from glycan_bridge import GlycanBridge
+            self._glycan_bridge = GlycanBridge()
+        return self._glycan_bridge
+
     def _get_camsol_bridge(self):
         if self._camsol_bridge is None:
             from camsol_bridge import CamsolBridge
@@ -1025,6 +1340,61 @@ class ToolRouter:
         seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", "".join(seq_parts).upper())
         return seq if len(seq) >= 5 else None
 
+    # ── Active-site command handler ────────────────────────────────────────────
+
+    # Patterns for active-site management commands (matched case-insensitively).
+    _ACTIVE_SITE_SET_RE   = re.compile(
+        r"^\s*set\s+active[\s\-]?site\s+residues?\s+([\d\s,]+)\s*$", re.I
+    )
+    _ACTIVE_SITE_CLEAR_RE = re.compile(
+        r"^\s*clear\s+active[\s\-]?site\s+residues?\s*$", re.I
+    )
+    _ACTIVE_SITE_SHOW_RE  = re.compile(
+        r"^\s*show\s+active[\s\-]?site\s+residues?\s*$", re.I
+    )
+
+    def handle_active_site_command(self, user_input: str) -> Optional[str]:
+        """
+        Handle active-site residue management commands without LLM translation.
+
+        Supported patterns:
+          "set active site residues 25 26 27"  → stores {25, 26, 27} in session
+          "clear active site residues"          → clears the stored set
+          "show active site residues"           → prints current set
+
+        Returns a human-readable result string if the command was handled,
+        or None if the input is not an active-site command (caller should
+        fall through to LLM translation).
+        """
+        text = user_input.strip()
+
+        m = self._ACTIVE_SITE_SET_RE.match(text)
+        if m:
+            nums_str = m.group(1)
+            nums = {
+                int(x)
+                for x in re.split(r"[\s,]+", nums_str.strip())
+                if x.strip()
+            }
+            self.session.set_functional_residues(nums)
+            return (
+                f"Active-site residues set: {sorted(nums)}.\n"
+                f"All subsequent proline scans will exclude positions "
+                f"within 2 residues of these sites."
+            )
+
+        if self._ACTIVE_SITE_CLEAR_RE.match(text):
+            self.session.set_functional_residues(set())
+            return "Active-site residues cleared — proline scans will use SASA auto-detection."
+
+        if self._ACTIVE_SITE_SHOW_RE.match(text):
+            current = self.session.get_functional_residues()
+            if current:
+                return f"Active-site residues: {sorted(current)}."
+            return "No active-site residues declared (SASA auto-detection will be used)."
+
+        return None   # not an active-site command
+
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _first_model_id(self) -> str:
@@ -1100,12 +1470,26 @@ class ToolRouter:
         except ImportError:
             status["disulfide"] = "module not found"
 
+        # proline
+        try:
+            __import__("proline_bridge")
+            status["proline"] = "active (backbone φ/ψ + ESM tolerance + optional DynaMut2)"
+        except ImportError:
+            status["proline"] = "module not found"
+
         # esmfold
         try:
             __import__("esmfold_bridge")
             status["esmfold"] = "active (ESM Atlas API — free, no auth)"
         except ImportError:
             status["esmfold"] = "module not found"
+
+        # glycan
+        try:
+            __import__("glycan_bridge")
+            status["glycan"] = "active (NXS/T sequon detection + SASA/SS/ESM scoring)"
+        except ImportError:
+            status["glycan"] = "module not found"
 
         # rosetta_local via WSL2
         try:

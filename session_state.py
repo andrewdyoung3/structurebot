@@ -222,11 +222,21 @@ class SessionState:
         # Disulfide candidates: model_id → {chain_pair_key: [candidate_dicts]}
         # e.g. {"1": {"A:B": [...]}}
         self.disulfide_candidates: Dict[str, Dict[str, Any]] = {}
+        # Proline substitution scan results: model_id → {chain_key: result_dict}
+        # e.g. {"1": {"A": {"candidates": [...], "count": 3, ...}}}
+        self.proline_results: Dict[str, Dict[str, Any]] = {}
+        # N-glycosylation site scan results: model_id → {chain_key: result_dict}
+        # e.g. {"1": {"A": {"native_sequons": [...], "engineered_candidates": [...]}}}
+        self.glycan_results: Dict[str, Dict[str, Any]] = {}
         # Rosetta relax cache: pdb_hash → relaxed_pdb_path
         # Tracks which PDB files have been FastRelax'd in WSL2.
         self.rosetta_relax_cache: Dict[str, str] = {}
         # WSL2 availability flag (set at startup by main.py)
         self.wsl_available: bool = False
+        # Known / declared active-site / functional residue numbers (1-based).
+        # Set by the user with "set active site residues 25 26 27".
+        # Passed to ProlineBridge.full_proline_scan() as functional_residues.
+        self.functional_residues: set = set()
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -507,6 +517,77 @@ class SessionState:
         )
         return entry["candidates"] if entry else None
 
+    # ── Proline scan result tracking ──────────────────────────────────────────
+
+    def set_proline_results(
+        self,
+        model_id: str,
+        chain:    str,
+        result:   Dict[str, Any],
+    ) -> None:
+        """Store proline scan results for a (model, chain) pair."""
+        from datetime import datetime as _dt
+        mid = str(model_id)
+        if mid not in self.proline_results:
+            self.proline_results[mid] = {}
+        self.proline_results[mid][chain] = {
+            "result":    result,
+            "timestamp": _dt.now().isoformat(timespec="seconds"),
+        }
+
+    def get_proline_results(
+        self,
+        model_id: str,
+        chain:    str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return stored proline scan results for a (model, chain) pair, or None."""
+        entry = self.proline_results.get(str(model_id), {}).get(chain)
+        return entry["result"] if entry else None
+
+    # ── Glycan site scan result tracking ─────────────────────────────────────
+
+    def set_glycan_results(
+        self,
+        model_id: str,
+        chain:    str,
+        result:   Dict[str, Any],
+    ) -> None:
+        """Store N-glycosylation scan results for a (model, chain) pair."""
+        from datetime import datetime as _dt
+        mid = str(model_id)
+        if mid not in self.glycan_results:
+            self.glycan_results[mid] = {}
+        self.glycan_results[mid][chain] = {
+            "result":    result,
+            "timestamp": _dt.now().isoformat(timespec="seconds"),
+        }
+
+    def get_glycan_results(
+        self,
+        model_id: str,
+        chain:    str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return stored glycan scan results for a (model, chain) pair, or None."""
+        entry = self.glycan_results.get(str(model_id), {}).get(chain)
+        return entry["result"] if entry else None
+
+    # ── Functional / active-site residue tracking ────────────────────────────
+
+    def set_functional_residues(self, residues: set) -> None:
+        """
+        Store the user-declared active-site / functional residue numbers.
+
+        Parameters
+        ----------
+        residues : set of 1-based residue sequence numbers, e.g. {25, 26, 27}.
+                   Pass an empty set to clear.
+        """
+        self.functional_residues = set(int(r) for r in residues)
+
+    def get_functional_residues(self) -> set:
+        """Return the current functional residue set (copy)."""
+        return set(self.functional_residues)
+
     # ── Rosetta relax cache tracking ──────────────────────────────────────────
 
     def set_relax_cache(self, pdb_hash: str, relaxed_path: str) -> None:
@@ -590,6 +671,12 @@ class SessionState:
                     lines.append(f"        Ligands    : {', '.join(str(l) for l in meta['ligands'])}")
         else:
             lines.append("\nNo structures currently loaded.")
+
+        if self.functional_residues:
+            lines.append(
+                f"\nActive-site residues (user-declared): "
+                f"{sorted(self.functional_residues)}"
+            )
 
         if self.named_selections:
             lines.append("\nNamed selections:")
@@ -696,7 +783,11 @@ class SessionState:
             "interface_residues":   self.interface_residues,
             "proteinmpnn_results":  self.proteinmpnn_results,
             "disulfide_candidates": self.disulfide_candidates,
+            "proline_results":      self.proline_results,
+            "glycan_results":       self.glycan_results,
             "rosetta_relax_cache":  self.rosetta_relax_cache,
+            # sets are not JSON-serialisable; store as sorted list
+            "functional_residues":  sorted(self.functional_residues),
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -722,7 +813,10 @@ class SessionState:
         state.interface_residues   = data.get("interface_residues", {})
         state.proteinmpnn_results  = data.get("proteinmpnn_results", {})
         state.disulfide_candidates = data.get("disulfide_candidates", {})
+        state.proline_results      = data.get("proline_results", {})
+        state.glycan_results       = data.get("glycan_results", {})
         state.rosetta_relax_cache  = data.get("rosetta_relax_cache", {})
+        state.functional_residues  = set(data.get("functional_residues", []))
         return state
 
     def __repr__(self) -> str:
@@ -752,7 +846,10 @@ class SessionState:
             "interface_residues":   self.interface_residues,
             "proteinmpnn_results":  self.proteinmpnn_results,
             "disulfide_candidates": self.disulfide_candidates,
+            "proline_results":      self.proline_results,
+            "glycan_results":       self.glycan_results,
             "rosetta_relax_cache":  self.rosetta_relax_cache,
+            "functional_residues":  set(self.functional_residues),
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -771,4 +868,7 @@ class SessionState:
         self.interface_residues   = copy.deepcopy(snap.get("interface_residues",   {}))
         self.proteinmpnn_results  = copy.deepcopy(snap.get("proteinmpnn_results",  {}))
         self.disulfide_candidates = copy.deepcopy(snap.get("disulfide_candidates", {}))
+        self.proline_results      = copy.deepcopy(snap.get("proline_results",      {}))
+        self.glycan_results       = copy.deepcopy(snap.get("glycan_results",       {}))
         self.rosetta_relax_cache  = copy.deepcopy(snap.get("rosetta_relax_cache",  {}))
+        self.functional_residues  = set(snap.get("functional_residues",  set()))
