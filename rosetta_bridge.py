@@ -1216,14 +1216,19 @@ try:
 
     pdb_path  = {wsl_pdb!r}
     mutations = json.loads({mut_list_json!r})
-    import json
-    mutations = json.loads(mutations) if isinstance(mutations, str) else mutations
     cache_dir = {relax_cache_wsl!r}
     hash_key  = {pdb_hash!r}
     relaxed   = os.path.join(cache_dir, f"{{hash_key}}_relaxed.pdb")
 
     os.makedirs(cache_dir, exist_ok=True)
 
+    from pyrosetta.toolbox import cleanATOM
+    cleaned_path = pdb_path.replace('.pdb', '_clean.pdb')
+    cleanATOM(pdb_path, cleaned_path)
+    import os
+    if os.path.isfile(cleaned_path) and os.path.getsize(cleaned_path) > 100:
+        pdb_path = cleaned_path
+    print(f"[Rosetta] PDB cleaned → {{pdb_path}}", flush=True)
     pose = pose_from_file(pdb_path)
     scorefxn = pyrosetta.create_score_function("ref2015")
 
@@ -1238,9 +1243,8 @@ try:
         wt_pose.dump_pdb(relaxed)
         print(f"[Rosetta] Relax complete → {{relaxed}}", flush=True)
 
-    wt_energy = scorefxn(wt_pose)
-
     print(f"[Rosetta] Starting mutation scoring, {{len(mutations)}} mutations", flush=True)
+    scorefxn_std = pyrosetta.create_score_function("ref2015")
     results = {{}}
     for mut in mutations:
         chain_id = mut["chain"]
@@ -1262,7 +1266,6 @@ try:
                 raise ValueError(f"Residue {{pos}}{{chain_id}} not found in pose")
             mut_mover = MutateResidue(target=res_num, new_res=to_aa3)
             mut_mover.apply(mut_pose)
-            scorefxn_std = pyrosetta.create_score_function("ref2015")
             relax_mut = FastRelax(scorefxn_std, 3)
             relax_mut.apply(mut_pose)
             wt_pose_rerelaxed = wt_pose.clone()
