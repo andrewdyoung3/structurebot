@@ -222,6 +222,21 @@ class ToolRouter:
         "hydrophobic core",
     )
 
+    # Assembly / dimer keywords trigger chains=None (all chains) in find_cavities
+    _CAVITY_ASSEMBLY_KEYWORDS: tuple = (
+        "full dimer",
+        "full assembly",
+        "both chains",
+        "all chains",
+        "dimer cavity",
+        "oligomer",
+        "assembly cavity",
+        "interface cavity",
+        "interface pocket",
+        "binding pocket",
+        "active site cavity",
+    )
+
     # Keywords that signal an N-glycosylation site scan request.
     # Checked case-insensitively; any match rewrites tools_needed to ["glycan"]
     # and clears any translator clarification_needed flag.
@@ -516,6 +531,18 @@ class ToolRouter:
                 if isinstance(inp, dict) and inp.get("chain"):
                     tool_inputs["cavity"]["chain"] = inp["chain"]
                     break
+
+        # ── Cavity assembly mode detection ──────────────────────────────────────
+        # When assembly keywords are present, find_cavities() uses chains=None
+        # (all chains), enabling interface cavity detection for dimers/oligomers.
+        if "cavity" in tool_inputs:
+            _cav_assembly = bool(
+                user_input and any(
+                    kw in user_input.lower()
+                    for kw in self._CAVITY_ASSEMBLY_KEYWORDS
+                )
+            )
+            tool_inputs["cavity"]["assembly_mode"] = _cav_assembly
 
         result = dict(translator_result)
         result["tools_needed"] = tools_needed
@@ -1122,10 +1149,13 @@ class ToolRouter:
     def _run_cavity(self, inputs: Dict[str, Any]) -> ToolStepResult:
         """Run cavity detection and filling suggestion."""
         import time as _time
-        bridge   = self._get_cavity_bridge()
-        model_id = inputs.get("model_id") or self._primary_model_id()
-        chain    = inputs.get("chain", "A")
-        top_n    = int(inputs.get("top_n", 10))
+        bridge        = self._get_cavity_bridge()
+        model_id      = inputs.get("model_id") or self._primary_model_id()
+        chain         = inputs.get("chain", "A")
+        top_n         = int(inputs.get("top_n", 10))
+        assembly_mode = bool(inputs.get("assembly_mode", False))
+        # chains=None → all chains (assembly mode); chains=[chain] → single chain
+        chains_for_cavity = None if assembly_mode else [chain]
 
         pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
         if not pdb_path:
@@ -1163,6 +1193,7 @@ class ToolRouter:
                 interface_residues = interface_residues,
                 esm_scores         = esm_scores,
                 top_n              = top_n,
+                chains             = chains_for_cavity,
             )
         except Exception as exc:
             import traceback as _tb
