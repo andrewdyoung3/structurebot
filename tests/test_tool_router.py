@@ -892,3 +892,65 @@ def test_sequence_display_no_truncation():
     assert long_seq in output, (
         'Full sequence should appear in output without truncation at 80 chars'
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Section N — Glycan positions routing
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_glycan_positions_phrase_routes():
+    """
+    'identify glycosylation positions for domain masking' must route to
+    glycan_positions, not the standard glycan tool.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "identify glycosylation positions for domain masking on chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "glycan_positions" in routed["tools_needed"], (
+        f"'domain masking' phrase should route to glycan_positions; "
+        f"got {routed['tools_needed']}"
+    )
+    assert "glycan" not in routed["tools_needed"], (
+        f"Should not also route to plain glycan tool; got {routed['tools_needed']}"
+    )
+
+
+def test_glycan_positions_projection_aware_keyword():
+    """
+    'projection-aware glycosylation' phrase must route to glycan_positions.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "show projection-aware glycosylation sites on chain B"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "glycan_positions" in routed["tools_needed"], (
+        f"'projection-aware glycosylation' should route to glycan_positions; "
+        f"got {routed['tools_needed']}"
+    )
+
+
+def test_glycan_positions_inputs_have_model_id_and_chain():
+    """
+    glycan_positions tool_inputs must carry model_id and chain keys.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "find glycan candidates for immunosilencing chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "glycan_positions" in routed["tools_needed"], (
+        f"'immunosilence' phrase should route to glycan_positions; "
+        f"got {routed['tools_needed']}"
+    )
+    gp_inputs = routed.get("tool_inputs", {}).get("glycan_positions", {})
+    assert "model_id" in gp_inputs, "glycan_positions inputs must include model_id"
+    assert "chain"    in gp_inputs, "glycan_positions inputs must include chain"
+    assert routed.get("clarification_needed") is None, (
+        "clarification_needed must be cleared for glycan_positions routing"
+    )

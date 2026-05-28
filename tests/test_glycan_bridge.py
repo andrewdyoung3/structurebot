@@ -618,3 +618,324 @@ class TestProjectionAndGeometry:
         size_cmds   = [c for c in cb_cmds if "atomRadius" in c]
         assert len(sphere_cmds) >= 1, "Expected 'style ... sphere' command for outward Cb"
         assert len(size_cmds)   >= 1, "Expected 'size ... atomRadius' command for outward Cb"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Section K — suggest_glycosylation_positions + validate_sequon_engineering
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestGlycanPositions:
+    """
+    Tests for GlycanBridge.suggest_glycosylation_positions() and
+    GlycanBridge.validate_sequon_engineering().
+
+    Structural data (projection / SASA) is mocked via patch('glycan_bridge._su')
+    to avoid network calls and PDB dependencies.  A tmp_path fixture supplies a
+    real (empty) file so that Path.exists() returns True inside the method.
+    """
+
+    def test_suggest_glycosylation_positions_ranks_by_projection(self, gb, tmp_path):
+        """
+        Candidates must be sorted descending by composite_score.
+        Composite is dominated by projection_score when SASA is constant.
+        """
+        seq = "MALEFQ"   # 6 AA, none G or P → all included
+        pdb_file = tmp_path / "dummy.pdb"
+        pdb_file.write_text("ATOM  1 dummy\n")
+
+        mock_su = MagicMock()
+        mock_su.compute_projection_score.return_value = {
+            1: {"projection_score": 0.9, "gly_proxy": False},  # M
+            2: {"projection_score": 0.6, "gly_proxy": False},  # A
+            3: {"projection_score": 0.55, "gly_proxy": False}, # L
+            4: {"projection_score": 0.8, "gly_proxy": False},  # E
+            5: {"projection_score": 0.7, "gly_proxy": False},  # F
+            6: {"projection_score": 0.52, "gly_proxy": False}, # Q
+        }
+        mock_su.compute_sasa.return_value = {i: 100.0 for i in range(1, 7)}
+
+        with patch("glycan_bridge._su", mock_su):
+            candidates = gb.suggest_glycosylation_positions(
+                pdb_path=str(pdb_file), chain="A", sequence=seq, min_projection=0.5
+            )
+
+        assert len(candidates) > 0
+        scores = [c["composite_score"] for c in candidates]
+        assert scores == sorted(scores, reverse=True), (
+            f"Candidates not sorted descending; scores={scores}"
+        )
+
+    def test_suggest_glycosylation_positions_filters_projection(self, gb, tmp_path):
+        """
+        Residues with projection_score < min_projection must be excluded.
+        Residues with projection_score >= min_projection must be included.
+        """
+        seq = "MALEF"   # 5 AA, none G or P
+        pdb_file = tmp_path / "dummy.pdb"
+        pdb_file.write_text("ATOM  1 dummy\n")
+
+        mock_su = MagicMock()
+        mock_su.compute_projection_score.return_value = {
+            1: {"projection_score": 0.8, "gly_proxy": False},  # M — passes
+            2: {"projection_score": 0.3, "gly_proxy": False},  # A — fails (< 0.5)
+            3: {"projection_score": 0.7, "gly_proxy": False},  # L — passes
+            4: {"projection_score": 0.1, "gly_proxy": False},  # E — fails (< 0.5)
+            5: {"projection_score": 0.9, "gly_proxy": False},  # F — passes
+        }
+        mock_su.compute_sasa.return_value = {i: 100.0 for i in range(1, 6)}
+
+        with patch("glycan_bridge._su", mock_su):
+            candidates = gb.suggest_glycosylation_positions(
+                pdb_path=str(pdb_file), chain="A", sequence=seq, min_projection=0.5
+            )
+
+        positions = {c["position"] for c in candidates}
+        assert 1 in positions, "Position 1 (proj=0.8) should pass min_projection=0.5"
+        assert 3 in positions, "Position 3 (proj=0.7) should pass"
+        assert 5 in positions, "Position 5 (proj=0.9) should pass"
+        assert 2 not in positions, "Position 2 (proj=0.3) must be filtered out"
+        assert 4 not in positions, "Position 4 (proj=0.1) must be filtered out"
+
+    def test_suggest_glycosylation_positions_excludes_gp(self, gb, tmp_path):
+        """
+        Glycine (G) and Proline (P) must be excluded by default
+        (exclude_residues='GP').
+        """
+        seq = "MGAPF"   # G at pos 2, P at pos 4
+        pdb_file = tmp_path / "dummy.pdb"
+        pdb_file.write_text("ATOM  1 dummy\n")
+
+        mock_su = MagicMock()
+        mock_su.compute_projection_score.return_value = {
+            i: {"projection_score": 0.8, "gly_proxy": False} for i in range(1, 6)
+        }
+        mock_su.compute_sasa.return_value = {i: 100.0 for i in range(1, 6)}
+
+        with patch("glycan_bridge._su", mock_su):
+            candidates = gb.suggest_glycosylation_positions(
+                pdb_path=str(pdb_file), chain="A", sequence=seq,
+            )
+
+        positions = {c["position"] for c in candidates}
+        assert 2 not in positions, "G at pos 2 must be excluded"
+        assert 4 not in positions, "P at pos 4 must be excluded"
+        assert 1 in positions, "M at pos 1 should be included"
+        assert 3 in positions, "A at pos 3 should be included"
+        assert 5 in positions, "F at pos 5 should be included"
+
+    def test_suggest_glycosylation_positions_engineering_notes_outward(self, gb, tmp_path):
+        """
+        An outward-projecting residue (proj_score ≥ 0.6) must have 'outward'
+        in its engineering_notes.
+        """
+        seq = "MALEF"
+        pdb_file = tmp_path / "dummy.pdb"
+        pdb_file.write_text("ATOM  1 dummy\n")
+
+        mock_su = MagicMock()
+        mock_su.compute_projection_score.return_value = {
+            1: {"projection_score": 0.9, "gly_proxy": False},  # outward
+        }
+        mock_su.compute_sasa.return_value = {1: 120.0}
+
+        with patch("glycan_bridge._su", mock_su):
+            candidates = gb.suggest_glycosylation_positions(
+                pdb_path=str(pdb_file), chain="A", sequence=seq, min_projection=0.5,
+            )
+
+        pos1 = next((c for c in candidates if c["position"] == 1), None)
+        assert pos1 is not None, "Position 1 should appear in candidates"
+        assert pos1["projection_category"] == "outward"
+        assert "outward" in pos1["engineering_notes"].lower(), (
+            f"Expected 'outward' in notes; got: {pos1['engineering_notes']!r}"
+        )
+
+    def test_suggest_glycosylation_positions_engineering_notes_inward(self, gb, tmp_path):
+        """
+        An inward-projecting residue (proj_score < 0.2) must have 'inward' in
+        engineering_notes.  Setting min_projection=0.0 disables the filter so
+        the residue is not removed from results.
+        """
+        seq = "MALEF"
+        pdb_file = tmp_path / "dummy.pdb"
+        pdb_file.write_text("ATOM  1 dummy\n")
+
+        mock_su = MagicMock()
+        mock_su.compute_projection_score.return_value = {
+            1: {"projection_score": 0.1, "gly_proxy": False},  # inward
+        }
+        mock_su.compute_sasa.return_value = {1: 120.0}
+
+        with patch("glycan_bridge._su", mock_su):
+            candidates = gb.suggest_glycosylation_positions(
+                pdb_path=str(pdb_file), chain="A", sequence=seq,
+                min_projection=0.0,   # disable projection filter
+            )
+
+        pos1 = next((c for c in candidates if c["position"] == 1), None)
+        assert pos1 is not None, "Position 1 should appear when min_projection=0.0"
+        assert pos1["projection_category"] == "inward"
+        assert "inward" in pos1["engineering_notes"].lower(), (
+            f"Expected 'inward' in notes; got: {pos1['engineering_notes']!r}"
+        )
+
+    def test_validate_sequon_engineering_esmfold_called(self, gb):
+        """
+        ESMFold bridge must be called at least twice: once for the wildtype
+        baseline and once per mutant (up to top_esm_designs).
+        """
+        mock_esmfold = MagicMock()
+        mock_esmfold.predict.return_value = {
+            "success": True, "mean_plddt": 80.0, "plddt": {}, "length": 9,
+        }
+        mock_rosetta = MagicMock()
+        mock_rosetta.analyze.return_value = MagicMock(
+            success=True, data={"ddg_scores": {"A5N": 0.3}}
+        )
+
+        wt_seq = "MALEAFGHI"
+        gb.validate_sequon_engineering(
+            position=5, wildtype_sequence=wt_seq,
+            mutations=["A5N"], pdb_path="dummy.pdb", chain="A",
+            esmfold_bridge=mock_esmfold, rosetta_bridge=mock_rosetta,
+            top_esm_designs=1,
+        )
+
+        # Wildtype call + 1 mutant call = at least 2
+        assert mock_esmfold.predict.call_count >= 2, (
+            f"Expected ≥ 2 ESMFold calls (wt + mutant); "
+            f"got {mock_esmfold.predict.call_count}"
+        )
+
+    def test_validate_sequon_engineering_rosetta_called(self, gb):
+        """
+        Rosetta bridge must be called with the parsed mutation dict.
+        """
+        mock_esmfold = MagicMock()
+        mock_esmfold.predict.return_value = {
+            "success": True, "mean_plddt": 78.0, "plddt": {}, "length": 9,
+        }
+        mock_rosetta = MagicMock()
+        mock_rosetta.analyze.return_value = MagicMock(
+            success=True, data={"ddg_scores": {"A5N": -0.8}}
+        )
+
+        wt_seq = "MALEAFGHI"
+        gb.validate_sequon_engineering(
+            position=5, wildtype_sequence=wt_seq,
+            mutations=["A5N"], pdb_path="dummy.pdb", chain="A",
+            esmfold_bridge=mock_esmfold, rosetta_bridge=mock_rosetta,
+        )
+
+        assert mock_rosetta.analyze.call_count >= 1, "Rosetta must be called"
+        # The second positional arg is the list of mutation dicts
+        call_args    = mock_rosetta.analyze.call_args
+        mut_dicts    = call_args[0][1]   # positional args tuple, index 1
+        assert any(
+            m.get("to_aa") == "N" and int(m.get("position", 0)) == 5
+            for m in mut_dicts
+        ), f"Expected A5N mutation dict; got {mut_dicts}"
+
+    def test_validate_sequon_engineering_ddg_classification(self, gb):
+        """
+        ddg_category must be 'stabilizing' (< -0.5), 'neutral' (≤ 0.5),
+        or 'destabilizing' (> 0.5).
+        """
+        mock_esmfold = MagicMock()
+        mock_esmfold.predict.return_value = {
+            "success": True, "mean_plddt": 80.0, "plddt": {}, "length": 5,
+        }
+
+        for ddg_val, expected_cat in [
+            (-1.0, "stabilizing"),
+            (0.2,  "neutral"),
+            (2.0,  "destabilizing"),
+        ]:
+            mock_rosetta = MagicMock()
+            mock_rosetta.analyze.return_value = MagicMock(
+                success=True, data={"ddg_scores": {"A2N": ddg_val}}
+            )
+
+            result = gb.validate_sequon_engineering(
+                position=2, wildtype_sequence="MALEF",
+                mutations=["A2N"], pdb_path="dummy.pdb", chain="A",
+                esmfold_bridge=mock_esmfold, rosetta_bridge=mock_rosetta,
+            )
+
+            assert len(result["results"]) >= 1
+            got = result["results"][0]["ddg_category"]
+            assert got == expected_cat, (
+                f"ddg={ddg_val}: expected '{expected_cat}', got '{got}'"
+            )
+
+    def test_validate_sequon_engineering_pass_threshold(self, gb):
+        """
+        pass_threshold=True only when pLDDT drop ≤ 5 AND ddG ≤ 1.0.
+
+        Case 1: wt_pLDDT=80, mut_pLDDT=78, ddG=0.5 → drop=-2, passes both.
+        Case 2: wt_pLDDT=80, mut_pLDDT=70, ddG=0.5 → drop=-10, fails pLDDT.
+        """
+        # Case 1 — should PASS
+        mock_esmfold_pass = MagicMock()
+        mock_esmfold_pass.predict.side_effect = [
+            {"success": True, "mean_plddt": 80.0, "plddt": {}, "length": 5},  # wt
+            {"success": True, "mean_plddt": 78.0, "plddt": {}, "length": 5},  # mut
+        ]
+        mock_rosetta = MagicMock()
+        mock_rosetta.analyze.return_value = MagicMock(
+            success=True, data={"ddg_scores": {"A2N": 0.5}}
+        )
+
+        result_pass = gb.validate_sequon_engineering(
+            position=2, wildtype_sequence="MALEF",
+            mutations=["A2N"], pdb_path="dummy.pdb", chain="A",
+            esmfold_bridge=mock_esmfold_pass, rosetta_bridge=mock_rosetta,
+        )
+        assert result_pass["results"][0]["pass_threshold"] is True, (
+            "Should pass: pLDDT drop=-2, ddG=0.5"
+        )
+
+        # Case 2 — should FAIL (pLDDT drop too large)
+        mock_esmfold_fail = MagicMock()
+        mock_esmfold_fail.predict.side_effect = [
+            {"success": True, "mean_plddt": 80.0, "plddt": {}, "length": 5},  # wt
+            {"success": True, "mean_plddt": 70.0, "plddt": {}, "length": 5},  # mut
+        ]
+        mock_rosetta2 = MagicMock()
+        mock_rosetta2.analyze.return_value = MagicMock(
+            success=True, data={"ddg_scores": {"A2N": 0.5}}
+        )
+
+        result_fail = gb.validate_sequon_engineering(
+            position=2, wildtype_sequence="MALEF",
+            mutations=["A2N"], pdb_path="dummy.pdb", chain="A",
+            esmfold_bridge=mock_esmfold_fail, rosetta_bridge=mock_rosetta2,
+        )
+        assert result_fail["results"][0]["pass_threshold"] is False, (
+            "Should fail: pLDDT drop=-10 (< -5)"
+        )
+
+    def test_validate_sequon_engineering_notes_generation(self, gb):
+        """
+        notes must be a non-empty string for each result dict.
+        """
+        mock_esmfold = MagicMock()
+        mock_esmfold.predict.return_value = {
+            "success": True, "mean_plddt": 75.0, "plddt": {}, "length": 5,
+        }
+        mock_rosetta = MagicMock()
+        mock_rosetta.analyze.return_value = MagicMock(
+            success=True, data={"ddg_scores": {"A2N": 0.3}}
+        )
+
+        result = gb.validate_sequon_engineering(
+            position=2, wildtype_sequence="MALEF",
+            mutations=["A2N"], pdb_path="dummy.pdb", chain="A",
+            esmfold_bridge=mock_esmfold, rosetta_bridge=mock_rosetta,
+        )
+
+        assert len(result["results"]) >= 1
+        for r in result["results"]:
+            assert isinstance(r["notes"], str) and len(r["notes"]) > 0, (
+                f"notes must be a non-empty string; got: {r['notes']!r}"
+            )

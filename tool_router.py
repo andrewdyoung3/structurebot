@@ -120,6 +120,7 @@ class ToolRouter:
         "disulfide":         "🔗⚗️",
         "proline":           "🧪",
         "glycan":            "🍬",
+        "glycan_positions":  "🍬🔮",
         "salt_bridge":       "⚡",
         "cavity":            "🕳",
     }
@@ -251,6 +252,20 @@ class ToolRouter:
         "glycosylation site",
         "n-glycan",
         "sugar",
+    )
+
+    # Keywords that signal a projection-aware glycosylation position scan
+    # (distinct from the classic NXS/T sequon scan).  Checked BEFORE the
+    # general glycan block so these phrases are never swallowed by _GLYCAN_KEYWORDS.
+    _GLYCAN_POSITIONS_KEYWORDS: tuple = (
+        "glycosylation positions",
+        "glycan candidates",
+        "glycan sites",
+        "domain masking",
+        "immunosilence",
+        "glycan engineering candidates",
+        "surface glycosylation",
+        "projection-aware glycosylation",
     )
 
     # Keywords that signal a proline substitution scan request.
@@ -394,6 +409,15 @@ class ToolRouter:
 
         return ["glycan"], new_inputs
 
+    @classmethod
+    def _detect_glycan_positions_intent(cls, text: str) -> bool:
+        """
+        Return True if *text* signals a projection-aware glycosylation
+        position scan (distinct from the classic NXS/T sequon scan).
+        """
+        lower = text.lower()
+        return any(kw in lower for kw in cls._GLYCAN_POSITIONS_KEYWORDS)
+
     # ── MPNN+ESMFold intent helpers ───────────────────────────────────────────
 
     @classmethod
@@ -496,6 +520,30 @@ class ToolRouter:
                     tools_needed, tool_inputs
                 )
 
+        # ── Glycan positions intent override ──────────────────────────────────
+        # Must fire BEFORE the general glycan check so that phrases like
+        # "glycan candidates" / "domain masking" are not swallowed by the
+        # broader glycan keyword set.
+        _glycan_positions_intent = bool(
+            user_input and self._detect_glycan_positions_intent(user_input)
+        )
+        if _glycan_positions_intent and "glycan_positions" not in tools_needed:
+            _gp_model_id = self._first_model_id()
+            _gp_chain    = "A"
+            for _inp in list(translator_result.get("tool_inputs", {}).values()):
+                if isinstance(_inp, dict) and _inp.get("chain"):
+                    _gp_chain = _inp["chain"]
+                    break
+            tools_needed = ["glycan_positions"]
+            tool_inputs  = {
+                "glycan_positions": {
+                    "model_id":    _gp_model_id,
+                    "chain":       _gp_chain,
+                    "top_n":       20,
+                    "_user_input": user_input,
+                }
+            }
+
         # ── Glycan intent override ─────────────────────────────────────────
         # Fires when glycan keywords are present and the translator did NOT
         # already emit "glycan" in tools_needed (wrong routing or unclear query).
@@ -505,7 +553,7 @@ class ToolRouter:
         # stop_reason='refusal' when the short answer ("chain A") has no prior
         # context the model can work with.
         _glycan_intent = bool(user_input and self._detect_glycan_intent(user_input))
-        if _glycan_intent and "glycan" not in tools_needed:
+        if _glycan_intent and "glycan" not in tools_needed and not _glycan_positions_intent:
             tools_needed, tool_inputs = self._rewrite_as_glycan(
                 tools_needed, tool_inputs
             )
@@ -550,7 +598,7 @@ class ToolRouter:
         result["_user_input"]  = user_input   # passed to execute() for guard
 
         # Suppress translator clarification when we've resolved the intent ourselves
-        if _glycan_intent:
+        if _glycan_intent or _glycan_positions_intent:
             result["clarification_needed"] = None
 
         step_info: List[Dict[str, Any]] = []
@@ -651,6 +699,14 @@ class ToolRouter:
             return (
                 f"N-glycosylation site scan — #{mid} chain {chain} "
                 "(NXS/T sequons, SASA + SS + ESM)"
+            )
+        if tool == "glycan_positions":
+            inp   = tool_inputs.get("glycan_positions", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            return (
+                f"Projection-aware glycosylation position scan — #{mid} chain {chain} "
+                "(all residues, SASA + projection + ESM)"
             )
         if tool == "salt_bridge":
             inp   = tool_inputs.get("salt_bridge", {})
@@ -815,6 +871,8 @@ class ToolRouter:
                 return self._run_proline(inputs)
             if tool == "glycan":
                 return self._run_glycan(inputs)
+            if tool == "glycan_positions":
+                return self._run_glycan_positions(inputs)
             if tool == "salt_bridge":
                 return self._run_salt_bridge(inputs)
             if tool == "cavity":
@@ -1068,6 +1126,102 @@ class ToolRouter:
             summary          = result.get("summary", "Glycan scan complete."),
             elapsed_ms       = elapsed_ms,
         )
+
+    def _run_glycan_positions(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """
+        Run projection-aware glycosylation position scan (all residues).
+
+        Unlike _run_glycan() which detects existing NXS/T sequons, this method
+        scans every surface-exposed, outward-projecting residue and ranks them
+        as engineering targets for de-novo glycan attachment.
+        """
+        import time as _time
+        bridge   = self._get_glycan_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain", "A")
+        top_n    = int(inputs.get("top_n", 20))
+
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+        if not sequence:
+            return ToolStepResult(
+                tool="glycan_positions", success=False,
+                error=(
+                    "Glycan position scan requires an amino-acid sequence. "
+                    "Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+
+        # Pull ESM tolerance scores from session if available
+        esm_scores: Optional[Dict[int, float]] = None
+        esm_entry = self.session.tool_results.get("esm", {}).get(model_id)
+        if isinstance(esm_entry, dict):
+            raw = esm_entry.get("per_residue_tolerance") or esm_entry.get("scores")
+            if isinstance(raw, dict):
+                esm_scores = {int(k): float(v) for k, v in raw.items()}
+
+        # Pull interface residues from session if available
+        interface_residues: Optional[set] = None
+        iface_data = self.session.get_interface_residues(model_id)
+        if iface_data:
+            protected = self.session.get_protected_residues_for_chain(model_id, chain)
+            if protected:
+                interface_residues = set(protected)
+
+        t0 = _time.perf_counter()
+        try:
+            candidates = bridge.suggest_glycosylation_positions(
+                pdb_path          = pdb_path,
+                chain             = chain,
+                sequence          = sequence,
+                interface_residues= interface_residues,
+                esm_scores        = esm_scores,
+                top_n             = top_n,
+            )
+        except Exception as exc:
+            import traceback as _tb
+            _tb.print_exc()
+            return ToolStepResult(
+                tool="glycan_positions", success=False,
+                error=f"Glycan position scan failed: {exc}",
+            )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        cx_cmds, cx_exps = bridge.generate_positions_chimerax_commands(
+            candidates, model_id=model_id, chain=chain, top_n=top_n
+        )
+        summary = bridge.generate_positions_summary(
+            candidates, chain=chain, top_n=top_n
+        )
+
+        return ToolStepResult(
+            tool             = "glycan_positions",
+            success          = True,
+            data             = {"candidates": candidates, "count": len(candidates)},
+            viz_commands     = cx_cmds,
+            viz_explanations = cx_exps,
+            summary          = summary,
+            elapsed_ms       = elapsed_ms,
+        )
+
+    @staticmethod
+    def _parse_glycan_validation_request(user_input: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse a glycan validation sub-request from user text.
+
+        Returns a dict with position if found, {"validate": True} if "validate"
+        is present but no position, or None if the input is not a validation request.
+        """
+        if not user_input:
+            return None
+        lower = user_input.lower()
+        if "validate" not in lower and "validation" not in lower:
+            return None
+        m = re.search(r"\b(?:position|pos|at)\s+(\d+)\b", lower)
+        if m:
+            return {"position": int(m.group(1))}
+        return {"validate": True}
 
     def _run_salt_bridge(self, inputs: Dict[str, Any]) -> ToolStepResult:
         """Run salt bridge analysis."""
@@ -2277,8 +2431,10 @@ class ToolRouter:
         try:
             __import__("glycan_bridge")
             status["glycan"] = "active (NXS/T sequon detection + SASA/SS/ESM scoring)"
+            status["glycan_positions"] = "active (projection-aware all-residue scan)"
         except ImportError:
             status["glycan"] = "module not found"
+            status["glycan_positions"] = "module not found"
 
         # salt_bridge
         try:
