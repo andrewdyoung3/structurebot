@@ -9,7 +9,7 @@ WSL2 INSTALLATION STATUS (checked at import time)
   Current status: Not installed.
 
   To install (PowerShell as Administrator):
-    wsl --install -d Ubuntu-22.04
+    wsl --install -d Ubuntu-24.04
   Then reboot.  After rebooting, set up Python 3.12 inside WSL2:
     wsl
     sudo apt update && sudo apt install python3.12 python3.12-venv python3-pip -y
@@ -36,6 +36,7 @@ import time
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional
 
+PYROSETTA_PYTHON = "/home/andre/pyrosetta_env/bin/python"
 
 # ── WSL availability cache ────────────────────────────────────────────────────
 
@@ -112,11 +113,11 @@ class WSLBridge:
         """
         Parameters
         ----------
-        distribution : WSL2 distribution name, e.g. "Ubuntu-22.04".
+        distribution : WSL2 distribution name, e.g. "Ubuntu-24.04".
                        If None, the first registered distribution is used.
         """
         self._distribution = distribution or os.environ.get(
-            "WSL_DISTRIBUTION", "Ubuntu-22.04"
+            "WSL_DISTRIBUTION", "Ubuntu-24.04"
         )
 
     # ── Availability ──────────────────────────────────────────────────────────
@@ -163,7 +164,7 @@ class WSLBridge:
                 "stderr":     "",
                 "error":      (
                     "WSL2 is not installed. "
-                    "Run: wsl --install -d Ubuntu-22.04  (as Administrator)"
+                    "Run: wsl --install -d Ubuntu-24.04  (as Administrator)"
                 ),
             }
 
@@ -300,7 +301,7 @@ class WSLBridge:
         if not self.is_available():
             return False
         result = self.run_command(
-            "python3 -c 'import pyrosetta; print(\"OK\")'",
+            f"{PYROSETTA_PYTHON} -c 'import pyrosetta; print(chr(79)+chr(75))'",
             timeout=30,
         )
         return result["ok"] and "OK" in result["stdout"]
@@ -331,7 +332,7 @@ class WSLBridge:
 
         try:
             wsl_path = self.translate_path(win_path)
-            return self.run_command(f"python3 '{wsl_path}'", timeout=timeout)
+            return self.run_command(f"{PYROSETTA_PYTHON} '{wsl_path}'", timeout=timeout)
         finally:
             try:
                 os.unlink(win_path)
@@ -344,7 +345,7 @@ class WSLBridge:
         """One-line status for the StructureBot startup display."""
         if not self.is_available():
             return (
-                "WSL2: not installed — run `wsl --install -d Ubuntu-22.04` "
+                "WSL2: not installed — run `wsl --install -d Ubuntu-24.04` "
                 "(PowerShell as Administrator) to enable local Rosetta"
             )
         distro = _WSL_DISTRO or self._distribution

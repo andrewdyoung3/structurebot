@@ -1185,10 +1185,10 @@ class RosettaBridge:
             )
 
         # Build PyRosetta script to run cartesian_ddg
-        import hashlib
+        import hashlib, json
         pdb_hash = hashlib.md5(open(pdb_path, "rb").read()).hexdigest()[:12]
 
-        mut_list_json = str([
+        mut_list_json = json.dumps([
             {
                 "chain":   m.get("chain", "A"),
                 "pos":     m.get("position", 1),
@@ -1215,7 +1215,9 @@ try:
     rosetta_init(options="-mute all -ex1 -ex2 -use_input_sc -ignore_unrecognized_res true")
 
     pdb_path  = {wsl_pdb!r}
-    mutations = {mut_list_json!r}
+    mutations = json.loads({mut_list_json!r})
+    import json
+    mutations = json.loads(mutations) if isinstance(mutations, str) else mutations
     cache_dir = {relax_cache_wsl!r}
     hash_key  = {pdb_hash!r}
     relaxed   = os.path.join(cache_dir, f"{{hash_key}}_relaxed.pdb")
@@ -1223,7 +1225,7 @@ try:
     os.makedirs(cache_dir, exist_ok=True)
 
     pose = pose_from_file(pdb_path)
-    scorefxn = pyrosetta.create_score_function("ref2015_cart")
+    scorefxn = pyrosetta.create_score_function("ref2015")
 
     if os.path.isfile(relaxed):
         print(f"[Rosetta] Loading cached relaxed structure: {{relaxed}}", flush=True)
@@ -1238,6 +1240,7 @@ try:
 
     wt_energy = scorefxn(wt_pose)
 
+    print(f"[Rosetta] Starting mutation scoring, {{len(mutations)}} mutations", flush=True)
     results = {{}}
     for mut in mutations:
         chain_id = mut["chain"]
@@ -1245,37 +1248,39 @@ try:
         from_aa  = mut["from_aa"]
         to_aa    = mut["to_aa"]
         key      = f"{{from_aa}}{{pos}}{{to_aa}}"
-
         try:
-            import pyrosetta.rosetta.core.pose as rpose
-            chain_idx = pose.chain_begin(ord(chain_id) - ord('A') + 1)
-
             from pyrosetta.rosetta.protocols.simple_moves import MutateResidue
-            from pyrosetta.rosetta.core.pack.task import TaskFactory
-            from pyrosetta.rosetta.core.pack.task.operation import RestrictToRepacking
-
+            from pyrosetta.rosetta.protocols.relax import FastRelax
+            _aa1to3 = {{'A':'ALA','C':'CYS','D':'ASP','E':'GLU','F':'PHE',
+                        'G':'GLY','H':'HIS','I':'ILE','K':'LYS','L':'LEU',
+                        'M':'MET','N':'ASN','P':'PRO','Q':'GLN','R':'ARG',
+                        'S':'SER','T':'THR','V':'VAL','W':'TRP','Y':'TYR'}}
+            to_aa3 = _aa1to3.get(to_aa, to_aa)
             mut_pose = wt_pose.clone()
-
-            # Mutate residue using MutateResidue mover
-            mut_mover = MutateResidue(target=rpose.pdb2pose(mut_pose, pos, chain_id),
-                                       new_res=to_aa)
+            res_num = mut_pose.pdb_info().pdb2pose(chain_id, pos)
+            if res_num == 0:
+                raise ValueError(f"Residue {{pos}}{{chain_id}} not found in pose")
+            mut_mover = MutateResidue(target=res_num, new_res=to_aa3)
             mut_mover.apply(mut_pose)
-
-            # Repack neighbors within 8 Å
-            tf = TaskFactory()
-            tf.push_back(RestrictToRepacking())
-            packer = pyrosetta.rosetta.protocols.minimization_packing.PackRotamersMover(scorefxn, tf.create_task_and_apply_taskoperations(mut_pose))
-            packer.apply(mut_pose)
-
-            ddg = scorefxn(mut_pose) - wt_energy
+            scorefxn_std = pyrosetta.create_score_function("ref2015")
+            relax_mut = FastRelax(scorefxn_std, 3)
+            relax_mut.apply(mut_pose)
+            wt_pose_rerelaxed = wt_pose.clone()
+            relax_wt = FastRelax(scorefxn_std, 3)
+            relax_wt.apply(wt_pose_rerelaxed)
+            wt_score = scorefxn_std(wt_pose_rerelaxed)
+            ddg = scorefxn_std(mut_pose) - wt_score
             results[key] = round(float(ddg), 3)
             print(f"[Rosetta] {{key}}: ddG = {{ddg:+.2f}} kcal/mol", flush=True)
         except Exception as e:
+            import traceback
             results[key] = None
             print(f"[Rosetta] {{key}} failed: {{e}}", flush=True)
+            traceback.print_exc()
 
     with open({wsl_results_path!r}, "w") as f:
         json.dump(results, f)
+    print(f"[Rosetta] Results written to {wsl_results_path!r}", flush=True)
     print("[Rosetta] Done.", flush=True)
 
 except Exception as exc:
@@ -1286,8 +1291,12 @@ except Exception as exc:
         json.dump({{"error": str(exc)}}, f)
 """
 
+        import tempfile, os
+        debug_path = os.path.join(tempfile.gettempdir(), "structurebot_worker_debug.py")
+        with open(debug_path, "w", encoding="utf-8") as _dbg:
+            _dbg.write(script)
         _prog("⚗️  [Rosetta] Running PyRosetta cartesian_ddg (may take 2–5 min per mutation)...")
-        result = wsl.run_python_script(script, timeout=600)
+        result = wsl.run_python_script(script, timeout=1800)
 
         if result["stdout"]:
             for line in result["stdout"].splitlines():
@@ -1300,7 +1309,7 @@ except Exception as exc:
                 error=(
                     f"PyRosetta WSL2 script failed.\n"
                     f"Stderr: {result['stderr'][:300]}\n"
-                    f"Stdout: {result['stdout'][-300:]}"
+                    f"Stdout: {result['stdout']}"
                 ),
             )
 
