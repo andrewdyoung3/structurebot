@@ -9,7 +9,7 @@ section and append a new entry." -->
 | Field | Value |
 |-------|-------|
 | Generated | 2026-05-29 |
-| Test count at generation | 452 collected / 440 passing (12 benchmark skipped pending WSL2+PyRosetta) |
+| Test count at generation | 496 collected / 484 passing (12 benchmark tests skip without WSL2+PyRosetta) |
 | Regenerate with | `claude "Read PROJECT_CONTEXT.md for regeneration instructions, then regenerate it in full by reading the entire codebase. Preserve the Changelog section and append a new entry."` |
 
 This file is the single source of truth for project state. It should be regenerated after every build session. All source of truth lives in the `.py` files, not here.
@@ -18,7 +18,7 @@ This file is the single source of truth for project state. It should be regenera
 
 ## 1. Project Overview
 
-StructureBot is a Windows-native natural-language interface for UCSF ChimeraX 1.11.1, running on Python 3.14 (main venv) with a GPU/ML delegation layer in Python 3.12 (venv312). Users type free-text biology requests ("suggest mutations to improve solubility of chain A, avoiding interfaces") into a Rich-console REPL; the system translates those requests via the Anthropic Claude API (claude-sonnet-4-6 with prompt caching), routes them through a pipeline of computational bridges (CamSol, ESM-2, ProteinMPNN, PyRosetta, DynaMut2, disulfide/proline/glycan/cavity/salt-bridge analysers), and executes the resulting ChimeraX commands via the ChimeraX REST API on port 60001. The application also supports a `--script` batch mode and session persistence via `session.json`.
+StructureBot is a Windows-native natural-language interface for UCSF ChimeraX 1.11.1, running on Python 3.14 (main venv) with a GPU/ML delegation layer in Python 3.12 (venv312). Users type free-text biology requests ("suggest mutations to improve solubility of chain A, avoiding interfaces") into a Rich-console REPL; the system translates those requests via the Anthropic Claude API (claude-sonnet-4-6 with prompt caching), routes them through a pipeline of computational bridges (CamSol, ESM-2, ProteinMPNN, PyRosetta, DynaMut2, disulfide/proline/glycan/cavity/salt-bridge/double-mutant analysers), and executes the resulting ChimeraX commands via the ChimeraX REST API on port 60001. The application also supports a `--script` batch mode and session persistence via `session.json`.
 
 ---
 
@@ -37,6 +37,8 @@ main.py / StructureBot
   │        Block 1: STATIC prompt (cached, ephemeral cache_control)
   │        Block 2: DYNAMIC session context (uncached, changes per turn)
   │  3. ToolRouter.route()      ← augments result, no execution
+  │     Intent overrides (in order): double_mutant → mpnn_esmfold → glycan_positions
+  │     → netnglyc → glycan → salt_bridge → cavity → double_mutant (final check)
   │  4. User confirmation / auto-proceed countdown
   │  5. ChimeraXBridge.run_commands()  ← initial viz commands
   │  6. ToolRouter.execute()    ← computational pipeline
@@ -45,6 +47,7 @@ main.py / StructureBot
   │     ├─ ESMFoldBridge        ← delegates to venv312 subprocess
   │     ├─ RosettaBridge        ← DynaMut2 API or WSL2 PyRosetta
   │     ├─ MutationScanner      ← orchestrates CamSol+ESM+Rosetta
+  │     ├─ DoubleMutantBridge   ← DynaMut2 prediction_mm + optional PyRosetta
   │     ├─ DisulfideBridge      ← BioPython + ESM + DynaMut2
   │     ├─ ProlineBridge        ← BioPython + ESM
   │     ├─ GlycanBridge         ← BioPython + ESM + NetNGlyc API
@@ -64,14 +67,14 @@ ChimeraX REST API  (http://127.0.0.1:60001/run)
 
 | Venv | Python | Purpose |
 |------|--------|---------|
-| `venv/` | 3.14 | Main process: Anthropic SDK, Rich, BioPython, requests, rosetta_bridge, all bridges |
-| `venv312/` | 3.12 | GPU/ML delegation: torch 2.11.0+cu128 (RTX 5070 Ti, sm_120 Blackwell), ESM-2 inference, ESMFold inference |
+| `venv/` | 3.14 | Main process: Anthropic SDK, Rich, BioPython, requests, all bridges |
+| `venv312/` | 3.12 | GPU/ML delegation: torch 2.11.0+cu128 (RTX 5070 Ti, sm_120), ESM-2 inference, ESMFold inference |
 
-The main venv cannot run GPU inference because no PyTorch cu128 build exists for Python 3.14. ESM-related bridges spawn `venv312/Scripts/python.exe` as a subprocess with JSON I/O (`--input`, `--output` temp files). The subprocess has **no imports from the project** — it only imports `torch`, `transformers`, `esm`, and stdlib.
+The main venv cannot run GPU inference because no PyTorch cu128 build exists for Python 3.14. ESM-related bridges spawn `venv312/Scripts/python.exe` as a subprocess with JSON I/O (`--input`, `--output` temp files). Worker scripts have **no project imports** — they only import `torch`, `transformers`, `esm`, and stdlib.
 
 ### WSL2 Layer (PyRosetta)
 
-When `ROSETTA_BACKEND=local`, `RosettaBridge._run_rosetta_local()` builds a standalone Python worker script as an f-string, writes it to a Windows temp file, translates the path to `/mnt/c/...` form, and runs it via `WSLBridge.run_python_script()` → `wsl.exe --distribution Ubuntu-24.04 --exec bash -c "{PYROSETTA_PYTHON} '{wsl_path}'"`. Results are returned as a JSON file at `/tmp/rosetta_ddg_{hash}.json`, copied back to Windows via `wsl.exe`.
+When `ROSETTA_BACKEND=local`, `RosettaBridge._run_rosetta_local()` builds a standalone Python worker script as an f-string, writes it to a Windows temp file, translates the path to `/mnt/c/...` form, and runs it via `WSLBridge.run_python_script()` → `wsl.exe --distribution Ubuntu-24.04 --exec bash -c "{PYROSETTA_PYTHON} '{wsl_path}'"`. Results are returned as a JSON file at `/tmp/rosetta_ddg_{hash}.json`, copied back to Windows via `wsl.exe`. Same pattern applies to `DoubleMutantBridge._run_pair_pyrosetta()` for close pairs.
 
 **Worker script constraints** (critical, applies to ALL worker scripts):
 - No project imports — completely standalone
@@ -87,26 +90,27 @@ When `ROSETTA_BACKEND=local`, `RosettaBridge._run_rosetta_local()` builds a stan
 | `main.py` | `StructureBot`, `_ElapsedTicker` | ✅ Complete | REPL + `--script` mode; startup sequence; session persistence |
 | `config.py` | constants + `load_env_file()` | ✅ Complete | Called first in `main.py`; all env-var overrides centralised here |
 | `translator.py` | `CommandTranslator` | ✅ Complete | Claude API; prompt caching (Block 1 static, Block 2 dynamic); rolling history `MAX_CONVERSATION_HISTORY=6` |
-| `tool_router.py` | `ToolRouter`, `ToolStepResult` | ✅ Complete | Dispatches 13 tool types; handles MPNN+ESMFold combined pipeline; FASTA export; sequence display fast-path |
-| `session_state.py` | `SessionState`, `parse_pdb_header()`, `fetch_rcsb_metadata()` | ✅ Complete | Persists all tool results, scan results, rosetta jobs, disulfide/glycan/proline/cavity/salt-bridge results; save/load/snapshot/restore |
+| `tool_router.py` | `ToolRouter`, `ToolStepResult` | ✅ Complete | Dispatches 14 tool types including `double_mutant`; intent detection for all tools; MPNN+ESMFold combined pipeline; FASTA export; sequence display fast-path |
+| `session_state.py` | `SessionState`, `parse_pdb_header()`, `fetch_rcsb_metadata()` | ✅ Complete | Persists all tool results including `double_mutant_results`; save/load/snapshot/restore |
 | `chimerax_bridge.py` | `ChimeraXBridge`, `find_chimerax()` | ✅ Complete | REST API on port 60001; blank-image post-save guard; `run_commands()` |
-| `wsl_bridge.py` | `WSLBridge`, `PYROSETTA_PYTHON` | ✅ Complete | `PYROSETTA_PYTHON="/home/andre/pyrosetta_env/bin/python"`; default distro `Ubuntu-24.04`; `check_pyrosetta()` uses `chr(79)+chr(75)` to avoid quote-escaping |
-| `rosetta_bridge.py` | `RosettaBridge`, `_select_backend()` | ⚠️ Known issues | 4 backends (dynamut2/empirical/pyrosetta-stub/local-WSL2); see §8 for audit findings; PyRosetta backend is the active WSL2 path |
+| `wsl_bridge.py` | `WSLBridge`, `PYROSETTA_PYTHON` | ✅ Complete | `PYROSETTA_PYTHON="/home/andre/pyrosetta_env/bin/python"`; default distro `Ubuntu-24.04`; `check_pyrosetta()` uses `chr(79)+chr(75)` |
+| `rosetta_bridge.py` | `RosettaBridge`, `_select_backend()` | ⚠️ Known issues | 4 backends (dynamut2/empirical/pyrosetta-stub/local-WSL2); benchmark run 1 complete: sign accuracy 60%, RMSE 5.49, r=−0.059; see §8 for protocol audit and failure modes |
+| `double_mutant_bridge.py` | `DoubleMutantBridge`, `generate_pairs()`, `compute_ca_distance()`, `route_pairs()`, `score_pairs_dynamut2()`, `score_pairs_pyrosetta()`, `compute_composite_score()`, `generate_summary()` | ✅ Complete | Two-mode (stability/epitope) double mutant ΔΔG scoring; DynaMut2 `prediction_mm` for distant pairs (>10 Å), PyRosetta WSL2 for close pairs (<4 Å); real epistasis = ddG(double) − ddG(additive); 36 tests |
 | `esm_bridge.py` | `EsmBridge` | ✅ Complete | ESM-2 `esm2_t6_8M_UR50D` default; delegates GPU inference to `esm_worker.py` via venv312 subprocess; disk cache `cache/esm_{hash}.json` |
 | `esm_worker.py` | standalone subprocess script | ✅ Complete | No project imports; writes JSON result file; run by venv312 python |
 | `esmfold_bridge.py` | `ESMFoldBridge` | ✅ Complete | Primary: venv312 GPU via `esmfold_worker.py`; fallback: ESM Atlas API; `compare_to_wildtype()`, `check_disulfide_foldability()` |
 | `esmfold_worker.py` | standalone subprocess script | ✅ Complete | HuggingFace `facebook/esmfold_v1`; no project imports; pLDDT normalisation guard (×100 if mean < 2.0) |
 | `mutation_scanner.py` | `MutationScanner` | ✅ Complete | CamSol+ESM+Rosetta pipeline; combined score `0.5×(-ddG) + 0.3×camsol_delta + 0.2×esm_tolerance`; Pro/Cys exclusion; interface protection |
-| `camsol_bridge.py` | `CamsolBridge` | ✅ Complete | Local CamSol algorithm; window=9, β=3.0; no network required; web-API fallback via `PROTEIN-SOL_URL` |
+| `camsol_bridge.py` | `CamsolBridge` | ✅ Complete | Local CamSol algorithm; window=9, β=3.0; no network required |
 | `disulfide_bridge.py` | `DisulfideBridge` | ✅ Complete | Cβ-Cβ geometry (4.5 Å cutoff) + ESM tolerance + DynaMut2 stability; combined score 0.4/0.3/0.3 |
 | `proline_bridge.py` | `ProlineBridge` | ✅ Complete | φ-angle scoring; DSSP or Ramachandran fallback; functional residue exclusion |
 | `glycan_bridge.py` | `GlycanBridge` | ✅ Complete | NXS/T sequon detection + SASA + SS + ESM + projection scoring; engineered sequon suggestion; NetNGlyc integration |
-| `netnglyc_bridge.py` | `predict_glycosylation()`, `integrate_with_glycan_candidates()` | ✅ Complete | DTU NetNGlyc 1.0 REST API; OST recognition scoring; harmonic mean integration |
+| `netnglyc_bridge.py` | `predict_glycosylation()`, `integrate_with_glycan_candidates()` | ✅ Complete | DTU NetNGlyc 1.0 REST API; OST recognition scoring |
 | `assembly_analyser.py` | `AssemblyAnalyser`, `fetch_assembly_info()` | ✅ Complete | RCSB assembly API; ChimeraX zone-select for interface detection (5 Å CA); monomer/multimer mode |
 | `salt_bridge_bridge.py` | `SaltBridgeBridge` | ✅ Complete | BioPython + FreeSASA; Asp/Glu↔Arg/Lys/His within 4 Å |
 | `cavity_bridge.py` | `CavityBridge` | ✅ Complete | BFS clustering on buried Cα; SASA < threshold; approximate volume (n_residues × 15 Å³); assembly-aware |
 | `structural_utils.py` | `extract_backbone_angles()`, `compute_sasa()`, `compute_projection_score()`, `classify_sequon_geometry()` | ✅ Complete | Shared geometry utilities; used by `glycan_bridge.py` and `proline_bridge.py` |
-| `rfdiffusion_bridge.py` | `RFdiffusionBridge` | 🔲 Stub | Documented stub; returns helpful error unless `RFDIFFUSION_DIR` set; Python 3.9-3.11 only |
+| `rfdiffusion_bridge.py` | `RFdiffusionBridge` | 🔲 Stub | Documented stub; returns helpful error unless `RFDIFFUSION_DIR` configured; requires Python 3.9-3.11 |
 | `log_analyser.py` | `display_stats()` | ✅ Complete | Parses JSONL session logs; `stats` command in REPL |
 | `diag.py` | — | ✅ Complete | One-off diagnostic script; tests WSL2 availability + PyRosetta import |
 
@@ -180,6 +184,15 @@ When `ROSETTA_BACKEND=local`, `RosettaBridge._run_rosetta_local()` builds a stan
 |----------|---------|-------------|
 | `DYNAMUT2_MAX_WORKERS` | `4` | Concurrent DynaMut2 requests (set to 1 to disable) |
 
+### Double Mutant Scoring
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `DOUBLE_MUTANT_DISTANCE_THRESHOLD_FAR` | `10.0` | Cα-Cα distance (Å) above which DynaMut2 is reliable for double mutants |
+| `DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE` | `4.0` | Cα-Cα distance (Å) below which PyRosetta is required |
+| `DOUBLE_MUTANT_MAX_PAIRS` | `500` | Max pairs to consider before distance-based routing |
+| `DOUBLE_MUTANT_TOP_N` | `10` | Default number of top-ranked pairs to return |
+
 ### NetNGlyc
 
 | Constant | Default | Description |
@@ -206,7 +219,7 @@ All subprocess calls that interact with Windows console handles **must** use:
 stdin=subprocess.DEVNULL
 creationflags=subprocess.CREATE_NO_WINDOW
 ```
-Rationale: `wsl.exe` is a Windows console app. Without these flags it calls `SetConsoleMode()` on the inherited stdin handle, which permanently disables `ReadConsole()` for the rest of the process lifetime, breaking the Rich REPL.
+Rationale: `wsl.exe` calls `SetConsoleMode()` on the inherited stdin handle, which permanently disables `ReadConsole()` for the rest of the process lifetime, breaking the Rich REPL.
 
 ### Path handling rule
 All file paths passed to ChimeraX commands **must** use `.as_posix()` to produce forward slashes. ChimeraX on Windows rejects backslashes in `save "..."` and `open "..."` commands.
@@ -215,13 +228,13 @@ cx_fwd = Path(some_path).as_posix()
 result = bridge.run_command(f'save "{cx_fwd}"')
 ```
 
-### Worker script rules (ESM worker, ESMFold worker, PyRosetta worker)
+### Worker script rules (ESM worker, ESMFold worker, PyRosetta worker, double mutant PyRosetta worker)
 Worker scripts that run in subprocesses or WSL2 **must**:
 1. Have zero imports from the StructureBot project
 2. Communicate exclusively via JSON files (never stdin/stdout for structured data)
 3. Write a result file even on exception (`try/except` at the outermost level)
-4. Use `flush=True` on all print calls (subprocess stdout is not line-buffered by default)
-5. PyRosetta worker: use double-braces `{{...}}` throughout because the script is embedded in a Python f-string
+4. Use `flush=True` on all print calls
+5. PyRosetta workers: use double-braces `{{...}}` throughout (embedded in Python f-string)
 
 ### ChimeraX selector ordering rule
 In ChimeraX commands, specifiers must appear in this order to avoid syntax errors:
@@ -231,19 +244,22 @@ In ChimeraX commands, specifiers must appear in this order to avoid syntax error
 Example: `#1/A:82@CA` — model first, then chain, then residue, then atom.
 
 ### Primary model guard
-Commands that should only act on the first loaded model must use `#1` explicitly. The ChimeraX default (no model specifier) acts on all open models, which causes unintended effects when multiple structures are loaded. The translator's static system prompt explicitly instructs Claude to always emit `#1` for single-model operations.
+Commands that should only act on the first loaded model must use `#1` explicitly. The translator's static system prompt instructs Claude to always emit `#1` for single-model operations.
 
 ### f-string double-brace rule in worker scripts
-The PyRosetta worker script is embedded as a Python f-string. Any literal `{...}` that should appear in the worker code (e.g., dict literals, f-string expressions in worker) must be written as `{{...}}`. The only single-brace `{...}` should be actual f-string interpolations from the outer scope (e.g., `{wsl_pdb!r}`, `{mut_list_json!r}`).
+The PyRosetta and double-mutant worker scripts are embedded as Python f-strings. Any literal `{...}` that should appear in the worker code must be written as `{{...}}`. Only actual f-string interpolations from the outer scope use single braces (e.g., `{wsl_pdb!r}`, `{mut_list_json!r}`).
 
 ### Error-first return convention (all bridges)
-All bridge `analyze()` methods return `ToolStepResult` — they **never raise**. On failure, `result.success = False` and `result.error` contains the message. Callers check `result.success` and degrade gracefully (e.g., fall back to empirical scoring).
+All bridge `analyze()` methods return `ToolStepResult` — they **never raise**. On failure, `result.success = False` and `result.error` contains the message. Callers check `result.success` and degrade gracefully.
+
+### Double mutant mode detection (in `_run_double_mutant`)
+Epitope keywords: `"epitope"`, `"binding"`, `"interface"`, `"preserve"`, `"target"` → `mode = "epitope"`. Otherwise → `mode = "stability"`. PyRosetta keywords: `"pyrosetta"`, `"rosetta"`, `"accurate"`, `"high accuracy"`, `"validate"` → `run_pyrosetta = True`.
 
 ---
 
 ## 6. Test Suite Summary
 
-**Total: 452 collected** | **440 passing** (12 benchmark tests skip unless WSL2+PyRosetta present)
+**Total: 496 collected** | **484 passing** (12 benchmark tests skip unless WSL2+PyRosetta present)
 
 Run commands:
 ```bash
@@ -253,30 +269,36 @@ pytest tests/ --ignore=tests/test_rosetta_benchmark.py -q
 # Including benchmark collection check
 pytest tests/ -q --collect-only
 
-# PyRosetta benchmarks (slow, 12–20 min each, requires WSL2+PyRosetta)
+# PyRosetta benchmarks (slow, requires WSL2+PyRosetta)
 pytest tests/test_rosetta_benchmark.py -m benchmark -v --timeout=1800 -s
+
+# Double mutant tests only
+pytest tests/test_double_mutant_bridge.py -v
 
 # Single benchmark spot-check
 pytest tests/test_rosetta_benchmark.py -m benchmark -v -s -k "t4_l99a"
 ```
 
+**Note:** `pytest.ini` now registers `benchmark`, `slow`, and `timeout` as known markers — no more `PytestUnknownMarkWarning`.
+
 | Test file | Tests | What it covers |
 |-----------|-------|----------------|
 | `test_glycan_bridge.py` | 56 | N-glycan sequon detection, SASA scoring, engineered sequon suggestion, NetNGlyc integration |
-| `test_tool_router.py` | 47 | Route dispatch, MPNN+ESMFold routing, FASTA export, active-site commands, tool icon registry |
+| `test_tool_router.py` | 55 | Route dispatch, MPNN+ESMFold routing, FASTA export, active-site commands, double mutant routing (8 new tests), tool icon registry |
+| `test_double_mutant_bridge.py` | 36 | Pair generation (stability and epitope modes), distance routing, DynaMut2 `prediction_mm` result parsing, PyRosetta worker schema, composite scoring formulas, epistasis sign convention, max-pairs cap |
 | `test_proline_bridge.py` | 35 | φ-angle scoring, functional residue exclusion, DSSP fallback, BioPython parsing |
 | `test_disulfide.py` | 35 | Cβ geometry, dihedral scoring, ESM tolerance, DynaMut2 mock, combined score |
 | `test_mpnn_esmfold_pipeline.py` | 29 | MPNN+ESMFold combined pipeline, session routing, pLDDT comparison |
-| `test_rosetta.py` | 27 | Backend detection, DynaMut2 HTTP mock, MutationScanner, combined scoring, session persistence, router wiring |
+| `test_rosetta.py` | 27 | Backend detection, DynaMut2 HTTP mock, MutationScanner, combined scoring, session persistence |
 | `test_proteinmpnn.py` | 26 | ProteinMPNN subprocess call, JSON output parsing, error paths |
 | `test_esmfold.py` | 25 | ESMFold local/atlas paths, pLDDT normalisation, foldability risk thresholds |
-| `test_tools.py` | 24 | Integration tests: CamSol, ESM, ChimeraX commands, DynaMut2 stub |
+| `test_tools.py` | 24 | Integration: CamSol, ESM, ChimeraX commands, DynaMut2 stub |
 | `test_assembly.py` | 21 | RCSB assembly metadata, monomer/multimer mode, interface detection mock |
 | `test_cavity_bridge.py` | 20 | BFS cavity clustering, SASA burial, volume estimation, interface flagging |
 | `test_netnglyc_bridge.py` | 19 | OST score parsing, harmonic mean integration, API mock |
 | `test_structural_utils.py` | 17 | `extract_backbone_angles()`, `compute_sasa()`, `compute_projection_score()` |
 | `test_wsl.py` | 12 | `WSLBridge` availability, path translation, `run_command()` (skip if no WSL2) |
-| `test_rosetta_benchmark.py` | 12 | PyRosetta ddG benchmarks vs ProThermDB; correlation analysis (skip if no WSL2+PyRosetta) |
+| `test_rosetta_benchmark.py` | 12 | PyRosetta ddG benchmarks vs ProThermDB (11 mutations + 1 correlation test); `@pytest.mark.benchmark` and `@pytest.mark.slow`; skipped without WSL2+PyRosetta |
 | `test_rfdiffusion.py` | 12 | RFdiffusion stub error structure, route detection, directory validation |
 | `test_salt_bridge_bridge.py` | 11 | Salt bridge geometry, charge classification, SASA burial scoring |
 | `test_main.py` | 10 | `StructureBot` startup mocking, ChimeraX connection, session save/load |
@@ -299,20 +321,29 @@ The following results have been confirmed working against **1HSG** (HIV-1 protea
 | CamSol solubility scan | Chain A scored; aggregation-prone residues coloured red in ChimeraX |
 | ESM-2 conservation | Chain A scored; conserved residues blue, variable red |
 | Mutation scan (full pipeline) | Top candidate `I64E` (ΔΔG = −3.53 kcal/mol by DynaMut2); `V82A` reference used in tests |
-| V82A ddG (DynaMut2) | ~+1.5 to +2.0 kcal/mol (Mahalingam et al.); used as benchmark reference in `test_rosetta_benchmark.py` |
-| Assembly analysis | 1HSG detected as homodimer (A2 stoichiometry); interface residues between chains A+B stored in session |
+| V82A ddG (DynaMut2) | ~+1.5 to +2.0 kcal/mol (Mahalingam et al.); used as benchmark reference |
+| Assembly analysis | 1HSG detected as homodimer (A2 stoichiometry); interface residues between chains A+B stored |
 | Disulfide candidates | Chain A↔B candidates with Cβ-Cβ < 4.5 Å ranked by geometry+ESM+stability |
 | Proline scan | φ-angle candidates on chain A; functional residue exclusion when active-site set |
 | Glycan scan | NXS/T sequons on chain A scored for surface exposure, SS content, ESM tolerance |
 | ProteinMPNN redesign | Chain A sequences generated; 3 top designs validated with ESMFold |
 | Salt bridge analysis | Asp/Glu↔Arg/Lys/His contacts within 4 Å on chain A |
 | Cavity detection | Internal voids in chain A ranked by burial depth and size |
+| Double mutant bridge | 484/484 tests passing; bridge importable; `analyze()` returns correct schema with all required keys. Live end-to-end test pending (requires live ChimeraX session with prior mutation scan) |
+
+**PyRosetta Benchmark Run 1 (2026-05-29)** — 11 mutations from ProThermDB:
+
+| Metric | Result |
+|--------|--------|
+| Sign accuracy | 6/10 = 60% (I64E excluded, no precise experimental value) |
+| Within 2.0 kcal/mol | 4/10 = 40% |
+| MAE | 3.823 kcal/mol |
+| RMSE | 5.492 kcal/mol |
+| Pearson r | −0.059 (driven negative by A98V outlier: +14.52 predicted vs −0.5 experimental) |
+
+Protocol suitable for sign prediction on surface-exposed mutations (4/6 correct for non-buried, non-interface positions); not reliable for buried mutations or magnitude accuracy. Without the A98V outlier, r ≈ +0.46 and RMSE ≈ 2.58 kcal/mol. Full analysis in `scripts/rosetta_validation_notes.md`.
 
 Full pipeline validation script: `scripts/validate_full_pipeline.txt`
-```
-open 1HSG → solubility scan → proline scan → glycan scan →
-salt bridges → cavities → MPNN redesign → show sequences → export
-```
 
 ---
 
@@ -322,23 +353,32 @@ salt bridges → cavities → MPNN redesign → show sequences → export
 
 | Issue | Severity | Detail |
 |-------|----------|--------|
-| Single relax trajectory | ⚠️ Medium | 1 trajectory per mutation; Kellogg 2011 recommends 50. Adds ~1–2 kcal/mol stochastic noise. Expected RMSE ~1.5–2.5 kcal/mol vs ~1.0 for 50-replicate protocol |
-| No large backbone flexibility | ⚠️ Medium | FastRelax moves sidechains + minimises backbone but can't model local unfolding |
-| Implicit solvation | ⚠️ Low | `ref2015` uses Lazaridis-Karplus; buried charged residue mutations systematically off |
-| Homodimer chain context | ⚠️ Low | 1HSG chains A+B both loaded; interface contacts from B on A mutations are present but not explicitly managed |
-| Runtime per mutation | ℹ️ | ~12–20 min per mutation (symmetric 3+3 cycle FastRelax); 50 mutations ≈ 10–17 hours |
+| Single relax trajectory | ⚠️ Medium | 1 trajectory per mutation; adds ~1–2 kcal/mol stochastic noise; RMSE 5.49 in benchmark |
+| cleanATOM removes crystallographic waters | ⚠️ High | Causes wrong-sign predictions for T26A (Barnase) and G88V (SNase) where buried waters contribute to stability; **one-line fix: preserve HOH records** |
+| Cavity-filling mutation overestimation | ⚠️ High | A98V: +14.52 predicted vs −0.5 experimental; single trajectory can't resolve backbone strain for volume-increasing substitutions; fix: detect mutant > WT size, use more relax cycles |
+| No large backbone flexibility | ⚠️ Medium | FastRelax can't model local unfolding; proline-insertion destabilisation underestimated |
+| Single-chain scoring for oligomers | ⚠️ Low | 1HSG chains A+B both loaded; interface contacts from B on A mutations present but not explicitly managed |
+
+### PyRosetta ddG benchmark failure modes (from run 1)
+
+**Failure mode 1 — Systematic overestimation of destabilisation:**
+I88V (+5.264 vs +0.6), L69A (+6.6 vs +2.4), L99A (+7.137 vs +4.0), A98V (+14.52 vs −0.5). Root cause: single trajectory landing in poor local minimum; 50-replicate averaging would resolve.
+
+**Failure mode 2 — Wrong sign on buried mutations:**
+T26A (−2.437 predicted vs +1.3 exp), G88V (−0.25 vs +2.1), V82A (−0.06 vs +1.75). Root cause: `cleanATOM` removing crystallographic waters that stabilise buried positions in Barnase and SNase.
+
+### Revised benchmark thresholds (updated based on run 1)
+Current tests assert `r > 0.50`, `RMSE < 2.50`, `sign_accuracy ≥ 70%` — all fail with current single-trajectory protocol. Realistic thresholds for current protocol: `r > 0.30`, `RMSE < 4.00`, `sign_accuracy ≥ 60%`. Tests in `test_rosetta_benchmark.py` need updating (follow-up task, not yet done).
 
 ### From code review (TODO/FIXME/stub findings)
 
 | Location | Issue |
 |----------|-------|
-| `rfdiffusion_bridge.py` | Entire module is a documented stub; returns error unless `RFDIFFUSION_DIR` configured; requires Python 3.9-3.11 |
-| `rosetta_bridge.py` — `_run_pyrosetta()` | Backend A (`pyrosetta` mode, line ~1056) is a documented stub for direct PyRosetta import (no Python 3.14 wheel); the active WSL2 path (`local` backend) works correctly |
-| `rosetta_bridge.py` docstring line 1108 | Still references `Ubuntu-22.04` in `_run_rosetta_local()` docstring (the runtime code correctly uses Ubuntu-24.04 via wsl_bridge defaults) |
-| `main.py` line 327 | WSL2 availability message still says `wsl --install -d Ubuntu-22.04` (display string, not functional) |
-| `esmfold_worker.py` | `compute_tm` may still produce NaN on very short sequences despite existing guard (`fix(esmfold): mixed precision` commit) — `ESMFOLD_FORCE_COLD_TIMEOUT=False` is correct default |
-| `rosetta_bridge.py` worker | `cleanATOM` call uses `cleanATOM(pdb_path, cleaned_path)` — fixed from incorrect keyword-arg version; not battle-tested yet on real PDBs with HETATM |
-| `diag.py` | One-off diagnostic script in project root; not imported by anything; safe to ignore or delete |
+| `rfdiffusion_bridge.py` | Entire module is a documented stub; requires Python 3.9-3.11 environment |
+| `rosetta_bridge.py` — `_run_pyrosetta()` | Backend A (`pyrosetta` mode) is a documented stub; WSL2 path (`local` backend) works |
+| `rosetta_bridge.py` docstring line ~1108 | Still references `Ubuntu-22.04` in `_run_rosetta_local()` docstring (runtime correctly uses Ubuntu-24.04) |
+| `main.py` line 327 | WSL2 availability message still says `wsl --install -d Ubuntu-22.04` (display string only) |
+| `diag.py` | One-off diagnostic script in project root; not imported by anything |
 
 ---
 
@@ -348,14 +388,14 @@ Prioritised by impact and readiness:
 
 | Priority | Item | Rationale |
 |----------|------|-----------|
-| 1 | **Run PyRosetta benchmark suite** | 12 benchmark tests exist against ProThermDB mutations (1BNI, 1UBQ, 2SNS, 2LZM, 1HSG). Currently untested. Run once to establish Pearson r and RMSE baseline. `pytest tests/test_rosetta_benchmark.py -m benchmark -v -s` |
-| 2 | **Fix Ubuntu-22.04 display strings** | `_run_rosetta_local()` docstring (line 1108) and `main.py` startup message (line 327) still say Ubuntu-22.04. Low risk but causes confusion |
-| 3 | **Multi-replica PyRosetta averaging** | Run 3 replicates per mutation and average ΔΔG to reduce ~1–2 kcal/mol trajectory noise. Would bring expected RMSE from ~2.0 down to ~1.5. Cost: 3× runtime |
-| 4 | **RFdiffusion activation** | Documented stub awaiting Python 3.9-3.11 environment setup and ~20 GB weight download. Would enable de novo binder design. Blocked on separate Python venv |
-| 5 | **LigandMPNN integration** | `PROTEINMPNN_DIR` supports LigandMPNN (ligand-aware redesign). Needs testing on 1HSG (MK1 ligand) to verify ligand-context designs differ from vanilla MPNN |
-| 6 | **ProteinMPNN scan hotspot mode** | ProteinMPNN can design only a specified region (hotspot residues). Currently whole-chain redesign only. Would combine with assembly interface data to redesign only non-interface surface |
-| 7 | **PyRosetta interface ΔΔG** | Current protocol scores single-chain ΔΔG. For interface mutations (e.g. 1HSG V82 which contacts chain B), an `InterfaceAnalyzerMover` protocol would give more accurate results |
-| 8 | **CamSol web-API fallback testing** | `PROTEIN-SOL_URL` env var enables Protein-Sol web API fallback. Untested. Low priority — local algorithm is adequate |
+| 1 | **Validate double mutant live end-to-end** | Bridge and tool router integration are built; need live validation: open 1HSG → mutation scan → "suggest double mutant combinations". Should print Rich Panel and execute ChimeraX coloring + distance lines |
+| 2 | **ColabFold bridge** (design agreed, prompt not yet written) | AF2-quality folding for designed sequences; template-guided mode validates ProteinMPNN designs with wildtype structure as template. Prerequisites: new `venv310` (Python 3.10, shared with RFdiffusion); ColabFold pip install; ~20 GB AF2 weights. Two modes: template-guided (primary), de novo. Returns pLDDT, PAE, TM-score vs template, per-residue RMSD. Integrates with MPNN+ESMFold pipeline as higher-accuracy validation. **Plan venv310 setup before writing ColabFold prompt** |
+| 3 | **RFdiffusion activation** (stub exists at `rfdiffusion_bridge.py`) | De novo backbone generation; completes design loop (RFdiffusion → ProteinMPNN → ColabFold). Prerequisites: `venv310` shared with ColabFold; ~20 GB weights; Python 3.9-3.11. Stub already written; activation is configuration + environment task |
+| 4 | **PyRosetta protocol improvements** (benchmark failures documented) | Three targeted fixes in priority order: (a) Preserve crystallographic waters — one-line change to `cleanATOM` call, highest impact/effort ratio, fixes T26A and G88V; (b) `ROSETTA_NUM_TRAJECTORIES` config flag for multi-trajectory averaging; (c) Detect mutant > WT size → extra relax cycles for A98V-type cavity-filling mutations |
+| 5 | **Update benchmark test thresholds** | `test_rosetta_benchmark.py` currently asserts `r > 0.50` which fails with current protocol. Update to `r > 0.30`, `RMSE < 4.00`, `sign_accuracy ≥ 60%` |
+| 6 | **Mid-execution ESC / cancellation** | Long-running tools (PyRosetta ~15 min, ColabFold ~5 min) have no cancellation. Background thread pattern needed |
+| 7 | **Double mutant — PyRosetta multi-mutation close-pair validation** | Close pairs (<4 Å) currently skipped when `run_pyrosetta=False`. After PyRosetta protocol is improved (item 4), these become scientifically valuable |
+| 8 | **GlycosuitDB lookup** | Expression system glycan characterisation for engineered sequons — tells what glycan structure to expect in CHO, HEK293, E. coli etc. |
 
 ---
 
@@ -368,7 +408,7 @@ Prioritised by impact and readiness:
 | `anthropic` | `>=0.40.0` | Claude API (translator, prompt caching) |
 | `requests` | `>=2.31.0` | DynaMut2 API, RCSB API, ChimeraX REST, ESM Atlas fallback |
 | `rich` | `>=13.7.0` | Console REPL, tables, panels |
-| `biopython` | [verify] | PDB parsing in disulfide/proline/cavity/salt-bridge bridges |
+| `biopython` | [verify] | PDB parsing in disulfide/proline/cavity/salt-bridge/structural_utils |
 | `freesasa` | [verify] | SASA computation in salt_bridge_bridge.py (optional — degrades gracefully) |
 
 ### venv312 (`venv312/`, Python 3.12)
@@ -386,14 +426,15 @@ Prioritised by impact and readiness:
 | PyRosetta | `/home/andre/pyrosetta_env/` | ddG calculations; Rosetta Commons **academic license required** |
 | Python venv | `/home/andre/pyrosetta_env/bin/python` | PyRosetta interpreter |
 
-**License note:** PyRosetta requires a free academic license from [https://www.rosettacommons.org/software/license-and-download](https://www.rosettacommons.org/software/license-and-download). Commercial use is not permitted under this license.
+**License note:** PyRosetta requires a free academic license from rosettacommons.org. Commercial use not permitted.
 
 ### External Services
 
 | Service | URL | Auth | Usage |
 |---------|-----|------|-------|
 | Anthropic API | `api.anthropic.com` | `ANTHROPIC_API_KEY` | Translation (every request) |
-| DynaMut2 | `biosig.lab.uq.edu.au/dynamut2/api` | None | ddG scoring (default backend) |
+| DynaMut2 (single) | `biosig.lab.uq.edu.au/dynamut2/api/prediction_single` | None | Single-point ddG scoring (default backend) |
+| DynaMut2 (multi) | `biosig.lab.uq.edu.au/dynamut2/api/prediction_mm` | None | Double mutant ddG via `prediction_mm` endpoint |
 | RCSB PDB | `data.rcsb.org/rest/v1/` | None | Assembly metadata, chain info |
 | NetNGlyc 1.0 | `services.healthtech.dtu.dk` | None | OST recognition prediction |
 | ESM Atlas | `esmatlas.com/api/fold` | None | ESMFold fallback (when local fails) |
@@ -404,7 +445,17 @@ Prioritised by impact and readiness:
 | Tool | Setup | Config |
 |------|-------|--------|
 | ProteinMPNN | `git clone https://github.com/dauparas/ProteinMPNN` | `PROTEINMPNN_DIR=C:\Users\andre\documents\structurebot\ProteinMPNN` |
-| RFdiffusion | `git clone https://github.com/RosettaCommons/RFdiffusion` + `bash scripts/download_models.sh` | `RFDIFFUSION_DIR=<path>` (not yet set) |
+| RFdiffusion | `git clone https://github.com/RosettaCommons/RFdiffusion` + weights | `RFDIFFUSION_DIR=<path>` (not yet set) |
+
+### Planned (not yet installed)
+
+| Package | Venv | Purpose |
+|---------|------|---------|
+| `colabfold` | `venv310` (Python 3.10, new) | AF2-quality folding with MMseqs2 MSA; template-guided and de novo modes |
+| `jax` / `jaxlib` | `venv310` | ColabFold runtime |
+| RFdiffusion | `venv310` (Python 3.9-3.11) | De novo backbone generation; shared venv with ColabFold |
+
+Note: `venv310` does not yet exist. It will be created when ColabFold or RFdiffusion setup is initiated. PyTorch (`venv312`) and JAX (`venv310`) must remain in separate venvs due to CUDA runtime conflicts.
 
 ---
 
@@ -420,15 +471,17 @@ Prioritised by impact and readiness:
 | ChimeraX executable | `C:\Users\andre\documents\ChimeraX 1.11.1\bin\ChimeraX.exe` |
 | ESM disk cache | `<root>\cache\esm_{hash}.json` |
 | Rosetta relax cache | `<root>\cache\rosetta_relaxed\` |
-| HuggingFace model cache | `~/.cache/huggingface/hub/models--facebook--esmfold_v1/` (default HF location) |
+| PDB download cache | `<root>\cache\{PDBID}.pdb` |
+| HuggingFace model cache | `~/.cache/huggingface/hub/models--facebook--esmfold_v1/` |
 | Session JSONL logs | `<root>\logs\session_YYYYMMDD_HHMMSS.jsonl` |
 | Named sessions | `<root>\sessions\{name}.cxs` + `{name}.json` |
 | Live session | `<root>\session.json` |
-| Worker debug dump | `%TEMP%\structurebot_worker_debug.py` (written each time local Rosetta runs) |
-| PDB download cache | `<root>\cache\{PDBID}.pdb` (benchmark tests) |
+| Worker debug dump | `%TEMP%\structurebot_worker_debug.py` (written each PyRosetta run) |
 | Benchmark results | `<root>\scripts\benchmark_results.json` |
+| Benchmark run log | `<root>\scripts\benchmark_run.log` |
+| PyRosetta audit + benchmark | `<root>\scripts\rosetta_validation_notes.md` |
 | Full pipeline script | `<root>\scripts\validate_full_pipeline.txt` |
-| Rosetta audit notes | `<root>\scripts\rosetta_validation_notes.md` |
+| Context update script | `<root>\scripts\update_context.sh` |
 | ProteinMPNN repo | `C:\Users\andre\documents\structurebot\ProteinMPNN\` |
 
 ---
@@ -437,15 +490,17 @@ Prioritised by impact and readiness:
 
 **For starting a new co-pilot conversation:**
 
-- **Test count**: 452 collected, 440 passing (12 benchmark tests skip without WSL2+PyRosetta)
-- **Last built and validated**: PyRosetta WSL2 backend (`_run_rosetta_local()` in `rosetta_bridge.py`) — full protocol with symmetric 3+3 cycle FastRelax, `cleanATOM` PDB prep, one-letter→three-letter AA conversion, `pose.pdb_info().pdb2pose()` modern API, `ref2015` score function; `wsl_bridge.py` updated with `PYROSETTA_PYTHON` constant and Ubuntu-24.04 default. Also created `tests/test_rosetta_benchmark.py` (11 ProThermDB mutations + correlation analysis) and `scripts/rosetta_validation_notes.md` (full protocol audit).
-- **Immediate next item**: Run the benchmark suite once to establish baseline Pearson r and RMSE: `pytest tests/test_rosetta_benchmark.py -m benchmark -v -s -k "t4_l99a"` (single test first); then full suite.
-- **In-progress / half-done**: Nothing half-done. The last session committed cleanly at `7cf9807`.
+- **Test count**: 496 collected, 484 passing (12 benchmark tests skip without WSL2+PyRosetta). No warnings about unknown markers.
+- **Last built and validated**: `double_mutant_bridge.py` (DoubleMutantBridge, 36 tests, two-mode stability/epitope scoring, DynaMut2 `prediction_mm` API, PyRosetta WSL2 close-pair validation, epistasis detection, distance-based backend routing). Tool router integration wired (`tool_router.py`, `session_state.py`, 8 new routing tests, `pytest.ini` marker registrations) — **all 484 tests green**, live end-to-end validation pending.
+- **Immediate next item**: Live validation of double mutant pipeline: `python main.py` → open 1HSG → "suggest mutations to improve solubility of chain A" → "suggest double mutant combinations". Expected: Rich Panel with top pairs table, ChimeraX colored spheres + Cα-Cα distance lines. Then test: "suggest double mutant combinations to preserve the epitope" → should use epitope mode.
+- **After double mutant validated**: ColabFold bridge. **First step is creating venv310** — write a venv310 setup prompt before the ColabFold bridge prompt. venv310 will be shared with RFdiffusion (plan both together).
+- **PyRosetta benchmark**: Run 1 complete. Sign accuracy 60%, RMSE 5.49, r=−0.059. Crystallographic water fix is highest-priority code change (one-line, targets T26A and G88V failures). `test_rosetta_benchmark.py` thresholds need updating from `r > 0.50` to `r > 0.30` (follow-up task).
 - **Active configuration flags**:
-  - `ROSETTA_BACKEND=local` in `.env.local` — routes ddG to PyRosetta via WSL2. Change to `dynamut2` to revert to web API if WSL2 is unavailable.
-  - `ESM_USE_VENV312=auto` — GPU inference if CUDA smoke-test passes.
-  - `ESMFOLD_FORCE_COLD_TIMEOUT=False` — correct, do not change.
+  - `ROSETTA_BACKEND=local` in `.env.local` — PyRosetta via WSL2
+  - `ESM_USE_VENV312=auto` — GPU inference if CUDA smoke-test passes
+  - `ESMFOLD_FORCE_COLD_TIMEOUT=False` — correct, do not change
 - **API key**: Set in `.env.local` as `ANTHROPIC_API_KEY` — do not commit this file.
+- **venv310 does not yet exist** — needed for ColabFold and RFdiffusion.
 
 ---
 
@@ -453,8 +508,9 @@ Prioritised by impact and readiness:
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-05-29 | 496 | double_mutant_bridge.py built (36 tests): two-mode stability/epitope pair scoring, DynaMut2 multi-mutation API (prediction_mm), PyRosetta WSL2 close-pair validation, epistasis detection, distance-based backend routing; 4 new config constants. Tool router integration: _DOUBLE_MUTANT_KEYWORDS intent detection, _run_double_mutant() with full 5-step pipeline, _build_double_mutant_viz(), session_state.double_mutant_results field, 8 new routing tests, pytest.ini marker registrations. PyRosetta benchmark run 1 complete: sign accuracy 60%, RMSE 5.49, r=-0.059 (A98V outlier); rosetta_validation_notes.md updated with failure mode analysis, revised thresholds (r>0.30, RMSE<4.0), improvement roadmap. ColabFold+RFdiffusion added to build queue. PROJECT_CONTEXT.md regenerated |
 | 2026-05-29 | 452 | PyRosetta WSL2 backend fully implemented: symmetric FastRelax ddG protocol, cleanATOM PDB prep, modern pdb2pose API, ref2015 score function, wsl_bridge PYROSETTA_PYTHON constant + Ubuntu-24.04 default; benchmark test suite (11 ProThermDB mutations) + rosetta_validation_notes.md created; PROJECT_CONTEXT.md generated |
-| 2026-05-28 | 440 | feat(netnglyc): NetNGlyc 1.0 OST recognition integration (Task 3) |
+| 2026-05-28 | 440 | feat(netnglyc): NetNGlyc 1.0 OST recognition integration |
 | 2026-05-28 | [verify] | feat(glycan): projection-aware glycosylation position scan + fold validation |
 | 2026-05-28 | [verify] | feat(cavity_bridge): dimer/oligomer-aware cavity detection with BFS clustering |
 | 2026-05-28 | [verify] | feat(glycan): projection scoring, sequon geometry, structural_utils shared module |

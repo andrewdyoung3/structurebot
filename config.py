@@ -126,6 +126,25 @@ ESM_USE_VENV312: str = os.environ.get("ESM_USE_VENV312", "auto").strip()
 # 4 is conservative — server handles up to ~5.  Set to 1 to disable parallelism.
 DYNAMUT2_MAX_WORKERS: int = int(os.environ.get("DYNAMUT2_MAX_WORKERS", "4"))
 
+# ── Double mutant scoring ─────────────────────────────────────────────────────
+
+# Cα-Cα distance threshold (Å) above which DynaMut2 is reliable for double mutants.
+DOUBLE_MUTANT_DISTANCE_THRESHOLD_FAR: float = float(
+    os.environ.get("DOUBLE_MUTANT_DISTANCE_THRESHOLD_FAR", "10.0")
+)
+
+# Cα-Cα distance threshold (Å) below which PyRosetta is required (DynaMut2 not used).
+DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE: float = float(
+    os.environ.get("DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE", "4.0")
+)
+
+# Maximum pairs to consider before applying distance-based routing.
+# If the combination count exceeds this, take top-N by sum of |ddG|.
+DOUBLE_MUTANT_MAX_PAIRS: int = int(os.environ.get("DOUBLE_MUTANT_MAX_PAIRS", "500"))
+
+# Default number of top-ranked pairs to return from analyze().
+DOUBLE_MUTANT_TOP_N: int = int(os.environ.get("DOUBLE_MUTANT_TOP_N", "10"))
+
 # ── ESMFold ───────────────────────────────────────────────────────────────────
 
 # Enable ESMFold foldability checking on top mutation/disulfide candidates.

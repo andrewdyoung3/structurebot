@@ -124,6 +124,7 @@ class ToolRouter:
         "netnglyc":          "🔬🍬",
         "salt_bridge":       "⚡",
         "cavity":            "🕳",
+        "double_mutant":     "⚗️🔗",
     }
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
@@ -285,6 +286,23 @@ class ToolRouter:
         "ost glycosylation",
     )
 
+    # Keywords that trigger double mutant pair scoring.
+    # Checked BEFORE mutation_scan dispatch so these phrases are never
+    # sent through the single-point scan pipeline.
+    _DOUBLE_MUTANT_KEYWORDS: tuple = (
+        "double mutant",
+        "combine mutations",
+        "combined mutations",
+        "synergistic",
+        "epistasis",
+        "pair mutations",
+        "two mutations",
+        "mutation combination",
+        "epitope preserv",
+        "preserve epitope",
+        "scaffold stabili",
+    )
+
     # Keywords that signal a proline substitution scan request.
     # Checked case-insensitively; any match overrides generic mutation_scan routing.
     _PROLINE_KEYWORDS: tuple = (
@@ -324,8 +342,17 @@ class ToolRouter:
         self._netnglyc_bridge:         Optional[Any] = None
         self._salt_bridge_bridge:      Optional[Any] = None
         self._cavity_bridge:           Optional[Any] = None
+        self._double_mutant_bridge:    Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
+
+    # ── Double mutant intent helpers ──────────────────────────────────────────
+
+    @classmethod
+    def _detect_double_mutant_intent(cls, text: str) -> bool:
+        """Return True if *text* signals a double mutant pair scoring request."""
+        lower = text.lower()
+        return any(kw in lower for kw in cls._DOUBLE_MUTANT_KEYWORDS)
 
     # ── Proline intent helpers ────────────────────────────────────────────────
 
@@ -638,6 +665,30 @@ class ToolRouter:
             )
             tool_inputs["cavity"]["assembly_mode"] = _cav_assembly
 
+        # ── Double mutant intent override ─────────────────────────────────────
+        # Fires when double mutant keywords are detected AND the tool is not
+        # already set.  Runs AFTER other overrides so proline/glycan/etc. take
+        # priority when their more-specific keywords also appear.
+        _dm_intent = bool(
+            user_input
+            and self._detect_double_mutant_intent(user_input)
+            and "double_mutant" not in tools_needed
+        )
+        if _dm_intent:
+            _dm_chain = "A"
+            for _inp in list(tool_inputs.values()):
+                if isinstance(_inp, dict) and _inp.get("chain"):
+                    _dm_chain = _inp["chain"]
+                    break
+            tools_needed = ["double_mutant"]
+            tool_inputs  = {
+                "double_mutant": {
+                    "model_id":    self._primary_model_id(),
+                    "chain":       _dm_chain,
+                    "_user_input": user_input,
+                }
+            }
+
         result = dict(translator_result)
         result["tools_needed"] = tools_needed
         result["tool_inputs"]  = tool_inputs
@@ -772,6 +823,15 @@ class ToolRouter:
             mid   = inp.get("model_id") or self._first_model_id()
             chain = inp.get("chain", "A")
             return f"Cavity detection and filling -- #{mid} chain {chain}"
+        if tool == "double_mutant":
+            inp  = tool_inputs.get("double_mutant", {})
+            mid  = inp.get("model_id") or self._first_model_id()
+            ui   = inp.get("_user_input", "")
+            mode = "epitope" if any(kw in ui.lower() for kw in ("epitope", "binding", "preserve")) else "stability"
+            return (
+                f"Double mutant pair scoring — #{mid} [{mode} mode] "
+                "(DynaMut2 prediction_mm + epistasis)"
+            )
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -895,6 +955,18 @@ class ToolRouter:
             if tool == "rosetta":
                 return self._run_rosetta(inputs)
             if tool == "mutation_scan":
+                # ── Double mutant guard (highest-priority secondary net) ──────
+                # Fires when user_input contains "double" or "combine" regardless
+                # of the full keyword list — covers "double mutations", "combine
+                # these mutations", etc. that route() may not have intercepted.
+                _lower_ui = user_input.lower() if user_input else ""
+                if _lower_ui and ("double" in _lower_ui or "combine" in _lower_ui):
+                    dm_inputs = {
+                        "model_id":    self._primary_model_id(),
+                        "chain":       inputs.get("chain", "A"),
+                        "_user_input": user_input,
+                    }
+                    return self._run_double_mutant(dm_inputs)
                 # ── Proline guard (secondary safety net) ─────────────────────
                 # If the user asked about proline and route() didn't catch it
                 # (e.g. user_input was not passed to route()), redirect here.
@@ -917,6 +989,8 @@ class ToolRouter:
                     }
                     return self._run_glycan(glycan_inputs)
                 return self._run_mutation_scan(inputs)
+            if tool == "double_mutant":
+                return self._run_double_mutant(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -940,7 +1014,8 @@ class ToolRouter:
                     "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
                     "assembly_analyser, disulfide, proline, glycan, "
-                    "glycan_positions, netnglyc, salt_bridge, cavity."
+                    "glycan_positions, netnglyc, salt_bridge, cavity, "
+                    "double_mutant."
                 ),
             )
         except Exception as exc:
@@ -2073,6 +2148,196 @@ class ToolRouter:
             elapsed_ms       = elapsed_ms,
         )
 
+    # ── Double mutant tool ────────────────────────────────────────────────────
+
+    def _run_double_mutant(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """
+        Score double mutant pairs from existing scan results.
+
+        Reads scan_results from session state, builds the mutations list,
+        routes pairs via DynaMut2 prediction_mm (or PyRosetta for close pairs),
+        and stores results in session_state.double_mutant_results.
+        """
+        import time as _time
+
+        user_input = user_input or inputs.get("_user_input", "")
+        model_id   = inputs.get("model_id") or self._primary_model_id()
+        lower      = user_input.lower()
+
+        # Step 1 — detect mode
+        _epitope_kw = ("epitope", "binding", "interface", "preserve", "target")
+        mode = "epitope" if any(kw in lower for kw in _epitope_kw) else "stability"
+        print(f"[DoubleMutant] Mode: {mode}", flush=True)
+
+        # Step 2 — prerequisites: PDB file
+        pdb_path = self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="double_mutant", success=False,
+                error=(
+                    "No structure loaded or PDB file unavailable. "
+                    "Run 'open 1HSG' (or your structure) first."
+                ),
+            )
+
+        # Step 2 — prerequisites: scan results
+        scan_data = self.session.get_scan_result(model_id)
+        if not scan_data:
+            return ToolStepResult(
+                tool="double_mutant", success=False,
+                error=(
+                    "No single-point scan results found. Run a mutation scan first, e.g.\n"
+                    "'suggest mutations to improve solubility of chain A',\n"
+                    "then ask for double mutant combinations."
+                ),
+            )
+
+        # Map scan result dicts → DoubleMutantBridge schema
+        # mutation_scanner uses 'solubility_delta'; bridge expects 'camsol_delta'
+        mutations: List[Dict[str, Any]] = []
+        for m in scan_data:
+            mutations.append({
+                "chain":             m.get("chain", "A"),
+                "position":          m.get("position"),
+                "from_aa":           m.get("from_aa"),
+                "to_aa":             m.get("to_aa"),
+                "ddg":               m.get("ddg", 0.0),
+                "camsol_delta":      m.get("solubility_delta") or m.get("camsol_delta", 0.0),
+                "esm_tolerance":     m.get("esm_tolerance", 1.0),
+                "interface_proximal": m.get("interface_proximal", False),
+            })
+
+        if len(mutations) < 2:
+            return ToolStepResult(
+                tool="double_mutant", success=False,
+                error=(
+                    "Need at least 2 candidate mutations to generate pairs. "
+                    "Run a wider mutation scan first."
+                ),
+            )
+
+        # Step 3 — detect run_pyrosetta flag
+        _pr_kw = ("pyrosetta", "rosetta", "accurate", "high accuracy", "validate")
+        run_pyrosetta = any(kw in lower for kw in _pr_kw)
+        if run_pyrosetta:
+            print(
+                "⚠ PyRosetta validation requested for close pairs — this adds ~30 min "
+                "per close pair. Close pairs only.",
+                flush=True,
+            )
+
+        # Step 4 — gather session context
+        iface_dict = self.session.get_interface_residues(model_id)
+        iface_set: Optional[set] = None
+        if iface_dict:
+            iface_set = set()
+            for resnos in iface_dict.values():
+                iface_set.update(resnos)
+
+        func_set = self.session.get_functional_residues()
+        func_residues: Optional[set] = func_set if func_set else None
+
+        import config as _cfg_dm
+        bridge_inputs: Dict[str, Any] = {
+            "pdb_path":            pdb_path,
+            "mutations":           mutations,
+            "mode":                mode,
+            "interface_residues":  iface_set,
+            "functional_residues": func_residues,
+            "top_n":               _cfg_dm.DOUBLE_MUTANT_TOP_N,
+            "run_pyrosetta":       run_pyrosetta,
+        }
+
+        bridge = self._get_double_mutant_bridge()
+        t0 = _time.perf_counter()
+        result = bridge.analyze(bridge_inputs, self.session)
+        result.elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        # Step 5 — handle result
+        if not result.success:
+            return result
+
+        self.session.set_double_mutant_results(model_id, result.data)
+
+        # Generate ChimeraX visualization
+        viz_cmds, viz_exps = self._build_double_mutant_viz(
+            result.data.get("top_pairs", []), model_id
+        )
+        result.viz_commands     = viz_cmds
+        result.viz_explanations = viz_exps
+
+        return result
+
+    def _build_double_mutant_viz(
+        self,
+        top_pairs: List[Dict[str, Any]],
+        model_id:  str,
+    ) -> tuple:
+        """Generate ChimeraX commands to visualize top double mutant pairs."""
+        if not top_pairs:
+            return [], []
+
+        _CONF_COLORS = {
+            "high":     "#6495ed",  # cornflower blue
+            "moderate": "#ffd700",  # gold
+            "low":      "#c0c0c0",  # light grey
+        }
+
+        cmds: List[str] = []
+        exps: List[str] = []
+
+        chain = top_pairs[0]["mutation_a"].get("chain", "A")
+        cmds.append(f"cartoon #{model_id}")
+        exps.append("Switch to cartoon for double mutant visualization")
+        cmds.append(f"color #{model_id}/{chain} white")
+        exps.append(f"Reset chain {chain} to white before pair coloring")
+
+        for pair in top_pairs[:5]:
+            m_a      = pair["mutation_a"]
+            m_b      = pair["mutation_b"]
+            chain_a  = m_a.get("chain", "A")
+            chain_b  = m_b.get("chain", "A")
+            pos_a    = m_a["position"]
+            pos_b    = m_b["position"]
+            conf     = pair.get("confidence", "low")
+            color    = _CONF_COLORS.get(conf, "#c0c0c0")
+            pair_key = pair.get("pair_key", f"pos{pos_a}+pos{pos_b}")
+            epistasis = pair.get("epistasis")
+            ep_str   = f" (e={epistasis:+.1f})" if epistasis is not None else ""
+            label    = f"{pair_key}{ep_str}"
+
+            spec_a = f"#{model_id}/{chain_a}:{pos_a}"
+            spec_b = f"#{model_id}/{chain_b}:{pos_b}"
+
+            cmds.append(f"color {spec_a} {color}")
+            exps.append(f"{pair_key}: color residue {pos_a} by confidence ({conf})")
+            cmds.append(f"color {spec_b} {color}")
+            exps.append(f"{pair_key}: color residue {pos_b} by confidence ({conf})")
+
+            cmds.append(f"show {spec_a} atoms")
+            exps.append(f"{pair_key}: show residue {pos_a} as atoms")
+            cmds.append(f"style {spec_a} sphere")
+            exps.append(f"{pair_key}: sphere style for residue {pos_a}")
+            cmds.append(f"show {spec_b} atoms")
+            exps.append(f"{pair_key}: show residue {pos_b} as atoms")
+            cmds.append(f"style {spec_b} sphere")
+            exps.append(f"{pair_key}: sphere style for residue {pos_b}")
+
+            cmds.append(f"distance {spec_a}@CA {spec_b}@CA")
+            exps.append(f"Draw Ca-Ca distance line for {pair_key}")
+
+            cmds.append(f'label {spec_a} text "{label}" size 12 color white')
+            exps.append(f"Label {pair_key} at residue {pos_a} with pair key and epistasis")
+
+        cmds.append(f"view #{model_id}")
+        exps.append("Fit structure in view to show all labeled pairs")
+
+        return cmds, exps
+
     # ── Bridge accessors (lazy init) ───────────────────────────────────────────
 
     def _get_assembly_analyser(self):
@@ -2119,6 +2384,12 @@ class ToolRouter:
             from cavity_bridge import CavityBridge
             self._cavity_bridge = CavityBridge()
         return self._cavity_bridge
+
+    def _get_double_mutant_bridge(self):
+        if self._double_mutant_bridge is None:
+            from double_mutant_bridge import DoubleMutantBridge
+            self._double_mutant_bridge = DoubleMutantBridge()
+        return self._double_mutant_bridge
 
     def _get_camsol_bridge(self):
         if self._camsol_bridge is None:

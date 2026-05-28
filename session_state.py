@@ -244,6 +244,9 @@ class SessionState:
         self.salt_bridge_results: Dict[str, Any] = {}
         # Cavity detection results: model_id → result dict
         self.cavity_results:      Dict[str, Any] = {}
+        # Double mutant pair scoring results: model_id → result data dict
+        # Populated by ToolRouter._run_double_mutant() after a successful run.
+        self.double_mutant_results: Dict[str, Any] = {}
         # NetNGlyc OST recognition results: model_id → annotated candidate list
         # Populated by _run_netnglyc() / _run_glycan_positions() in tool_router.
         self.netnglyc_results:    Dict[str, Any] = {}
@@ -663,6 +666,16 @@ class SessionState:
         """Return stored cavity detection results for a model, or None."""
         return self.cavity_results.get(str(model_id))
 
+    # ── Double mutant pair scoring result tracking ────────────────────────────
+
+    def set_double_mutant_results(self, model_id: str, result: Dict[str, Any]) -> None:
+        """Store double mutant pair scoring results for a model."""
+        self.double_mutant_results[str(model_id)] = result
+
+    def get_double_mutant_results(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return stored double mutant results for a model, or None."""
+        return self.double_mutant_results.get(str(model_id))
+
     # ── Rosetta relax cache tracking ──────────────────────────────────────────
 
     def set_relax_cache(self, pdb_hash: str, relaxed_path: str) -> None:
@@ -874,9 +887,10 @@ class SessionState:
             "rosetta_relax_cache":  self.rosetta_relax_cache,
             # sets are not JSON-serialisable; store as sorted list
             "functional_residues":  sorted(self.functional_residues),
-            "salt_bridge_results":  self.salt_bridge_results,
-            "cavity_results":       self.cavity_results,
-            "netnglyc_results":     self.netnglyc_results,
+            "salt_bridge_results":    self.salt_bridge_results,
+            "cavity_results":         self.cavity_results,
+            "double_mutant_results":  self.double_mutant_results,
+            "netnglyc_results":       self.netnglyc_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -908,9 +922,10 @@ class SessionState:
         state.rosetta_relax_cache  = data.get("rosetta_relax_cache", {})
         state.functional_residues  = set(data.get("functional_residues", []))
         obj = state
-        obj.salt_bridge_results = data.get("salt_bridge_results", {})
-        obj.cavity_results      = data.get("cavity_results", {})
-        obj.netnglyc_results    = data.get("netnglyc_results", {})
+        obj.salt_bridge_results    = data.get("salt_bridge_results", {})
+        obj.cavity_results         = data.get("cavity_results", {})
+        obj.double_mutant_results  = data.get("double_mutant_results", {})
+        obj.netnglyc_results       = data.get("netnglyc_results", {})
         return state
 
     def __repr__(self) -> str:
@@ -945,9 +960,10 @@ class SessionState:
             "mpnn_esmfold_results":  self.mpnn_esmfold_results,
             "rosetta_relax_cache":   self.rosetta_relax_cache,
             "functional_residues":   set(self.functional_residues),
-            "salt_bridge_results":   self.salt_bridge_results,
-            "cavity_results":        self.cavity_results,
-            "netnglyc_results":      self.netnglyc_results,
+            "salt_bridge_results":    self.salt_bridge_results,
+            "cavity_results":         self.cavity_results,
+            "double_mutant_results":  self.double_mutant_results,
+            "netnglyc_results":       self.netnglyc_results,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -971,6 +987,7 @@ class SessionState:
         self.mpnn_esmfold_results  = copy.deepcopy(snap.get("mpnn_esmfold_results",  {}))
         self.rosetta_relax_cache   = copy.deepcopy(snap.get("rosetta_relax_cache",   {}))
         self.functional_residues   = set(snap.get("functional_residues",   set()))
-        self.salt_bridge_results   = snap.get("salt_bridge_results", {})
-        self.cavity_results        = snap.get("cavity_results", {})
-        self.netnglyc_results      = copy.deepcopy(snap.get("netnglyc_results", {}))
+        self.salt_bridge_results    = snap.get("salt_bridge_results", {})
+        self.cavity_results         = snap.get("cavity_results", {})
+        self.double_mutant_results  = copy.deepcopy(snap.get("double_mutant_results", {}))
+        self.netnglyc_results       = copy.deepcopy(snap.get("netnglyc_results", {}))

@@ -1,0 +1,112 @@
+{
+  "1BNI_T26A": {
+    "pdb": "1BNI",
+    "mutation": "T26A",
+    "chain": "A",
+    "predicted": -2.437,
+    "experimental": 1.3,
+    "sign_correct": false,
+    "within_tolerance": false,
+    "error_kcal": -3.737
+  },
+  "1BNI_I88V": {
+    "pdb": "1BNI",
+    "mutation": "I88V",
+    "chain": "A",
+    "predicted": 5.264,
+    "experimental": 0.6,
+    "sign_correct": true,
+    "within_tolerance": false,
+    "error_kcal": 4.664
+  },
+  "1BNI_A43G": {
+    "pdb": "1BNI",
+    "mutation": "A43G",
+    "chain": "A",
+    "predicted": 2.412,
+    "experimental": 0.8,
+    "sign_correct": true,
+    "within_tolerance": true,
+    "error_kcal": 1.612
+  },
+  "1UBQ_L69A": {
+    "pdb": "1UBQ",
+    "mutation": "L69A",
+    "chain": "A",
+    "predicted": 6.6,
+    "experimental": 2.4,
+    "sign_correct": true,
+    "within_tolerance": false,
+    "error_kcal": 4.2
+  },
+  "1UBQ_V70A": {
+    "pdb": "1UBQ",
+    "mutation": "V70A",
+    "chain": "A",
+    "predicted": 2.729,
+    "experimental": 1.8,
+    "sign_correct": true,
+    "within_tolerance": true,
+    "error_kcal": 0.929
+  },
+  "2SNS_V66L": {
+    "pdb": "2SNS",
+    "mutation": "V66L",
+    "chain": "A",
+    "predicted": -1.27,
+    "experimental": -0.5,
+    "sign_correct": true,
+    "within_tolerance": true,
+    "error_kcal": -0.77
+  },
+  "2SNS_G88V": {
+    "pdb": "2SNS",
+    "mutation": "G88V",
+    "chain": "A",
+    "predicted": -0.25,
+    "experimental": 2.1,
+    "sign_correct": false,
+    "within_tolerance": false,
+    "error_kcal": -2.35
+  },
+  "2LZM_L99A": {
+    "pdb": "2LZM",
+    "mutation": "L99A",
+    "chain": "A",
+    "predicted": 7.137,
+    "experimental": 4.0,
+    "sign_correct": true,
+    "within_tolerance": false,
+    "error_kcal": 3.137
+  },
+  "2LZM_A98V": {
+    "pdb": "2LZM",
+    "mutation": "A98V",
+    "chain": "A",
+    "predicted": 14.52,
+    "experimental": -0.5,
+    "sign_correct": false,
+    "within_tolerance": false,
+    "error_kcal": 15.02
+  },
+  "1HSG_V82A": {
+    "pdb": "1HSG",
+    "mutation": "V82A",
+    "chain": "A",
+    "predicted": -0.06,
+    "experimental": 1.75,
+    "sign_correct": false,
+    "within_tolerance": true,
+    "error_kcal": -1.81
+  },
+  "1HSG_I64E": {
+    "pdb": "1HSG",
+    "mutation": "I64E",
+    "chain": "A",
+    "predicted": 4.726,
+    "experimental": 3.0,
+    "sign_correct": true,
+    "within_tolerance": true,
+    "error_kcal": 1.726
+  }
+}

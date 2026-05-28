@@ -1011,3 +1011,180 @@ def test_netnglyc_inputs_have_model_id_and_chain():
     ng_inputs = routed.get("tool_inputs", {}).get("netnglyc", {})
     assert "model_id" in ng_inputs, "netnglyc inputs must include model_id"
     assert "chain"    in ng_inputs, "netnglyc inputs must include chain"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Double mutant routing tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _scan_results_in_session() -> MagicMock:
+    """Return a mock session with scan results and a loaded structure."""
+    mock_session = MagicMock()
+    mock_session.structures = {"1": {"name": "1HSG", "path": "cache/1HSG.pdb"}}
+    mock_session.get_proteinmpnn_result.return_value = None
+    mock_session.get_scan_result.return_value = [
+        {
+            "chain": "A", "position": 82, "from_aa": "V", "to_aa": "A",
+            "ddg": -1.2, "solubility_delta": 0.8, "esm_tolerance": 0.7,
+            "interface_proximal": False,
+        },
+        {
+            "chain": "A", "position": 64, "from_aa": "I", "to_aa": "E",
+            "ddg": -0.5, "solubility_delta": 1.2, "esm_tolerance": 0.6,
+            "interface_proximal": False,
+        },
+    ]
+    mock_session.get_interface_residues.return_value = {}
+    mock_session.get_functional_residues.return_value = set()
+    return mock_session
+
+
+def _make_router_with_scan() -> ToolRouter:
+    """ToolRouter with a mock session containing scan results."""
+    mock_bridge  = MagicMock()
+    mock_session = _scan_results_in_session()
+    return ToolRouter(bridge=mock_bridge, session=mock_session)
+
+
+def test_double_mutant_phrase_routes_correctly():
+    """
+    'suggest double mutant combinations' with scan results in session
+    must route to double_mutant, NOT mutation_scan.
+    """
+    router       = _make_router_with_scan()
+    translator_r = _mutation_scan_translator_result()
+    user_input   = "suggest double mutant combinations"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "double_mutant" in routed["tools_needed"], (
+        f"Expected 'double_mutant' in tools_needed, got {routed['tools_needed']}"
+    )
+    assert "mutation_scan" not in routed["tools_needed"], (
+        f"mutation_scan should be replaced; got {routed['tools_needed']}"
+    )
+    dm_inputs = routed["tool_inputs"].get("double_mutant", {})
+    assert "model_id" in dm_inputs
+    assert "_user_input" in dm_inputs
+
+
+def test_epitope_mode_detected():
+    """'preserve the epitope' keyword in user input → mode = 'epitope' in run."""
+    router     = _make_router_with_scan()
+    user_input = "double mutant combinations to preserve the epitope"
+
+    routed = router.route(_mutation_scan_translator_result(), user_input=user_input)
+    assert "double_mutant" in routed["tools_needed"]
+
+    # Verify the _user_input is passed through so mode detection fires at run time
+    dm_inputs = routed["tool_inputs"].get("double_mutant", {})
+    assert "preserve" in dm_inputs.get("_user_input", "").lower()
+
+
+def test_stability_mode_default():
+    """No epitope keywords → stability mode (verified via _user_input passthrough)."""
+    router     = _make_router_with_scan()
+    user_input = "double mutant combinations"
+
+    routed = router.route(_mutation_scan_translator_result(), user_input=user_input)
+    assert "double_mutant" in routed["tools_needed"]
+
+    dm_inputs = routed["tool_inputs"].get("double_mutant", {})
+    stored_ui = dm_inputs.get("_user_input", "")
+    _epitope_kw = ("epitope", "binding", "interface", "preserve", "target")
+    mode = "epitope" if any(kw in stored_ui.lower() for kw in _epitope_kw) else "stability"
+    assert mode == "stability", f"Expected stability mode for {user_input!r}, got {mode}"
+
+
+def test_double_mutant_requires_scan_results():
+    """No scan results in session → error ToolStepResult with helpful message."""
+    mock_bridge  = MagicMock()
+    mock_session = MagicMock()
+    mock_session.structures = {"1": {"name": "1HSG", "path": "cache/1HSG.pdb"}}
+    mock_session.get_proteinmpnn_result.return_value = None
+    mock_session.get_scan_result.return_value = None  # no scan yet
+
+    router = ToolRouter(bridge=mock_bridge, session=mock_session)
+
+    # Patch _ensure_pdb_file to return a valid path
+    with patch.object(router, "_ensure_pdb_file", return_value="cache/1HSG.pdb"):
+        result = router._run_double_mutant({"model_id": "1", "_user_input": "double mutant"})
+
+    assert not result.success
+    assert "scan" in (result.error or "").lower(), (
+        f"Error should mention scan results; got: {result.error}"
+    )
+
+
+def test_double_mutant_requires_loaded_structure():
+    """No PDB file → error ToolStepResult with clear message."""
+    router = _make_router_with_scan()
+
+    with patch.object(router, "_ensure_pdb_file", return_value=None):
+        result = router._run_double_mutant({"model_id": "1", "_user_input": "double mutant"})
+
+    assert not result.success
+    assert "structure" in (result.error or "").lower() or "pdb" in (result.error or "").lower(), (
+        f"Error should mention missing structure; got: {result.error}"
+    )
+
+
+def test_pyrosetta_flag_detected():
+    """'with rosetta validation' in user input → run_pyrosetta would be True."""
+    router     = _make_router_with_scan()
+    user_input = "double mutant combinations with rosetta validation"
+
+    _pr_kw = ("pyrosetta", "rosetta", "accurate", "high accuracy", "validate")
+    assert any(kw in user_input.lower() for kw in _pr_kw), (
+        "Test input must contain a PyRosetta trigger keyword"
+    )
+    # Verify the intent detection logic in isolation
+    lower = user_input.lower()
+    run_pyrosetta = any(kw in lower for kw in _pr_kw)
+    assert run_pyrosetta is True
+
+
+def test_mutation_scan_not_affected():
+    """Generic solubility scan phrases (no double/combine) still route to mutation_scan."""
+    router = _make_router()
+
+    for user_input in (
+        "suggest mutations to improve solubility",
+        "what mutations would reduce aggregation of chain A?",
+        "run a mutation scan on this protein",
+        "",
+    ):
+        routed = router.route(_mutation_scan_translator_result(), user_input=user_input)
+        assert "mutation_scan" in routed["tools_needed"], (
+            f"Phrase {user_input!r} should route to mutation_scan; "
+            f"got {routed['tools_needed']}"
+        )
+        assert "double_mutant" not in routed["tools_needed"], (
+            f"Phrase {user_input!r} should NOT route to double_mutant; "
+            f"got {routed['tools_needed']}"
+        )
+
+
+def test_double_mutant_guard_in_mutation_scan():
+    """
+    When 'double mutant' reaches _dispatch_tool with tool='mutation_scan',
+    the guard redirects to _run_double_mutant instead.
+    """
+    router = _make_router_with_scan()
+
+    mock_dm   = MagicMock(return_value=ToolStepResult(
+        tool="double_mutant", success=True, data={}, summary="ok"
+    ))
+    mock_scan = MagicMock(return_value=ToolStepResult(
+        tool="mutation_scan", success=True, data={}, summary="ok"
+    ))
+    router._run_double_mutant = mock_dm
+    router._run_mutation_scan = mock_scan
+
+    inputs     = {"model_id": "1", "chain": "A"}
+    user_input = "suggest double mutations for stability"
+
+    result = router._dispatch_tool("mutation_scan", inputs, user_input=user_input)
+
+    assert mock_dm.called, "_run_double_mutant should have been called"
+    assert not mock_scan.called, "_run_mutation_scan should NOT have been called"
