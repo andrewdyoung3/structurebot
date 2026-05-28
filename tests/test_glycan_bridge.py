@@ -450,3 +450,171 @@ def test_analyze_viz_commands_non_empty_for_real_sequence(gb):
     assert "\n" in result["summary"], (
         "summary must contain newlines to trigger the Rich Panel"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Section J — Projection scoring and sequon geometry (new fields)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestProjectionAndGeometry:
+
+    def test_score_sequon_sites_projection_outward_bonus(self, gb):
+        """
+        A site with projection_score=0.9 must score higher than the same site
+        with projection_score=0.3 (when no backbone is passed — loop_factor=1.0).
+        """
+        seq = "MNATL"
+        sites = gb.scan_sequons(seq, "A")
+
+        proj_high = {2: {"projection_score": 0.9, "gly_proxy": False}}
+        proj_low  = {2: {"projection_score": 0.3, "gly_proxy": False}}
+
+        scored_high = gb.score_sequon_sites(sites, projection_scores=proj_high)
+        scored_low  = gb.score_sequon_sites(sites, projection_scores=proj_low)
+
+        assert len(scored_high) == 1 and len(scored_low) == 1
+        assert scored_high[0]["composite_score"] > scored_low[0]["composite_score"]
+
+    def test_score_sequon_sites_projection_helix_penalty(self, gb):
+        """
+        When backbone has helix φ/ψ at all three sequon positions,
+        sequon_geometry='helix' and sequon_geometry_factor=0.5.
+        """
+        seq   = "MNATL"
+        sites = gb.scan_sequons(seq, "A")
+
+        # φ=-57, ψ=-47 → canonical helix for all three positions (2, 3, 4)
+        backbone = {
+            2: {"phi": -57.0, "psi": -47.0, "ss": "H"},
+            3: {"phi": -57.0, "psi": -47.0, "ss": "H"},
+            4: {"phi": -57.0, "psi": -47.0, "ss": "H"},
+        }
+        scored = gb.score_sequon_sites(sites, backbone=backbone)
+
+        assert len(scored) == 1
+        s = scored[0]
+        assert s["sequon_geometry"] == "helix"
+        assert s["sequon_geometry_factor"] == pytest.approx(0.5)
+
+    def test_score_sequon_sites_projection_none_falls_back(self, gb):
+        """
+        projection_scores=None → proj_factor=1.0, projection_category='unknown'.
+        composite_score still computed (no crash).
+        """
+        seq   = "MNATL"
+        sites = gb.scan_sequons(seq, "A")
+        scored = gb.score_sequon_sites(sites, projection_scores=None)
+
+        assert len(scored) == 1
+        s = scored[0]
+        assert s["projection_category"] == "unknown"
+        assert s["projection_score"]    is None
+        assert s["composite_score"]     == pytest.approx(0.5, abs=1e-3)
+
+    def test_score_sequon_sites_beta_turn_bonus(self, gb):
+        """
+        When all three sequon positions are in turn-like φ/ψ,
+        sequon_geometry='beta_turn' and sequon_geometry_factor=1.4.
+        """
+        seq   = "MNATL"
+        sites = gb.scan_sequons(seq, "A")
+
+        # φ=-50, ψ=20 → turn region (not helix, not extended)
+        backbone = {
+            2: {"phi": -50.0, "psi": 20.0, "ss": "L"},
+            3: {"phi": -50.0, "psi": 20.0, "ss": "L"},
+            4: {"phi": -50.0, "psi": 20.0, "ss": "L"},
+        }
+        scored = gb.score_sequon_sites(sites, backbone=backbone)
+
+        assert len(scored) == 1
+        s = scored[0]
+        assert s["sequon_geometry"]        == "beta_turn"
+        assert s["sequon_geometry_factor"] == pytest.approx(1.4)
+
+    def test_score_sequon_sites_projection_categories(self, gb):
+        """
+        Score ≥ 0.6 → 'outward'; 0.2 ≤ score < 0.6 → 'flat'; < 0.2 → 'inward'.
+        """
+        seq   = "MNATL"
+        sites = gb.scan_sequons(seq, "A")
+
+        for score, expected_cat in [(0.7, "outward"), (0.4, "flat"), (0.1, "inward")]:
+            proj = {2: {"projection_score": score, "gly_proxy": False}}
+            scored = gb.score_sequon_sites(sites, projection_scores=proj)
+            assert scored[0]["projection_category"] == expected_cat, (
+                f"score={score}: expected '{expected_cat}', "
+                f"got '{scored[0]['projection_category']}'"
+            )
+
+    def test_full_glycan_scan_includes_projection_fields(self, gb):
+        """
+        full_glycan_scan() (no PDB) must include projection_score,
+        projection_category, and sequon_geometry in every candidate.
+        """
+        result = gb.full_glycan_scan(sequence="MNASVNATL", chain="A")
+        assert result["success"] is True
+
+        all_candidates = result["all_ranked"] + result["engineered_candidates"]
+        assert len(all_candidates) > 0, "Expected at least one candidate"
+
+        for cand in all_candidates:
+            assert "projection_score"       in cand, f"Missing projection_score in {cand}"
+            assert "projection_category"    in cand, f"Missing projection_category in {cand}"
+            assert "sequon_geometry"        in cand, f"Missing sequon_geometry in {cand}"
+            assert "sequon_geometry_factor" in cand, f"Missing sequon_geometry_factor in {cand}"
+
+    def test_analyze_summary_includes_projection_column(self, gb):
+        """
+        analyze() on a sequence with engineered candidates must produce a
+        summary string containing 'Projection' and 'Geometry' column headers.
+        """
+        # Use HIV protease (no native sequons → forced into engineered candidates path)
+        seq_1hsg = (
+            "PQITLWQRPIVTIKIGGQLKEALLDTGADDTVLEEMSLPGRWKPKMIGGIGGFIKVRQYDQ"
+            "ILIEICGHKAIGTVLVGPTPVNIIGRNLLTQIGCTLNF"
+        )
+        result = gb.analyze(sequence=seq_1hsg, chain="A", model_id="1")
+        summary = result.get("summary", "")
+
+        assert "Projection" in summary, "Summary missing 'Projection' column"
+        assert "Geometry"   in summary, "Summary missing 'Geometry' column"
+
+    def test_chimerax_commands_cb_sphere_for_outward_only(self, gb):
+        """
+        An outward candidate must produce @CB sphere commands;
+        a flat candidate must NOT produce @CB sphere commands.
+        """
+        outward_cand = {
+            "position": 5, "confidence": "high", "composite_score": 0.8,
+            "engineered": True, "mutation": "A5N", "chain": "A",
+            "projection_category": "outward",
+        }
+        flat_cand = {
+            "position": 12, "confidence": "moderate", "composite_score": 0.4,
+            "engineered": True, "mutation": "E12N", "chain": "A",
+            "projection_category": "flat",
+        }
+
+        cmds, _ = gb.generate_chimerax_commands(
+            [outward_cand, flat_cand], model_id="1", chain="A"
+        )
+
+        # Find commands containing @CB
+        cb_cmds = [c for c in cmds if "@CB" in c]
+        assert len(cb_cmds) > 0, "Expected @CB sphere commands for outward candidate"
+
+        # All @CB commands must reference residue 5 (outward) not 12 (flat)
+        for c in cb_cmds:
+            assert ":5@CB" in c, (
+                f"@CB command references wrong residue: {c}"
+            )
+            assert ":12@CB" not in c, (
+                f"Flat candidate residue 12 should not have @CB command: {c}"
+            )
+
+        # Verify sphere and size commands specifically
+        sphere_cmds = [c for c in cb_cmds if "sphere" in c]
+        size_cmds   = [c for c in cb_cmds if "atomRadius" in c]
+        assert len(sphere_cmds) >= 1, "Expected 'style ... sphere' command for outward Cb"
+        assert len(size_cmds)   >= 1, "Expected 'size ... atomRadius' command for outward Cb"

@@ -60,6 +60,12 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from tool_router import ToolStepResult
 
+# Shared structural utilities — graceful fallback if unavailable
+try:
+    import structural_utils as _su
+except ImportError:                 # pragma: no cover
+    _su = None  # type: ignore[assignment]
+
 
 # ── Catalytic residue types for SASA-based active-site heuristic ─────────────
 # His, Asp, Glu, Ser, Cys: common charge-relay / nucleophile residues.
@@ -113,9 +119,9 @@ class ProlineBridge:
         """
         Extract per-residue backbone geometry from a PDB file.
 
-        Uses BioPython PPBuilder for φ/ψ angles (in degrees after conversion
-        from radians).  Attempts DSSP for secondary structure; falls back to
-        Ramachandran classification when DSSP is unavailable.
+        Thin wrapper around structural_utils.extract_backbone_angles() that
+        preserves the original public API and raises ValueError for
+        non-existent paths (backward-compatible behaviour).
 
         Parameters
         ----------
@@ -126,29 +132,40 @@ class ProlineBridge:
         -------
         dict[int, dict] keyed by 1-based residue sequence number, each entry:
           {
-            "phi":     float | None,   # degrees, None for terminus
-            "psi":     float | None,
-            "ss":      str,            # "H", "E", or "L"
-            "resname": str,            # 3-letter code, e.g. "LEU"
-            "aa":      str,            # 1-letter code, e.g. "L"
+            "phi":      float | None,   # degrees, None at terminus
+            "psi":      float | None,
+            "ss":       str,            # "H", "E", or "L"
+            "resname":  str,            # 3-letter code, e.g. "LEU"
+            "aa":       str,            # 1-letter code, e.g. "L"
+            "ca_coords": tuple | None,  # (x, y, z) Cα coordinates
           }
         """
-        from Bio.PDB import PDBParser, PPBuilder
-        from Bio.PDB.Polypeptide import is_aa
-
         pdb_path_str = Path(pdb_path).as_posix()
-        parser       = PDBParser(QUIET=True)
 
+        # Raise immediately for non-existent files (original behaviour)
+        if not Path(pdb_path).exists():
+            raise ValueError(
+                f"Could not parse PDB file '{pdb_path}': file not found"
+            )
+
+        # Delegate to structural_utils when available
+        if _su is not None:
+            return _su.extract_backbone_angles(pdb_path_str, chain)
+
+        # ── Legacy fallback (structural_utils unavailable) ────────────────────
+        from Bio.PDB import PDBParser, PPBuilder
+
+        parser = PDBParser(QUIET=True)
         try:
             structure = parser.get_structure("prot", pdb_path_str)
         except Exception as exc:
-            raise ValueError(f"Could not parse PDB file '{pdb_path}': {exc}") from exc
+            raise ValueError(
+                f"Could not parse PDB file '{pdb_path}': {exc}"
+            ) from exc
 
-        model = structure[0]
-
-        # Collect raw φ/ψ from PPBuilder
-        builder    = PPBuilder()
-        raw_angles: Dict[int, Dict[str, Any]] = {}   # seqnum → {phi, psi, resname}
+        model   = structure[0]
+        builder = PPBuilder()
+        raw_angles: Dict[int, Dict[str, Any]] = {}
 
         for chain_obj in model:
             if chain_obj.id != chain:
@@ -156,29 +173,24 @@ class ProlineBridge:
             for pp in builder.build_peptides(chain_obj):
                 phi_psi = pp.get_phi_psi_list()
                 for residue, (phi_rad, psi_rad) in zip(pp, phi_psi):
-                    seq_num  = residue.get_id()[1]
-                    resname  = residue.get_resname().strip()
-                    phi_deg  = math.degrees(phi_rad) if phi_rad is not None else None
-                    psi_deg  = math.degrees(psi_rad) if psi_rad is not None else None
+                    seq_num = residue.get_id()[1]
+                    resname = residue.get_resname().strip()
+                    phi_deg = math.degrees(phi_rad) if phi_rad is not None else None
+                    psi_deg = math.degrees(psi_rad) if psi_rad is not None else None
                     raw_angles[seq_num] = {
-                        "phi":     phi_deg,
-                        "psi":     psi_deg,
-                        "resname": resname,
+                        "phi": phi_deg, "psi": psi_deg, "resname": resname,
                     }
 
         if not raw_angles:
             return {}
 
-        # Try DSSP for secondary structure
         ss_map: Dict[int, str] = {}
         try:
             from Bio.PDB.DSSP import DSSP
-            # DSSP needs the PDB path as a string (POSIX ok on all platforms for Bio)
             dssp = DSSP(model, pdb_path_str)
             for key in dssp:
-                res_id  = key[1][1]   # sequence number
+                res_id  = key[1][1]
                 ss_code = dssp[key][2]
-                # DSSP codes: H E B G I T S C → map to H/E/L
                 if ss_code in ("H", "G", "I"):
                     ss_map[res_id] = "H"
                 elif ss_code in ("E", "B"):
@@ -186,7 +198,6 @@ class ProlineBridge:
                 else:
                     ss_map[res_id] = "L"
         except Exception:
-            # DSSP not available (common on Windows) — use φ/ψ fallback
             for seq_num, ang in raw_angles.items():
                 phi = ang.get("phi")
                 psi = ang.get("psi")
@@ -195,19 +206,17 @@ class ProlineBridge:
                 else:
                     ss_map[seq_num] = "L"
 
-        # Merge into output dict
-        result: Dict[int, Dict[str, Any]] = {}
-        for seq_num, ang in raw_angles.items():
-            resname = ang["resname"]
-            result[seq_num] = {
-                "phi":     ang["phi"],
-                "psi":     ang["psi"],
-                "ss":      ss_map.get(seq_num, "L"),
-                "resname": resname,
-                "aa":      _THREE_TO_ONE.get(resname, "X"),
+        return {
+            seq_num: {
+                "phi":      ang["phi"],
+                "psi":      ang["psi"],
+                "ss":       ss_map.get(seq_num, "L"),
+                "resname":  ang["resname"],
+                "aa":       _THREE_TO_ONE.get(ang["resname"], "X"),
+                "ca_coords": None,
             }
-
-        return result
+            for seq_num, ang in raw_angles.items()
+        }
 
     # ── 2. Candidate scanning ────────────────────────────────────────────────
 

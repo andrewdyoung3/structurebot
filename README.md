@@ -176,6 +176,9 @@ structurebot/
 ├── session_state.py      # Loaded structures, selections, history
 │                         #   • parse_pdb_header() for local .pdb files
 │                         #   • fetch_rcsb_metadata() for PDB IDs (gets ligand codes)
+├── structural_utils.py   # Shared geometry utilities (backbone angles, SASA,
+│                         #   projection scoring, sequon geometry).
+│                         #   Shared dependency of proline_bridge.py and glycan_bridge.py.
 ├── rosetta_bridge.py     # Stability / ddG backend: DynaMut2 + empirical fallback
 ├── mutation_scanner.py   # Multi-criterion mutation ranking pipeline
 ├── chimerax_commands.md  # Curated reference injected into every API call

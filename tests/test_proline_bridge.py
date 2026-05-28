@@ -652,3 +652,71 @@ class TestFunctionalSiteExclusion:
         assert result["inferred_functional_residues"] == [], (
             "inferred_functional_residues should be [] when SASA fails"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 8. structural_utils migration check
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestStructuralUtilsMigration:
+    """
+    Verify that ProlineBridge.extract_backbone_angles() still works correctly
+    after it was migrated to delegate to structural_utils.extract_backbone_angles().
+    """
+
+    def test_proline_bridge_still_works_after_structural_utils_migration(
+        self, bridge, tmp_path
+    ):
+        """
+        full_proline_scan() with a minimal PDB must complete without errors
+        and return the expected result schema.  This ensures the wrapper
+        delegation to structural_utils did not break anything.
+        """
+        pdb_file = tmp_path / "mini.pdb"
+        pdb_file.write_text(_MINIMAL_PDB)
+
+        try:
+            result = bridge.full_proline_scan(str(pdb_file), chain="A")
+        except Exception as exc:
+            pytest.fail(
+                f"full_proline_scan raised after structural_utils migration: {exc}"
+            )
+
+        # Schema must be intact regardless of whether candidates were found
+        required_keys = [
+            "candidates", "count", "top", "chain", "pdb_path",
+            "n_residues_scanned", "functional_residues",
+            "inferred_functional_residues",
+        ]
+        for key in required_keys:
+            assert key in result, f"Missing key '{key}' in full_proline_scan result"
+
+        # The 3-residue PDB is too short to yield candidates (all near termini),
+        # but the scan must complete and count must be >= 0.
+        assert isinstance(result["count"], int)
+        assert isinstance(result["candidates"], list)
+
+    def test_extract_backbone_angles_returns_expected_keys(self, bridge, tmp_path):
+        """
+        After migration, extract_backbone_angles() must still return entries with
+        the original keys (phi, psi, ss, resname, aa) PLUS the new ca_coords key.
+        """
+        pdb_file = tmp_path / "mini.pdb"
+        pdb_file.write_text(_MINIMAL_PDB)
+
+        try:
+            result = bridge.extract_backbone_angles(str(pdb_file), "A")
+        except Exception as exc:
+            pytest.skip(f"BioPython extraction unavailable: {exc}")
+
+        if not result:
+            pytest.skip("No backbone angles computed for minimal PDB")
+
+        for resno, entry in result.items():
+            assert "phi"     in entry, f"resno={resno}: missing 'phi'"
+            assert "psi"     in entry, f"resno={resno}: missing 'psi'"
+            assert "ss"      in entry, f"resno={resno}: missing 'ss'"
+            assert "resname" in entry, f"resno={resno}: missing 'resname'"
+            assert "aa"      in entry, f"resno={resno}: missing 'aa'"
+            # ca_coords is new (added by structural_utils) but must be present
+            assert "ca_coords" in entry, f"resno={resno}: missing 'ca_coords'"

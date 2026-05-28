@@ -30,6 +30,13 @@ import traceback as _traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Shared structural utilities — imported lazily so the module loads even if the
+# file has not yet been created (graceful degradation).
+try:
+    import structural_utils as _su
+except ImportError:          # pragma: no cover
+    _su = None  # type: ignore[assignment]
+
 # ── Glycosylation sequon pattern ──────────────────────────────────────────────
 # N-X-S/T where X ≠ P  (canonical NXS/T sequon)
 _SEQUON_RE = re.compile(r"N[^P][ST]")
@@ -52,61 +59,90 @@ def _get_sasa(pdb_path: str, chain: str, residue_numbers: List[int]) -> Dict[int
     """
     Return per-residue relative SASA (0–1) for *residue_numbers*.
 
-    Tries freesasa first; falls back to BioPython ShrakeRupley.
+    Delegates to structural_utils.compute_sasa() (which tries freesasa then
+    BioPython ShrakeRupley) and normalises raw Å² values to the 0–1 range
+    using a 300 Å² reference for a fully exposed residue.
+
     Returns {} on complete failure — caller substitutes 0.5.
     """
     path = Path(pdb_path)
     if not path.exists():
         return {}
 
-    # ── freesasa ──────────────────────────────────────────────────────────────
-    try:
-        import freesasa  # type: ignore
-        structure = freesasa.Structure(str(path))
-        result    = freesasa.calc(structure)
-        area_map: Dict[int, float] = {}
-        for i in range(structure.nAtoms()):
-            raw = structure.residueNumber(i)
-            try:
-                res_n = int(str(raw).strip())
-            except (ValueError, AttributeError):
-                continue
-            if res_n not in residue_numbers:
-                continue
-            area_map[res_n] = area_map.get(res_n, 0.0) + result.atomArea(i)
-        # Normalise: ~300 Å² = fully exposed residue
-        if area_map:
-            return {r: min(1.0, a / 300.0) for r, a in area_map.items()}
-    except Exception:
-        pass
+    raw: Dict[int, float] = {}
+    if _su is not None:
+        try:
+            raw = _su.compute_sasa(pdb_path, chain)
+        except Exception:
+            pass
 
-    # ── BioPython ShrakeRupley fallback ───────────────────────────────────────
-    try:
-        from Bio.PDB import PDBParser  # type: ignore
-        from Bio.PDB.SASA import ShrakeRupley  # type: ignore
-        parser = PDBParser(QUIET=True)
-        struct = parser.get_structure("s", str(path))
-        sr = ShrakeRupley()
-        sr.compute(struct, level="R")
-        sasa_map: Dict[int, float] = {}
-        for model in struct:
-            for ch in model:
-                if ch.id != chain:
+    if not raw:
+        # Legacy fallback: freesasa / BioPython ShrakeRupley directly
+        try:
+            import freesasa  # type: ignore
+            structure = freesasa.Structure(str(path))
+            result    = freesasa.calc(structure)
+            area_map: Dict[int, float] = {}
+            for i in range(structure.nAtoms()):
+                _raw = structure.residueNumber(i)
+                try:
+                    res_n = int(str(_raw).strip())
+                except (ValueError, AttributeError):
                     continue
-                for res in ch:
-                    rn = res.id[1]
-                    if rn in residue_numbers:
-                        sasa_map[rn] = min(1.0, res.sasa / 300.0)
-        return sasa_map
-    except Exception:
+                if res_n not in residue_numbers:
+                    continue
+                area_map[res_n] = area_map.get(res_n, 0.0) + result.atomArea(i)
+            if area_map:
+                raw = area_map
+        except Exception:
+            pass
+
+    if not raw:
+        try:
+            from Bio.PDB import PDBParser  # type: ignore
+            from Bio.PDB.SASA import ShrakeRupley  # type: ignore
+            parser = PDBParser(QUIET=True)
+            struct = parser.get_structure("s", str(path))
+            sr = ShrakeRupley()
+            sr.compute(struct, level="R")
+            for model in struct:
+                for ch in model:
+                    if ch.id != chain:
+                        continue
+                    for res in ch:
+                        rn = res.id[1]
+                        if rn in residue_numbers:
+                            raw[rn] = getattr(res, "sasa", 0.0) * 300.0  # un-normalised for consistency
+        except Exception:
+            return {}
+
+    if not raw:
         return {}
+
+    # Normalise: ~300 Å² = fully exposed residue
+    return {r: min(1.0, raw[r] / 300.0) for r in residue_numbers if r in raw}
 
 
 def _get_backbone_angles(pdb_path: str, chain: str) -> Dict[int, Tuple[float, float]]:
     """
-    Return {residue_number: (phi_deg, psi_deg)} via BioPython PPBuilder.
-    Returns {} if BioPython is not installed or the PDB is unreadable.
+    Return {residue_number: (phi_deg, psi_deg)} via structural_utils.
+
+    Thin wrapper — delegates to structural_utils.extract_backbone_angles()
+    and reformats the result into the legacy (phi, psi) tuple format.
+    Returns {} on any failure.
     """
+    if _su is not None:
+        try:
+            backbone = _su.extract_backbone_angles(pdb_path, chain)
+            return {
+                resno: (data["phi"], data["psi"])
+                for resno, data in backbone.items()
+                if data.get("phi") is not None and data.get("psi") is not None
+            }
+        except Exception:
+            pass
+
+    # Legacy fallback (structural_utils unavailable)
     try:
         from Bio.PDB import PDBParser, PPBuilder  # type: ignore
         parser  = PDBParser(QUIET=True)
@@ -235,20 +271,61 @@ class GlycanBridge:
         pdb_path:           Optional[str] = None,
         interface_residues: Optional[List[int]] = None,
         esm_scores:         Optional[Dict[int, float]] = None,
+        projection_scores:  Optional[Dict[int, Dict[str, Any]]] = None,
+        backbone:           Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Enrich *sequon_list* with structural and tolerance scores.
 
         Adds per-site keys:
           sasa, secondary_structure, interface_proximity,
-          esm_tolerance, composite_score, confidence
+          esm_tolerance, composite_score, confidence,
+          projection_score, projection_category,
+          sequon_geometry, sequon_geometry_factor
+
+        Parameters
+        ----------
+        sequon_list        : from scan_sequons() or suggest_engineered_sequons()
+        pdb_path           : local PDB path for SASA / secondary-structure lookups
+        interface_residues : 1-based residue numbers near binding interface
+        esm_scores         : {position: esm_tolerance (0–1)}
+        projection_scores  : from structural_utils.compute_projection_score()
+                             {resno: {"projection_score": float, "gly_proxy": bool}}
+        backbone           : from structural_utils.extract_backbone_angles()
+                             {resno: {"phi": float, "psi": float, ...}}
+                             When provided, sequon_geo_factor replaces loop_factor
+                             in the composite score formula.
+
+        Projection categories
+        ---------------------
+        "outward"  : score ≥ 0.6
+        "flat"     : 0.2 ≤ score < 0.6
+        "inward"   : score < 0.2
+        "unknown"  : projection_scores not supplied, position absent, or Gly proxy
+
+        Sequon geometry factors
+        -----------------------
+        "beta_turn" : 1.4  (glycans enriched at β-turns)
+        "loop"      : 1.2
+        "extended"  : 1.0
+        "helix"     : 0.5  (sterically problematic)
+        "unknown"   : 1.0
+
+        Composite score formula
+        -----------------------
+        When *backbone* is supplied:
+          composite = sasa × proj_factor × geom_factor × iface_factor × esm_factor
+        Otherwise (backward-compatible):
+          composite = sasa × proj_factor × loop_factor × iface_factor × esm_factor
+
+        Where proj_factor = projection_score (if outward/flat/inward) else 1.0.
         """
         if not sequon_list:
             return []
 
         interface_residues = interface_residues or []
         esm_scores         = esm_scores         or {}
-        chain = sequon_list[0].get("chain", "A")
+        chain     = sequon_list[0].get("chain", "A")
         positions = [s["position"] for s in sequon_list]
 
         # Structural data — only when a valid PDB is available
@@ -257,6 +334,15 @@ class GlycanBridge:
         if pdb_path and Path(pdb_path).exists():
             sasa_map = _get_sasa(pdb_path, chain, positions)
             ss_map   = _get_secondary_structure(pdb_path, chain)
+
+        # Sequon geometry factor lookup
+        _GEO_FACTORS: Dict[str, float] = {
+            "beta_turn": 1.4,
+            "loop":      1.2,
+            "extended":  1.0,
+            "helix":     0.5,
+            "unknown":   1.0,
+        }
 
         scored: List[Dict[str, Any]] = []
         for site in sequon_list:
@@ -268,17 +354,61 @@ class GlycanBridge:
             interface_factor = 0.5 if near_interface else 1.0
             esm_tol          = esm_scores.get(pos, 1.0)
 
-            composite  = _compute_composite_score(sasa, ss, interface_factor, esm_tol)
+            # ── Projection score ──────────────────────────────────────────────
+            proj_entry = (projection_scores or {}).get(pos)
+            if proj_entry is not None and not proj_entry.get("gly_proxy", False):
+                proj_score = proj_entry["projection_score"]
+                if proj_score >= 0.6:
+                    proj_cat = "outward"
+                elif proj_score >= 0.2:
+                    proj_cat = "flat"
+                else:
+                    proj_cat = "inward"
+                proj_factor: float = proj_score
+            else:
+                proj_score = None
+                proj_cat   = "unknown"
+                proj_factor = 1.0
+
+            # ── Sequon geometry ───────────────────────────────────────────────
+            if backbone is not None and _su is not None:
+                try:
+                    geom = _su.classify_sequon_geometry(backbone, pos)
+                except Exception:
+                    geom = "unknown"
+            elif backbone is not None:
+                # structural_utils unavailable — simple φ/ψ classification fallback
+                geom = "unknown"
+            else:
+                geom = "unknown"
+            geom_factor: float = _GEO_FACTORS.get(geom, 1.0)
+
+            # ── Composite score ───────────────────────────────────────────────
+            if backbone is not None:
+                composite = round(
+                    sasa * proj_factor * geom_factor * interface_factor * esm_tol, 3
+                )
+            else:
+                loop_factor = {"L": 1.0, "H": 0.5, "E": 0.3}.get(ss, 1.0)
+                composite   = round(
+                    sasa * proj_factor * loop_factor * interface_factor * esm_tol, 3
+                )
+
             confidence = _classify_confidence(composite)
 
             scored.append({
                 **site,
-                "sasa":                round(sasa, 4),
-                "secondary_structure": ss,
-                "interface_proximity": near_interface,
-                "esm_tolerance":       round(esm_tol, 4),
-                "composite_score":     composite,
-                "confidence":          confidence,
+                "sasa":                   round(sasa, 4),
+                "secondary_structure":    ss,
+                "interface_proximity":    near_interface,
+                "esm_tolerance":          round(esm_tol, 4),
+                "composite_score":        composite,
+                "confidence":             confidence,
+                # ── new fields ──────────────────────────────────────────────
+                "projection_score":        proj_score,
+                "projection_category":     proj_cat,
+                "sequon_geometry":         geom,
+                "sequon_geometry_factor":  geom_factor,
             })
 
         scored.sort(key=lambda s: -s["composite_score"])
@@ -294,6 +424,8 @@ class GlycanBridge:
         pdb_path:           Optional[str] = None,
         esm_scores:         Optional[Dict[int, float]] = None,
         top_n:              int = 3,
+        projection_scores:  Optional[Dict[int, Dict[str, Any]]] = None,
+        backbone:           Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Suggest single-AA mutations that would create a new NXS/T sequon.
@@ -341,7 +473,9 @@ class GlycanBridge:
         # Score using same pipeline
         if pdb_path and Path(pdb_path).exists():
             candidates = self.score_sequon_sites(
-                candidates, pdb_path, [], esm_scores
+                candidates, pdb_path, [], esm_scores,
+                projection_scores=projection_scores,
+                backbone=backbone,
             )
         else:
             # No PDB — assign defaults; apply ESM factor if available
@@ -349,12 +483,16 @@ class GlycanBridge:
                 esm_tol   = esm_scores.get(c["position"], 1.0)
                 composite = _compute_composite_score(0.5, "L", 1.0, esm_tol)
                 c.update({
-                    "sasa":                0.5,
-                    "secondary_structure": "L",
-                    "interface_proximity": False,
-                    "esm_tolerance":       round(esm_tol, 4),
-                    "composite_score":     composite,
-                    "confidence":          _classify_confidence(composite),
+                    "sasa":                   0.5,
+                    "secondary_structure":     "L",
+                    "interface_proximity":     False,
+                    "esm_tolerance":           round(esm_tol, 4),
+                    "composite_score":         composite,
+                    "confidence":              _classify_confidence(composite),
+                    "projection_score":        None,
+                    "projection_category":     "unknown",
+                    "sequon_geometry":         "unknown",
+                    "sequon_geometry_factor":  1.0,
                 })
 
         candidates.sort(key=lambda c: -c.get("composite_score", 0.0))
@@ -398,15 +536,36 @@ class GlycanBridge:
             }
 
         try:
+            # ── Compute projection and backbone geometry (graceful fallback) ──
+            projection_scores: Optional[Dict[int, Dict[str, Any]]] = None
+            backbone:          Optional[Dict[int, Dict[str, Any]]] = None
+            if pdb_path and Path(pdb_path).exists() and _su is not None:
+                try:
+                    _proj = _su.compute_projection_score(pdb_path, chain)
+                    if _proj:
+                        projection_scores = _proj
+                except Exception:
+                    pass
+                try:
+                    _bb = _su.extract_backbone_angles(pdb_path, chain)
+                    if _bb:
+                        backbone = _bb
+                except Exception:
+                    pass
+
             raw_sequons    = self.scan_sequons(sequence, chain)
             scored_sequons = self.score_sequon_sites(
-                raw_sequons, pdb_path, interface_residues, esm_scores
+                raw_sequons, pdb_path, interface_residues, esm_scores,
+                projection_scores=projection_scores,
+                backbone=backbone,
             )
             native_sequons = [
                 s for s in scored_sequons if s["composite_score"] >= min_score
             ]
             eng_candidates = self.suggest_engineered_sequons(
-                scored_sequons, sequence, chain, pdb_path, esm_scores, top_n
+                scored_sequons, sequence, chain, pdb_path, esm_scores, top_n,
+                projection_scores=projection_scores,
+                backbone=backbone,
             )
 
             return {
@@ -511,13 +670,29 @@ class GlycanBridge:
         if eng:
             lines.append("")
             lines.append(f"Engineered candidates ({len(eng)} proposed):")
+            # Column header
+            HDR = (f"  {'Mutation':<10}{'Sequon':<8}{'Projection':<12}"
+                   f"{'Geometry':<12}{'Score':>6}  {'Conf'}")
+            SEP = "  " + "-" * (len(HDR) - 2)
+            lines.append(HDR)
+            lines.append(SEP)
             for e in eng:
-                mut = e.get("mutation", "?")
-                seq = e.get("sequon", "")
+                mut      = e.get("mutation", "?")
+                seq      = e.get("sequon", "")
+                proj     = e.get("projection_category", "unknown")
+                geom     = e.get("sequon_geometry", "unknown")
+                score    = e.get("composite_score", 0.0)
+                conf     = e.get("confidence", "?")
                 lines.append(
-                    f"  {mut} → {seq}  {e['confidence']}"
-                    f"  score={e['composite_score']:.3f}"
+                    f"  {mut:<10}{seq:<8}{proj:<12}{geom:<12}{score:>6.3f}  {conf}"
                 )
+            lines.append("")
+            lines.append(
+                "  Legend: projection = side chain direction vs solvent"
+            )
+            lines.append(
+                "          geometry   = local backbone at sequon positions i/i+1/i+2"
+            )
 
         summary = "\n".join(lines)
 
@@ -567,6 +742,7 @@ class GlycanBridge:
             confidence = cand.get("confidence", "moderate")
             engineered = bool(cand.get("engineered", False))
             score      = cand.get("composite_score", cand.get("score", 0.0))
+            proj_cat   = cand.get("projection_category", "unknown")
 
             if confidence == "high" and not engineered:
                 hex_color = _COLOR_NATIVE
@@ -590,10 +766,18 @@ class GlycanBridge:
                 f'color {hex_color} height 1.0'
             )
 
+            # ── Cβ sphere — only for outward-projecting sites ─────────────────
+            # Shows the Cβ prominently so the user can see projection direction.
+            if proj_cat == "outward":
+                spec_cb = f"#{model_id}/{chain}:{pos}@CB"
+                cmds.append(f"style {spec_cb} sphere")
+                cmds.append(f"size {spec_cb} atomRadius 1.5")
+
             kind = "Engineered" if engineered else "Native"
+            proj_note = f", proj={proj_cat}" if proj_cat != "unknown" else ""
             exps.append(
                 f"{kind} glycosylation site N{pos} — {confidence} confidence "
-                f"(score={score:.3f})"
+                f"(score={score:.3f}{proj_note})"
             )
 
         return cmds, exps
