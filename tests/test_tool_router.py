@@ -797,3 +797,98 @@ def test_sequence_display_sequences_for_redesigns():
         "'sequences for the redesigns' should trigger sequence display when session has MPNN results"
     )
     assert isinstance(result, str) and len(result) > 10
+
+
+# ================================================================================
+# 12. Salt bridge routing
+# ================================================================================
+
+def test_salt_bridge_phrase_routes_correctly():
+    """
+    'find salt bridges on chain A' must route to the salt_bridge tool.
+    """
+    router = _make_router()
+    translator_r = _mutation_scan_translator_result()
+    user_input = 'find salt bridges on chain A'
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert 'salt_bridge' in routed['tools_needed'], (
+        f"Expected 'salt_bridge' in tools_needed, got {routed['tools_needed']}"
+    )
+    assert 'mutation_scan' not in routed['tools_needed']
+    sb_inp = routed['tool_inputs'].get('salt_bridge', {})
+    assert sb_inp.get('model_id') is not None
+
+
+# ================================================================================
+# 13. Cavity routing
+# ================================================================================
+
+def test_cavity_phrase_routes_correctly():
+    """
+    'detect cavities in chain A' must route to the cavity tool.
+    """
+    router = _make_router()
+    translator_r = _mutation_scan_translator_result()
+    user_input = 'detect cavities in chain A'
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert 'cavity' in routed['tools_needed'], (
+        f"Expected 'cavity' in tools_needed, got {routed['tools_needed']}"
+    )
+    assert 'mutation_scan' not in routed['tools_needed']
+    cav_inp = routed['tool_inputs'].get('cavity', {})
+    assert cav_inp.get('model_id') is not None
+
+
+# ================================================================================
+# 14. FASTA export keyword
+# ================================================================================
+
+def test_fasta_export_keyword():
+    """
+    'export fasta' phrase must trigger _export_sequences_fasta, not _show_designed_sequences.
+    When session has no MPNN results, the export returns an informative error string.
+    """
+    router = _make_router()  # no MPNN results
+    result = router.handle_sequence_display_command('export fasta')
+    # Should not be None -- FASTA export is checked before session guard
+    assert result is not None, (
+        'FASTA export keyword should return a string (error message if no results)'
+    )
+    assert isinstance(result, str)
+    # With no session results, should mention ProteinMPNN
+    assert 'ProteinMPNN' in result or 'sequences' in result.lower()
+
+
+# ================================================================================
+# 15. Sequence display no truncation
+# ================================================================================
+
+def test_sequence_display_no_truncation():
+    """
+    _show_designed_sequences() must include the full sequence, not truncated at 80 chars.
+    We inject a 120-char sequence and verify it appears in full.
+    """
+    long_seq = 'ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRS'
+    assert len(long_seq) > 80, 'Test sequence should be longer than 80 chars'
+
+    mock_bridge  = MagicMock()
+    mock_session = MagicMock()
+    mock_session.structures = {'1': {'name': '1HSG', 'path': None}}
+    mpnn_data = {
+        'sequences': [
+            {'sequence': long_seq, 'score': -1.5, 'recovery': 0.95, 'mutations': []},
+        ],
+        'wildtype_sequence': 'A' * 10,
+        'backend': 'local',
+    }
+    mock_session.get_proteinmpnn_result.return_value = mpnn_data
+    router = ToolRouter(bridge=mock_bridge, session=mock_session)
+
+    output = router._show_designed_sequences()
+    assert long_seq in output, (
+        'Full sequence should appear in output without truncation at 80 chars'
+    )

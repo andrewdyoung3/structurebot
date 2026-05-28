@@ -1,0 +1,11 @@
+# Full pipeline validation script
+# Run with: python main.py --script scripts/validate_full_pipeline.txt
+open 1HSG
+suggest mutations to improve solubility of chain A avoiding chain interfaces
+suggest proline mutations to stabilise chain A
+suggest glycosylation sites on chain A
+find salt bridges on chain A
+detect cavities in chain A
+design chain A with MPNN
+show designed sequences
+export sequences

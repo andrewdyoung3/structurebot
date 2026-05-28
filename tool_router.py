@@ -120,6 +120,8 @@ class ToolRouter:
         "disulfide":         "🔗⚗️",
         "proline":           "🧪",
         "glycan":            "🍬",
+        "salt_bridge":       "⚡",
+        "cavity":            "🕳",
     }
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
@@ -191,6 +193,35 @@ class ToolRouter:
         "show", "output", "print", "list", "display", "what",
     )
 
+    _FASTA_EXPORT_KEYWORDS: tuple = (
+        "export sequences",
+        "save sequences",
+        "save fasta",
+        "export fasta",
+        "write sequences",
+        "download sequences",
+    )
+
+    _SALT_BRIDGE_KEYWORDS: tuple = (
+        "salt bridge",
+        "salt-bridge",
+        "electrostatic",
+        "ionic interaction",
+        "charge pair",
+        "engineer salt",
+        "new salt bridge",
+    )
+
+    _CAVITY_KEYWORDS: tuple = (
+        "cavit",              # matches cavity, cavities, cavity-filling, etc.
+        "void",
+        "cavity fill",
+        "fill cavity",
+        "internal void",
+        "packing defect",
+        "hydrophobic core",
+    )
+
     # Keywords that signal an N-glycosylation site scan request.
     # Checked case-insensitively; any match rewrites tools_needed to ["glycan"]
     # and clears any translator clarification_needed flag.
@@ -243,6 +274,8 @@ class ToolRouter:
         self._disulfide_bridge:        Optional[Any] = None
         self._proline_bridge:          Optional[Any] = None
         self._glycan_bridge:           Optional[Any] = None
+        self._salt_bridge_bridge:      Optional[Any] = None
+        self._cavity_bridge:           Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -462,6 +495,28 @@ class ToolRouter:
                 tools_needed, tool_inputs
             )
 
+        # ── Salt bridge intent override ────────────────────────────────────────
+        _sb_intent = bool(user_input and any(kw in user_input.lower() for kw in self._SALT_BRIDGE_KEYWORDS))
+        if _sb_intent and "salt_bridge" not in tools_needed:
+            # Rewrite to salt_bridge tool
+            tools_needed = ["salt_bridge"]
+            tool_inputs = {"salt_bridge": {"model_id": self._primary_model_id(), "chain": "A"}}
+            # Extract chain from any existing tool_input
+            for inp in list(translator_result.get("tool_inputs", {}).values()):
+                if isinstance(inp, dict) and inp.get("chain"):
+                    tool_inputs["salt_bridge"]["chain"] = inp["chain"]
+                    break
+
+        # ── Cavity intent override ──────────────────────────────────────────────
+        _cav_intent = bool(user_input and any(kw in user_input.lower() for kw in self._CAVITY_KEYWORDS))
+        if _cav_intent and "cavity" not in tools_needed:
+            tools_needed = ["cavity"]
+            tool_inputs = {"cavity": {"model_id": self._primary_model_id(), "chain": "A"}}
+            for inp in list(translator_result.get("tool_inputs", {}).values()):
+                if isinstance(inp, dict) and inp.get("chain"):
+                    tool_inputs["cavity"]["chain"] = inp["chain"]
+                    break
+
         result = dict(translator_result)
         result["tools_needed"] = tools_needed
         result["tool_inputs"]  = tool_inputs
@@ -570,6 +625,16 @@ class ToolRouter:
                 f"N-glycosylation site scan — #{mid} chain {chain} "
                 "(NXS/T sequons, SASA + SS + ESM)"
             )
+        if tool == "salt_bridge":
+            inp   = tool_inputs.get("salt_bridge", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            return f"Salt bridge analysis -- #{mid} chain {chain}"
+        if tool == "cavity":
+            inp   = tool_inputs.get("cavity", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            return f"Cavity detection and filling -- #{mid} chain {chain}"
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -723,13 +788,18 @@ class ToolRouter:
                 return self._run_proline(inputs)
             if tool == "glycan":
                 return self._run_glycan(inputs)
+            if tool == "salt_bridge":
+                return self._run_salt_bridge(inputs)
+            if tool == "cavity":
+                return self._run_cavity(inputs)
             return ToolStepResult(
                 tool=tool, success=False,
                 error=(
                     f"Unknown tool '{tool}'. "
                     "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
-                    "assembly_analyser, disulfide, proline, glycan."
+                    "assembly_analyser, disulfide, proline, glycan, "
+                    "salt_bridge, cavity."
                 ),
             )
         except Exception as exc:
@@ -969,6 +1039,159 @@ class ToolRouter:
             viz_commands     = cx_cmds,
             viz_explanations = cx_exps,
             summary          = result.get("summary", "Glycan scan complete."),
+            elapsed_ms       = elapsed_ms,
+        )
+
+    def _run_salt_bridge(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run salt bridge analysis."""
+        import time as _time
+        bridge   = self._get_salt_bridge_bridge()
+        model_id = inputs.get("model_id") or self._primary_model_id()
+        chain    = inputs.get("chain", "A")
+        top_n    = int(inputs.get("top_n", 10))
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="salt_bridge", success=False,
+                error=(
+                    "Salt bridge analysis requires a local PDB file.\n"
+                    "  Load a structure from a local .pdb file, or ensure\n"
+                    "  internet access so StructureBot can download from RCSB."
+                ),
+            )
+
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+
+        # Pull ESM scores and interface residues from session
+        esm_scores: Optional[Dict[int, float]] = None
+        esm_entry = self.session.tool_results.get("esm", {}).get(model_id)
+        if isinstance(esm_entry, dict):
+            raw = esm_entry.get("per_residue_tolerance") or esm_entry.get("scores")
+            if isinstance(raw, dict):
+                esm_scores = {int(k): float(v) for k, v in raw.items()}
+
+        interface_residues: Optional[List[int]] = None
+        iface_data = self.session.get_interface_residues(model_id)
+        if iface_data:
+            protected = self.session.get_protected_residues_for_chain(model_id, chain)
+            if protected:
+                interface_residues = protected
+
+        t0 = _time.perf_counter()
+        try:
+            result = bridge.full_salt_bridge_scan(
+                pdb_path           = pdb_path,
+                chain              = chain,
+                sequence           = sequence or "",
+                interface_residues = interface_residues,
+                esm_scores         = esm_scores,
+                top_n              = top_n,
+            )
+        except Exception as exc:
+            import traceback as _tb
+            _tb.print_exc()
+            return ToolStepResult(
+                tool="salt_bridge", success=False,
+                error=f"Salt bridge analysis failed: {exc}",
+            )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if not result.get("success"):
+            return ToolStepResult(
+                tool="salt_bridge", success=False,
+                error=result.get("error", "Salt bridge analysis failed"),
+                elapsed_ms=elapsed_ms,
+            )
+
+        self.session.set_salt_bridge_results(model_id, result)
+
+        cx_cmds, cx_exps = bridge.generate_chimerax_commands(result, model_id=model_id)
+        summary = bridge.generate_summary(result)
+
+        return ToolStepResult(
+            tool             = "salt_bridge",
+            success          = True,
+            data             = result,
+            viz_commands     = cx_cmds,
+            viz_explanations = cx_exps,
+            summary          = summary,
+            elapsed_ms       = elapsed_ms,
+        )
+
+    def _run_cavity(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """Run cavity detection and filling suggestion."""
+        import time as _time
+        bridge   = self._get_cavity_bridge()
+        model_id = inputs.get("model_id") or self._primary_model_id()
+        chain    = inputs.get("chain", "A")
+        top_n    = int(inputs.get("top_n", 10))
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="cavity", success=False,
+                error=(
+                    "Cavity detection requires a local PDB file.\n"
+                    "  Load a structure from a local .pdb file, or ensure\n"
+                    "  internet access so StructureBot can download from RCSB."
+                ),
+            )
+
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+
+        esm_scores: Optional[Dict[int, float]] = None
+        esm_entry = self.session.tool_results.get("esm", {}).get(model_id)
+        if isinstance(esm_entry, dict):
+            raw = esm_entry.get("per_residue_tolerance") or esm_entry.get("scores")
+            if isinstance(raw, dict):
+                esm_scores = {int(k): float(v) for k, v in raw.items()}
+
+        interface_residues: Optional[List[int]] = None
+        iface_data = self.session.get_interface_residues(model_id)
+        if iface_data:
+            protected = self.session.get_protected_residues_for_chain(model_id, chain)
+            if protected:
+                interface_residues = protected
+
+        t0 = _time.perf_counter()
+        try:
+            result = bridge.full_cavity_scan(
+                pdb_path           = pdb_path,
+                chain              = chain,
+                sequence           = sequence or "",
+                interface_residues = interface_residues,
+                esm_scores         = esm_scores,
+                top_n              = top_n,
+            )
+        except Exception as exc:
+            import traceback as _tb
+            _tb.print_exc()
+            return ToolStepResult(
+                tool="cavity", success=False,
+                error=f"Cavity analysis failed: {exc}",
+            )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if not result.get("success"):
+            return ToolStepResult(
+                tool="cavity", success=False,
+                error=result.get("error", "Cavity analysis failed"),
+                elapsed_ms=elapsed_ms,
+            )
+
+        self.session.set_cavity_results(model_id, result)
+
+        cx_cmds, cx_exps = bridge.generate_chimerax_commands(result, model_id=model_id)
+        summary = bridge.generate_summary(result)
+
+        return ToolStepResult(
+            tool             = "cavity",
+            success          = True,
+            data             = result,
+            viz_commands     = cx_cmds,
+            viz_explanations = cx_exps,
+            summary          = summary,
             elapsed_ms       = elapsed_ms,
         )
 
@@ -1499,6 +1722,18 @@ class ToolRouter:
             self._glycan_bridge = GlycanBridge()
         return self._glycan_bridge
 
+    def _get_salt_bridge_bridge(self):
+        if self._salt_bridge_bridge is None:
+            from salt_bridge_bridge import SaltBridgeBridge
+            self._salt_bridge_bridge = SaltBridgeBridge()
+        return self._salt_bridge_bridge
+
+    def _get_cavity_bridge(self):
+        if self._cavity_bridge is None:
+            from cavity_bridge import CavityBridge
+            self._cavity_bridge = CavityBridge()
+        return self._cavity_bridge
+
     def _get_camsol_bridge(self):
         if self._camsol_bridge is None:
             from camsol_bridge import CamsolBridge
@@ -1757,6 +1992,46 @@ class ToolRouter:
 
     # ── Sequence display command handler ──────────────────────────────────────
 
+    def _export_sequences_fasta(self) -> str:
+        """Export ProteinMPNN designed sequences to a FASTA file on the desktop."""
+        import config as _cfg
+        model_id  = self._primary_model_id()
+        mpnn_data = self.session.get_proteinmpnn_result(model_id)
+        if not mpnn_data:
+            return (
+                "No ProteinMPNN sequences in session -- run "
+                "'redesign chain A with ProteinMPNN' first."
+            )
+        sequences = mpnn_data.get("sequences", [])
+        wildtype  = mpnn_data.get("wildtype_sequence", "")
+
+        try:
+            desktop = _cfg.desktop_path()
+        except Exception:
+            desktop = Path.home() / "Desktop"
+
+        out_path = Path(desktop) / "proteinmpnn_designs.fasta"
+        lines: list = []
+
+        if wildtype:
+            lines.append(f">wildtype length={len(wildtype)}")
+            lines.append(wildtype)
+
+        for i, entry in enumerate(sequences, 1):
+            seq       = entry.get("sequence", "")
+            score     = entry.get("score", 0.0)
+            recovery  = entry.get("recovery", 0.0)
+            mutations = entry.get("mutations", [])
+            n_muts    = len(mutations)
+            lines.append(
+                f">design_{i} score={score:.3f} "
+                f"recovery={recovery:.3f} mutations={n_muts}"
+            )
+            lines.append(seq)
+
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return f"Sequences saved to {out_path}"
+
     def handle_sequence_display_command(self, user_input: str) -> Optional[str]:
         """
         Handle "show designed sequences" and similar commands without LLM translation.
@@ -1774,6 +2049,10 @@ class ToolRouter:
         "can you output the sequences" that aren't covered by explicit keywords.
         """
         lower = user_input.lower().strip()
+
+        # FASTA export takes priority
+        if any(kw in lower for kw in self._FASTA_EXPORT_KEYWORDS):
+            return self._export_sequences_fasta()
 
         # 1. Exact keyword match
         matched = any(kw in lower for kw in self._SEQUENCE_DISPLAY_KEYWORDS)
@@ -1851,7 +2130,7 @@ class ToolRouter:
             lines.append(
                 f"    Mutations: {n_muts} — {mut_display if mut_display else 'none (identical to WT)'}"
             )
-            seq_display = seq[:80] + ("…" if len(seq) > 80 else "")
+            seq_display = seq
             lines.append(f"    Sequence:  {seq_display}")
             lines.append("")
 
@@ -1969,6 +2248,20 @@ class ToolRouter:
             status["glycan"] = "active (NXS/T sequon detection + SASA/SS/ESM scoring)"
         except ImportError:
             status["glycan"] = "module not found"
+
+        # salt_bridge
+        try:
+            __import__("salt_bridge_bridge")
+            status["salt_bridge"] = "active (BioPython + FreeSASA)"
+        except ImportError:
+            status["salt_bridge"] = "module not found"
+
+        # cavity
+        try:
+            __import__("cavity_bridge")
+            status["cavity"] = "active (BioPython + FreeSASA dual-probe)"
+        except ImportError:
+            status["cavity"] = "module not found"
 
         # mpnn_esmfold
         try:

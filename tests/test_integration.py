@@ -560,3 +560,73 @@ def test_proline_full_scan_mocked_backbone():
     for c in result["candidates"]:
         assert c["to_aa"] == "P"
         assert c["from_aa"] == "L"
+
+
+# ================================================================================
+# Pytest integration tests -- salt_bridge + cavity session state coexistence
+# ================================================================================
+
+def test_salt_bridge_cavity_coexist_in_session_state():
+    """
+    set_salt_bridge_results and set_cavity_results must both persist without
+    overwriting each other in the same SessionState.
+    """
+    from session_state import SessionState
+    s = SessionState()
+
+    sb_result = {
+        'success': True,
+        'chain': 'A',
+        'existing_salt_bridges': [{'res1': 'A10', 'res2': 'A20', 'distance': 3.5}],
+        'candidates': [],
+        'total_existing': 1,
+        'total_candidates': 0,
+        'error': None,
+    }
+    cav_result = {
+        'success': True,
+        'chain': 'A',
+        'cavities': [{'cavity_id': 1, 'lining_residues': ['A5'], 'estimated_volume_A3': 30.0}],
+        'candidates': [],
+        'total_cavities': 1,
+        'total_candidates': 0,
+        'error': None,
+    }
+
+    s.set_salt_bridge_results('1', sb_result)
+    s.set_cavity_results('1', cav_result)
+
+    retrieved_sb  = s.get_salt_bridge_results('1')
+    retrieved_cav = s.get_cavity_results('1')
+
+    assert retrieved_sb  is not None, 'salt_bridge_results should be retrievable'
+    assert retrieved_cav is not None, 'cavity_results should be retrievable'
+    assert retrieved_sb['total_existing'] == 1
+    assert retrieved_cav['total_cavities'] == 1
+
+
+def test_all_five_results_coexist():
+    """
+    Five result types -- proline, glycan, salt_bridge, cavity, and ProteinMPNN --
+    must all coexist in the same session without cross-contamination.
+    """
+    from session_state import SessionState
+    s = SessionState()
+
+    # Store each result type
+    s.set_proline_results('1', 'A', {'candidates': [], 'count': 0, 'chain': 'A'})
+    s.set_glycan_results('1', 'A', {'native_sequons': [], 'engineered_candidates': []})
+    s.set_salt_bridge_results('1', {'chain': 'A', 'existing_salt_bridges': [], 'candidates': []})
+    s.set_cavity_results('1', {'chain': 'A', 'cavities': [], 'candidates': []})
+    s.add_proteinmpnn_result('1', {'sequences': [], 'wildtype_sequence': 'AKLDE'})
+
+    # All should be independently retrievable
+    assert s.get_proline_results('1', 'A') is not None, 'Proline results missing'
+    assert s.get_glycan_results('1', 'A')  is not None, 'Glycan results missing'
+    assert s.get_salt_bridge_results('1')  is not None, 'Salt bridge results missing'
+    assert s.get_cavity_results('1')       is not None, 'Cavity results missing'
+    assert s.get_proteinmpnn_result('1')   is not None, 'ProteinMPNN results missing'
+
+    # No cross-contamination
+    assert s.get_salt_bridge_results('2') is None, 'model 2 should have no salt bridge data'
+    assert s.get_cavity_results('2')      is None, 'model 2 should have no cavity data'

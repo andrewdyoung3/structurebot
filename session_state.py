@@ -240,6 +240,10 @@ class SessionState:
         # Set by the user with "set active site residues 25 26 27".
         # Passed to ProlineBridge.full_proline_scan() as functional_residues.
         self.functional_residues: set = set()
+        # Salt bridge analysis results: model_id → result dict
+        self.salt_bridge_results: Dict[str, Any] = {}
+        # Cavity detection results: model_id → result dict
+        self.cavity_results:      Dict[str, Any] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -621,6 +625,26 @@ class SessionState:
         """Return the current functional residue set (copy)."""
         return set(self.functional_residues)
 
+    # ── Salt bridge analysis tracking ─────────────────────────────────────────
+
+    def set_salt_bridge_results(self, model_id: str, result: Dict[str, Any]) -> None:
+        """Store salt bridge analysis results for a model."""
+        self.salt_bridge_results[str(model_id)] = result
+
+    def get_salt_bridge_results(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return stored salt bridge analysis results for a model, or None."""
+        return self.salt_bridge_results.get(str(model_id))
+
+    # ── Cavity detection tracking ─────────────────────────────────────────────
+
+    def set_cavity_results(self, model_id: str, result: Dict[str, Any]) -> None:
+        """Store cavity detection results for a model."""
+        self.cavity_results[str(model_id)] = result
+
+    def get_cavity_results(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return stored cavity detection results for a model, or None."""
+        return self.cavity_results.get(str(model_id))
+
     # ── Rosetta relax cache tracking ──────────────────────────────────────────
 
     def set_relax_cache(self, pdb_hash: str, relaxed_path: str) -> None:
@@ -832,6 +856,8 @@ class SessionState:
             "rosetta_relax_cache":  self.rosetta_relax_cache,
             # sets are not JSON-serialisable; store as sorted list
             "functional_residues":  sorted(self.functional_residues),
+            "salt_bridge_results":  self.salt_bridge_results,
+            "cavity_results":       self.cavity_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -862,6 +888,9 @@ class SessionState:
         state.mpnn_esmfold_results = data.get("mpnn_esmfold_results", {})
         state.rosetta_relax_cache  = data.get("rosetta_relax_cache", {})
         state.functional_residues  = set(data.get("functional_residues", []))
+        obj = state
+        obj.salt_bridge_results = data.get("salt_bridge_results", {})
+        obj.cavity_results      = data.get("cavity_results", {})
         return state
 
     def __repr__(self) -> str:
@@ -896,6 +925,8 @@ class SessionState:
             "mpnn_esmfold_results":  self.mpnn_esmfold_results,
             "rosetta_relax_cache":   self.rosetta_relax_cache,
             "functional_residues":   set(self.functional_residues),
+            "salt_bridge_results":   self.salt_bridge_results,
+            "cavity_results":        self.cavity_results,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -919,3 +950,5 @@ class SessionState:
         self.mpnn_esmfold_results  = copy.deepcopy(snap.get("mpnn_esmfold_results",  {}))
         self.rosetta_relax_cache   = copy.deepcopy(snap.get("rosetta_relax_cache",   {}))
         self.functional_residues   = set(snap.get("functional_residues",   set()))
+        self.salt_bridge_results   = snap.get("salt_bridge_results", {})
+        self.cavity_results        = snap.get("cavity_results", {})
