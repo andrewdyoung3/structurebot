@@ -121,6 +121,7 @@ class ToolRouter:
         "proline":           "🧪",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
+        "netnglyc":          "🔬🍬",
         "salt_bridge":       "⚡",
         "cavity":            "🕳",
     }
@@ -268,6 +269,22 @@ class ToolRouter:
         "projection-aware glycosylation",
     )
 
+    # Keywords that trigger a standalone NetNGlyc OST recognition prediction.
+    # These fire when the user explicitly requests OST/NetNGlyc scoring
+    # without going through glycan_positions (which auto-calls NetNGlyc on
+    # top-5 candidates already).
+    _NETNGLYC_KEYWORDS: tuple = (
+        "netnglyc",
+        "ost recognition",
+        "ost score",
+        "oligosaccharyltransferase",
+        "ost prediction",
+        "glycosylation efficiency",
+        "sequon recognition",
+        "glycan ost",
+        "ost glycosylation",
+    )
+
     # Keywords that signal a proline substitution scan request.
     # Checked case-insensitively; any match overrides generic mutation_scan routing.
     _PROLINE_KEYWORDS: tuple = (
@@ -304,6 +321,7 @@ class ToolRouter:
         self._disulfide_bridge:        Optional[Any] = None
         self._proline_bridge:          Optional[Any] = None
         self._glycan_bridge:           Optional[Any] = None
+        self._netnglyc_bridge:         Optional[Any] = None
         self._salt_bridge_bridge:      Optional[Any] = None
         self._cavity_bridge:           Optional[Any] = None
 
@@ -417,6 +435,12 @@ class ToolRouter:
         """
         lower = text.lower()
         return any(kw in lower for kw in cls._GLYCAN_POSITIONS_KEYWORDS)
+
+    @classmethod
+    def _detect_netnglyc_intent(cls, text: str) -> bool:
+        """Return True if *text* signals a standalone NetNGlyc OST prediction request."""
+        lower = text.lower()
+        return any(kw in lower for kw in cls._NETNGLYC_KEYWORDS)
 
     # ── MPNN+ESMFold intent helpers ───────────────────────────────────────────
 
@@ -544,6 +568,28 @@ class ToolRouter:
                 }
             }
 
+        # ── NetNGlyc intent override ───────────────────────────────────────────
+        # Fires for explicit OST recognition requests (e.g. "run NetNGlyc on
+        # my sequence" / "what is the OST score for position 42?").
+        _netnglyc_intent = bool(
+            user_input and self._detect_netnglyc_intent(user_input)
+        )
+        if _netnglyc_intent and "netnglyc" not in tools_needed:
+            _ng_model_id = self._first_model_id()
+            _ng_chain    = "A"
+            for _inp in list(translator_result.get("tool_inputs", {}).values()):
+                if isinstance(_inp, dict) and _inp.get("chain"):
+                    _ng_chain = _inp["chain"]
+                    break
+            tools_needed = ["netnglyc"]
+            tool_inputs  = {
+                "netnglyc": {
+                    "model_id":    _ng_model_id,
+                    "chain":       _ng_chain,
+                    "_user_input": user_input,
+                }
+            }
+
         # ── Glycan intent override ─────────────────────────────────────────
         # Fires when glycan keywords are present and the translator did NOT
         # already emit "glycan" in tools_needed (wrong routing or unclear query).
@@ -553,7 +599,7 @@ class ToolRouter:
         # stop_reason='refusal' when the short answer ("chain A") has no prior
         # context the model can work with.
         _glycan_intent = bool(user_input and self._detect_glycan_intent(user_input))
-        if _glycan_intent and "glycan" not in tools_needed and not _glycan_positions_intent:
+        if _glycan_intent and "glycan" not in tools_needed and not _glycan_positions_intent and not _netnglyc_intent:
             tools_needed, tool_inputs = self._rewrite_as_glycan(
                 tools_needed, tool_inputs
             )
@@ -598,7 +644,7 @@ class ToolRouter:
         result["_user_input"]  = user_input   # passed to execute() for guard
 
         # Suppress translator clarification when we've resolved the intent ourselves
-        if _glycan_intent or _glycan_positions_intent:
+        if _glycan_intent or _glycan_positions_intent or _netnglyc_intent:
             result["clarification_needed"] = None
 
         step_info: List[Dict[str, Any]] = []
@@ -707,6 +753,14 @@ class ToolRouter:
             return (
                 f"Projection-aware glycosylation position scan — #{mid} chain {chain} "
                 "(all residues, SASA + projection + ESM)"
+            )
+        if tool == "netnglyc":
+            inp   = tool_inputs.get("netnglyc", {})
+            mid   = inp.get("model_id") or self._first_model_id()
+            chain = inp.get("chain", "A")
+            return (
+                f"NetNGlyc OST recognition prediction — #{mid} chain {chain} "
+                "(DTU Health Tech API)"
             )
         if tool == "salt_bridge":
             inp   = tool_inputs.get("salt_bridge", {})
@@ -873,6 +927,8 @@ class ToolRouter:
                 return self._run_glycan(inputs)
             if tool == "glycan_positions":
                 return self._run_glycan_positions(inputs)
+            if tool == "netnglyc":
+                return self._run_netnglyc(inputs)
             if tool == "salt_bridge":
                 return self._run_salt_bridge(inputs)
             if tool == "cavity":
@@ -884,7 +940,7 @@ class ToolRouter:
                     "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
                     "assembly_analyser, disulfide, proline, glycan, "
-                    "salt_bridge, cavity."
+                    "glycan_positions, netnglyc, salt_bridge, cavity."
                 ),
             )
         except Exception as exc:
@@ -1188,21 +1244,160 @@ class ToolRouter:
             )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
+        # ── Auto-call NetNGlyc on top N candidates (when enabled) ───────────────
+        netnglyc_annotated: bool = False
+        try:
+            import config as _cfg
+            _netnglyc_enabled = getattr(_cfg, "NETNGLYC_ENABLED", True)
+            _netnglyc_top_n   = getattr(_cfg, "NETNGLYC_TOP_N", 5)
+        except ImportError:
+            _netnglyc_enabled = True
+            _netnglyc_top_n   = 5
+
+        if _netnglyc_enabled and candidates:
+            try:
+                ng_bridge = self._get_netnglyc_bridge()
+                top_cands = candidates[:_netnglyc_top_n]
+                # Build an engineered sequence: apply the first candidate's
+                # mutation to the sequence so NxS/T sequons appear at each pos.
+                # We use the raw sequence as proxy (NetNGlyc scans all N positions).
+                annotated = ng_bridge.integrate_with_glycan_candidates(
+                    candidates          = top_cands,
+                    engineered_sequence = sequence,
+                )
+                # Merge ost_score, ost_category, combined_confidence back into candidates
+                annotated_map = {c.get("position"): c for c in annotated}
+                for cand in candidates:
+                    pos = cand.get("position")
+                    if pos in annotated_map:
+                        ann = annotated_map[pos]
+                        cand["ost_score"]          = ann.get("ost_score")
+                        cand["ost_category"]       = ann.get("ost_category")
+                        cand["ost_prediction"]     = ann.get("ost_prediction")
+                        cand["ost_confidence"]     = ann.get("ost_confidence")
+                        cand["combined_confidence"] = ann.get("combined_confidence")
+                # Store in session
+                try:
+                    self.session.set_netnglyc_results(model_id, annotated)
+                except Exception:
+                    pass
+                netnglyc_annotated = True
+            except Exception:
+                pass   # NetNGlyc failure is non-fatal — proceed without OST scores
+
         cx_cmds, cx_exps = bridge.generate_positions_chimerax_commands(
             candidates, model_id=model_id, chain=chain, top_n=top_n
         )
         summary = bridge.generate_positions_summary(
             candidates, chain=chain, top_n=top_n
         )
+        if netnglyc_annotated:
+            summary += "\n  [OST scores from NetNGlyc 1.0 added to top candidates]"
 
         return ToolStepResult(
             tool             = "glycan_positions",
             success          = True,
-            data             = {"candidates": candidates, "count": len(candidates)},
+            data             = {
+                "candidates":         candidates,
+                "count":              len(candidates),
+                "netnglyc_annotated": netnglyc_annotated,
+            },
             viz_commands     = cx_cmds,
             viz_explanations = cx_exps,
             summary          = summary,
             elapsed_ms       = elapsed_ms,
+        )
+
+    def _run_netnglyc(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """
+        Run NetNGlyc 1.0 OST recognition prediction for a sequence.
+
+        Fetches the sequence from session, submits to the NetNGlyc REST API,
+        and returns per-sequon OST scores annotated with confidence categories.
+        Stores annotated results in session.netnglyc_results.
+        """
+        import time as _time
+        try:
+            import config as _cfg
+            if not getattr(_cfg, "NETNGLYC_ENABLED", True):
+                return ToolStepResult(
+                    tool="netnglyc", success=False,
+                    error="NetNGlyc is disabled (NETNGLYC_ENABLED=false in config).",
+                )
+        except ImportError:
+            pass
+
+        bridge   = self._get_netnglyc_bridge()
+        model_id = inputs.get("model_id") or self._first_model_id()
+        chain    = inputs.get("chain", "A")
+        sequence = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
+
+        if not sequence:
+            return ToolStepResult(
+                tool="netnglyc", success=False,
+                error=(
+                    "NetNGlyc requires an amino-acid sequence. "
+                    "Load a structure first, or pass a sequence explicitly."
+                ),
+            )
+
+        # Use the position hint from user input if present (score_engineered_sequon mode)
+        sequon_position: Optional[int] = inputs.get("sequon_position")
+        engineered_seq:  Optional[str] = inputs.get("engineered_sequence")
+        wildtype_seq:    Optional[str] = inputs.get("wildtype_sequence") or sequence
+
+        t0 = _time.perf_counter()
+        if sequon_position and engineered_seq:
+            result = bridge.score_engineered_sequon(
+                sequon_position      = sequon_position,
+                engineered_sequence  = engineered_seq,
+                wildtype_sequence    = wildtype_seq,
+            )
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            if not result.get("success"):
+                return ToolStepResult(
+                    tool="netnglyc", success=False,
+                    error=result.get("error", "NetNGlyc prediction failed"),
+                    elapsed_ms=elapsed_ms,
+                )
+            summary = (
+                f"NetNGlyc — position {sequon_position}: "
+                f"OST score={result['ost_score']:.3f} ({result['ost_category']}). "
+                f"{result.get('notes', '')}"
+            )
+            data = result
+        else:
+            result = bridge.predict_glycosylation(
+                sequence = sequence,
+                name     = f"model{model_id}_chain{chain}",
+            )
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            if not result.get("success"):
+                return ToolStepResult(
+                    tool="netnglyc", success=False,
+                    error=result.get("error", "NetNGlyc prediction failed"),
+                    elapsed_ms=elapsed_ms,
+                )
+            n_found = result["n_sequons_found"]
+            n_high  = result["n_sequons_high_score"]
+            summary = (
+                f"NetNGlyc — {n_found} sequon(s) found, "
+                f"{n_high} with high OST score (>0.7)."
+            )
+            data = result
+
+        # Store in session
+        try:
+            self.session.set_netnglyc_results(model_id, data)
+        except Exception:
+            pass
+
+        return ToolStepResult(
+            tool       = "netnglyc",
+            success    = True,
+            data       = data,
+            summary    = summary,
+            elapsed_ms = elapsed_ms,
         )
 
     @staticmethod
@@ -1906,6 +2101,12 @@ class ToolRouter:
             from glycan_bridge import GlycanBridge
             self._glycan_bridge = GlycanBridge()
         return self._glycan_bridge
+
+    def _get_netnglyc_bridge(self):
+        if self._netnglyc_bridge is None:
+            from netnglyc_bridge import NetNGlycBridge
+            self._netnglyc_bridge = NetNGlycBridge()
+        return self._netnglyc_bridge
 
     def _get_salt_bridge_bridge(self):
         if self._salt_bridge_bridge is None:

@@ -939,3 +939,86 @@ class TestGlycanPositions:
             assert isinstance(r["notes"], str) and len(r["notes"]) > 0, (
                 f"notes must be a non-empty string; got: {r['notes']!r}"
             )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Section L — SessionState netnglyc_results save/load round-trip
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestSessionStateNetNGlyc:
+    """
+    Verify that netnglyc_results are correctly persisted and reloaded via
+    SessionState.save() / SessionState.load().
+    """
+
+    def test_netnglyc_results_save_load_round_trip(self, tmp_path):
+        """
+        set_netnglyc_results() / get_netnglyc_results() must survive a
+        save-load round-trip through JSON.
+        """
+        import sys, os
+        _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if _ROOT not in sys.path:
+            sys.path.insert(0, _ROOT)
+
+        from session_state import SessionState
+
+        state = SessionState()
+        payload = [
+            {"position": 5,  "ost_score": 0.72, "ost_category": "high"},
+            {"position": 12, "ost_score": 0.31, "ost_category": "low"},
+        ]
+        state.set_netnglyc_results("1", payload)
+
+        # Verify accessor works before save
+        retrieved = state.get_netnglyc_results("1")
+        assert retrieved is not None
+        assert retrieved[0]["ost_score"] == 0.72
+
+        # Save and reload
+        json_path = str(tmp_path / "session.json")
+        state.save(json_path)
+        loaded = SessionState.load(json_path)
+
+        reloaded = loaded.get_netnglyc_results("1")
+        assert reloaded is not None, "netnglyc_results should survive save/load"
+        assert len(reloaded) == 2
+        assert reloaded[0]["ost_category"] == "high"
+        assert reloaded[1]["position"] == 12
+
+    def test_netnglyc_results_snapshot_restore(self):
+        """
+        netnglyc_results must be included in snapshot() / restore().
+        """
+        import sys, os
+        _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if _ROOT not in sys.path:
+            sys.path.insert(0, _ROOT)
+
+        from session_state import SessionState
+
+        state = SessionState()
+        state.set_netnglyc_results("2", [{"position": 99, "ost_score": 0.55}])
+
+        snap = state.snapshot()
+        # Clear and restore
+        state.netnglyc_results = {}
+        state.restore(snap)
+
+        restored = state.get_netnglyc_results("2")
+        assert restored is not None, "netnglyc_results should survive snapshot/restore"
+        assert restored[0]["position"] == 99
+
+    def test_missing_netnglyc_returns_none(self):
+        """
+        get_netnglyc_results() must return None for a model_id with no stored results.
+        """
+        import sys, os
+        _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if _ROOT not in sys.path:
+            sys.path.insert(0, _ROOT)
+
+        from session_state import SessionState
+
+        state = SessionState()
+        assert state.get_netnglyc_results("99") is None

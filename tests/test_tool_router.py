@@ -954,3 +954,60 @@ def test_glycan_positions_inputs_have_model_id_and_chain():
     assert routed.get("clarification_needed") is None, (
         "clarification_needed must be cleared for glycan_positions routing"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Section O — NetNGlyc routing
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_netnglyc_keyword_routes_to_netnglyc():
+    """
+    'run netnglyc on my sequence' must route to the netnglyc tool.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "run netnglyc on my sequence for chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "netnglyc" in routed["tools_needed"], (
+        f"'netnglyc' keyword should route to netnglyc tool; "
+        f"got {routed['tools_needed']}"
+    )
+    assert routed.get("clarification_needed") is None, (
+        "clarification_needed must be cleared for netnglyc routing"
+    )
+
+
+def test_ost_recognition_phrase_routes_to_netnglyc():
+    """
+    'predict OST recognition for the engineered sequon' must route to netnglyc.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "predict ost recognition for the engineered sequon at position 42"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "netnglyc" in routed["tools_needed"], (
+        f"'ost recognition' phrase should route to netnglyc; "
+        f"got {routed['tools_needed']}"
+    )
+
+
+def test_netnglyc_inputs_have_model_id_and_chain():
+    """
+    netnglyc tool_inputs must carry model_id and chain keys.
+    """
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "show me the netnglyc ost score for this protein"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "netnglyc" in routed["tools_needed"], (
+        f"netnglyc routing missing; got {routed['tools_needed']}"
+    )
+    ng_inputs = routed.get("tool_inputs", {}).get("netnglyc", {})
+    assert "model_id" in ng_inputs, "netnglyc inputs must include model_id"
+    assert "chain"    in ng_inputs, "netnglyc inputs must include chain"

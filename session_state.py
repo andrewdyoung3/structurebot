@@ -244,6 +244,9 @@ class SessionState:
         self.salt_bridge_results: Dict[str, Any] = {}
         # Cavity detection results: model_id → result dict
         self.cavity_results:      Dict[str, Any] = {}
+        # NetNGlyc OST recognition results: model_id → annotated candidate list
+        # Populated by _run_netnglyc() / _run_glycan_positions() in tool_router.
+        self.netnglyc_results:    Dict[str, Any] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -625,6 +628,21 @@ class SessionState:
         """Return the current functional residue set (copy)."""
         return set(self.functional_residues)
 
+    # ── NetNGlyc OST recognition tracking ────────────────────────────────────
+
+    def set_netnglyc_results(self, model_id: str, result: Any) -> None:
+        """Store NetNGlyc OST recognition results for a model."""
+        from datetime import datetime as _dt
+        self.netnglyc_results[str(model_id)] = {
+            "result":    result,
+            "timestamp": _dt.now().isoformat(timespec="seconds"),
+        }
+
+    def get_netnglyc_results(self, model_id: str) -> Optional[Any]:
+        """Return stored NetNGlyc results for a model, or None."""
+        entry = self.netnglyc_results.get(str(model_id))
+        return entry["result"] if entry else None
+
     # ── Salt bridge analysis tracking ─────────────────────────────────────────
 
     def set_salt_bridge_results(self, model_id: str, result: Dict[str, Any]) -> None:
@@ -858,6 +876,7 @@ class SessionState:
             "functional_residues":  sorted(self.functional_residues),
             "salt_bridge_results":  self.salt_bridge_results,
             "cavity_results":       self.cavity_results,
+            "netnglyc_results":     self.netnglyc_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -891,6 +910,7 @@ class SessionState:
         obj = state
         obj.salt_bridge_results = data.get("salt_bridge_results", {})
         obj.cavity_results      = data.get("cavity_results", {})
+        obj.netnglyc_results    = data.get("netnglyc_results", {})
         return state
 
     def __repr__(self) -> str:
@@ -927,6 +947,7 @@ class SessionState:
             "functional_residues":   set(self.functional_residues),
             "salt_bridge_results":   self.salt_bridge_results,
             "cavity_results":        self.cavity_results,
+            "netnglyc_results":      self.netnglyc_results,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -952,3 +973,4 @@ class SessionState:
         self.functional_residues   = set(snap.get("functional_residues",   set()))
         self.salt_bridge_results   = snap.get("salt_bridge_results", {})
         self.cavity_results        = snap.get("cavity_results", {})
+        self.netnglyc_results      = copy.deepcopy(snap.get("netnglyc_results", {}))

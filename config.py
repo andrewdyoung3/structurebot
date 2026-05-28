@@ -186,6 +186,28 @@ MPNN_ESMFOLD_INCLUDE_WT: bool = (
     not in ("0", "false", "no")
 )
 
+# ── NetNGlyc 1.0 (OST recognition prediction) ─────────────────────────────────
+
+# REST API endpoint for DTU Health Tech NetNGlyc 1.0.
+# Note: "SEQENCE" typo in POST data is intentional — server-side parameter name.
+NETNGLYC_API_URL: str = os.environ.get(
+    "NETNGLYC_API_URL",
+    "https://services.healthtech.dtu.dk/service.php?NetNGlyc-1.0",
+)
+
+# HTTP timeout in seconds for NetNGlyc API calls.
+NETNGLYC_TIMEOUT: int = int(os.environ.get("NETNGLYC_TIMEOUT", "30"))
+
+# Set to False to skip all NetNGlyc API calls (e.g. in offline/CI environments).
+NETNGLYC_ENABLED: bool = (
+    os.environ.get("NETNGLYC_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no")
+)
+
+# How many top glycan-position candidates to annotate via NetNGlyc after a
+# projection-aware scan (_run_glycan_positions in tool_router.py).
+NETNGLYC_TOP_N: int = int(os.environ.get("NETNGLYC_TOP_N", "5"))
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 

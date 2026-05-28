@@ -605,6 +605,8 @@ class GlycanBridge:
         esm_scores:         Optional[Dict[int, float]] = None,
         min_score:          float = 0.05,
         top_n:              int = 3,
+        include_netnglyc:   bool = True,
+        netnglyc_bridge:    Any = None,
         **kwargs:           Any,
     ) -> Dict[str, Any]:
         """
@@ -612,6 +614,15 @@ class GlycanBridge:
 
         Adds keys to full_glycan_scan output:
           summary, viz_commands, viz_explanations
+
+        Parameters
+        ----------
+        include_netnglyc : when True (default) and *netnglyc_bridge* is
+                           provided, annotate engineered candidates with OST
+                           recognition scores from NetNGlyc 1.0.
+        netnglyc_bridge  : a NetNGlycBridge instance (or compatible mock).
+                           If None, NetNGlyc annotation is skipped even when
+                           include_netnglyc is True.
         """
         result = self.full_glycan_scan(
             pdb_path           = pdb_path,
@@ -634,6 +645,19 @@ class GlycanBridge:
         native     = result["native_sequons"]
         eng        = result["engineered_candidates"]
         all_ranked = result["all_ranked"]   # all sequons, no min_score filter
+
+        # ── Optional NetNGlyc OST annotation ──────────────────────────────────
+        if include_netnglyc and netnglyc_bridge is not None and eng:
+            try:
+                annotated = netnglyc_bridge.integrate_with_glycan_candidates(
+                    candidates          = eng,
+                    engineered_sequence = sequence,
+                )
+                # Replace engineered_candidates with annotated version in result
+                result["engineered_candidates"] = annotated
+                eng = annotated
+            except Exception:
+                pass   # NetNGlyc annotation is non-fatal; proceed without it
 
         # ── Visualization candidate list ───────────────────────────────────────
         # Use all_ranked (unfiltered by min_score) so proteins with no
