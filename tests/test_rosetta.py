@@ -455,6 +455,103 @@ def test_dynamut2_rate_limit_retry() -> None:
         Path(pdb_path).unlink(missing_ok=True)
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+# B2. DynaMut2 single-mutation poll response format (current "status" API)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def test_dynamut2_single_status_done_parsed() -> None:
+    """Current API: {"status": "DONE", "prediction": 0.789, ...} -> ddg == 0.789."""
+    from rosetta_bridge import _parse_dynamut2_result
+
+    data = {
+        "status": "DONE", "prediction": 0.789, "chain": "A",
+        "wild-type": "ILE", "mutant": "ARG", "position": "72",
+        "results_page": "http://example/x",
+    }
+    ddg = _parse_dynamut2_result(data, "I72R")
+    _assert(ddg == 0.789, "status=DONE prediction parsed", str(ddg))
+    assert ddg == 0.789
+
+
+def test_dynamut2_single_status_running_continues() -> None:
+    """
+    {"status": "RUNNING"} must be treated as still-running, NOT a result:
+    the parser raises, and the poll loop keeps polling until DONE.
+    """
+    from rosetta_bridge import RosettaBridge, _parse_dynamut2_result
+
+    # Parser: RUNNING is not a completed result (raises, does not return a value).
+    running_raises = False
+    try:
+        _parse_dynamut2_result({"status": "RUNNING", "job_id": "j1"}, "I72R")
+    except ValueError:
+        running_raises = True
+    _assert(running_raises, "status=RUNNING raises (not parsed as result)")
+    assert running_raises
+
+    # Poll loop: RUNNING then DONE -> two GETs, returns the final prediction.
+    pdb_path = _write_temp_pdb()
+    try:
+        os.environ["ROSETTA_BACKEND"] = "dynamut2"
+        mut = {"chain": "A", "position": 72, "from_aa": "I", "to_aa": "R"}
+
+        submit_resp = MagicMock(status_code=200)
+        submit_resp.json.return_value = {"job_id": "job-running-1"}
+
+        running_resp = MagicMock(status_code=200)
+        running_resp.raise_for_status = MagicMock()
+        running_resp.json.return_value = {"status": "RUNNING", "job_id": "job-running-1"}
+
+        done_resp = MagicMock(status_code=200)
+        done_resp.raise_for_status = MagicMock()
+        done_resp.json.return_value = {"status": "DONE", "prediction": 0.789}
+
+        with patch("requests.post", return_value=submit_resp), \
+             patch("requests.get",  side_effect=[running_resp, done_resp]) as mock_get, \
+             patch("time.sleep"):
+            bridge = RosettaBridge()
+            ddg = bridge._query_dynamut2_single(pdb_path, mut, progress=lambda s: None)
+
+        _assert(mock_get.call_count == 2,
+                "polled twice (RUNNING then DONE)", str(mock_get.call_count))
+        _assert(ddg == 0.789, "returns prediction after RUNNING poll", str(ddg))
+        assert mock_get.call_count == 2 and ddg == 0.789
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_dynamut2_single_prediction_string_cast() -> None:
+    """String prediction form {"status":"DONE","prediction":"1.4"} -> 1.4 (float)."""
+    from rosetta_bridge import _parse_dynamut2_result
+
+    ddg = _parse_dynamut2_result({"status": "DONE", "prediction": "1.4"}, "I72R")
+    _assert(ddg == 1.4, "string prediction cast to float", str(ddg))
+    _assert(isinstance(ddg, float), "extracted ddg is a float")
+    assert ddg == 1.4 and isinstance(ddg, float)
+
+
+def test_dynamut2_single_error_not_zero() -> None:
+    """
+    {"status": "ERROR"} must be flagged as a failure (raises), never silently
+    parsed as a real ddG of 0.0 — a failed lookup must stay distinguishable.
+    """
+    from rosetta_bridge import _parse_dynamut2_result
+
+    extracted: Any = "sentinel"
+    raised = False
+    try:
+        extracted = _parse_dynamut2_result(
+            {"status": "ERROR", "job_id": "j-err", "message": "internal failure"},
+            "I72R",
+        )
+    except (RuntimeError, ValueError):
+        raised = True
+    _assert(raised, "status=ERROR raises instead of returning a value")
+    _assert(extracted != 0.0, "ERROR is NOT parsed as ddg 0.0", repr(extracted))
+    assert raised and extracted != 0.0
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # C. MutationScanner -- candidate selection
 # ════════════════════════════════════════════════════════════════════════════════

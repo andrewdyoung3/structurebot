@@ -17,9 +17,12 @@ BACKEND B — DynaMut2 web API  [DEFAULT]
   https://biosig.lab.uq.edu.au/dynamut2/
   Free, no registration or API key required.
   Two-step async flow per mutation:
-    1. POST /api/prediction_single  ->  {"job_id": "..."}
-    2. GET  /api/prediction_single?job_id=...  ->  {"prediction": float, ...}
-       (poll until response is not {"message": "RUNNING"})
+    1. POST /api/prediction_single (data: chain, mutation; files: pdb_file)
+         ->  {"job_id": "..."}
+    2. GET  /api/prediction_single (job_id)
+         ->  while running: {"status": "RUNNING", "job_id": ...}
+         ->  when done:     {"status": "DONE", "prediction": <float>, ...}
+       (poll until status is DONE / a numeric "prediction" appears)
   Handles rate-limiting and transient errors with retry + exponential backoff.
   Automatically falls through to empirical for mutations that fail.
 
@@ -71,11 +74,12 @@ DynaMut2 API details
     Response: {"job_id": "<uuid>"}
 
   Step 2 — Poll:
-    GET https://biosig.lab.uq.edu.au/dynamut2/api/prediction_single?job_id=<uuid>
-    Response while running: {"message": "RUNNING"}
+    GET https://biosig.lab.uq.edu.au/dynamut2/api/prediction_single (job_id)
+    Response while running: {"status": "RUNNING", "job_id": "<uuid>"}
     Response when done:
-      {"prediction": <float>, "chain": "A", "res_number": 82,
-       "wild-type": "V", "mutant": "A", "results_page": "<url>"}
+      {"status": "DONE", "prediction": <float>, "chain": "A",
+       "wild-type": "ILE", "mutant": "ARG", "position": "72",
+       "results_page": "<url>"}
 
   Sign convention: positive prediction = destabilising, negative = stabilising.
   Auth: none required.
@@ -193,23 +197,44 @@ def _parse_dynamut2_result(data: Dict[str, Any], mutation_str: str) -> float:
     """
     Extract ΔΔG (kcal/mol) from a completed DynaMut2 result JSON.
 
-    Expected format:
-      {"prediction": <float>, "chain": "A", "res_number": 82,
-       "wild-type": "V", "mutant": "A", "results_page": "<url>"}
+    Current API format (prediction_single), confirmed live 2026-05:
+      {"status": "DONE", "prediction": 0.789, "chain": "A",
+       "wild-type": "ILE", "mutant": "ARG", "position": "72",
+       "results_page": "<url>"}
+    Legacy format (still accepted):
+      {"prediction": "1.4", "chain": "A", "res_number": 82, ...}
 
-    Sign convention: positive = destabilising, negative = stabilising.
+    Sign convention: positive = destabilising, negative = stabilising
+    (matches StructureBot's internal convention — no flip needed).
 
-    Raises ValueError if the response is not a completed result
-    (e.g. still {"message": "RUNNING"}) or lacks a numeric prediction.
+    Raises:
+      RuntimeError if the job reports a server-side error (status=ERROR) —
+        the caller must treat this as a failure, never as a real ddG of 0.0.
+      ValueError if the response is not yet complete (status RUNNING/PENDING/
+        QUEUED, or legacy {"message": "RUNNING"}) or lacks a numeric prediction.
     """
-    if "message" in data:
-        raise ValueError(
-            f"DynaMut2 job for {mutation_str!r} not yet complete: "
-            f"{data['message']!r}"
+    status = str(data.get("status", "")).strip().lower()
+    msg    = str(data.get("message", "")).strip().upper()
+
+    # Server-side error — distinct from a valid 0.0 prediction.
+    if (status in ("error", "failed", "failure")
+            or "error" in str(data.get("error", "")).lower()):
+        raise RuntimeError(
+            f"DynaMut2 job reported an error for {mutation_str!r}: "
+            f"{data.get('message') or data.get('error') or status!r}"
         )
 
-    # Primary field: "prediction"
-    if "prediction" in data:
+    # Still running — not a completed result yet.
+    if (status in ("running", "pending", "queued", "processing", "submitted", "waiting")
+            or msg in ("RUNNING", "PENDING", "QUEUED")):
+        raise ValueError(
+            f"DynaMut2 job for {mutation_str!r} not yet complete "
+            f"(status={status or msg or 'unknown'!r})"
+        )
+
+    # Completed result: extract "prediction" (cast robustly — the live API
+    # returns a float, the legacy docs show a string).
+    if data.get("prediction") is not None:
         try:
             return round(float(data["prediction"]), 3)
         except (TypeError, ValueError) as exc:
@@ -310,6 +335,9 @@ class RosettaBridge:
 
     def __init__(self) -> None:
         self._backend = _select_backend()
+        # TEMP DEBUG (remove after live verification): log the first parsed
+        # DynaMut2 single-mutation poll response so we can confirm the live fix.
+        self._dynamut2_debug_logged = False
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -394,7 +422,7 @@ class RosettaBridge:
                     return "Local Rosetta: WSL2 available but PyRosetta not installed in WSL2"
                 return (
                     "Local Rosetta: WSL2 not installed — "
-                    "run `wsl --install -d Ubuntu-22.04` (Administrator)"
+                    "run `wsl --install -d Ubuntu-24.04` (Administrator)"
                 )
             except ImportError:
                 pass
@@ -761,9 +789,9 @@ class RosettaBridge:
           Response: {"job_id": "<uuid>"}
 
         Step 2 — Poll:
-          GET https://biosig.lab.uq.edu.au/dynamut2/api/prediction_single?job_id=<uuid>
-          Response while running: {"message": "RUNNING"}
-          Response when done: {"prediction": <float>, ...}
+          GET https://biosig.lab.uq.edu.au/dynamut2/api/prediction_single (job_id)
+          Response while running: {"status": "RUNNING", "job_id": "<uuid>"}
+          Response when done:     {"status": "DONE", "prediction": <float>, ...}
 
         per_mutation_deadline : time.perf_counter() deadline.  Checked before
           each retry/poll so the overall-scan budget is never exceeded by a
@@ -865,9 +893,12 @@ class RosettaBridge:
             time.sleep(_DYNAMUT2_POLL_INTERVAL)
 
             try:
+                # The live prediction_single endpoint reads job_id from the form
+                # body (data=); send it as a query param too for backward compat.
                 r = requests.get(
                     _DYNAMUT2_RESULT_URL,
                     params  = {"job_id": job_id},
+                    data    = {"job_id": job_id},
                     timeout = _DYNAMUT2_TIMEOUT,
                 )
                 r.raise_for_status()
@@ -879,13 +910,12 @@ class RosettaBridge:
                 progress(f"  DynaMut2 poll {poll_n + 1} error ({exc}); retrying...")
                 continue
 
-            # Result ready?
-            if "prediction" in data:
-                return _parse_dynamut2_result(data, mutation_str)
+            msg    = str(data.get("message", "")).strip().upper()
+            status = str(data.get("status",  "")).strip().lower()
 
-            # Explicit server-side error — don't keep polling
-            msg    = str(data.get("message", "")).upper()
-            status = str(data.get("status",  "")).lower()
+            # Explicit server-side error — don't keep polling. Raising here
+            # surfaces a failure upstream (→ empirical fallback), keeping a real
+            # ddG of 0.0 distinguishable from a failed lookup.
             if (status in ("error", "failed", "failure")
                     or "error" in str(data.get("error", "")).lower()):
                 raise RuntimeError(
@@ -893,13 +923,27 @@ class RosettaBridge:
                     f"{data.get('message') or data.get('error') or status!r}"
                 )
 
+            # Completed? Current API uses status=DONE; legacy responses carry a
+            # top-level numeric "prediction" with no status.
+            if (status in ("done", "finished", "complete", "completed", "success")
+                    or data.get("prediction") is not None):
+                ddg = _parse_dynamut2_result(data, mutation_str)
+                # TEMP DEBUG (remove after live verification): first parsed result.
+                if not self._dynamut2_debug_logged:
+                    self._dynamut2_debug_logged = True
+                    print(
+                        f"[DynaMut2 single] {mutation_str}: raw={data} "
+                        f"extracted_ddg={ddg}",
+                        flush=True,
+                    )
+                return ddg
+
             # Still running?
             still_running = (
                 msg in ("RUNNING", "PENDING", "QUEUED")
                 or status in ("running", "pending", "queued", "processing",
                               "submitted", "waiting")
-                or (not msg and not status and "prediction" not in data
-                    and "error" not in data)
+                or (not msg and not status)   # empty/unknown → assume spinning up
             )
 
             if still_running:
@@ -911,8 +955,12 @@ class RosettaBridge:
                     )
                 continue
 
-            # Unrecognised non-error response — attempt to extract prediction
-            return _parse_dynamut2_result(data, mutation_str)
+            # Unrecognised non-error, non-running response — try to parse;
+            # if it isn't a usable result, keep polling rather than crash.
+            try:
+                return _parse_dynamut2_result(data, mutation_str)
+            except ValueError:
+                continue
 
         raise TimeoutError(
             f"DynaMut2 job {job_id} for {mutation_str} timed out "
@@ -1069,28 +1117,28 @@ class RosettaBridge:
             ),
         )
 
-    # ── Future: Local Rosetta (publication-quality ddG) ───────────────────────
-    # To activate: set ROSETTA_LOCAL_PATH in .env.local pointing
-    # to your Rosetta installation directory on Linux/Mac
+    # ── Local Rosetta (publication-quality ddG via PyRosetta in WSL2) ─────────
+    # ACTIVE implementation (not a stub).  Selected when ROSETTA_BACKEND=local.
     #
-    # Required setup:
-    # 1. Obtain free academic license: https://rosettacommons.org
-    # 2. Install on Linux/Mac (Windows not supported for science)
-    # 3. Set ROSETTA_LOCAL_PATH=/path/to/rosetta/source/bin
-    # 4. Set ROSETTA_BACKEND=local in .env.local
+    # How it works:
+    #   1. Copy the PDB into WSL2 /tmp (wsl_bridge.copy_to_wsl)
+    #   2. Build a standalone PyRosetta worker script and run it under
+    #      WSL2 (wsl_bridge.run_python_script → PYROSETTA_PYTHON)
+    #   3. Worker: cleanATOM → FastRelax (cached by PDB hash) → per-mutation
+    #      MutateResidue + FastRelax → ddG = score(mut) − score(wt)
+    #   4. Copy the results JSON back and parse per-mutation ΔΔG
     #
-    # Protocol: cartesian_ddg
-    # Expected accuracy: Pearson r ~0.8 vs experimental
-    # Expected runtime: 5-30 min per mutation (CPU)
-    #                   30-120 min for full scan (100 candidates)
+    # Requirements: WSL2 (Ubuntu-24.04) with PyRosetta installed in
+    #   PYROSETTA_PYTHON (see wsl_bridge.py).  Academic license required:
+    #   https://rosettacommons.org
     #
-    # Citation: Frenz et al. (2020) Biochemistry
-    #           Park et al. (2016) J Chem Theory Comput
+    # Protocol: per-mutation FastRelax ddG (ref2015).  Pearson r ~0.8 vs
+    # experimental.  Runtime: ~2–5 min per mutation on CPU.
+    # Citation: Park et al. (2016) J Chem Theory Comput; Frenz et al. (2020).
     #
-    # The _run_rosetta_local() method below is a documented stub.
-    # Implement by calling:
-    #   {ROSETTA_LOCAL_PATH}/rosetta_scripts.linuxgccrelease
-    #   with the cartesian_ddg XML protocol
+    # If the WSL2/PyRosetta run fails as a whole, this method falls back to
+    # per-mutation empirical BLOSUM62 estimates (marked ddg_source="empirical")
+    # rather than returning all-zero ddG.
 
     def _run_rosetta_local(
         self,
@@ -1105,7 +1153,7 @@ class RosettaBridge:
 
         Requires
         --------
-        1. WSL2 installed:  wsl --install -d Ubuntu-22.04  (Administrator)
+        1. WSL2 installed:  wsl --install -d Ubuntu-24.04  (Administrator)
         2. PyRosetta in WSL2:
              pip install pyrosetta-installer
              python3 -c "import pyrosetta_installer;
@@ -1147,9 +1195,9 @@ class RosettaBridge:
                 tool="rosetta", success=False,
                 error=(
                     "Local Rosetta (PyRosetta via WSL2) is not configured.\n"
-                    "WSL2 is not installed or Ubuntu-22.04 distribution is not found.\n\n"
+                    "WSL2 is not installed or Ubuntu-24.04 distribution is not found.\n\n"
                     "To enable (PowerShell as Administrator):\n"
-                    "  1. wsl --install -d Ubuntu-22.04\n"
+                    "  1. wsl --install -d Ubuntu-24.04\n"
                     "  2. Reboot\n"
                     "  3. Inside WSL2:\n"
                     "       pip install pyrosetta-installer\n"
@@ -1166,7 +1214,7 @@ class RosettaBridge:
                 tool="rosetta", success=False,
                 error=(
                     "WSL2 is available but PyRosetta is not installed inside it.\n"
-                    "In your WSL2 terminal (Ubuntu-22.04), run:\n"
+                    "In your WSL2 terminal (Ubuntu-24.04), run:\n"
                     "  pip install pyrosetta-installer\n"
                     "  python3 -c \"import pyrosetta_installer; "
                     "pyrosetta_installer.install_pyrosetta()\"\n"
@@ -1206,6 +1254,10 @@ class RosettaBridge:
 import json, sys, os
 sys.path.insert(0, '/opt/conda/lib/python3.12/site-packages')  # common PyRosetta location
 
+# TEMP DIAGNOSTIC (remove after live verification): _debug is collected
+# throughout and written to the results JSON under a "debug" key so it
+# survives back to the Python side.
+_debug = {{}}
 try:
     import pyrosetta
     from pyrosetta import init as rosetta_init, pose_from_file
@@ -1219,17 +1271,78 @@ try:
     cache_dir = {relax_cache_wsl!r}
     hash_key  = {pdb_hash!r}
     relaxed   = os.path.join(cache_dir, f"{{hash_key}}_relaxed.pdb")
+    _debug["input_path"] = pdb_path
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    from pyrosetta.toolbox import cleanATOM
+    # ── cleanATOM + size guard (diagnosed) ────────────────────────────────
     cleaned_path = pdb_path.replace('.pdb', '_clean.pdb')
-    cleanATOM(pdb_path, cleaned_path)
-    import os
-    if os.path.isfile(cleaned_path) and os.path.getsize(cleaned_path) > 100:
-        pdb_path = cleaned_path
-    print(f"[Rosetta] PDB cleaned → {{pdb_path}}", flush=True)
-    pose = pose_from_file(pdb_path)
+    if cleaned_path == pdb_path:            # input had no .pdb extension
+        cleaned_path = pdb_path + '_clean.pdb'
+    try:
+        cleanATOM(pdb_path, cleaned_path)
+    except Exception as _clean_exc:
+        _debug["cleanATOM_error"] = str(_clean_exc)
+    _clean_exists = os.path.isfile(cleaned_path)
+    _clean_size   = os.path.getsize(cleaned_path) if _clean_exists else 0
+    _orig_path    = pdb_path
+    if _clean_exists and _clean_size > 100:
+        pdb_path     = cleaned_path
+        _used_clean  = True
+    else:
+        _used_clean  = False
+    _debug["cleanATOM"] = {{
+        "cleaned_path": cleaned_path, "cleaned_exists": _clean_exists,
+        "cleaned_size": _clean_size, "used_cleaned": _used_clean,
+        "kept_path": pdb_path,
+    }}
+    print(f"[Rosetta DEBUG] cleanATOM: cleaned={{cleaned_path}} exists={{_clean_exists}} "
+          f"size={{_clean_size}} used_cleaned={{_used_clean}}", flush=True)
+
+    # ── Validate the file we are about to load ────────────────────────────
+    # pose_from_file infers type from extension/content; a non-.pdb name or
+    # an empty/HTML file raises "Cannot determine file type".
+    _load_exists = os.path.isfile(pdb_path)
+    _load_size   = os.path.getsize(pdb_path) if _load_exists else 0
+    _head = []
+    if _load_exists:
+        with open(pdb_path, "r", errors="replace") as _fh:
+            for _i, _ln in enumerate(_fh):
+                if _i >= 5:
+                    break
+                _head.append(_ln.rstrip("\\n"))
+    _debug["load"] = {{"path": pdb_path, "exists": _load_exists,
+                       "size": _load_size, "head": _head}}
+    print(f"[Rosetta DEBUG] pose_from_file target: path={{pdb_path}} "
+          f"exists={{_load_exists}} size={{_load_size}}", flush=True)
+    print(f"[Rosetta DEBUG] first lines: {{_head}}", flush=True)
+
+    if not _load_exists or _load_size == 0:
+        raise RuntimeError(f"PDB to load is missing/empty: {{pdb_path}} (size={{_load_size}})")
+    _valid_starts = ("ATOM", "HETATM", "HEADER", "CRYST", "MODEL",
+                     "REMARK", "TITLE", "SEQRES", "EXPDTA", "COMPND")
+    if not any(any(_l.startswith(_p) for _p in _valid_starts) for _l in _head):
+        raise RuntimeError(f"File does not look like PDB; first lines: {{_head}}")
+
+    # Ensure the loaded path ends in .pdb so file-type inference succeeds.
+    if not pdb_path.endswith(".pdb"):
+        _renamed = pdb_path + ".pdb"
+        import shutil as _shutil
+        _shutil.copyfile(pdb_path, _renamed)
+        pdb_path = _renamed
+        _debug["renamed_to"] = pdb_path
+        print(f"[Rosetta DEBUG] renamed load target to .pdb: {{pdb_path}}", flush=True)
+
+    try:
+        pose = pose_from_file(pdb_path)
+    except Exception as _load_exc:
+        # Explicit PDB reader fallback when type inference fails.
+        _debug["pose_from_file_error"] = str(_load_exc)
+        print(f"[Rosetta DEBUG] pose_from_file failed ({{_load_exc}}); "
+              "trying pose_from_pdb", flush=True)
+        from pyrosetta import pose_from_pdb
+        pose = pose_from_pdb(pdb_path)
+    print(f"[Rosetta] PDB loaded → {{pdb_path}}", flush=True)
     scorefxn = pyrosetta.create_score_function("ref2015")
 
     if os.path.isfile(relaxed):
@@ -1281,6 +1394,7 @@ try:
             print(f"[Rosetta] {{key}} failed: {{e}}", flush=True)
             traceback.print_exc()
 
+    results["debug"] = _debug   # TEMP DIAGNOSTIC
     with open({wsl_results_path!r}, "w") as f:
         json.dump(results, f)
     print(f"[Rosetta] Results written to {wsl_results_path!r}", flush=True)
@@ -1288,16 +1402,67 @@ try:
 
 except Exception as exc:
     import traceback
+    _tb = traceback.format_exc()
     print(f"[Rosetta] FATAL: {{exc}}", flush=True)
-    traceback.print_exc()
+    print(f"[Rosetta DEBUG] traceback:\\n{{_tb}}", flush=True)
+    _debug["traceback"] = _tb
     with open({wsl_results_path!r}, "w") as f:
-        json.dump({{"error": str(exc)}}, f)
+        json.dump({{"error": str(exc), "debug": _debug}}, f)
 """
 
         import tempfile, os
         debug_path = os.path.join(tempfile.gettempdir(), "structurebot_worker_debug.py")
         with open(debug_path, "w", encoding="utf-8") as _dbg:
             _dbg.write(script)
+
+        # Defensive whole-batch fallback: if the PyRosetta WSL2 run fails as a
+        # whole, score every mutation with the empirical BLOSUM62 estimate
+        # (marked ddg_source="empirical") instead of returning all-zero ddG.
+        def _empirical_result(reason: str) -> "ToolStepResult":
+            _prog(f"  [Rosetta] {reason} — falling back to empirical BLOSUM62 estimates.")
+            _scores: Dict[str, float] = {}
+            _source: Dict[str, str]   = {}
+            for _m in mutations:
+                _k = _mutation_key(_m)
+                _scores[_k] = _empirical_ddg_single(_m, pdb_path)
+                _source[_k] = "empirical"
+            _warns = [
+                f"PyRosetta WSL2 failed ({reason}). All ddG values are empirical "
+                "BLOSUM62 + B-factor estimates (Pearson r ~0.4). For screening only."
+            ]
+            _change = sum(_scores.values()) / len(_scores) if _scores else 0.0
+            _vc, _ve = self._build_viz_commands(mutations, _scores, model_id, chain)
+            _bk = min(_scores, key=_scores.get) if _scores else "?"
+            _summary = (
+                f"Stability (empirical fallback): {len(_scores)}/{len(mutations)} "
+                f"mutations estimated. Most stabilising: {_bk} "
+                f"({_scores.get(_bk, 0.0):+.2f} kcal/mol). Mean ΔΔG: {_change:+.2f} kcal/mol."
+            )
+            _prog(f"! ⚗️  {_summary}")
+            return ToolStepResult(
+                tool="rosetta", success=True,
+                data={
+                    "mutations":        mutations,
+                    "ddg_scores":       _scores,
+                    "ddg_source":       _source,
+                    "stability_change": round(_change, 3),
+                    "confidence":       "low",
+                    "backend":          "empirical_fallback",
+                    "warnings":         _warns,
+                    "method_note": (
+                        "PyRosetta WSL2 failed; empirical BLOSUM62 + B-factor "
+                        "estimates (Pearson r ~0.4). For screening only."
+                    ),
+                    "job_id":           None,
+                },
+                viz_commands     = _vc,
+                viz_explanations = _ve,
+                summary          = _summary,
+            )
+
+        # TEMP DIAGNOSTIC (remove after live verification): paths to the worker.
+        _prog(f"  [Rosetta DEBUG] Windows PDB: {pdb_path}")
+        _prog(f"  [Rosetta DEBUG] WSL2 PDB:    {wsl_pdb}")
         _prog("⚗️  [Rosetta] Running PyRosetta cartesian_ddg (may take 2–5 min per mutation)...")
         result = wsl.run_python_script(script, timeout=1800)
 
@@ -1307,13 +1472,8 @@ except Exception as exc:
                     _prog(f"  {line.strip()}")
 
         if not result["ok"]:
-            return ToolStepResult(
-                tool="rosetta", success=False,
-                error=(
-                    f"PyRosetta WSL2 script failed.\n"
-                    f"Stderr: {result['stderr'][:300]}\n"
-                    f"Stdout: {result['stdout']}"
-                ),
+            return _empirical_result(
+                f"WSL2 script failed: {str(result.get('stderr', ''))[:200]}"
             )
 
         # Copy results file back from WSL2
@@ -1323,35 +1483,35 @@ except Exception as exc:
         )
         ok = wsl.copy_from_wsl(wsl_results_path, win_results)
         if not ok or not Path(win_results).is_file():
-            return ToolStepResult(
-                tool="rosetta", success=False,
-                error="PyRosetta produced no output file.",
-            )
+            return _empirical_result("no output file produced by worker")
 
         try:
             with open(win_results, "r") as fh:
                 ddg_raw = _json.load(fh)
         except Exception as exc:
-            return ToolStepResult(
-                tool="rosetta", success=False,
-                error=f"Failed to parse Rosetta output: {exc}",
-            )
+            return _empirical_result(f"could not parse worker output ({exc})")
+
+        # TEMP DIAGNOSTIC (remove after live verification): surface worker debug.
+        _worker_debug = ddg_raw.pop("debug", None) if isinstance(ddg_raw, dict) else None
+        if _worker_debug is not None:
+            _prog(f"  [Rosetta DEBUG] worker debug: {_worker_debug}")
 
         if "error" in ddg_raw:
-            return ToolStepResult(
-                tool="rosetta", success=False,
-                error=f"PyRosetta error: {ddg_raw['error']}",
-            )
+            return _empirical_result(f"worker error: {str(ddg_raw['error'])[:200]}")
 
-        # Fill in any missing mutations with empirical estimates
+        # Fill in any missing mutations with empirical estimates; record the
+        # source of each value so real PyRosetta ddG is distinguishable.
         ddg_scores: Dict[str, float] = {}
+        ddg_source: Dict[str, str]   = {}
         warnings:   List[str]        = []
         for mut in mutations:
             key = _mutation_key(mut)
             if key in ddg_raw and ddg_raw[key] is not None:
                 ddg_scores[key] = float(ddg_raw[key])
+                ddg_source[key] = "pyrosetta"
             else:
                 ddg_scores[key] = _empirical_ddg_single(mut, pdb_path)
+                ddg_source[key] = "empirical"
                 warnings.append(
                     f"PyRosetta failed for {key}; using empirical BLOSUM62 estimate."
                 )
@@ -1378,6 +1538,7 @@ except Exception as exc:
             data    = {
                 "mutations":        mutations,
                 "ddg_scores":       ddg_scores,
+                "ddg_source":       ddg_source,
                 "stability_change": round(stability_change, 3),
                 "confidence":       "high",
                 "backend":          "pyrosetta_wsl2",

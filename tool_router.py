@@ -2233,7 +2233,7 @@ class ToolRouter:
             f"Mutation scan [{analysis_mode} mode]: {len(results)} candidate(s) found.{excluded_note} "
             f"Top: {top['from_aa']}{top['position']}{top['to_aa']} "
             f"(score={top['combined_score']:+.2f}, "
-            f"ddG={top['ddg']:+.2f} kcal/mol, "
+            f"ddG={top['ddg']:+.3f} kcal/mol [{top.get('ddg_source', '?')}], "
             f"solubility delta={top['solubility_delta']:+.2f})"
         )
 

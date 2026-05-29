@@ -319,12 +319,13 @@ class MutationScanner:
                 "Candidates ranked by CamSol + ESM only (ddG = 0.0)."
             )
             ddg_scores: Dict[str, float] = {}
+            ddg_source: Dict[str, str]   = {}
         else:
             self._progress(
                 f"Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations..."
             )
             _t0 = time.perf_counter()
-            ddg_scores = self._run_rosetta_batch(
+            ddg_scores, ddg_source = self._run_rosetta_batch(
                 pdb_path, raw_candidates, chain_id,
                 scan_deadline=_scan_deadline,
             )
@@ -339,6 +340,9 @@ class MutationScanner:
             key     = f"{from_aa}{pos}{to_aa}"
 
             ddg           = ddg_scores.get(key, 0.0)
+            # Provenance: "pyrosetta" / "empirical" / backend label, or "none"
+            # when ddG was not computed (timeout/failure → defaulted to 0.0).
+            ddg_src       = ddg_source.get(key, "none")
             camsol_delta  = cand["estimated_camsol_delta"]
             esm_cons      = esm_scores.get(pos, 0.5)
             esm_tol       = round(1.0 - esm_cons, 4)
@@ -358,6 +362,7 @@ class MutationScanner:
                 "from_aa":           from_aa,
                 "to_aa":             to_aa,
                 "ddg":               round(ddg, 3),
+                "ddg_source":        ddg_src,
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
                 "combined_score":    score,
@@ -653,12 +658,15 @@ class MutationScanner:
         candidates:    List[Dict[str, Any]],
         chain_id:      Optional[str],
         scan_deadline: Optional[float] = None,
-    ) -> Dict[str, float]:
+    ) -> Tuple[Dict[str, float], Dict[str, str]]:
         """
         Run Rosetta ddG for all candidate mutations in one batch call.
 
-        Returns {mutation_key: ddg_kcal_mol}.
-        If Rosetta is unavailable, returns empty dict so the pipeline can still
+        Returns (ddg_scores, ddg_source):
+          ddg_scores : {mutation_key: ddg_kcal_mol}
+          ddg_source : {mutation_key: provenance}  where provenance is
+                       "pyrosetta", "empirical", or the backend label.
+        If Rosetta is unavailable, returns ({}, {}) so the pipeline can still
         rank by CamSol + ESM alone (with a user-visible warning).
 
         scan_deadline : time.perf_counter() deadline for the overall scan.
@@ -669,7 +677,7 @@ class MutationScanner:
             self._progress(
                 "  PDB file not found — skipping Rosetta (ddG will be 0.0)."
             )
-            return {}
+            return {}, {}
 
         from rosetta_bridge import RosettaBridge
         bridge = RosettaBridge()
@@ -696,14 +704,21 @@ class MutationScanner:
         )
 
         if result.success:
-            return result.data.get("ddg_scores", {})
+            scores = result.data.get("ddg_scores", {})
+            source = dict(result.data.get("ddg_source", {}))
+            if not source:
+                # Bridge did not provide per-mutation provenance (e.g. the
+                # DynaMut2 path) — label every scored value with the backend.
+                be = result.data.get("backend", "rosetta")
+                source = {k: be for k in scores}
+            return scores, source
 
         # Rosetta failed — warn and continue with zeros
         self._progress(
             f"  Rosetta ddG unavailable: {(result.error or '')[:100]}\n"
             "    Candidates ranked by CamSol + ESM only (ddG = 0.0)."
         )
-        return {}
+        return {}, {}
 
     @staticmethod
     def _error_result(msg: str) -> List[Dict[str, Any]]:
@@ -735,11 +750,12 @@ class MutationScanner:
             to_aa   = c.get("to_aa", "?")
             score   = c.get("combined_score", 0.0)
             ddg     = c.get("ddg", 0.0)
+            src     = c.get("ddg_source", "?")
             sol     = c.get("solubility_delta", 0.0)
             tol     = c.get("esm_tolerance", 0.0)
             lines.append(
                 f"  #{rank}  {chain}{pos}: {from_aa} -> {to_aa}  "
-                f"score={score:+.2f}  ddG={ddg:+.2f} kcal/mol  "
+                f"score={score:+.2f}  ddG={ddg:+.3f} kcal/mol [{src}]  "
                 f"solubility+={sol:+.2f}  ESM_tol={tol:.2f}"
             )
 
