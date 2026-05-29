@@ -9,7 +9,7 @@ section and append a new entry." -->
 | Field | Value |
 |-------|-------|
 | Generated | 2026-05-29 |
-| Test count at generation | 496 collected / 484 passing (12 benchmark tests skip without WSL2+PyRosetta) |
+| Test count at generation | 511 collected / 499 passing (12 benchmark tests skip without WSL2+PyRosetta) |
 | Regenerate with | `claude "Read PROJECT_CONTEXT.md for regeneration instructions, then regenerate it in full by reading the entire codebase. Preserve the Changelog section and append a new entry."` |
 
 This file is the single source of truth for project state. It should be regenerated after every build session. All source of truth lives in the `.py` files, not here.
@@ -95,7 +95,7 @@ When `ROSETTA_BACKEND=local`, `RosettaBridge._run_rosetta_local()` builds a stan
 | `chimerax_bridge.py` | `ChimeraXBridge`, `find_chimerax()` | ✅ Complete | REST API on port 60001; blank-image post-save guard; `run_commands()` |
 | `wsl_bridge.py` | `WSLBridge`, `PYROSETTA_PYTHON` | ✅ Complete | `PYROSETTA_PYTHON="/home/andre/pyrosetta_env/bin/python"`; default distro `Ubuntu-24.04`; `check_pyrosetta()` uses `chr(79)+chr(75)` |
 | `rosetta_bridge.py` | `RosettaBridge`, `_select_backend()` | ⚠️ Known issues | 4 backends (dynamut2/empirical/pyrosetta-stub/local-WSL2); benchmark run 1 complete: sign accuracy 60%, RMSE 5.49, r=−0.059; see §8 for protocol audit and failure modes |
-| `double_mutant_bridge.py` | `DoubleMutantBridge`, `generate_pairs()`, `compute_ca_distance()`, `route_pairs()`, `score_pairs_dynamut2()`, `score_pairs_pyrosetta()`, `compute_composite_score()`, `generate_summary()` | ✅ Complete | Two-mode (stability/epitope) double mutant ΔΔG scoring; DynaMut2 `prediction_mm` for distant pairs (>10 Å), PyRosetta WSL2 for close pairs (<4 Å); real epistasis = ddG(double) − ddG(additive); 36 tests |
+| `double_mutant_bridge.py` | `DoubleMutantBridge`, `generate_pairs()`, `compute_ca_distance()`, `route_pairs()`, `score_pairs_dynamut2()`, `score_pairs_pyrosetta()`, `compute_composite_score()`, `generate_summary()`, `_apply_additive_fallback()` | ✅ Complete | Two-mode (stability/epitope) double mutant ΔΔG scoring; DynaMut2 `prediction_mm` for distant pairs (>10 Å), PyRosetta WSL2 for close pairs (<4 Å); real epistasis = ddG(double) − ddG(additive). Stability ddG filter excludes a pair only when **both** mutations are clearly destabilising (`ddg > DOUBLE_MUTANT_DESTABILISING_DDG`); `ddg=0.0` treated as neutral. Close pairs fall back to additive scoring when `run_pyrosetta=False` (no longer dropped). Shared `_apply_additive_fallback()` helper. 42 tests |
 | `esm_bridge.py` | `EsmBridge` | ✅ Complete | ESM-2 `esm2_t6_8M_UR50D` default; delegates GPU inference to `esm_worker.py` via venv312 subprocess; disk cache `cache/esm_{hash}.json` |
 | `esm_worker.py` | standalone subprocess script | ✅ Complete | No project imports; writes JSON result file; run by venv312 python |
 | `esmfold_bridge.py` | `ESMFoldBridge` | ✅ Complete | Primary: venv312 GPU via `esmfold_worker.py`; fallback: ESM Atlas API; `compare_to_wildtype()`, `check_disulfide_foldability()` |
@@ -189,9 +189,11 @@ When `ROSETTA_BACKEND=local`, `RosettaBridge._run_rosetta_local()` builds a stan
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `DOUBLE_MUTANT_DISTANCE_THRESHOLD_FAR` | `10.0` | Cα-Cα distance (Å) above which DynaMut2 is reliable for double mutants |
-| `DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE` | `4.0` | Cα-Cα distance (Å) below which PyRosetta is required |
+| `DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE` | `4.0` | Cα-Cα distance (Å) below which PyRosetta is required (close pairs) |
 | `DOUBLE_MUTANT_MAX_PAIRS` | `500` | Max pairs to consider before distance-based routing |
 | `DOUBLE_MUTANT_TOP_N` | `10` | Default number of top-ranked pairs to return |
+| `DOUBLE_MUTANT_DESTABILISING_DDG` | `2.0` | ΔΔG (kcal/mol) above which a mutation is "clearly destabilising". Stability mode drops a pair only when **both** mutations exceed this; `ddg=0.0` (DynaMut2 neutral/unknown) is never filtered |
+| `DOUBLE_MUTANT_ADDITIVE_FALLBACK` | `True` | When True, pairs with no epistasis-aware backend available (DynaMut2 mm API down, or close pair with PyRosetta disabled) are scored additively (ddG_A + ddG_B, epistasis=0) instead of dropped |
 
 ### NetNGlyc
 
@@ -255,11 +257,15 @@ All bridge `analyze()` methods return `ToolStepResult` — they **never raise**.
 ### Double mutant mode detection (in `_run_double_mutant`)
 Epitope keywords: `"epitope"`, `"binding"`, `"interface"`, `"preserve"`, `"target"` → `mode = "epitope"`. Otherwise → `mode = "stability"`. PyRosetta keywords: `"pyrosetta"`, `"rosetta"`, `"accurate"`, `"high accuracy"`, `"validate"` → `run_pyrosetta = True`.
 
+### Double mutant ddG / fallback semantics
+- **`ddg=0.0` is neutral/unknown, not destabilising.** The stability-mode pair filter excludes a pair only when **both** mutations have `ddg > DOUBLE_MUTANT_DESTABILISING_DDG` (default +2.0 kcal/mol). A single `ddg=0.0` mutation never eliminates a pair. (Earlier logic required at least one *beneficial* mutation, which collapsed the candidate set to ~2 pairs whenever DynaMut2 returned all-zero ΔΔG.)
+- **Additive fallback never drops a pair.** When no epistasis-aware backend is available — DynaMut2 mm API down, circuit breaker tripped, or a close pair with `run_pyrosetta=False` — `_apply_additive_fallback()` scores the pair as `ddG_A + ddG_B` with `epistasis=0.0` and `backend_used="additive_fallback"`, and appends a warning. Set `DOUBLE_MUTANT_ADDITIVE_FALLBACK=False` to drop such pairs instead.
+
 ---
 
 ## 6. Test Suite Summary
 
-**Total: 496 collected** | **484 passing** (12 benchmark tests skip unless WSL2+PyRosetta present)
+**Total: 511 collected** | **499 passing** (12 benchmark tests skip unless WSL2+PyRosetta present; on this machine they run, since PyRosetta is installed in WSL2)
 
 Run commands:
 ```bash
@@ -285,7 +291,7 @@ pytest tests/test_rosetta_benchmark.py -m benchmark -v -s -k "t4_l99a"
 |-----------|-------|----------------|
 | `test_glycan_bridge.py` | 56 | N-glycan sequon detection, SASA scoring, engineered sequon suggestion, NetNGlyc integration |
 | `test_tool_router.py` | 55 | Route dispatch, MPNN+ESMFold routing, FASTA export, active-site commands, double mutant routing (8 new tests), tool icon registry |
-| `test_double_mutant_bridge.py` | 36 | Pair generation (stability and epitope modes), distance routing, DynaMut2 `prediction_mm` result parsing, PyRosetta worker schema, composite scoring formulas, epistasis sign convention, max-pairs cap |
+| `test_double_mutant_bridge.py` | 42 | Pair generation (stability and epitope modes), distance routing, DynaMut2 `prediction_mm` result parsing, PyRosetta worker schema, composite scoring formulas, epistasis sign convention, max-pairs cap, ddG-filter neutrality (`ddg=0.0` not excluded), additive fallback (API failure, circuit-breaker survival, close-pair-without-PyRosetta) |
 | `test_proline_bridge.py` | 35 | φ-angle scoring, functional residue exclusion, DSSP fallback, BioPython parsing |
 | `test_disulfide.py` | 35 | Cβ geometry, dihedral scoring, ESM tolerance, DynaMut2 mock, combined score |
 | `test_mpnn_esmfold_pipeline.py` | 29 | MPNN+ESMFold combined pipeline, session routing, pLDDT comparison |
@@ -329,7 +335,7 @@ The following results have been confirmed working against **1HSG** (HIV-1 protea
 | ProteinMPNN redesign | Chain A sequences generated; 3 top designs validated with ESMFold |
 | Salt bridge analysis | Asp/Glu↔Arg/Lys/His contacts within 4 Å on chain A |
 | Cavity detection | Internal voids in chain A ranked by burial depth and size |
-| Double mutant bridge | 484/484 tests passing; bridge importable; `analyze()` returns correct schema with all required keys. Live end-to-end test pending (requires live ChimeraX session with prior mutation scan) |
+| Double mutant bridge | All double-mutant unit tests passing (42 in `test_double_mutant_bridge.py`); bridge importable; `analyze()` returns correct schema with all required keys. Stability filter now yields the full candidate set (~79 pairs on the all-zero-ΔΔG dataset that previously collapsed to 2); close pairs scored additively when PyRosetta disabled. Live end-to-end test pending (requires live ChimeraX session with prior mutation scan) |
 
 **PyRosetta Benchmark Run 1 (2026-05-29)** — 11 mutations from ProThermDB:
 
@@ -394,7 +400,7 @@ Prioritised by impact and readiness:
 | 4 | **PyRosetta protocol improvements** (benchmark failures documented) | Three targeted fixes in priority order: (a) Preserve crystallographic waters — one-line change to `cleanATOM` call, highest impact/effort ratio, fixes T26A and G88V; (b) `ROSETTA_NUM_TRAJECTORIES` config flag for multi-trajectory averaging; (c) Detect mutant > WT size → extra relax cycles for A98V-type cavity-filling mutations |
 | 5 | **Update benchmark test thresholds** | `test_rosetta_benchmark.py` currently asserts `r > 0.50` which fails with current protocol. Update to `r > 0.30`, `RMSE < 4.00`, `sign_accuracy ≥ 60%` |
 | 6 | **Mid-execution ESC / cancellation** | Long-running tools (PyRosetta ~15 min, ColabFold ~5 min) have no cancellation. Background thread pattern needed |
-| 7 | **Double mutant — PyRosetta multi-mutation close-pair validation** | Close pairs (<4 Å) currently skipped when `run_pyrosetta=False`. After PyRosetta protocol is improved (item 4), these become scientifically valuable |
+| 7 | **Double mutant — PyRosetta multi-mutation close-pair validation** | Close pairs (<4 Å) now get an *additive* estimate when `run_pyrosetta=False` (no longer dropped), but additive scoring cannot capture epistasis for strongly-interacting residues. After the PyRosetta protocol is improved (item 4), enabling real close-pair scoring becomes scientifically valuable |
 | 8 | **GlycosuitDB lookup** | Expression system glycan characterisation for engineered sequons — tells what glycan structure to expect in CHO, HEK293, E. coli etc. |
 
 ---
@@ -490,8 +496,8 @@ Note: `venv310` does not yet exist. It will be created when ColabFold or RFdiffu
 
 **For starting a new co-pilot conversation:**
 
-- **Test count**: 496 collected, 484 passing (12 benchmark tests skip without WSL2+PyRosetta). No warnings about unknown markers.
-- **Last built and validated**: `double_mutant_bridge.py` (DoubleMutantBridge, 36 tests, two-mode stability/epitope scoring, DynaMut2 `prediction_mm` API, PyRosetta WSL2 close-pair validation, epistasis detection, distance-based backend routing). Tool router integration wired (`tool_router.py`, `session_state.py`, 8 new routing tests, `pytest.ini` marker registrations) — **all 484 tests green**, live end-to-end validation pending.
+- **Test count**: 511 collected, 499 passing (12 benchmark tests skip without WSL2+PyRosetta). Non-benchmark suite runs in ~37s. No warnings about unknown markers.
+- **Last built and validated**: `double_mutant_bridge.py` (DoubleMutantBridge, 42 tests, two-mode stability/epitope scoring, DynaMut2 `prediction_mm` API, PyRosetta WSL2 close-pair validation, epistasis detection, distance-based backend routing). Most recent change (commit `fix(double_mutant): treat ddg=0.0 as neutral; additive fallback for close pairs`): stability ddG filter now treats `ddg=0.0` as neutral and excludes a pair only when **both** mutations exceed `DOUBLE_MUTANT_DESTABILISING_DDG` (+2.0) — this restored the full candidate set (~79 pairs) from a previous collapse to 2; close pairs now get additive fallback scoring when `run_pyrosetta=False` instead of being dropped. Tool router integration wired (`tool_router.py`, `session_state.py`, 8 routing tests, `pytest.ini` marker registrations) — **all 499 non-benchmark tests green**, live end-to-end validation pending.
 - **Immediate next item**: Live validation of double mutant pipeline: `python main.py` → open 1HSG → "suggest mutations to improve solubility of chain A" → "suggest double mutant combinations". Expected: Rich Panel with top pairs table, ChimeraX colored spheres + Cα-Cα distance lines. Then test: "suggest double mutant combinations to preserve the epitope" → should use epitope mode.
 - **After double mutant validated**: ColabFold bridge. **First step is creating venv310** — write a venv310 setup prompt before the ColabFold bridge prompt. venv310 will be shared with RFdiffusion (plan both together).
 - **PyRosetta benchmark**: Run 1 complete. Sign accuracy 60%, RMSE 5.49, r=−0.059. Crystallographic water fix is highest-priority code change (one-line, targets T26A and G88V failures). `test_rosetta_benchmark.py` thresholds need updating from `r > 0.50` to `r > 0.30` (follow-up task).
@@ -508,6 +514,7 @@ Note: `venv310` does not yet exist. It will be created when ColabFold or RFdiffu
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-05-29 | 511 | fix(double_mutant): stability-mode ddG filter rewritten — `ddg=0.0` (DynaMut2 neutral/unknown) is no longer treated as non-beneficial; a pair is excluded only when **both** mutations are clearly destabilising (`ddg > DOUBLE_MUTANT_DESTABILISING_DDG`, new config constant, default +2.0). Restores the full candidate set (~79 pairs) that previously collapsed to 2 when all single-point ΔΔG were zero. Close (`pyrosetta_required`, <4 Å) pairs now scored with additive fallback (`ddG_A + ddG_B`, epistasis=0) when `run_pyrosetta=False` instead of being dropped; new `DOUBLE_MUTANT_ADDITIVE_FALLBACK` flag documented; shared `_apply_additive_fallback()` helper extracted. Tests: +`test_ddg_zero_not_filtered_in_stability_mode`, +`test_pyrosetta_pairs_get_additive_fallback_when_disabled`, replaced obsolete close-pair-skip test (double-mutant file 36→42). PROJECT_CONTEXT.md updated |
 | 2026-05-29 | 496 | double_mutant_bridge.py built (36 tests): two-mode stability/epitope pair scoring, DynaMut2 multi-mutation API (prediction_mm), PyRosetta WSL2 close-pair validation, epistasis detection, distance-based backend routing; 4 new config constants. Tool router integration: _DOUBLE_MUTANT_KEYWORDS intent detection, _run_double_mutant() with full 5-step pipeline, _build_double_mutant_viz(), session_state.double_mutant_results field, 8 new routing tests, pytest.ini marker registrations. PyRosetta benchmark run 1 complete: sign accuracy 60%, RMSE 5.49, r=-0.059 (A98V outlier); rosetta_validation_notes.md updated with failure mode analysis, revised thresholds (r>0.30, RMSE<4.0), improvement roadmap. ColabFold+RFdiffusion added to build queue. PROJECT_CONTEXT.md regenerated |
 | 2026-05-29 | 452 | PyRosetta WSL2 backend fully implemented: symmetric FastRelax ddG protocol, cleanATOM PDB prep, modern pdb2pose API, ref2015 score function, wsl_bridge PYROSETTA_PYTHON constant + Ubuntu-24.04 default; benchmark test suite (11 ProThermDB mutations) + rosetta_validation_notes.md created; PROJECT_CONTEXT.md generated |
 | 2026-05-28 | 440 | feat(netnglyc): NetNGlyc 1.0 OST recognition integration |
