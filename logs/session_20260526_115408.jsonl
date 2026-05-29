@@ -1,0 +1,2 @@
+{"timestamp": "2026-05-26T11:54:31", "user_input": "open 1hsg", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
+{"timestamp": "2026-05-26T11:56:34", "user_input": "suggest mutations to improve the solubility of chain A", "commands": [], "success": true, "error": null}

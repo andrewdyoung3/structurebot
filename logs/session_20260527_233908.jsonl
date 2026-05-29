@@ -1,0 +1,2 @@
+{"timestamp": "2026-05-27T23:39:32", "user_input": "open 1HSG", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
+{"timestamp": "2026-05-27T23:40:07", "user_input": "check foldability of mutation I64E in chain A", "commands": [], "success": true, "error": null, "tool_steps": [{"tool": "esmfold", "elapsed_ms": 16598.7, "success": false}]}

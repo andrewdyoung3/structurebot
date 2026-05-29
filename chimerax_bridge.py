@@ -207,10 +207,47 @@ class ChimeraXBridge:
         """
         Execute a single ChimeraX command via the REST API.
 
+        Resilient to a dropped REST connection (e.g. after a long-running
+        operation): if the server is unreachable, attempt a single reconnect
+        via ensure_connected() and retry the command once.  If reconnection
+        succeeds the retry proceeds silently; if it fails, a ConnectionError is
+        raised telling the user to check that ChimeraX is still open.
+
         Returns a dict with at least one of:
             {"value": "...", "error": None}   — success
-            {"value": None,  "error": "..."}  — ChimeraX reported an error
-            {"value": None,  "error": "..."}  — network/HTTP error
+            {"value": None,  "error": "..."}  — ChimeraX reported an error / timeout
+        """
+        try:
+            return self._run_command_once(command, timeout)
+        except ConnectionError as exc:
+            # REST server unreachable (dropped connection). Try to reconnect once.
+            if self._try_reconnect():
+                return self._run_command_once(command, timeout)
+            raise ConnectionError(
+                f"ChimeraX REST server is not reachable and automatic "
+                f"reconnection failed while running {command!r}.\n"
+                "Check that ChimeraX is still open — the REST server stops when "
+                "ChimeraX is closed.\n"
+                f"(original error: {exc})"
+            ) from exc
+
+    def _try_reconnect(self) -> bool:
+        """
+        Attempt a single reconnect to the ChimeraX REST server after a dropped
+        connection.  Returns True if the server is reachable afterward.  Never
+        raises (failures are reported via the return value).
+        """
+        try:
+            return self.ensure_connected(auto_start=True)
+        except Exception:
+            return False
+
+    def _run_command_once(self, command: str, timeout: int = REQUEST_TIMEOUT) -> dict:
+        """
+        Execute a single ChimeraX command via the REST API (one attempt, no
+        reconnect).  Raises ConnectionError if the REST server is unreachable
+        (either at the pre-check or mid-request); run_command() handles the
+        reconnect/retry around this method.
         """
         if not self.is_running():
             raise ConnectionError(
@@ -231,7 +268,10 @@ class ChimeraXBridge:
         except requests.exceptions.Timeout:
             return {"value": None, "error": f"Request timed out after {timeout}s: {command!r}"}
         except requests.exceptions.ConnectionError as exc:
-            return {"value": None, "error": f"Connection lost during command: {exc}"}
+            # Raise so run_command() can attempt one reconnect + retry.
+            raise ConnectionError(
+                f"Connection lost during command {command!r}: {exc}"
+            ) from exc
 
         # ChimeraX 1.x returns plain text (not JSON) for all responses.
         # Errors are returned as 200 OK with an error-prefixed string, e.g.:

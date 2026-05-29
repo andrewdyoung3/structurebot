@@ -1,0 +1,3 @@
+{"timestamp": "2026-05-29T08:33:12", "user_input": "open 1hsg", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
+{"timestamp": "2026-05-29T08:33:36", "user_input": "suggest mutation to improve solubility of chain A avoiding chain interfaces", "commands": [], "success": true, "error": null, "tool_steps": [{"tool": "cavity", "elapsed_ms": 1203.4, "success": true}]}
+{"timestamp": "2026-05-29T08:34:07", "user_input": "suggest double mutant combinations", "commands": [], "success": true, "error": null, "tool_steps": [{"tool": "double_mutant", "elapsed_ms": 0.4, "success": false}]}

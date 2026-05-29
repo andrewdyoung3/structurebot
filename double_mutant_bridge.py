@@ -237,32 +237,19 @@ class DoubleMutantBridge:
 
         # ── Step 2: distance routing ───────────────────────────────────────────
         progress_cb("  Computing CA-CA distances and routing pairs...")
-        print(f"[DoubleMutant] Pairs before route_pairs: {len(raw_pairs)}", flush=True)
-        for _p in raw_pairs:
-            _ma, _mb = _p
-            print(
-                f"[DoubleMutant]   pair: {_pair_key(_ma, _mb)} "
-                f"mut_a={_ma} mut_b={_mb}",
-                flush=True,
-            )
         pair_dicts = self.route_pairs(raw_pairs, pdb_path)
-        print(f"[DoubleMutant] Pairs after route_pairs: {len(pair_dicts)}", flush=True)
-        for _pd in pair_dicts:
-            print(
-                f"[DoubleMutant]   routed: {_pd.get('pair_key')} "
-                f"backend={_pd.get('backend')} distance={_pd.get('ca_distance')}",
-                flush=True,
-            )
 
         # Split by backend
         dynamut2_pairs = [p for p in pair_dicts
                           if p["backend"] in ("dynamut2", "dynamut2_warned")]
         pyrosetta_pairs = [p for p in pair_dicts
                            if p["backend"] == "pyrosetta_required"]
-        print(
-            f"[DoubleMutant] dynamut2_pairs={len(dynamut2_pairs)} "
-            f"pyrosetta_pairs={len(pyrosetta_pairs)}",
-            flush=True,
+
+        _n_far    = sum(1 for p in pair_dicts if p["backend"] == "dynamut2")
+        _n_warned = sum(1 for p in pair_dicts if p["backend"] == "dynamut2_warned")
+        progress_cb(
+            f"  Routed {len(pair_dicts)} pairs: {_n_far} dynamut2, "
+            f"{_n_warned} dynamut2_warned, {len(pyrosetta_pairs)} pyrosetta_required"
         )
 
         # Close pairs with PyRosetta disabled → score with additive fallback
@@ -572,7 +559,6 @@ class DoubleMutantBridge:
         pairs:    List[Tuple[Dict[str, Any], Dict[str, Any]]],
         pdb_path: str,
     ) -> List[Dict[str, Any]]:
-        print(f"[DoubleMutant] route_pairs called with {len(pairs)} pairs", flush=True)
         """
         Convert (m_a, m_b) tuples to fully annotated pair dicts with backend routing.
 
@@ -609,13 +595,6 @@ class DoubleMutantBridge:
             else:
                 backend = "pyrosetta_required"
                 zone    = "close"
-
-            pk = _pair_key(m_a, m_b)
-            dist_str = f"{dist:.1f}" if dist is not None else "None"
-            print(
-                f"[DoubleMutant] {pk}: distance={dist_str}Å zone={zone} backend={backend}",
-                flush=True,
-            )
 
             result.append({
                 "mutation_a":     dict(m_a),

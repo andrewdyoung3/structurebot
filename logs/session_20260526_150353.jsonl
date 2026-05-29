@@ -1,0 +1,2 @@
+{"timestamp": "2026-05-26T15:04:14", "user_input": "open 1HSG", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
+{"timestamp": "2026-05-26T15:04:48", "user_input": "show me the interface between chains A and B", "commands": [], "success": true, "error": null}
