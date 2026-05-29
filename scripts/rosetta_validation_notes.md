@@ -387,3 +387,51 @@ single-trajectory, water-stripping form.
   accuracy improvement available.
 
 - **Re-run benchmark** after each improvement to track progress against the revised thresholds.
+
+---
+
+## Convergence-vs-Bias Diagnostic — Results (2026-05-29)
+
+Standalone diagnostic (`scripts/test_pyrosetta_convergence_diag.py`) to determine whether
+the large-cavity ddG over-prediction is fixable by better relax convergence or is baked into
+the single-structure FastRelax protocol. Three T4 lysozyme (2LZM) mutations spanning the bias
+question, each scored at three convergence levels, taking the **median of 5 trajectories** at
+each level (so per-trajectory noise — established at ~8 kcal/mol by the aggregation diagnostic —
+is controlled and we watch how the *median* moves). Cycle counts swept via the new
+`relax_cycles` parameter of `_run_rosetta_local` (per-mutation mutant relax + symmetric WT
+re-relax; default 3 = production, unchanged).
+
+### Median ΔΔG vs relax cycles
+
+| Mutation | exp | A: 3+3 | B: 5+5 | C: 8+8 | A→C movement |
+|----------|----:|-------:|-------:|-------:|--------------|
+| L99A (large cavity) | +5.0 | +9.24 | +9.31 | +7.30 | −1.94 toward exp |
+| V87M (cavity-fill)  | +1.5 | +7.24 | +6.35 | +5.37 | −1.87 toward exp |
+| N116D (surface)     | +0.1 | −1.70 | −0.63 | +0.64 | converges to ~0 |
+
+Mean trajectory spread (max−min within a mutation, averaged): **7.61 → 7.08 → 5.13 kcal/mol**
+as cycles increase A→C.
+
+### Verdict: PARTIALLY convergence-fixable
+
+More FastRelax cycles move **every** median toward experiment **and** shrink the trajectory
+spread — both effects point the right way. But at 8+8 cycles only **~half the gap closes**:
+L99A is still +7.30 vs exp +5.0, and V87M is still +5.37 vs exp +1.5. **V87M** (a cavity-FILLING
+Met that over-packs) carries a **residual bias that more cycles do not clear** — the trend is
+favourable but does not converge to the experimental value within this sweep.
+
+### Conclusion
+
+The multi-trajectory fix is **two-pronged**: **median aggregation + increased relax cycles**
+for a dedicated **validation tier**. Even then, **absolute magnitudes remain approximate** —
+ranking/sign is reliable (T4 cross-check r = +0.487, sign 100%), but calibrated absolute ddG
+is **not proven**. A **full 2LZM-panel re-run at the chosen N + cycle count is required to
+confirm RMSE** before claiming calibration. Direction (which mutations are more destabilising)
+is trustworthy; the kcal/mol number is not yet.
+
+### Cost note
+
+8+8-cycle trajectories took ~3–5 min each, and one trajectory **stalled ~25 min** before the
+WSL2 worker's 1800 s timeout would have fired (it recovered on its own). N-trajectory median at
+8 cycles is therefore a **validation-tier protocol only — not for interactive scans**; the live
+scan path must stay at the fast single-trajectory (or low-N) setting.
