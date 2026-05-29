@@ -1,43 +1,8 @@
-# Python
+﻿cache/
+*.pdb
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-
-# Virtual environment
+.env.local
+session.json
 venv/
 venv312/
-.venv/
-env/
-
-# External tool repos (cloned alongside the project, not submodules)
-ProteinMPNN/
-RFdiffusion/
-LigandMPNN/
-
-# StructureBot runtime files
-session.json
-sessions/
-*.png
-*.jpg
-
-# Session logs (contain API traffic and user commands)
-logs/
-
-# Secrets — never commit
-.env.local
-*.env
-
-# Claude Code local settings
-.claude/
-
-# Debug / scratch scripts
-_debug_*.py
-_test_*.py
-_probe_*.py
-
-# Editor
-.vscode/
-.idea/
-*.swp
