@@ -1,2 +1,0 @@
-{"timestamp": "2026-05-28T22:41:57", "user_input": "load 1hsg", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
-{"timestamp": "2026-05-28T22:42:14", "user_input": "calculate stability V82A", "commands": [], "success": true, "error": null, "tool_steps": [{"tool": "rosetta", "elapsed_ms": 46.3, "success": false}]}

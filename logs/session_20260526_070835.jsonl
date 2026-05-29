@@ -1,2 +1,0 @@
-{"timestamp": "2026-05-26T07:09:13", "user_input": "open 1hsg", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
-{"timestamp": "2026-05-26T07:10:17", "user_input": "which residues in chain A are evolutionarily conserved?", "commands": [], "success": true, "error": null}

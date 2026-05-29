@@ -1,3 +1,0 @@
-{"timestamp": "2026-05-28T22:53:00", "user_input": "oprn 1hsg", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
-{"timestamp": "2026-05-28T22:53:18", "user_input": "calculate stability V82A", "commands": ["cartoon #1", "color #1/A white", "color #1/A:82 yellow", "show #1/A:82 atoms", "view #1"], "success": true, "error": null, "tool_steps": [{"tool": "rosetta", "elapsed_ms": 3718.7, "success": true}]}
-{"timestamp": "2026-05-28T22:55:33", "user_input": "calculate stability of V82A", "commands": ["cartoon #1", "color #1/A white", "color #1/A:82 yellow", "show #1/A:82 atoms", "view #1"], "success": true, "error": null, "tool_steps": [{"tool": "rosetta", "elapsed_ms": 3638.8, "success": true}]}

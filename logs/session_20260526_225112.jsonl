@@ -1,3 +1,0 @@
-{"timestamp": "2026-05-26T22:51:36", "user_input": "open 1HSG", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
-{"timestamp": "2026-05-26T22:56:39", "user_input": "suggest disulfide bonds to stabilise the dimer interface", "commands": [], "success": true, "error": null}
-{"timestamp": "2026-05-26T22:59:34", "user_input": "redesign chain A keeping the active site fixed", "commands": [], "success": true, "error": null}

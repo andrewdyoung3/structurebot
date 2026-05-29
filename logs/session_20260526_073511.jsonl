@@ -1,2 +1,0 @@
-{"timestamp": "2026-05-26T07:35:33", "user_input": "open 1hsg", "commands": ["open 1HSG", "cartoon #1", "color bychain", "view"], "success": true, "error": null}
-{"timestamp": "2026-05-26T07:35:49", "user_input": "show evolutionary conservation of chain A", "commands": [], "success": true, "error": null}
