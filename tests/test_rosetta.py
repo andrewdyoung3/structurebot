@@ -552,6 +552,164 @@ def test_dynamut2_single_error_not_zero() -> None:
     assert raised and extracted != 0.0
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+# B3. Multi-trajectory ddG: median aggregation, spread, confidence, tiering
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _mock_wsl_with_results(fake_results: dict):
+    """A MagicMock WSLBridge whose worker 'returns' fake_results as the JSON file."""
+    import json as _json
+    wsl = MagicMock()
+    wsl.is_available.return_value = True
+    wsl.check_pyrosetta.return_value = True
+    wsl.copy_to_wsl.return_value = "/tmp/x.pdb"
+    wsl.translate_path.return_value = "/mnt/c/x"
+    wsl.run_python_script.return_value = {"ok": True, "stdout": "", "stderr": ""}
+
+    def _copy_from_wsl(wsl_path, win_dest):
+        with open(win_dest, "w", encoding="utf-8") as fh:
+            _json.dump(fake_results, fh)
+        return True
+
+    wsl.copy_from_wsl.side_effect = _copy_from_wsl
+    return wsl
+
+
+def test_num_trajectories_default_one() -> None:
+    """Production default is a single trajectory (config + rendered worker)."""
+    print("\n--- B3. Multi-trajectory ddG ---")
+    import config as _cfg
+    import tempfile, os as _os
+    from rosetta_bridge import RosettaBridge
+
+    _assert(_cfg.ROSETTA_NUM_TRAJECTORIES == 1,
+            "ROSETTA_NUM_TRAJECTORIES default is 1", str(_cfg.ROSETTA_NUM_TRAJECTORIES))
+    assert _cfg.ROSETTA_NUM_TRAJECTORIES == 1
+
+    # Rendered worker (no num_trajectories passed) must use _n_traj = 1.
+    pdb_path = _write_temp_pdb()
+    try:
+        os.environ["ROSETTA_BACKEND"] = "local"
+        wsl = MagicMock()
+        wsl.is_available.return_value = True
+        wsl.check_pyrosetta.return_value = True
+        wsl.copy_to_wsl.return_value = "/tmp/x.pdb"
+        wsl.translate_path.return_value = "/mnt/c/x"
+        wsl.run_python_script.return_value = {"ok": False, "stdout": "", "stderr": "forced"}
+        with patch("wsl_bridge.WSLBridge", return_value=wsl):
+            RosettaBridge()._run_rosetta_local(
+                pdb_path, [{"chain": "A", "position": 1, "from_aa": "A", "to_aa": "K"}],
+            )
+        dump = _os.path.join(tempfile.gettempdir(), "structurebot_worker_debug.py")
+        worker_src = open(dump, encoding="utf-8").read()
+        _assert("_n_traj = 1" in worker_src, "default worker renders _n_traj = 1")
+        assert "_n_traj = 1" in worker_src
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_single_trajectory_unchanged() -> None:
+    """N=1 → single value reported, spread 0.0, confidence 'single-trajectory'."""
+    from rosetta_bridge import RosettaBridge
+
+    pdb_path = _write_temp_pdb()
+    try:
+        os.environ["ROSETTA_BACKEND"] = "local"
+        fake = {"A1K": {"ddg": -0.003, "spread": 0.0, "n": 1, "trajectories": [-0.003]}}
+        wsl = _mock_wsl_with_results(fake)
+        with patch("wsl_bridge.WSLBridge", return_value=wsl):
+            res = RosettaBridge()._run_rosetta_local(
+                pdb_path, [{"chain": "A", "position": 1, "from_aa": "A", "to_aa": "K"}],
+                num_trajectories=1,
+            )
+        d = res.data
+        _assert(d["ddg_scores"]["A1K"] == -0.003, "single value reported as-is",
+                str(d["ddg_scores"]))
+        _assert(d["ddg_source"]["A1K"] == "pyrosetta", "source=pyrosetta")
+        _assert(d["ddg_confidence"]["A1K"] == "single-trajectory",
+                "N=1 confidence is single-trajectory", str(d["ddg_confidence"]))
+        assert d["ddg_scores"]["A1K"] == -0.003
+        assert d["ddg_confidence"]["A1K"] == "single-trajectory"
+    finally:
+        os.environ.pop("ROSETTA_BACKEND", None)
+        Path(pdb_path).unlink(missing_ok=True)
+
+
+def test_median_aggregation() -> None:
+    """median([1.0,2.0,9.0,2.5,1.5]) = 2.0 reported (NOT mean 3.2)."""
+    from rosetta_bridge import _aggregate_ddg_trajectories
+    med, _mad = _aggregate_ddg_trajectories([1.0, 2.0, 9.0, 2.5, 1.5])
+    _assert(med == 2.0, "median is 2.0 (not mean 3.2)", f"got {med}")
+    assert med == 2.0
+    assert med != 3.2
+
+
+def test_min_not_used() -> None:
+    """Aggregator is the median, not the min (two-sided noise → min invents stabilisers)."""
+    from rosetta_bridge import _aggregate_ddg_trajectories
+    med, _ = _aggregate_ddg_trajectories([-8.0, 1.0, 2.0, 1.5, 0.5])
+    _assert(med == 1.0, "median is 1.0", f"got {med}")
+    _assert(med != -8.0, "result is NOT the min (-8.0)")
+    assert med == 1.0 and med != min([-8.0, 1.0, 2.0, 1.5, 0.5])
+
+
+def test_spread_reported() -> None:
+    """MAD spread is correct for N>1 and 0.0 for a single trajectory."""
+    from rosetta_bridge import _aggregate_ddg_trajectories
+    med, mad = _aggregate_ddg_trajectories([1.0, 2.0, 9.0, 2.5, 1.5])
+    # median 2.0; deviations [1.0,0.0,7.0,0.5,0.5] → MAD = median = 0.5
+    _assert(mad == 0.5, "MAD spread = 0.5", f"got {mad}")
+    assert mad == 0.5
+    _, mad1 = _aggregate_ddg_trajectories([3.3])
+    _assert(mad1 == 0.0, "single-trajectory spread = 0.0", f"got {mad1}")
+    assert mad1 == 0.0
+
+
+def test_confidence_label_from_spread() -> None:
+    """Tight spread→high, wide→low, N=1→single-trajectory (never high)."""
+    from rosetta_bridge import _ddg_confidence_label
+    _assert(_ddg_confidence_label(0.5, 5) == "high", "tight spread -> high")
+    _assert(_ddg_confidence_label(2.0, 5) == "moderate", "mid spread -> moderate")
+    _assert(_ddg_confidence_label(4.0, 5) == "low", "wide spread -> low")
+    _assert(_ddg_confidence_label(None, 1) == "single-trajectory",
+            "N=1 -> single-trajectory (not high)")
+    assert _ddg_confidence_label(0.5, 5) == "high"
+    assert _ddg_confidence_label(4.0, 5) == "low"
+    assert _ddg_confidence_label(None, 1) != "high"
+
+
+def test_validation_tier_uses_validation_config() -> None:
+    """validate_ddg() runs _run_rosetta_local with the *validation* N and cycles."""
+    import config as _cfg
+    from rosetta_bridge import RosettaBridge
+    from tool_router import ToolStepResult
+
+    captured = {}
+
+    def _fake_local(self, pdb_path, mutations, model_id="1", chain=None,
+                    progress_callback=None, relax_cycles=3, num_trajectories=None):
+        captured["relax_cycles"] = relax_cycles
+        captured["num_trajectories"] = num_trajectories
+        return ToolStepResult(tool="rosetta", success=True,
+                              data={"ddg_scores": {}, "ddg_source": {},
+                                    "ddg_spread": {}, "ddg_confidence": {},
+                                    "warnings": []})
+
+    with patch.object(RosettaBridge, "_run_rosetta_local", _fake_local):
+        RosettaBridge().validate_ddg(
+            "fake.pdb", [{"chain": "A", "position": 72, "from_aa": "I", "to_aa": "R"}],
+        )
+
+    _assert(captured["num_trajectories"] == _cfg.ROSETTA_VALIDATION_TRAJECTORIES,
+            "validation tier uses ROSETTA_VALIDATION_TRAJECTORIES",
+            str(captured))
+    _assert(captured["relax_cycles"] == _cfg.ROSETTA_VALIDATION_CYCLES,
+            "validation tier uses ROSETTA_VALIDATION_CYCLES", str(captured))
+    assert captured["num_trajectories"] == _cfg.ROSETTA_VALIDATION_TRAJECTORIES
+    assert captured["relax_cycles"] == _cfg.ROSETTA_VALIDATION_CYCLES
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # C. MutationScanner -- candidate selection
 # ════════════════════════════════════════════════════════════════════════════════

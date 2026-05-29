@@ -106,6 +106,40 @@ def test_proline_phrase_routes_to_proline_bridge():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# High-accuracy ddG validation tier routing
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_validation_tier_intent_routing():
+    """
+    'validate ddg for I72R' must route to the validate_ddg tool — NOT the
+    fast single-trajectory mutation_scan and NOT double_mutant.
+    """
+    router = _make_router()
+    translator_r = _mutation_scan_translator_result()   # LLM guessed mutation_scan
+    routed = router.route(translator_r, user_input="validate ddg for I72R")
+
+    assert routed["tools_needed"] == ["validate_ddg"], (
+        f"Expected ['validate_ddg'], got {routed['tools_needed']}"
+    )
+    assert "mutation_scan" not in routed["tools_needed"]
+    assert "double_mutant" not in routed["tools_needed"]
+    vinp = routed["tool_inputs"].get("validate_ddg", {})
+    assert vinp.get("model_id") == "1"
+    assert vinp.get("_user_input") == "validate ddg for I72R"
+
+
+def test_generic_scan_not_routed_to_validation():
+    """A plain solubility-scan request must NOT trigger the validation tier."""
+    router = _make_router()
+    translator_r = _mutation_scan_translator_result()
+    routed = router.route(
+        translator_r, user_input="suggest mutations to improve solubility of chain A"
+    )
+    assert "validate_ddg" not in routed["tools_needed"]
+    assert "mutation_scan" in routed["tools_needed"]
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # 2. _dispatch_tool() guard redirects mutation_scan → proline
 # ════════════════════════════════════════════════════════════════════════════════
 

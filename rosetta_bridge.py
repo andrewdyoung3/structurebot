@@ -312,6 +312,54 @@ def _empirical_ddg_single(mut: Dict[str, Any], pdb_path: str) -> float:
     return round(raw_ddg * buried_f, 3)
 
 
+def _aggregate_ddg_trajectories(trajectories):
+    """
+    Aggregate per-trajectory ΔΔG values → (median, MAD spread).
+
+    Canonical aggregation rule for the multi-trajectory ddG (the WSL2 worker
+    mirrors this exact formula): the reported ddG is the **median** — NOT the
+    mean (outlier-sensitive) and NOT the min (two-sided trajectory noise makes
+    min invent fake stabilisers; see scripts/rosetta_validation_notes.md). The
+    spread is the median absolute deviation (MAD), robust and consistent with
+    the median. Returns (None, None) if there are no usable values; MAD is 0.0
+    for a single trajectory.
+    """
+    import statistics as _stats
+    vals = [float(x) for x in (trajectories or []) if x is not None]
+    if not vals:
+        return None, None
+    med = _stats.median(vals)
+    mad = _stats.median([abs(x - med) for x in vals]) if len(vals) > 1 else 0.0
+    return round(med, 3), round(mad, 3)
+
+
+def _ddg_confidence_label(spread: Optional[float], n_trajectories: Optional[int]) -> str:
+    """
+    Confidence label for a (multi-trajectory) PyRosetta ddG, from the
+    median-absolute-deviation spread across trajectories.
+
+      "single-trajectory"  n <= 1 (spread undefined — NOT labelled high)
+      "high"               spread <= 1.5 kcal/mol
+      "moderate"           spread <= ROSETTA_SPREAD_LOW_CONFIDENCE (default 3.0)
+      "low"                spread >  ROSETTA_SPREAD_LOW_CONFIDENCE
+
+    Note: even "high" confidence means trajectory agreement, NOT calibrated
+    accuracy — large-cavity magnitudes are systematically over-predicted.
+    """
+    if not n_trajectories or n_trajectories <= 1 or spread is None:
+        return "single-trajectory"
+    try:
+        import config as _cfg
+        low = float(getattr(_cfg, "ROSETTA_SPREAD_LOW_CONFIDENCE", 3.0))
+    except Exception:
+        low = 3.0
+    if spread <= 1.5:
+        return "high"
+    if spread <= low:
+        return "moderate"
+    return "low"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Public bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1136,15 +1184,20 @@ class RosettaBridge:
         chain:     Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         relax_cycles: int = 3,
+        num_trajectories: Optional[int] = None,
     ) -> "ToolStepResult":
         """
         PyRosetta cartesian_ddg protocol via WSL2.
 
         relax_cycles : FastRelax cycles for the per-mutation mutant relax AND
             the symmetric WT re-relax (default 3 = production behaviour; do not
-            change for the production scan path). Exposed only so convergence
-            diagnostics can sweep the cycle count; the cached WT baseline relax
-            is unaffected.
+            change for the production scan path). Exposed only so the validation
+            tier / convergence diagnostics can sweep the cycle count; the cached
+            WT baseline relax is unaffected.
+        num_trajectories : independent relax+score trajectories per mutation;
+            reported ddG is the MEDIAN, with a spread (MAD) for confidence.
+            None → config.ROSETTA_NUM_TRAJECTORIES (default 1 = production,
+            single trajectory, byte-for-byte unchanged behaviour).
 
         Requires
         --------
@@ -1172,9 +1225,14 @@ class RosettaBridge:
             else:
                 _safe_print(msg)
 
-        # Per-mutation relax cycles (3 = production default). int-coerced so the
-        # value interpolated into the worker script is always a safe integer.
+        # Per-mutation relax cycles (3 = production default) and trajectory count
+        # (config default 1 = production). int-coerced so the values interpolated
+        # into the worker script are always safe integers.
+        import config as _cfg_traj
         relax_cycles = max(1, int(relax_cycles))
+        if num_trajectories is None:
+            num_trajectories = getattr(_cfg_traj, "ROSETTA_NUM_TRAJECTORIES", 1)
+        num_trajectories = max(1, int(num_trajectories))
 
         try:
             from wsl_bridge import WSLBridge
@@ -1319,7 +1377,12 @@ try:
         wt_pose.dump_pdb(relaxed)
         print(f"[Rosetta] Relax complete → {{relaxed}}", flush=True)
 
-    print(f"[Rosetta] Starting mutation scoring, {{len(mutations)}} mutations", flush=True)
+    import statistics as _stats
+    import random as _pyrng
+    _n_traj = {num_trajectories}
+    _base_seed = _pyrng.SystemRandom().randint(1, 2000000000)
+    print(f"[Rosetta] Starting mutation scoring, {{len(mutations)}} mutation(s) "
+          f"({{_n_traj}} trajectory/ies x {relax_cycles} relax cycles)", flush=True)
     scorefxn_std = pyrosetta.create_score_function("ref2015")
     results = {{}}
     for mut in mutations:
@@ -1336,21 +1399,37 @@ try:
                         'M':'MET','N':'ASN','P':'PRO','Q':'GLN','R':'ARG',
                         'S':'SER','T':'THR','V':'VAL','W':'TRP','Y':'TYR'}}
             to_aa3 = _aa1to3.get(to_aa, to_aa)
-            mut_pose = wt_pose.clone()
-            res_num = mut_pose.pdb_info().pdb2pose(chain_id, pos)
+            res_num = wt_pose.pdb_info().pdb2pose(chain_id, pos)
             if res_num == 0:
                 raise ValueError(f"Residue {{pos}}{{chain_id}} not found in pose")
-            mut_mover = MutateResidue(target=res_num, new_res=to_aa3)
-            mut_mover.apply(mut_pose)
-            relax_mut = FastRelax(scorefxn_std, {relax_cycles})
-            relax_mut.apply(mut_pose)
-            wt_pose_rerelaxed = wt_pose.clone()
-            relax_wt = FastRelax(scorefxn_std, {relax_cycles})
-            relax_wt.apply(wt_pose_rerelaxed)
-            wt_score = scorefxn_std(wt_pose_rerelaxed)
-            ddg = scorefxn_std(mut_pose) - wt_score
-            results[key] = round(float(ddg), 3)
-            print(f"[Rosetta] {{key}}: ddG = {{ddg:+.2f}} kcal/mol", flush=True)
+            _traj = []
+            for _t in range(_n_traj):
+                # Independent random seed per trajectory (only when N>1, so the
+                # N=1 production path is identical to the previous single run).
+                if _n_traj > 1:
+                    try:
+                        from pyrosetta.rosetta.numeric.random import rg as _rg
+                        _rg().set_seed(int((_base_seed + _t * 104729) % 2147483647))
+                    except Exception:
+                        pass  # seeding best-effort; the global RNG still advances
+                mut_pose = wt_pose.clone()
+                MutateResidue(target=res_num, new_res=to_aa3).apply(mut_pose)
+                FastRelax(scorefxn_std, {relax_cycles}).apply(mut_pose)
+                wt_re = wt_pose.clone()
+                FastRelax(scorefxn_std, {relax_cycles}).apply(wt_re)
+                _ddg_t = scorefxn_std(mut_pose) - scorefxn_std(wt_re)
+                _traj.append(round(float(_ddg_t), 3))
+                print(f"[Rosetta] {{key}} traj {{_t+1}}/{{_n_traj}}: "
+                      f"ddG = {{_ddg_t:+.2f}} kcal/mol", flush=True)
+            _median = _stats.median(_traj)
+            # Median absolute deviation — robust spread, consistent with median.
+            _mad = _stats.median([abs(x - _median) for x in _traj]) if len(_traj) > 1 else 0.0
+            results[key] = {{"ddg": round(float(_median), 3),
+                             "spread": round(float(_mad), 3),
+                             "n": len(_traj),
+                             "trajectories": _traj}}
+            print(f"[Rosetta] {{key}}: median ddG = {{_median:+.2f}} kcal/mol "
+                  f"(spread {{_mad:.2f}}, n={{len(_traj)}})", flush=True)
         except Exception as e:
             import traceback
             results[key] = None
@@ -1382,10 +1461,14 @@ except Exception as exc:
             _prog(f"  [Rosetta] {reason} — falling back to empirical BLOSUM62 estimates.")
             _scores: Dict[str, float] = {}
             _source: Dict[str, str]   = {}
+            _spread: Dict[str, Optional[float]] = {}
+            _conf:   Dict[str, str]   = {}
             for _m in mutations:
                 _k = _mutation_key(_m)
                 _scores[_k] = _empirical_ddg_single(_m, pdb_path)
                 _source[_k] = "empirical"
+                _spread[_k] = None
+                _conf[_k]   = "empirical"
             _warns = [
                 f"PyRosetta WSL2 failed ({reason}). All ddG values are empirical "
                 "BLOSUM62 + B-factor estimates (Pearson r ~0.4). For screening only."
@@ -1405,6 +1488,9 @@ except Exception as exc:
                     "mutations":        mutations,
                     "ddg_scores":       _scores,
                     "ddg_source":       _source,
+                    "ddg_spread":       _spread,
+                    "ddg_confidence":   _conf,
+                    "n_trajectories":   num_trajectories,
                     "stability_change": round(_change, 3),
                     "confidence":       "low",
                     "backend":          "empirical_fallback",
@@ -1421,7 +1507,14 @@ except Exception as exc:
             )
 
         _prog("⚗️  [Rosetta] Running PyRosetta cartesian_ddg (may take 2–5 min per mutation)...")
-        result = wsl.run_python_script(script, timeout=1800)
+        # Scale the WSL2 process timeout to the workload: ALL num_trajectories
+        # trajectories run inside one worker process, so the budget must cover
+        # the whole batch. N=1, cycles=3 (production) → 1800s, unchanged.
+        _wsl_timeout = max(
+            1800,
+            int(len(mutations) * num_trajectories * (relax_cycles * 90 + 150) + 300),
+        )
+        result = wsl.run_python_script(script, timeout=_wsl_timeout)
 
         if result["stdout"]:
             for line in result["stdout"].splitlines():
@@ -1429,9 +1522,10 @@ except Exception as exc:
                     _prog(f"  {line.strip()}")
 
         if not result["ok"]:
-            return _empirical_result(
-                f"WSL2 script failed: {str(result.get('stderr', ''))[:200]}"
-            )
+            # Surface the error field (e.g. "timed out after Ns") AND stderr so a
+            # timeout is distinguishable from a crash.
+            _why = (result.get("error") or "").strip() or str(result.get("stderr", "")).strip()
+            return _empirical_result(f"WSL2 script failed: {_why[:200]}")
 
         # Copy results file back from WSL2
         import tempfile, json as _json
@@ -1451,19 +1545,38 @@ except Exception as exc:
         if "error" in ddg_raw:
             return _empirical_result(f"worker error: {str(ddg_raw['error'])[:200]}")
 
-        # Fill in any missing mutations with empirical estimates; record the
-        # source of each value so real PyRosetta ddG is distinguishable.
-        ddg_scores: Dict[str, float] = {}
-        ddg_source: Dict[str, str]   = {}
-        warnings:   List[str]        = []
+        # Parse per-mutation results. The worker emits a dict per key:
+        # {"ddg": median, "spread": MAD, "n": n_trajectories, "trajectories":[...]}.
+        # Missing/failed mutations fall back to an empirical estimate so real
+        # PyRosetta ddG stays distinguishable (ddg_source) and confidence is
+        # derived from the trajectory spread.
+        ddg_scores: Dict[str, float]        = {}
+        ddg_source: Dict[str, str]          = {}
+        ddg_spread: Dict[str, Optional[float]] = {}
+        ddg_confidence: Dict[str, str]      = {}
+        warnings:   List[str]               = []
         for mut in mutations:
-            key = _mutation_key(mut)
-            if key in ddg_raw and ddg_raw[key] is not None:
-                ddg_scores[key] = float(ddg_raw[key])
-                ddg_source[key] = "pyrosetta"
+            key   = _mutation_key(mut)
+            entry = ddg_raw.get(key)
+            if isinstance(entry, dict) and entry.get("ddg") is not None:
+                ddg_scores[key]     = float(entry["ddg"])
+                ddg_source[key]     = "pyrosetta"
+                _sp                 = entry.get("spread")
+                ddg_spread[key]     = float(_sp) if _sp is not None else None
+                ddg_confidence[key] = _ddg_confidence_label(
+                    ddg_spread[key], entry.get("n", num_trajectories)
+                )
+            elif entry is not None and not isinstance(entry, dict):
+                # Legacy flat-float schema (older worker) — accept defensively.
+                ddg_scores[key]     = float(entry)
+                ddg_source[key]     = "pyrosetta"
+                ddg_spread[key]     = None
+                ddg_confidence[key] = _ddg_confidence_label(None, num_trajectories)
             else:
-                ddg_scores[key] = _empirical_ddg_single(mut, pdb_path)
-                ddg_source[key] = "empirical"
+                ddg_scores[key]     = _empirical_ddg_single(mut, pdb_path)
+                ddg_source[key]     = "empirical"
+                ddg_spread[key]     = None
+                ddg_confidence[key] = "empirical"
                 warnings.append(
                     f"PyRosetta failed for {key}; using empirical BLOSUM62 estimate."
                 )
@@ -1476,11 +1589,16 @@ except Exception as exc:
         )
         best_key = min(ddg_scores, key=ddg_scores.get) if ddg_scores else "?"
         best_ddg = ddg_scores.get(best_key, 0.0)
+        _multi = num_trajectories > 1
+        _traj_note = (
+            f" Median of {num_trajectories} trajectories x {relax_cycles} cycles."
+            if _multi else ""
+        )
         summary = (
             f"Stability (PyRosetta/WSL2): "
             f"{len(ddg_scores)}/{len(mutations)} mutations scored. "
             f"Most stabilising: {best_key} ({best_ddg:+.2f} kcal/mol). "
-            f"Mean ΔΔG: {stability_change:+.2f} kcal/mol."
+            f"Mean ΔΔG: {stability_change:+.2f} kcal/mol.{_traj_note}"
         )
         _prog(f"✓ ⚗️  {summary}")
 
@@ -1491,13 +1609,20 @@ except Exception as exc:
                 "mutations":        mutations,
                 "ddg_scores":       ddg_scores,
                 "ddg_source":       ddg_source,
+                "ddg_spread":       ddg_spread,
+                "ddg_confidence":   ddg_confidence,
+                "n_trajectories":   num_trajectories,
                 "stability_change": round(stability_change, 3),
                 "confidence":       "high",
                 "backend":          "pyrosetta_wsl2",
                 "warnings":         warnings,
                 "method_note":      (
                     "PyRosetta CartesianDDG via WSL2 (Park et al. 2016). "
-                    "Pearson r ~0.8 vs experimental. Publication quality."
+                    + (f"Median of {num_trajectories} independent trajectories "
+                       f"({relax_cycles} relax cycles); spread reported as MAD. "
+                       "Ranking-grade — absolute magnitudes approximate."
+                       if _multi else
+                       "Single-trajectory screening. Pearson r ~0.8 vs experimental.")
                 ),
                 "job_id":           None,
             },
@@ -1505,6 +1630,61 @@ except Exception as exc:
             viz_explanations = viz_exps,
             summary          = summary,
         )
+
+    # ── High-accuracy validation tier ───────────────────────────────────────────
+
+    def validate_ddg(
+        self,
+        pdb_path:  str,
+        mutations: List[Dict[str, Any]],
+        session:   Any = None,
+        model_id:  str = "1",
+        chain:     Optional[str] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> "ToolStepResult":
+        """
+        High-accuracy validation tier: multi-trajectory MEDIAN ddG on a SMALL
+        explicit set of mutations, using ROSETTA_VALIDATION_TRAJECTORIES and
+        ROSETTA_VALIDATION_CYCLES. Always uses the local PyRosetta/WSL2 path
+        (returns a clear error if WSL2/PyRosetta is unavailable).
+
+        NOT for full interactive scans — see _run_rosetta_local for the fast
+        single-trajectory production path. Absolute magnitudes remain
+        approximate (large-cavity over-prediction); ranking/sign is reliable.
+        """
+        import config as _cfg
+        n   = max(1, int(getattr(_cfg, "ROSETTA_VALIDATION_TRAJECTORIES", 5)))
+        cyc = max(1, int(getattr(_cfg, "ROSETTA_VALIDATION_CYCLES", 8)))
+
+        def _prog(msg: str) -> None:
+            (progress_callback or _safe_print)(msg)
+
+        _per_min = max(1, round(n * cyc * 0.6))
+        _prog(
+            f"⚗️  High-accuracy validation: {n} trajectories x {cyc} cycles per "
+            f"mutation, ~{_per_min} min per mutation. Magnitudes remain approximate "
+            "for large-cavity mutations even at this tier — use for confidence "
+            "ranking, validate critical predictions experimentally."
+        )
+
+        result = self._run_rosetta_local(
+            pdb_path, mutations, model_id, chain, progress_callback,
+            relax_cycles=cyc, num_trajectories=n,
+        )
+
+        # Honest disclosure + tier metadata (non-negotiable: never claim calibration).
+        if result.success and isinstance(result.data, dict):
+            result.data["tier"] = "validation"
+            result.data.setdefault("warnings", []).append(
+                "High-accuracy validation tier (median of "
+                f"{n} trajectories x {cyc} relax cycles). Absolute ΔΔG remains "
+                "APPROXIMATE — large-cavity mutations are systematically "
+                "over-predicted even at this tier (more cycles only partially "
+                "close the gap). Ranking/sign is reliable; high spread = low "
+                "confidence = low trust. NOT calibrated — confirm critical "
+                "predictions experimentally."
+            )
+        return result
 
     # ── Visualization ──────────────────────────────────────────────────────────
 

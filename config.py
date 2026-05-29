@@ -94,6 +94,28 @@ ROSETTA_RELAX_CACHE: Path = Path(
 )
 ROSETTA_RELAX_CACHE.mkdir(parents=True, exist_ok=True)
 
+# ── Multi-trajectory ddG (PyRosetta local path) ─────────────────────────────────
+# Number of independent relax+score trajectories per mutation; the reported ddG
+# is the MEDIAN across trajectories (median chosen over min/mean — see
+# scripts/rosetta_validation_notes.md: two-sided noise makes min invent fake
+# stabilisers). Default 1 = fast single-trajectory production scan behaviour
+# (UNCHANGED). The high-accuracy validation tier uses the *_VALIDATION_* values.
+ROSETTA_NUM_TRAJECTORIES: int = int(os.environ.get("ROSETTA_NUM_TRAJECTORIES", "1"))
+
+# High-accuracy validation tier: more trajectories + more relax cycles, run only
+# on a small explicit set of candidate mutations (NOT on full interactive scans —
+# 8+8-cycle trajectories are ~3-5 min each).
+ROSETTA_VALIDATION_TRAJECTORIES: int = int(
+    os.environ.get("ROSETTA_VALIDATION_TRAJECTORIES", "5")
+)
+ROSETTA_VALIDATION_CYCLES: int = int(os.environ.get("ROSETTA_VALIDATION_CYCLES", "8"))
+
+# Median-absolute-deviation spread (kcal/mol) above which a multi-trajectory
+# ddG prediction is flagged low-confidence.
+ROSETTA_SPREAD_LOW_CONFIDENCE: float = float(
+    os.environ.get("ROSETTA_SPREAD_LOW_CONFIDENCE", "3.0")
+)
+
 # ── venv312 (Python 3.12 + CUDA torch 2.11.0+cu128) ─────────────────────────
 
 # Absolute path to the Python 3.12 virtual-environment interpreter.

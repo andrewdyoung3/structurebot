@@ -318,14 +318,16 @@ class MutationScanner:
                 f"  Overall scan timeout ({scan_timeout}s) reached before ddG scoring. "
                 "Candidates ranked by CamSol + ESM only (ddG = 0.0)."
             )
-            ddg_scores: Dict[str, float] = {}
-            ddg_source: Dict[str, str]   = {}
+            ddg_scores:     Dict[str, float] = {}
+            ddg_source:     Dict[str, str]   = {}
+            ddg_spread:     Dict[str, Any]   = {}
+            ddg_confidence: Dict[str, str]   = {}
         else:
             self._progress(
                 f"Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations..."
             )
             _t0 = time.perf_counter()
-            ddg_scores, ddg_source = self._run_rosetta_batch(
+            ddg_scores, ddg_source, ddg_spread, ddg_confidence = self._run_rosetta_batch(
                 pdb_path, raw_candidates, chain_id,
                 scan_deadline=_scan_deadline,
             )
@@ -343,6 +345,8 @@ class MutationScanner:
             # Provenance: "pyrosetta" / "empirical" / backend label, or "none"
             # when ddG was not computed (timeout/failure → defaulted to 0.0).
             ddg_src       = ddg_source.get(key, "none")
+            ddg_sprd      = ddg_spread.get(key)            # MAD, or None (single-traj)
+            ddg_conf      = ddg_confidence.get(key, "single-trajectory")
             camsol_delta  = cand["estimated_camsol_delta"]
             esm_cons      = esm_scores.get(pos, 0.5)
             esm_tol       = round(1.0 - esm_cons, 4)
@@ -363,6 +367,8 @@ class MutationScanner:
                 "to_aa":             to_aa,
                 "ddg":               round(ddg, 3),
                 "ddg_source":        ddg_src,
+                "ddg_spread":        ddg_sprd,
+                "ddg_confidence":    ddg_conf,
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
                 "combined_score":    score,
@@ -658,16 +664,19 @@ class MutationScanner:
         candidates:    List[Dict[str, Any]],
         chain_id:      Optional[str],
         scan_deadline: Optional[float] = None,
-    ) -> Tuple[Dict[str, float], Dict[str, str]]:
+    ) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, Any], Dict[str, str]]:
         """
         Run Rosetta ddG for all candidate mutations in one batch call.
 
-        Returns (ddg_scores, ddg_source):
-          ddg_scores : {mutation_key: ddg_kcal_mol}
-          ddg_source : {mutation_key: provenance}  where provenance is
-                       "pyrosetta", "empirical", or the backend label.
-        If Rosetta is unavailable, returns ({}, {}) so the pipeline can still
-        rank by CamSol + ESM alone (with a user-visible warning).
+        Returns (ddg_scores, ddg_source, ddg_spread, ddg_confidence):
+          ddg_scores     : {mutation_key: ddg_kcal_mol}
+          ddg_source     : {mutation_key: provenance} ("pyrosetta"/"empirical"/backend)
+          ddg_spread     : {mutation_key: MAD across trajectories | None}
+          ddg_confidence : {mutation_key: "high"/"moderate"/"low"/"single-trajectory"}
+        Production scans are single-trajectory (ROSETTA_NUM_TRAJECTORIES=1), so
+        spread is None and confidence is "single-trajectory".
+        If Rosetta is unavailable, returns ({}, {}, {}, {}) so the pipeline can
+        still rank by CamSol + ESM alone (with a user-visible warning).
 
         scan_deadline : time.perf_counter() deadline for the overall scan.
                         Forwarded to RosettaBridge so DynaMut2 can switch to
@@ -677,7 +686,7 @@ class MutationScanner:
             self._progress(
                 "  PDB file not found — skipping Rosetta (ddG will be 0.0)."
             )
-            return {}, {}
+            return {}, {}, {}, {}
 
         from rosetta_bridge import RosettaBridge
         bridge = RosettaBridge()
@@ -706,19 +715,21 @@ class MutationScanner:
         if result.success:
             scores = result.data.get("ddg_scores", {})
             source = dict(result.data.get("ddg_source", {}))
+            spread = dict(result.data.get("ddg_spread", {}))
+            conf   = dict(result.data.get("ddg_confidence", {}))
             if not source:
                 # Bridge did not provide per-mutation provenance (e.g. the
                 # DynaMut2 path) — label every scored value with the backend.
                 be = result.data.get("backend", "rosetta")
                 source = {k: be for k in scores}
-            return scores, source
+            return scores, source, spread, conf
 
         # Rosetta failed — warn and continue with zeros
         self._progress(
             f"  Rosetta ddG unavailable: {(result.error or '')[:100]}\n"
             "    Candidates ranked by CamSol + ESM only (ddG = 0.0)."
         )
-        return {}, {}
+        return {}, {}, {}, {}
 
     @staticmethod
     def _error_result(msg: str) -> List[Dict[str, Any]]:
@@ -751,11 +762,15 @@ class MutationScanner:
             score   = c.get("combined_score", 0.0)
             ddg     = c.get("ddg", 0.0)
             src     = c.get("ddg_source", "?")
+            conf    = c.get("ddg_confidence", "single-trajectory")
+            sprd    = c.get("ddg_spread")
             sol     = c.get("solubility_delta", 0.0)
             tol     = c.get("esm_tolerance", 0.0)
+            # Show provenance + confidence; include spread only when multi-trajectory.
+            _prov = f"[{src}, {conf}" + (f", spread {sprd:.2f}]" if sprd is not None else "]")
             lines.append(
                 f"  #{rank}  {chain}{pos}: {from_aa} -> {to_aa}  "
-                f"score={score:+.2f}  ddG={ddg:+.3f} kcal/mol [{src}]  "
+                f"score={score:+.2f}  ddG={ddg:+.3f} kcal/mol {_prov}  "
                 f"solubility+={sol:+.2f}  ESM_tol={tol:.2f}"
             )
 

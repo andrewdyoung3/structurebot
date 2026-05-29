@@ -125,6 +125,7 @@ class ToolRouter:
         "salt_bridge":       "⚡",
         "cavity":            "🕳",
         "double_mutant":     "⚗️🔗",
+        "validate_ddg":      "⚗️✅",
     }
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
@@ -333,6 +334,26 @@ class ToolRouter:
         "scaffold stabili",
     )
 
+    # Keywords that signal the high-accuracy ddG VALIDATION tier (multi-trajectory
+    # median ddG on a small explicit set of mutations / top scan candidates).
+    # Distinct from the fast single-trajectory mutation_scan path. Checked
+    # case-insensitively; checked BEFORE mutation_scan / double_mutant overrides.
+    _VALIDATE_DDG_KEYWORDS: tuple = (
+        "validate ddg",
+        "validate the ddg",
+        "high accuracy ddg",
+        "high-accuracy ddg",
+        "high confidence stability",
+        "high-confidence stability",
+        "confirm ddg",
+        "confirm the ddg",
+        "confirm stability",
+        "validate stability",
+        "high accuracy stability",
+        "multi-trajectory",
+        "multitrajectory",
+    )
+
     # Keywords that signal a proline substitution scan request.
     # Checked case-insensitively; any match overrides generic mutation_scan routing.
     _PROLINE_KEYWORDS: tuple = (
@@ -421,6 +442,12 @@ class ToolRouter:
         return any(kw in lower for kw in cls._DOUBLE_MUTANT_KEYWORDS)
 
     # ── Proline intent helpers ────────────────────────────────────────────────
+
+    @classmethod
+    def _detect_validate_ddg_intent(cls, text: str) -> bool:
+        """Return True if *text* requests the high-accuracy ddG validation tier."""
+        lower = (text or "").lower()
+        return any(kw in lower for kw in cls._VALIDATE_DDG_KEYWORDS)
 
     @classmethod
     def _detect_proline_intent(cls, text: str) -> bool:
@@ -612,6 +639,27 @@ class ToolRouter:
         """
         tools_needed = translator_result.get("tools_needed") or ["chimerax"]
         tool_inputs  = translator_result.get("tool_inputs") or {}
+
+        # ── High-accuracy ddG validation tier override ─────────────────────────
+        # Checked FIRST so "validate ddg" / "high-accuracy stability" route to the
+        # multi-trajectory validation tier, NOT the fast single-trajectory scan or
+        # double-mutant pipeline. Operates on an explicit mutation list (parsed in
+        # _run_validate_ddg) or the top candidates from existing scan_results.
+        _vddg_intent = bool(user_input and self._detect_validate_ddg_intent(user_input))
+        if _vddg_intent and "validate_ddg" not in tools_needed:
+            _v_chain = "A"
+            for _inp in list(tool_inputs.values()):
+                if isinstance(_inp, dict) and _inp.get("chain"):
+                    _v_chain = _inp["chain"]
+                    break
+            tools_needed = ["validate_ddg"]
+            tool_inputs  = {
+                "validate_ddg": {
+                    "model_id":    self._primary_model_id(),
+                    "chain":       _v_chain,
+                    "_user_input": user_input,
+                }
+            }
 
         # ── Proline intent override ────────────────────────────────────────────
         # Check BEFORE building step_info so the icon/description are correct.
@@ -939,6 +987,16 @@ class ToolRouter:
                 f"Double mutant pair scoring — #{mid} [{mode} mode] "
                 "(DynaMut2 prediction_mm + epistasis)"
             )
+        if tool == "validate_ddg":
+            inp = tool_inputs.get("validate_ddg", {})
+            mid = inp.get("model_id") or self._first_model_id()
+            import config as _cfg
+            n   = getattr(_cfg, "ROSETTA_VALIDATION_TRAJECTORIES", 5)
+            cyc = getattr(_cfg, "ROSETTA_VALIDATION_CYCLES", 8)
+            return (
+                f"High-accuracy ddG validation — #{mid} "
+                f"({n} trajectories x {cyc} cycles, median + confidence)"
+            )
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -1098,6 +1156,8 @@ class ToolRouter:
                 return self._run_mutation_scan(inputs)
             if tool == "double_mutant":
                 return self._run_double_mutant(inputs, user_input=user_input)
+            if tool == "validate_ddg":
+                return self._run_validate_ddg(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -1122,7 +1182,7 @@ class ToolRouter:
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
                     "assembly_analyser, disulfide, proline, glycan, "
                     "glycan_positions, netnglyc, salt_bridge, cavity, "
-                    "double_mutant."
+                    "double_mutant, validate_ddg."
                 ),
             )
         except Exception as exc:
@@ -2035,6 +2095,136 @@ class ToolRouter:
             session   = self.session,
             model_id  = model_id,
             chain     = chain,
+        )
+
+    def _run_validate_ddg(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """
+        High-accuracy ddG validation tier: multi-trajectory MEDIAN ddG + spread
+        + confidence on a SMALL explicit set of mutations (named in the request)
+        or the top candidates from existing scan_results. NOT a full re-scan.
+        """
+        import re as _re
+        user_input = user_input or inputs.get("_user_input", "")
+        model_id   = inputs.get("model_id") or self._primary_model_id()
+        chain      = inputs.get("chain", "A")
+
+        pdb_path = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="validate_ddg", success=False,
+                error=(
+                    "No structure loaded or PDB file unavailable. "
+                    "Run 'open 1HSG' (or your structure) first."
+                ),
+            )
+
+        # 1) Explicit mutations named in the request, e.g. "I72R", "V82A".
+        mutations: List[Dict[str, Any]] = []
+        seen: set = set()
+        for m in _re.finditer(
+            r"\b([ACDEFGHIKLMNPQRSTVWY])(\d{1,4})([ACDEFGHIKLMNPQRSTVWY])\b",
+            user_input or "",
+        ):
+            frm, pos, to = m.group(1), int(m.group(2)), m.group(3)
+            key = f"{frm}{pos}{to}"
+            if key in seen:
+                continue
+            seen.add(key)
+            mutations.append({"chain": chain, "position": pos,
+                              "from_aa": frm, "to_aa": to})
+
+        source_note = ""
+        if mutations:
+            source_note = f"{len(mutations)} mutation(s) named in request"
+        else:
+            # 2) Fall back to the top candidates from a prior scan.
+            scan_data = self.session.get_scan_result(model_id)
+            if not scan_data:
+                return ToolStepResult(
+                    tool="validate_ddg", success=False,
+                    error=(
+                        "No mutations named and no prior scan found. "
+                        "Name the mutations (e.g. 'validate ddg for I72R and V82A'), "
+                        "or run a mutation scan first then ask to validate the top hits."
+                    ),
+                )
+            top = sorted(
+                scan_data, key=lambda c: c.get("combined_score", 0.0), reverse=True
+            )[:3]
+            for c in top:
+                mutations.append({
+                    "chain":    c.get("chain", chain),
+                    "position": c.get("position"),
+                    "from_aa":  c.get("from_aa"),
+                    "to_aa":    c.get("to_aa"),
+                })
+            source_note = f"top {len(mutations)} candidate(s) from prior scan"
+
+        if not mutations:
+            return ToolStepResult(
+                tool="validate_ddg", success=False,
+                error="Could not determine any mutations to validate.",
+            )
+
+        def _status(msg: str) -> None:
+            print(msg, flush=True)
+
+        bridge = self._get_rosetta_bridge()
+        result = bridge.validate_ddg(
+            pdb_path          = pdb_path,
+            mutations         = mutations,
+            session           = self.session,
+            model_id          = model_id,
+            chain             = chain,
+            progress_callback = _status,
+        )
+
+        if not result.success:
+            return ToolStepResult(
+                tool="validate_ddg", success=False,
+                error=result.error or "Validation-tier ddG failed.",
+            )
+
+        data    = result.data or {}
+        scores  = data.get("ddg_scores", {})
+        spreads = data.get("ddg_spread", {})
+        confs   = data.get("ddg_confidence", {})
+        srcs    = data.get("ddg_source", {})
+        n_traj  = data.get("n_trajectories", "?")
+
+        # Build a confidence table (multi-line → shown in a Rich Panel).
+        lines: List[str] = [
+            f"=== High-Accuracy ddG Validation ({n_traj} trajectories, "
+            f"median + MAD spread) ===",
+            f"Mutations: {source_note}",
+            "",
+            f"  {'Mutation':<9} {'ddG(med)':>9} {'spread':>7} {'confidence':<12} {'source'}",
+            "  " + "-" * 56,
+        ]
+        for key in scores:
+            ddg = scores.get(key)
+            sp  = spreads.get(key)
+            cf  = confs.get(key, "?")
+            sr  = srcs.get(key, "?")
+            ddg_s = f"{ddg:+.3f}" if ddg is not None else "  N/A"
+            sp_s  = f"{sp:.2f}" if sp is not None else "  —"
+            lines.append(f"  {key:<9} {ddg_s:>9} {sp_s:>7} {cf:<12} {sr}")
+        lines.append("")
+        for w in data.get("warnings", []) or []:
+            lines.append(f"[!] {w}")
+        summary = "\n".join(lines)
+
+        return ToolStepResult(
+            tool             = "validate_ddg",
+            success          = True,
+            data             = data,
+            viz_commands     = result.viz_commands,
+            viz_explanations = result.viz_explanations,
+            summary          = summary,
         )
 
     def _run_assembly_analyser(self, inputs: Dict[str, Any]) -> ToolStepResult:
