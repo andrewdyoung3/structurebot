@@ -16,7 +16,7 @@ epitope   : engineer epitope-proximal pairs; targets interface-proximal
 
 Backends
 --------
-dynamut2            : Cα-Cα > 10 Å — residues too far to interact directly;
+dynamut2            : CA-CA > 10 Å — residues too far to interact directly;
                       DynaMut2 prediction is reliable.
 dynamut2_warned     : 4–10 Å — possible direct interaction; DynaMut2 used
                       with an accuracy warning.
@@ -207,20 +207,40 @@ class DoubleMutantBridge:
             )
 
         # ── Step 2: distance routing ───────────────────────────────────────────
-        progress_cb("  Computing Cα-Cα distances and routing pairs...")
+        progress_cb("  Computing CA-CA distances and routing pairs...")
+        print(f"[DoubleMutant] Pairs before route_pairs: {len(raw_pairs)}", flush=True)
+        for _p in raw_pairs:
+            _ma, _mb = _p
+            print(
+                f"[DoubleMutant]   pair: {_pair_key(_ma, _mb)} "
+                f"mut_a={_ma} mut_b={_mb}",
+                flush=True,
+            )
         pair_dicts = self.route_pairs(raw_pairs, pdb_path)
+        print(f"[DoubleMutant] Pairs after route_pairs: {len(pair_dicts)}", flush=True)
+        for _pd in pair_dicts:
+            print(
+                f"[DoubleMutant]   routed: {_pd.get('pair_key')} "
+                f"backend={_pd.get('backend')} distance={_pd.get('ca_distance')}",
+                flush=True,
+            )
 
         # Split by backend
         dynamut2_pairs = [p for p in pair_dicts
                           if p["backend"] in ("dynamut2", "dynamut2_warned")]
         pyrosetta_pairs = [p for p in pair_dicts
                            if p["backend"] == "pyrosetta_required"]
+        print(
+            f"[DoubleMutant] dynamut2_pairs={len(dynamut2_pairs)} "
+            f"pyrosetta_pairs={len(pyrosetta_pairs)}",
+            flush=True,
+        )
 
         # Close pairs with PyRosetta disabled → skip + warn
         if pyrosetta_pairs and not run_pyrosetta:
             n_skipped = len(pyrosetta_pairs)
             warnings.append(
-                f"{n_skipped} pair(s) skipped — Cα-Cα < "
+                f"{n_skipped} pair(s) skipped — CA-CA < "
                 f"{_cfg.DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE:.1f} Å requires "
                 "PyRosetta (set run_pyrosetta=True to enable)."
             )
@@ -230,7 +250,7 @@ class DoubleMutantBridge:
         n_mid = sum(1 for p in dynamut2_pairs if p["backend"] == "dynamut2_warned")
         if n_mid:
             warnings.append(
-                f"{n_mid} pair(s) have Cα-Cα distance "
+                f"{n_mid} pair(s) have CA-CA distance "
                 f"{_cfg.DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE:.1f}–"
                 f"{_cfg.DOUBLE_MUTANT_DISTANCE_THRESHOLD_FAR:.1f} Å — "
                 "DynaMut2 accuracy may be reduced; verify top pairs experimentally."
@@ -289,7 +309,7 @@ class DoubleMutantBridge:
                 dist = pair.get("ca_distance")
                 dist_str = f"{dist:.1f} Å" if dist is not None else "unknown"
                 pair_warns.append(
-                    f"Mid-range Cα-Cα distance ({dist_str}); "
+                    f"Mid-range CA-CA distance ({dist_str}); "
                     "DynaMut2 accuracy reduced for interacting residues."
                 )
             pair["warnings"] = pair_warns
@@ -319,7 +339,7 @@ class DoubleMutantBridge:
                 f"DoubleMutantBridge ({mode} mode). "
                 f"DynaMut2 prediction_mm endpoint for far/mid pairs; "
                 f"PyRosetta WSL2 for close pairs. "
-                f"Epistasis = ddG(double) − ddG(additive). "
+                f"Epistasis = ddG(double) - ddG(additive). "
                 f"n_pairs_evaluated={len(pair_dicts)}, n_scored={len(scored_pairs)}."
             ),
         }
@@ -368,6 +388,8 @@ class DoubleMutantBridge:
                     continue
                 all_pairs.append((m_a, m_b))
 
+        print(f"[DoubleMutant] After same-position filter: {len(all_pairs)} pairs", flush=True)
+
         # Cap at DOUBLE_MUTANT_MAX_PAIRS before mode filtering
         if len(all_pairs) > _cfg.DOUBLE_MUTANT_MAX_PAIRS:
             all_pairs.sort(
@@ -377,6 +399,7 @@ class DoubleMutantBridge:
                 reverse=True,
             )
             all_pairs = all_pairs[:_cfg.DOUBLE_MUTANT_MAX_PAIRS]
+            print(f"[DoubleMutant] After cap ({_cfg.DOUBLE_MUTANT_MAX_PAIRS}): {len(all_pairs)} pairs", flush=True)
 
         filtered: List[Tuple[Dict, Dict]] = []
 
@@ -407,6 +430,8 @@ class DoubleMutantBridge:
 
                 filtered.append((m_a, m_b))
 
+            print(f"[DoubleMutant] After ddG filter ({mode} mode): {len(filtered)} pairs", flush=True)
+
         elif mode == "epitope":
             for m_a, m_b in all_pairs:
                 pos_a = m_a["position"]
@@ -429,6 +454,9 @@ class DoubleMutantBridge:
 
                 filtered.append((m_a, m_b))
 
+            print(f"[DoubleMutant] After ESM filter ({mode} mode): {len(filtered)} pairs", flush=True)
+
+        print(f"[DoubleMutant] After mode filter: {len(filtered)} pairs", flush=True)
         return filtered
 
     # ── Step 2: distance routing ───────────────────────────────────────────────
@@ -442,7 +470,7 @@ class DoubleMutantBridge:
         chain2:   Optional[str] = None,
     ) -> Optional[float]:
         """
-        Euclidean distance between Cα atoms of two residues in Å.
+        Euclidean distance between CA atoms of two residues in Å.
 
         Parameters
         ----------
@@ -466,7 +494,7 @@ class DoubleMutantBridge:
         chain:    str,
         resno:    int,
     ) -> Optional[Tuple[float, float, float]]:
-        """Extract Cα coordinates for a single residue. Returns None on failure."""
+        """Extract CA coordinates for a single residue. Returns None on failure."""
         try:
             from Bio.PDB import PDBParser  # type: ignore
             parser    = PDBParser(QUIET=True)
@@ -486,6 +514,7 @@ class DoubleMutantBridge:
         pairs:    List[Tuple[Dict[str, Any], Dict[str, Any]]],
         pdb_path: str,
     ) -> List[Dict[str, Any]]:
+        print(f"[DoubleMutant] route_pairs called with {len(pairs)} pairs", flush=True)
         """
         Convert (m_a, m_b) tuples to fully annotated pair dicts with backend routing.
 
@@ -522,6 +551,13 @@ class DoubleMutantBridge:
             else:
                 backend = "pyrosetta_required"
                 zone    = "close"
+
+            pk = _pair_key(m_a, m_b)
+            dist_str = f"{dist:.1f}" if dist is not None else "None"
+            print(
+                f"[DoubleMutant] {pk}: distance={dist_str}Å zone={zone} backend={backend}",
+                flush=True,
+            )
 
             result.append({
                 "mutation_a":     dict(m_a),
@@ -560,15 +596,38 @@ class DoubleMutantBridge:
         Runs pairs concurrently (DYNAMUT2_MAX_WORKERS). Each pair writes its
         result back into the pair dict in-place and returns it.
         """
-        max_workers = max(1, getattr(_cfg, "DYNAMUT2_MAX_WORKERS", 4))
+        if not pairs:
+            print("[DoubleMutant] No pairs to score via DynaMut2", flush=True)
+            return []
+
+        # Cap at 2 for the multi-mutation endpoint — higher concurrency triggers
+        # rate limiting (HTTP 429) on the DynaMut2 server.
+        max_workers = min(2, max(1, getattr(_cfg, "DYNAMUT2_MAX_WORKERS", 4)))
 
         _cb_lock        = __import__("threading").Lock()
         _consec_fail    = [0]
         _circuit_broken = __import__("threading").Event()
+        _debug_once     = [True]  # print mutations_list content for first pair only
 
         def _score_one(pair: Dict[str, Any]) -> Dict[str, Any]:
             if _circuit_broken.is_set():
                 return pair
+
+            # Stagger submissions to avoid rate-limiting on the mm endpoint
+            time.sleep(2)
+
+            # Debug: print the mutations_list content for the first pair submitted
+            if _debug_once[0]:
+                _debug_once[0] = False
+                _ma = pair["mutation_a"]
+                _mb = pair["mutation_b"]
+                _la = f"{_ma.get('chain', 'A')} {_ma['from_aa']}{_ma['position']}{_ma['to_aa']}"
+                _lb = f"{_mb.get('chain', 'A')} {_mb['from_aa']}{_mb['position']}{_mb['to_aa']}"
+                print(
+                    f"[DoubleMutant] mutations_list debug (first pair {pair['pair_key']}):\n"
+                    f"  {_la}\n  {_lb}",
+                    flush=True,
+                )
 
             per_deadline = time.perf_counter() + _PER_PAIR_TIMEOUT
             try:
@@ -741,35 +800,42 @@ class DoubleMutantBridge:
             except Exception:
                 continue
 
-            # Running check
-            if "message" in data:
-                msg = str(data["message"]).upper()
-                if msg in ("RUNNING", "PENDING", "QUEUED"):
-                    continue
-                if "error" in msg.lower():
-                    raise RuntimeError(
-                        f"DynaMut2 mm job error for {pair['pair_key']}: {data['message']}"
-                    )
+            # ── Status / running check — BEFORE attempting to parse result ───────
+            # prediction_mm uses "status" key; single-mutation uses "message".
+            msg    = str(data.get("message", "")).upper()
+            status = str(data.get("status",  "")).upper()
 
-            # Find the result entry — key is "{chain} {mut1};{chain} {mut2}"
+            # Still running?
+            if (msg in ("RUNNING", "PENDING", "QUEUED")
+                    or status in ("RUNNING", "PENDING", "QUEUED")):
+                if poll_n % 6 == 0:
+                    elapsed = (poll_n + 1) * _POLL_INTERVAL
+                    _safe_print(
+                        f"  DynaMut2 mm {pair['pair_key']}: waiting "
+                        f"({elapsed}s elapsed, status={status or msg or 'unknown'})..."
+                    )
+                continue
+
+            # Server-side error?
+            if status == "ERROR":
+                raise RuntimeError(
+                    f"DynaMut2 mm job {job_id} failed for {pair['pair_key']}: "
+                    f"status=ERROR response={str(data)[:200]}"
+                )
+            if "error" in msg.lower():
+                raise RuntimeError(
+                    f"DynaMut2 mm job error for {pair['pair_key']}: {data.get('message')}"
+                )
+
+            # ── Attempt to parse result ────────────────────────────────────────
             parsed = self._parse_mm_result(data, line_a, line_b, pair["pair_key"])
             if parsed is not None:
                 return parsed
-
-            # Check for status / error fields
-            status = str(data.get("status", "")).lower()
-            if status in ("error", "failed", "failure"):
-                raise RuntimeError(
-                    f"DynaMut2 mm job failed for {pair['pair_key']}: {data}"
-                )
-
-            # Still waiting — no recognisable result key yet
-            if poll_n % 6 == 0:
-                elapsed = (poll_n + 1) * _POLL_INTERVAL
-                _safe_print(
-                    f"  DynaMut2 mm {pair['pair_key']}: waiting "
-                    f"({elapsed}s elapsed)..."
-                )
+            print(
+                f"[DoubleMutant] {pair['pair_key']}: unparseable poll response "
+                f"(poll {poll_n + 1}): {str(data)[:300]}",
+                flush=True,
+            )
 
         raise TimeoutError(
             f"DynaMut2 mm job {job_id} timed out after "
@@ -1181,7 +1247,7 @@ except Exception as exc:
         if warns:
             lines.append("")
             for w in warns:
-                lines.append(f"  ⚠ {w}")
+                lines.append(f"  [!] {w}")
 
         lines.append("")
         lines.append(

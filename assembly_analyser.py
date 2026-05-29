@@ -31,6 +31,7 @@ residue numbers are merged.  Interface residues are stored in session_state.
 from __future__ import annotations
 
 import re
+import time as _time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
@@ -408,8 +409,31 @@ class AssemblyAnalyser:
             interfaces = self.detect_interfaces(model_id, contact_distance)
             result["interfaces"] = interfaces
 
-            # Store in session
-            self.session.set_interface_residues(model_id, interfaces)
+            # Sanity check: if RCSB confirms multimer but detection returned 0,
+            # do NOT store empty interfaces — leave session at default (unknown)
+            # so downstream tools know data is unavailable, not that the interface
+            # is genuinely empty.
+            _asm_type   = (asm_info.get("assembly_type") or "").lower()
+            _n_sub      = asm_info.get("n_subunits") or 0
+            _is_obligate = asm_info.get("is_obligate", False)
+            _is_confirmed_multimer = (
+                _n_sub > 1
+                or _is_obligate
+                or any(w in _asm_type for w in ("dimer", "trimer", "tetramer",
+                                                 "pentamer", "hexamer", "mer"))
+            )
+
+            if not interfaces and _is_confirmed_multimer:
+                result["warnings"].append(
+                    f"Interface detection returned 0 residues for a confirmed "
+                    f"{asm_info.get('assembly_type', 'multimer')} after 3 attempts. "
+                    "Interface data unavailable — mutation scan will not exclude "
+                    "interface residues. Try 'analyse as multimer' again to retry."
+                )
+                result["interface_detection_incomplete"] = True
+                # Leave session.interface_residues at default ({} = unknown)
+            else:
+                self.session.set_interface_residues(model_id, interfaces)
 
             # Determine protected residues for the requested chain
             protected: List[int] = []
@@ -478,21 +502,34 @@ class AssemblyAnalyser:
                 pair: Tuple[str, str] = tuple(sorted([c1, c2]))  # type: ignore[assignment]
                 resnos: set = set()
 
-                # Collect CA atoms from each chain that are near the other
-                for sel_chain, near_chain in ((c1, c2), (c2, c1)):
-                    cmd = (
-                        f"select #{model_id}/{sel_chain}@CA"
-                        f" & (#{model_id}/{near_chain} :< {contact_distance})"
-                        f"; info selection"
-                    )
-                    res = self.bridge.run_command(cmd)
-                    if res.get("error"):
-                        continue
-                    text = res.get("value") or ""
-                    for line in text.splitlines():
-                        m = pat.search(line)
-                        if m:
-                            resnos.add(int(m.group(2)))
+                # Retry up to 3 times: ChimeraX may not have finished rendering
+                # the structure when the zone-select runs, returning 0 residues.
+                for attempt in range(3):
+                    attempt_resnos: set = set()
+
+                    # Collect CA atoms from each chain that are near the other
+                    for sel_chain, near_chain in ((c1, c2), (c2, c1)):
+                        cmd = (
+                            f"select #{model_id}/{sel_chain}@CA"
+                            f" & (#{model_id}/{near_chain} :< {contact_distance})"
+                            f"; info selection"
+                        )
+                        res = self.bridge.run_command(cmd)
+                        if res.get("error"):
+                            continue
+                        text = res.get("value") or ""
+                        for line in text.splitlines():
+                            m = pat.search(line)
+                            if m:
+                                attempt_resnos.add(int(m.group(2)))
+
+                    if attempt_resnos:
+                        resnos = attempt_resnos
+                        break
+
+                    # 0 residues — may be a timing issue; wait before retrying
+                    if attempt < 2:
+                        _time.sleep(1)
 
                 if resnos:
                     interfaces[pair] = resnos

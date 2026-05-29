@@ -581,3 +581,86 @@ def test_session_save_load_assembly_fields(tmp_path):
     assert loaded.get_analysis_mode("1") == "multimer"
     ifaces = loaded.get_interface_residues("1")
     assert len(ifaces) == 1
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Interface detection retry behaviour
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_interface_detection_retries_on_zero_result(mock_session):
+    """
+    If zone-select returns 0 residues on the first attempt but non-zero on
+    the second, detect_interfaces() must use the non-zero value.
+    The retry logic waits 1 s between attempts (mocked out here).
+    """
+    call_count = [0]
+
+    def _run_cmd(cmd: str):
+        if "select clear" in cmd:
+            return {"value": "", "error": None}
+        call_count[0] += 1
+        if call_count[0] <= 2:
+            # First attempt (both directions): return 0 residues
+            return {"value": "0 atoms, 0 bonds selected", "error": None}
+        # Second attempt: return real residues
+        if "/A@CA" in cmd:
+            return {"value": _zone_selection_output("A", [25, 26, 27]), "error": None}
+        return {"value": _zone_selection_output("B", [24, 25, 26]), "error": None}
+
+    bridge = MagicMock()
+    bridge.is_running.return_value = True
+    bridge.run_command.side_effect = _run_cmd
+
+    analyser = AssemblyAnalyser(bridge=bridge, session=mock_session)
+
+    with patch("assembly_analyser._time.sleep"):  # don't actually sleep in tests
+        ifaces = analyser.detect_interfaces("1", contact_distance=5.0)
+
+    assert ifaces, "detect_interfaces() should return non-empty after retry"
+    pair = list(ifaces.keys())[0]
+    assert len(ifaces[pair]) > 0, "Retried result should contain residue numbers"
+    assert call_count[0] > 2, "Should have made more than 2 zone-select calls (retry fired)"
+
+
+def test_interface_detection_stores_none_on_persistent_zero_for_multimer(mock_session):
+    """
+    If zone-select returns 0 on all 3 attempts for a confirmed multimer,
+    analyse() must:
+      - NOT store empty interfaces in session (leaves default = unknown)
+      - Add a warning about interface data being unavailable
+    """
+    bridge = MagicMock()
+    bridge.is_running.return_value = True
+    # Always return 0 residues for every zone-select call
+    bridge.run_command.return_value = {"value": "0 atoms, 0 bonds selected", "error": None}
+
+    analyser = AssemblyAnalyser(bridge=bridge, session=mock_session)
+
+    homodimer_info = {
+        "assembly_type": "homodimer",
+        "stoichiometry":  "A2",
+        "n_subunits":     2,
+        "is_obligate":    True,
+        "chains":         ["A", "B"],
+        "oligomeric_state": "Homo 2-mer",
+        "error":          None,
+    }
+
+    with patch("assembly_analyser.fetch_assembly_info", return_value=homodimer_info), \
+         patch("assembly_analyser._time.sleep"):
+        result = analyser.analyse(
+            "1", pdb_id="1HSG", mode="multimer", chain_id="A"
+        )
+
+    # Warning must be present
+    warns = result.get("warnings", [])
+    assert any("unavailable" in w.lower() or "0 residues" in w.lower() for w in warns), (
+        f"Expected unavailability warning for multimer with 0 interfaces, got: {warns}"
+    )
+
+    # Session must NOT have stored empty interfaces (leaves it at default = unknown)
+    stored = mock_session.get_interface_residues("1")
+    assert not stored, (
+        "Session should not store empty interface data for a confirmed multimer; "
+        f"got: {stored}"
+    )

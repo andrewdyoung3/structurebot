@@ -455,8 +455,18 @@ class StructureBot:
 
     def _handle_request(self, user_input: str, is_retry: bool = False) -> None:
         # 1. Translate
-        with console.status("[cyan]Translating…[/cyan]"):
-            result = self.translator.translate(user_input, self.session)
+        try:
+            with console.status("[cyan]Translating…[/cyan]"):
+                result = self.translator.translate(user_input, self.session)
+        except ValueError as exc:
+            if "refusal" in str(exc).lower() or "safety" in str(exc).lower():
+                console.print(
+                    "[warn]⚠ The request was flagged by the API safety filter. "
+                    "Try rephrasing — for example, use 'interface residues' "
+                    "instead of 'epitope' if asking about binding site mutations.[/warn]"
+                )
+                return
+            raise
 
         # 2. Route (augment with tool pipeline info; no execution yet)
         result = self.router.route(result, user_input=user_input)

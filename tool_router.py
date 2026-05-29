@@ -208,24 +208,36 @@ class ToolRouter:
     _SALT_BRIDGE_KEYWORDS: tuple = (
         "salt bridge",
         "salt-bridge",
-        "electrostatic",
-        "ionic interaction",
+        "electrostatic interaction",   # narrowed from "electrostatic" — avoids matching
+        "ionic interaction",           # "show electrostatic surface" (visualization)
         "charge pair",
         "engineer salt",
         "new salt bridge",
     )
 
+    # Cavity keyword list — does NOT include bare "void" (matches "avoiding").
+    # Bare "void" / "voids" is handled with word-boundary regex in
+    # _detect_cavity_intent().  Only explicit cavity-specific compound forms here.
+    # Removed: "hydrophobic core" (too broad — matches mutation scan requests)
     _CAVITY_KEYWORDS: tuple = (
-        "cavit",              # matches cavity, cavities, cavity-filling, etc.
-        "void",
+        "cavit",           # cavity, cavities, cavity-filling
+        "internal void",   # compound — "internal voids" also matches via substring
+        "buried void",     # compound — "buried voids" also matches via substring
+        "fill void",
         "cavity fill",
         "fill cavity",
-        "internal void",
         "packing defect",
-        "hydrophobic core",
+        "buried pocket",   # pocket + burial context
+        "internal pocket",
+        "fill pocket",
+        "hollow",          # hollow protein core
+        "fpocket",         # explicit cavity-detection tool name
+        "tunnel",          # protein tunnel / channel
     )
 
-    # Assembly / dimer keywords trigger chains=None (all chains) in find_cavities
+    # Assembly / dimer keywords trigger chains=None (all chains) in find_cavities.
+    # Removed: "binding pocket" — too broad; a binding-pocket analysis request is
+    # not the same as asking for dimer cavity detection.
     _CAVITY_ASSEMBLY_KEYWORDS: tuple = (
         "full dimer",
         "full assembly",
@@ -236,7 +248,6 @@ class ToolRouter:
         "assembly cavity",
         "interface cavity",
         "interface pocket",
-        "binding pocket",
         "active site cavity",
     )
 
@@ -284,6 +295,25 @@ class ToolRouter:
         "sequon recognition",
         "glycan ost",
         "ost glycosylation",
+    )
+
+    # Keywords that signal a mutation scan / engineering scan request.
+    # Used as a fallback when the translator returns an unexpected tool
+    # (e.g. cavity) for a clear solubility / mutation engineering request.
+    # Matches both "mutation" (singular) and "mutations" (plural) via "mutati".
+    _MUTATION_SCAN_KEYWORDS: tuple = (
+        "suggest mutation",       # singular
+        "suggest mutations",      # plural
+        "improve solubility",     # solubility improvement without explicit mutation
+        "reduce aggregation",     # aggregation engineering
+        "mutation scan",          # explicit scan name
+        "solubility scan",        # explicit scan name
+        "mutation to improve",    # singular + context
+        "mutations to improve",   # plural + context
+        "engineering candidate",  # engineering language
+        "stabilising mutation",   # stability mutation (British)
+        "stabilizing mutation",   # stability mutation (American)
+        "stability mutation",
     )
 
     # Keywords that trigger double mutant pair scoring.
@@ -345,6 +375,42 @@ class ToolRouter:
         self._double_mutant_bridge:    Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
+
+    # ── Cavity intent helpers ─────────────────────────────────────────────────
+
+    @classmethod
+    def _detect_cavity_intent(cls, text: str) -> bool:
+        """
+        Return True if *text* signals a cavity detection / filling request.
+
+        "void" / "voids" are matched with a word-boundary regex (\\bvoids?\\b) so
+        that "avoiding" does NOT trigger cavity routing.  All other cavity keywords
+        are matched as substrings (they are long enough to be unambiguous).
+        """
+        lower = text.lower()
+        if re.search(r'\bvoids?\b', lower):
+            return True
+        return any(kw in lower for kw in cls._CAVITY_KEYWORDS)
+
+    # ── Mutation scan intent helpers ──────────────────────────────────────────
+
+    @classmethod
+    def _detect_mutation_scan_intent(cls, text: str) -> bool:
+        """
+        Return True if *text* signals a mutation scan / engineering request.
+
+        Matches 'mutation' (singular) and 'mutations' (plural) via shared
+        substring, plus standalone solubility / aggregation engineering phrases.
+        Used as a routing fallback when the translator returns an unexpected tool.
+        """
+        lower = text.lower()
+        # Substring check covers mutation / mutations / mutational
+        if "mutati" in lower and any(
+            kw in lower for kw in ("solubility", "aggregation", "stabili", "engineer",
+                                   "improve", "suggest", "scan", "candidate")
+        ):
+            return True
+        return any(kw in lower for kw in cls._MUTATION_SCAN_KEYWORDS)
 
     # ── Double mutant intent helpers ──────────────────────────────────────────
 
@@ -644,7 +710,7 @@ class ToolRouter:
                     break
 
         # ── Cavity intent override ──────────────────────────────────────────────
-        _cav_intent = bool(user_input and any(kw in user_input.lower() for kw in self._CAVITY_KEYWORDS))
+        _cav_intent = bool(user_input and self._detect_cavity_intent(user_input))
         if _cav_intent and "cavity" not in tools_needed:
             tools_needed = ["cavity"]
             tool_inputs = {"cavity": {"model_id": self._primary_model_id(), "chain": "A"}}
@@ -686,6 +752,47 @@ class ToolRouter:
                     "model_id":    self._primary_model_id(),
                     "chain":       _dm_chain,
                     "_user_input": user_input,
+                }
+            }
+
+        # ── Mutation scan intent fallback ──────────────────────────────────────
+        # Fires when user clearly wants a mutation scan but the translator returned
+        # a different tool (e.g. cavity, chimerax).  Handles singular "mutation"
+        # as well as "improve solubility" without the mutation keyword.
+        # Runs LAST: all more-specific overrides (proline, glycan, double_mutant)
+        # have already fired and take priority.
+        # Blocks on ACTUAL user keywords (not translator output) so that cavity
+        # and salt-bridge are only respected when the user's words match those tools.
+        _lower_ui_ms = user_input.lower() if user_input else ""
+        _ms_intent = bool(
+            user_input
+            and self._detect_mutation_scan_intent(user_input)
+            and "mutation_scan" not in tools_needed
+            and not self._detect_proline_intent(user_input)
+            and not self._detect_glycan_intent(user_input)
+            and not self._detect_double_mutant_intent(user_input)
+            and not any(t in tools_needed for t in (
+                "proline", "glycan", "glycan_positions", "double_mutant", "disulfide",
+            ))
+            # Only skip if the user's words genuinely match cavity / salt-bridge tools.
+            and not self._detect_cavity_intent(user_input)
+            and not any(kw in _lower_ui_ms for kw in self._SALT_BRIDGE_KEYWORDS)
+        )
+        if _ms_intent:
+            _ms_chain    = "A"
+            _ms_model_id = self._primary_model_id()
+            for _inp in list(tool_inputs.values()):
+                if isinstance(_inp, dict):
+                    if _inp.get("chain"):
+                        _ms_chain = _inp["chain"]
+                    if _inp.get("model_id"):
+                        _ms_model_id = str(_inp["model_id"])
+            tools_needed = ["mutation_scan"]
+            tool_inputs  = {
+                "mutation_scan": {
+                    "model_id": _ms_model_id,
+                    "chain":    _ms_chain,
+                    "focus":    "solubility",
                 }
             }
 
@@ -2187,6 +2294,16 @@ class ToolRouter:
         # Step 2 — prerequisites: scan results
         scan_data = self.session.get_scan_result(model_id)
         if not scan_data:
+            # Diagnostic: show which session fields have data to aid debugging
+            populated = [
+                k for k in vars(self.session)
+                if k not in ("session_start", "working_dir")
+                and getattr(self.session, k, None)
+            ]
+            print(
+                f"[DoubleMutant] Session state fields with data: {populated}",
+                flush=True,
+            )
             return ToolStepResult(
                 tool="double_mutant", success=False,
                 error=(

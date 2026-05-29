@@ -1188,3 +1188,187 @@ def test_double_mutant_guard_in_mutation_scan():
 
     assert mock_dm.called, "_run_double_mutant should have been called"
     assert not mock_scan.called, "_run_mutation_scan should NOT have been called"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Mutation scan intent fallback routing tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_solubility_singular_routes_to_mutation_scan():
+    """
+    'suggest mutation to improve solubility' (singular) must route to
+    mutation_scan, not cavity or any other tool.
+    """
+    router = _make_router()
+
+    # Simulate translator returning "cavity" (the bug case)
+    translator_r = {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "medium",
+        "tools_needed":         ["cavity"],
+        "tool_inputs":          {"cavity": {"model_id": "1", "chain": "A"}},
+    }
+    user_input = "suggest mutation to improve solubility of chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mutation_scan" in routed["tools_needed"], (
+        f"Singular 'mutation' should route to mutation_scan; "
+        f"got {routed['tools_needed']}"
+    )
+    assert "cavity" not in routed["tools_needed"], (
+        f"cavity should be overridden; got {routed['tools_needed']}"
+    )
+
+
+def test_solubility_without_mutation_keyword_routes_correctly():
+    """
+    'improve solubility of chain A avoiding interfaces' (no 'mutation' keyword)
+    must still route to mutation_scan.
+    """
+    router = _make_router()
+
+    # Simulate translator returning only chimerax (failed to detect scan intent)
+    translator_r = {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "medium",
+        "tools_needed":         ["chimerax"],
+        "tool_inputs":          {},
+    }
+    user_input = "improve solubility of chain A avoiding interfaces"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "mutation_scan" in routed["tools_needed"], (
+        f"'improve solubility' should route to mutation_scan; "
+        f"got {routed['tools_needed']}"
+    )
+
+
+def test_refusal_error_handled_gracefully():
+    """
+    When translator.translate() raises ValueError with 'refusal' in the message,
+    _handle_request() must catch it, print a helpful message, and return cleanly
+    without re-raising or crashing the process.
+    """
+    import main as _main_module
+    from main import StructureBot
+    from translator import CommandTranslator
+
+    mock_bridge  = MagicMock()
+    mock_session = MagicMock()
+    mock_session.structures = {}
+    mock_session.command_history = []
+    mock_session.get_proteinmpnn_result.return_value = None
+
+    bot = StructureBot.__new__(StructureBot)
+    bot.bridge         = mock_bridge
+    bot.session        = mock_session
+    bot.auto_proceed   = False
+    bot.auto_proceed_delay = 0
+    bot.log_file       = Path("/tmp/test_structurebot.log")
+    bot.router         = ToolRouter(bridge=mock_bridge, session=mock_session)
+    bot.translator     = MagicMock(spec=CommandTranslator)
+    bot.translator.translate.side_effect = ValueError(
+        "API returned empty response (stop_reason='refusal'). "
+        "The prompt may have triggered a safety filter."
+    )
+
+    # Mock console so status() context manager and print() work in test environment
+    mock_console = MagicMock()
+    _cm = MagicMock()
+    _cm.__enter__ = MagicMock(return_value=None)
+    _cm.__exit__  = MagicMock(return_value=False)  # do not suppress exceptions
+    mock_console.status.return_value = _cm
+
+    raised = False
+    with patch.object(_main_module, "console", mock_console):
+        try:
+            bot._handle_request("suggest epitope preserving mutations")
+        except Exception:
+            raised = True
+
+    assert not raised, (
+        "_handle_request() should catch refusal ValueError and return cleanly, "
+        "not propagate an exception"
+    )
+    # Verify a warning was printed (console.print called with refusal message)
+    assert mock_console.print.called, "console.print should have been called with the warning"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Cavity detection precision tests
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_cavity_does_not_match_solubility_request():
+    """
+    'suggest mutation to improve solubility of chain A' (singular) must NOT
+    route to cavity — it must route to mutation_scan.
+    """
+    router       = _make_router()
+    # Simulate the exact bug: translator wrongly returned ["cavity"]
+    translator_r = {
+        "commands":             [],
+        "explanations":         [],
+        "warnings":             [],
+        "clarification_needed": None,
+        "confidence":           "medium",
+        "tools_needed":         ["cavity"],
+        "tool_inputs":          {"cavity": {"model_id": "1", "chain": "A"}},
+    }
+    user_input = "suggest mutation to improve solubility of chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "cavity" not in routed["tools_needed"], (
+        f"Solubility request should NOT route to cavity; got {routed['tools_needed']}"
+    )
+    assert "mutation_scan" in routed["tools_needed"], (
+        f"Solubility request should route to mutation_scan; got {routed['tools_needed']}"
+    )
+
+
+def test_cavity_does_not_match_stability_request():
+    """'calculate stability of V82A' must NOT route to cavity."""
+    router       = _make_router()
+    translator_r = _mutation_scan_translator_result()
+    user_input   = "calculate stability of V82A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "cavity" not in routed["tools_needed"], (
+        f"Stability request should NOT route to cavity; got {routed['tools_needed']}"
+    )
+
+
+def test_cavity_matches_explicit_cavity_request():
+    """'identify cavities in chain A' must route to cavity."""
+    router       = _make_router()
+    # Translator may return chimerax for this request
+    translator_r = _chimerax_translator_result()
+    user_input   = "identify cavities in chain A"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "cavity" in routed["tools_needed"], (
+        f"Explicit cavity request should route to cavity; got {routed['tools_needed']}"
+    )
+
+
+def test_cavity_matches_fill_request():
+    """'find buried voids to fill' must route to cavity."""
+    router       = _make_router()
+    translator_r = _chimerax_translator_result()
+    user_input   = "find buried voids to fill"
+
+    routed = router.route(translator_r, user_input=user_input)
+
+    assert "cavity" in routed["tools_needed"], (
+        f"'buried voids' should route to cavity; got {routed['tools_needed']}"
+    )

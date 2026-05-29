@@ -76,6 +76,16 @@ from session_state import SessionState
 
 DEFAULT_MODEL: str = config.ANTHROPIC_MODEL
 
+
+class RefusalError(ValueError):
+    """
+    Raised when the Anthropic API declines to process the request
+    (stop_reason='refusal' or an empty-content response from a safety filter).
+
+    Callers should catch RefusalError separately from generic ValueError so they
+    can show a user-friendly message instead of propagating a traceback.
+    """
+
 # ── Static system block (cached) ───────────────────────────────────────────────
 
 _STATIC_SYSTEM = """\
@@ -698,7 +708,7 @@ class CommandTranslator:
         )
         if not response.content:
             stop = getattr(response, "stop_reason", "unknown")
-            raise ValueError(
+            raise RefusalError(
                 f"API returned empty response (stop_reason={stop!r}). "
                 "The prompt may have triggered a safety filter or the "
                 "request was malformed."
