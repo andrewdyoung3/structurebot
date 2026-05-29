@@ -158,6 +158,7 @@ HELP_TEXT = """
   [cmd]stats[/cmd]             show usage statistics across all sessions
   [cmd]undo[/cmd]              undo the last ChimeraX action
   [cmd]clear[/cmd]             close all models, reset session
+  [cmd]clear session[/cmd]     delete session.json and start fresh (keeps ChimeraX models)
   [cmd]save session NAME[/cmd] save ChimeraX session + state to sessions/NAME
   [cmd]load session NAME[/cmd] restore a saved session
   [cmd]reset[/cmd]             clear conversation context
@@ -238,6 +239,10 @@ class StructureBot:
 
         self.auto_proceed       = auto_proceed
         self.auto_proceed_delay = auto_proceed_delay
+
+        # Restore-on-startup bookkeeping
+        self._resume_flag = resume   # --resume already loaded session.json in load()
+        self._interactive = True     # set False by run_script() to skip prompts
 
         # Log file path
         log_name = datetime.now().strftime("session_%Y%m%d_%H%M%S.jsonl")
@@ -330,13 +335,151 @@ class StructureBot:
         except Exception:
             pass  # WSL2 status is informational only
 
-        # 6. Resume info
-        if self.session.command_history:
-            console.print(
-                f"[dim]Resumed session: {len(self.session.structures)} structure(s), "
-                f"{len(self.session.command_history)} prior commands.[/dim]"
-            )
+        # 6. Session auto-restore (mutation scans etc. survive restarts)
+        self._maybe_restore_session()
         console.print()
+
+    # ── Session restore ─────────────────────────────────────────────────────────
+
+    def _maybe_restore_session(self) -> None:
+        """
+        On startup, offer to restore a previous session.json so expensive
+        computed state (mutation scans, double-mutant results, interfaces,
+        active-site residues, …) survives restarts.
+
+        --resume auto-accepts (the file was already loaded in __init__).
+        Otherwise the user is prompted: restore / start fresh / delete.
+        Corrupt or incompatible files are reported and skipped (start fresh).
+        """
+        # --resume already loaded the file in __init__ → treat as accepted.
+        if self._resume_flag:
+            if self.session.structures or self.session.scan_results:
+                console.print(
+                    f"[dim]Resumed session: {len(self.session.structures)} structure(s), "
+                    f"{len(self.session.scan_results)} scan result(s), "
+                    f"{len(self.session.command_history)} prior commands.[/dim]"
+                )
+                self._reconnect_or_offer_reopen()
+            return
+
+        state, err = SessionState.try_load(SESSION_FILE)
+        if err:
+            console.print(
+                f"[warn]⚠ Previous session ({SESSION_FILE}) could not be read "
+                f"({escape(err)}); starting fresh.[/warn]"
+            )
+            return
+        if state is None:
+            return  # no session file at all
+
+        # Anything worth restoring?
+        if not (state.structures or state.scan_results
+                or state.double_mutant_results or state.command_history):
+            return
+
+        # Non-interactive (script) runs never block on a prompt.
+        if not self._interactive:
+            return
+
+        console.print(Panel(
+            state.restore_summary(),
+            title="[bold cyan]Previous session found[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 2),
+        ))
+        choice = Prompt.ask(
+            "[hi]Restore it?[/hi] "
+            "[dim][[y]es / [n]o (keep file) / [c]lear (delete it)][/dim]",
+            default="y",
+        ).strip().lower()
+
+        if choice in ("c", "clear"):
+            self._wipe_session_file()
+            console.print("[ok]✓[/ok] Previous session deleted — starting fresh.")
+            return
+        if choice in ("n", "no"):
+            console.print(
+                "[dim]Starting fresh. The previous session.json is kept and will "
+                "be overwritten when you quit.[/dim]"
+            )
+            return
+
+        # Accept → swap in the restored session and rebind the router to it.
+        self.session = state
+        self.router  = ToolRouter(self.bridge, self.session)
+        console.print(
+            f"[ok]✓[/ok] Session restored: {len(self.session.structures)} structure(s), "
+            f"{len(self.session.scan_results)} scan result(s)."
+        )
+        self._reconnect_or_offer_reopen()
+
+    def _chimerax_model_ids(self) -> set:
+        """
+        Return the set of model-id strings currently open in ChimeraX
+        (e.g. {"1", "2"}).  Empty set if ChimeraX is unreachable.
+        """
+        try:
+            if not self.bridge.is_running():
+                return set()
+            res = self.bridge.run_command("info models")
+            val = (res.get("value") or "") if isinstance(res, dict) else ""
+            return set(re.findall(r"#(\d+)", val))
+        except Exception:
+            return set()
+
+    def _reconnect_or_offer_reopen(self) -> None:
+        """
+        For each restored structure, check whether it is still loaded in
+        ChimeraX. Present ones are reused as-is; missing ones can be re-opened
+        (a fast fetch for PDB IDs / local files, not a re-computation).
+        """
+        if not self.session.structures:
+            return
+        open_ids = self._chimerax_model_ids()
+        for mid, info in list(self.session.structures.items()):
+            name = str(info.get("name", "?"))
+            if mid in open_ids:
+                console.print(
+                    f"  [dim]✓ #{mid} {escape(name)} still loaded in ChimeraX.[/dim]"
+                )
+                continue
+
+            console.print(
+                f"  [warn]⚠ #{mid} {escape(name)} is not loaded in ChimeraX "
+                "(session state kept).[/warn]"
+            )
+            # Re-open only makes sense for a 4-char PDB ID or a known file path.
+            reopenable = (
+                bool(re.match(r"^[A-Za-z0-9]{4}$", name.strip()))
+                or bool(info.get("path"))
+            )
+            if not reopenable or not self._interactive:
+                continue
+
+            choice = Prompt.ask(
+                f"[hi]Re-open {escape(name)} in ChimeraX?[/hi] [dim][[y]es / [n]o][/dim]",
+                default="y",
+            ).strip().lower()
+            if choice in ("n", "no"):
+                continue
+
+            target = info.get("path") or name
+            res = self.bridge.run_command(f"open {target}")
+            if isinstance(res, dict) and res.get("error"):
+                console.print(
+                    f"  [err]✗ open failed: {escape(str(res['error'])[:80])}[/err]"
+                )
+            else:
+                console.print(f"  [ok]✓[/ok] Re-opened {escape(name)}.")
+
+    def _wipe_session_file(self) -> None:
+        """Delete the persisted session.json (silent if absent)."""
+        try:
+            p = Path(SESSION_FILE)
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
 
     # ── REPL ──────────────────────────────────────────────────────────────────
 
@@ -364,6 +507,8 @@ class StructureBot:
                 self._cmd_state()
             elif lower == "undo":
                 self._cmd_undo()
+            elif lower in ("clear session", "new session", "clearsession", "newsession"):
+                self._cmd_clear_session()
             elif lower == "clear":
                 self._cmd_clear()
             elif lower == "reset":
@@ -434,6 +579,8 @@ class StructureBot:
             import sys as _sys
             _sys.exit(1)
 
+        # Batch mode: never block on an interactive restore/reopen prompt.
+        self._interactive = False
         self.startup()
 
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -1028,6 +1175,21 @@ class StructureBot:
         self.session.named_selections.clear()
         self.session.applied_styles.clear()
         console.print("[ok]✓[/ok] All models closed, session reset.")
+
+    def _cmd_clear_session(self) -> None:
+        """
+        Delete the persisted session.json and reset in-memory state to a fresh
+        session, so the user is not stuck with stale restored state. Loaded
+        ChimeraX models are left untouched (use 'clear' to close those).
+        """
+        self._wipe_session_file()
+        self.session = SessionState()
+        self.router  = ToolRouter(self.bridge, self.session)
+        console.print(
+            f"[ok]✓[/ok] Session cleared — fresh start "
+            f"([dim]{SESSION_FILE}[/dim] removed). "
+            "Loaded ChimeraX models are untouched."
+        )
 
     def _cmd_reset(self) -> None:
         confirm = Prompt.ask(

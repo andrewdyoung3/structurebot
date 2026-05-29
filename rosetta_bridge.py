@@ -335,9 +335,6 @@ class RosettaBridge:
 
     def __init__(self) -> None:
         self._backend = _select_backend()
-        # TEMP DEBUG (remove after live verification): log the first parsed
-        # DynaMut2 single-mutation poll response so we can confirm the live fix.
-        self._dynamut2_debug_logged = False
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -927,16 +924,7 @@ class RosettaBridge:
             # top-level numeric "prediction" with no status.
             if (status in ("done", "finished", "complete", "completed", "success")
                     or data.get("prediction") is not None):
-                ddg = _parse_dynamut2_result(data, mutation_str)
-                # TEMP DEBUG (remove after live verification): first parsed result.
-                if not self._dynamut2_debug_logged:
-                    self._dynamut2_debug_logged = True
-                    print(
-                        f"[DynaMut2 single] {mutation_str}: raw={data} "
-                        f"extracted_ddg={ddg}",
-                        flush=True,
-                    )
-                return ddg
+                return _parse_dynamut2_result(data, mutation_str)
 
             # Still running?
             still_running = (
@@ -1254,10 +1242,6 @@ class RosettaBridge:
 import json, sys, os
 sys.path.insert(0, '/opt/conda/lib/python3.12/site-packages')  # common PyRosetta location
 
-# TEMP DIAGNOSTIC (remove after live verification): _debug is collected
-# throughout and written to the results JSON under a "debug" key so it
-# survives back to the Python side.
-_debug = {{}}
 try:
     import pyrosetta
     from pyrosetta import init as rosetta_init, pose_from_file
@@ -1271,54 +1255,28 @@ try:
     cache_dir = {relax_cache_wsl!r}
     hash_key  = {pdb_hash!r}
     relaxed   = os.path.join(cache_dir, f"{{hash_key}}_relaxed.pdb")
-    _debug["input_path"] = pdb_path
 
     os.makedirs(cache_dir, exist_ok=True)
 
-    # ── cleanATOM + size guard (diagnosed) ────────────────────────────────
+    # cleanATOM + size guard: keep the cleaned file only if it is non-trivial.
     cleaned_path = pdb_path.replace('.pdb', '_clean.pdb')
     if cleaned_path == pdb_path:            # input had no .pdb extension
         cleaned_path = pdb_path + '_clean.pdb'
-    try:
-        cleanATOM(pdb_path, cleaned_path)
-    except Exception as _clean_exc:
-        _debug["cleanATOM_error"] = str(_clean_exc)
-    _clean_exists = os.path.isfile(cleaned_path)
-    _clean_size   = os.path.getsize(cleaned_path) if _clean_exists else 0
-    _orig_path    = pdb_path
-    if _clean_exists and _clean_size > 100:
-        pdb_path     = cleaned_path
-        _used_clean  = True
-    else:
-        _used_clean  = False
-    _debug["cleanATOM"] = {{
-        "cleaned_path": cleaned_path, "cleaned_exists": _clean_exists,
-        "cleaned_size": _clean_size, "used_cleaned": _used_clean,
-        "kept_path": pdb_path,
-    }}
-    print(f"[Rosetta DEBUG] cleanATOM: cleaned={{cleaned_path}} exists={{_clean_exists}} "
-          f"size={{_clean_size}} used_cleaned={{_used_clean}}", flush=True)
+    cleanATOM(pdb_path, cleaned_path)
+    if os.path.isfile(cleaned_path) and os.path.getsize(cleaned_path) > 100:
+        pdb_path = cleaned_path
+    print(f"[Rosetta] PDB cleaned → {{pdb_path}}", flush=True)
 
-    # ── Validate the file we are about to load ────────────────────────────
-    # pose_from_file infers type from extension/content; a non-.pdb name or
-    # an empty/HTML file raises "Cannot determine file type".
-    _load_exists = os.path.isfile(pdb_path)
-    _load_size   = os.path.getsize(pdb_path) if _load_exists else 0
+    # Validate before loading: pose_from_file infers type from extension/content,
+    # so an empty/HTML file or a non-.pdb name raises "Cannot determine file type".
+    if not os.path.isfile(pdb_path) or os.path.getsize(pdb_path) == 0:
+        raise RuntimeError(f"PDB to load is missing/empty: {{pdb_path}}")
     _head = []
-    if _load_exists:
-        with open(pdb_path, "r", errors="replace") as _fh:
-            for _i, _ln in enumerate(_fh):
-                if _i >= 5:
-                    break
-                _head.append(_ln.rstrip("\\n"))
-    _debug["load"] = {{"path": pdb_path, "exists": _load_exists,
-                       "size": _load_size, "head": _head}}
-    print(f"[Rosetta DEBUG] pose_from_file target: path={{pdb_path}} "
-          f"exists={{_load_exists}} size={{_load_size}}", flush=True)
-    print(f"[Rosetta DEBUG] first lines: {{_head}}", flush=True)
-
-    if not _load_exists or _load_size == 0:
-        raise RuntimeError(f"PDB to load is missing/empty: {{pdb_path}} (size={{_load_size}})")
+    with open(pdb_path, "r", errors="replace") as _fh:
+        for _i, _ln in enumerate(_fh):
+            if _i >= 5:
+                break
+            _head.append(_ln.rstrip("\\n"))
     _valid_starts = ("ATOM", "HETATM", "HEADER", "CRYST", "MODEL",
                      "REMARK", "TITLE", "SEQRES", "EXPDTA", "COMPND")
     if not any(any(_l.startswith(_p) for _p in _valid_starts) for _l in _head):
@@ -1326,23 +1284,17 @@ try:
 
     # Ensure the loaded path ends in .pdb so file-type inference succeeds.
     if not pdb_path.endswith(".pdb"):
-        _renamed = pdb_path + ".pdb"
         import shutil as _shutil
+        _renamed = pdb_path + ".pdb"
         _shutil.copyfile(pdb_path, _renamed)
         pdb_path = _renamed
-        _debug["renamed_to"] = pdb_path
-        print(f"[Rosetta DEBUG] renamed load target to .pdb: {{pdb_path}}", flush=True)
 
     try:
         pose = pose_from_file(pdb_path)
-    except Exception as _load_exc:
+    except Exception:
         # Explicit PDB reader fallback when type inference fails.
-        _debug["pose_from_file_error"] = str(_load_exc)
-        print(f"[Rosetta DEBUG] pose_from_file failed ({{_load_exc}}); "
-              "trying pose_from_pdb", flush=True)
         from pyrosetta import pose_from_pdb
         pose = pose_from_pdb(pdb_path)
-    print(f"[Rosetta] PDB loaded → {{pdb_path}}", flush=True)
     scorefxn = pyrosetta.create_score_function("ref2015")
 
     if os.path.isfile(relaxed):
@@ -1394,7 +1346,6 @@ try:
             print(f"[Rosetta] {{key}} failed: {{e}}", flush=True)
             traceback.print_exc()
 
-    results["debug"] = _debug   # TEMP DIAGNOSTIC
     with open({wsl_results_path!r}, "w") as f:
         json.dump(results, f)
     print(f"[Rosetta] Results written to {wsl_results_path!r}", flush=True)
@@ -1402,12 +1353,10 @@ try:
 
 except Exception as exc:
     import traceback
-    _tb = traceback.format_exc()
     print(f"[Rosetta] FATAL: {{exc}}", flush=True)
-    print(f"[Rosetta DEBUG] traceback:\\n{{_tb}}", flush=True)
-    _debug["traceback"] = _tb
+    traceback.print_exc()
     with open({wsl_results_path!r}, "w") as f:
-        json.dump({{"error": str(exc), "debug": _debug}}, f)
+        json.dump({{"error": str(exc)}}, f)
 """
 
         import tempfile, os
@@ -1460,9 +1409,6 @@ except Exception as exc:
                 summary          = _summary,
             )
 
-        # TEMP DIAGNOSTIC (remove after live verification): paths to the worker.
-        _prog(f"  [Rosetta DEBUG] Windows PDB: {pdb_path}")
-        _prog(f"  [Rosetta DEBUG] WSL2 PDB:    {wsl_pdb}")
         _prog("⚗️  [Rosetta] Running PyRosetta cartesian_ddg (may take 2–5 min per mutation)...")
         result = wsl.run_python_script(script, timeout=1800)
 
@@ -1490,11 +1436,6 @@ except Exception as exc:
                 ddg_raw = _json.load(fh)
         except Exception as exc:
             return _empirical_result(f"could not parse worker output ({exc})")
-
-        # TEMP DIAGNOSTIC (remove after live verification): surface worker debug.
-        _worker_debug = ddg_raw.pop("debug", None) if isinstance(ddg_raw, dict) else None
-        if _worker_debug is not None:
-            _prog(f"  [Rosetta DEBUG] worker debug: {_worker_debug}")
 
         if "error" in ddg_raw:
             return _empirical_result(f"worker error: {str(ddg_raw['error'])[:200]}")

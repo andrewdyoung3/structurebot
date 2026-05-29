@@ -896,12 +896,9 @@ class SessionState:
             json.dump(data, fh, indent=2, ensure_ascii=False)
 
     @classmethod
-    def load(cls, path: str = "session.json") -> "SessionState":
+    def _from_dict(cls, data: Dict[str, Any]) -> "SessionState":
+        """Build a SessionState from an already-parsed session dict."""
         state = cls()
-        if not Path(path).is_file():
-            return state
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
         state.session_start       = data.get("session_start", state.session_start)
         state.working_dir         = data.get("working_dir",   state.working_dir)
         state.structures          = data.get("structures",    {})
@@ -921,12 +918,90 @@ class SessionState:
         state.mpnn_esmfold_results = data.get("mpnn_esmfold_results", {})
         state.rosetta_relax_cache  = data.get("rosetta_relax_cache", {})
         state.functional_residues  = set(data.get("functional_residues", []))
-        obj = state
-        obj.salt_bridge_results    = data.get("salt_bridge_results", {})
-        obj.cavity_results         = data.get("cavity_results", {})
-        obj.double_mutant_results  = data.get("double_mutant_results", {})
-        obj.netnglyc_results       = data.get("netnglyc_results", {})
+        state.salt_bridge_results    = data.get("salt_bridge_results", {})
+        state.cavity_results         = data.get("cavity_results", {})
+        state.double_mutant_results  = data.get("double_mutant_results", {})
+        state.netnglyc_results       = data.get("netnglyc_results", {})
         return state
+
+    @classmethod
+    def try_load(cls, path: str = "session.json"):
+        """
+        Attempt to load a session file without ever raising.
+
+        Returns a (state, error) tuple:
+          (None, None)      — the file does not exist (nothing to restore)
+          (None, "message") — the file exists but is corrupt / unreadable /
+                              incompatible (caller should warn and start fresh)
+          (state, None)     — loaded successfully
+        """
+        p = Path(path)
+        if not p.is_file():
+            return None, None
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return None, f"corrupt JSON ({str(exc)[:80]})"
+        except OSError as exc:
+            return None, f"unreadable ({str(exc)[:80]})"
+        if not isinstance(data, dict):
+            return None, "session file is not a JSON object"
+        try:
+            return cls._from_dict(data), None
+        except Exception as exc:  # malformed/incompatible field shapes
+            return None, f"incompatible session data ({str(exc)[:80]})"
+
+    @classmethod
+    def load(cls, path: str = "session.json") -> "SessionState":
+        """
+        Load a session, never raising: returns a fresh state if the file is
+        missing, corrupt, or incompatible.  Use try_load() when you need to
+        distinguish those cases (e.g. to warn the user).
+        """
+        state, _err = cls.try_load(path)
+        return state if state is not None else cls()
+
+    def restore_summary(self) -> str:
+        """
+        Short human-readable summary of restorable content, for the startup
+        restore prompt.  Lists structures, scan / double-mutant results,
+        detected interfaces, and prior command count.
+        """
+        lines: List[str] = [f"Saved        : {self.session_start}"]
+
+        if self.structures:
+            structs = ", ".join(
+                f"#{mid} {info.get('name', '?')}"
+                for mid, info in self.structures.items()
+            )
+            lines.append(f"Structures   : {structs}")
+        else:
+            lines.append("Structures   : none")
+
+        if self.scan_results:
+            parts = []
+            for mid, entry in self.scan_results.items():
+                dat = entry.get("data", {})
+                n = len(dat) if isinstance(dat, list) else "?"
+                parts.append(f"#{mid} ({n} candidates)")
+            lines.append(f"Scan results : {', '.join(parts)}")
+
+        if self.double_mutant_results:
+            keys = ", ".join(f"#{m}" for m in self.double_mutant_results)
+            lines.append(f"Double-mutant: {keys}")
+
+        if self.interface_residues:
+            keys = ", ".join(f"#{m}" for m in self.interface_residues)
+            lines.append(f"Interfaces   : {keys}")
+
+        if self.functional_residues:
+            lines.append(f"Active site  : {sorted(self.functional_residues)}")
+
+        if self.command_history:
+            lines.append(f"Prior commands: {len(self.command_history)}")
+
+        return "\n".join(lines)
 
     def __repr__(self) -> str:
         return (
