@@ -1135,9 +1135,16 @@ class RosettaBridge:
         model_id:  str = "1",
         chain:     Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
+        relax_cycles: int = 3,
     ) -> "ToolStepResult":
         """
         PyRosetta cartesian_ddg protocol via WSL2.
+
+        relax_cycles : FastRelax cycles for the per-mutation mutant relax AND
+            the symmetric WT re-relax (default 3 = production behaviour; do not
+            change for the production scan path). Exposed only so convergence
+            diagnostics can sweep the cycle count; the cached WT baseline relax
+            is unaffected.
 
         Requires
         --------
@@ -1164,6 +1171,10 @@ class RosettaBridge:
                 progress_callback(msg)
             else:
                 _safe_print(msg)
+
+        # Per-mutation relax cycles (3 = production default). int-coerced so the
+        # value interpolated into the worker script is always a safe integer.
+        relax_cycles = max(1, int(relax_cycles))
 
         try:
             from wsl_bridge import WSLBridge
@@ -1331,10 +1342,10 @@ try:
                 raise ValueError(f"Residue {{pos}}{{chain_id}} not found in pose")
             mut_mover = MutateResidue(target=res_num, new_res=to_aa3)
             mut_mover.apply(mut_pose)
-            relax_mut = FastRelax(scorefxn_std, 3)
+            relax_mut = FastRelax(scorefxn_std, {relax_cycles})
             relax_mut.apply(mut_pose)
             wt_pose_rerelaxed = wt_pose.clone()
-            relax_wt = FastRelax(scorefxn_std, 3)
+            relax_wt = FastRelax(scorefxn_std, {relax_cycles})
             relax_wt.apply(wt_pose_rerelaxed)
             wt_score = scorefxn_std(wt_pose_rerelaxed)
             ddg = scorefxn_std(mut_pose) - wt_score
