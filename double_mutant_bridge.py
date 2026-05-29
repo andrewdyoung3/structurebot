@@ -100,6 +100,35 @@ def _pair_key(m_a: Dict[str, Any], m_b: Dict[str, Any]) -> str:
     return f"{_mk(m_a)}+{_mk(m_b)}"
 
 
+def _apply_additive_fallback(pair: Dict[str, Any], note: Optional[str] = None) -> None:
+    """
+    Populate a pair with an additive ΔΔG estimate (ddG_A + ddG_B) in place.
+
+    Used whenever no epistasis-aware backend is available for a pair — the
+    DynaMut2 mm API is down/unreachable, or PyRosetta is disabled for a close
+    (< CLOSE Å) pair. Epistasis is set to 0.0 since additivity is assumed.
+
+    `note` overrides the default warning text appended to the pair.
+    """
+    m_a   = pair["mutation_a"]
+    m_b   = pair["mutation_b"]
+    ddg_a = float(m_a.get("ddg") or 0.0)
+    ddg_b = float(m_b.get("ddg") or 0.0)
+    total = round(ddg_a + ddg_b, 3)
+    pair["ddg_double"]   = total
+    pair["ddg_additive"] = total
+    pair["ddg_A"]        = round(ddg_a, 3)
+    pair["ddg_B"]        = round(ddg_b, 3)
+    pair["epistasis"]    = 0.0
+    pair["backend_used"] = "additive_fallback"
+    pair["warnings"] = pair.get("warnings", []) + [
+        note or (
+            "DynaMut2 mm API unavailable — using additive ddG estimate "
+            "(ddG_A + ddG_B). Epistasis not captured."
+        )
+    ]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,15 +265,15 @@ class DoubleMutantBridge:
             flush=True,
         )
 
-        # Close pairs with PyRosetta disabled → skip + warn
+        # Close pairs with PyRosetta disabled → score with additive fallback
+        # (Step 4) rather than dropping them, so the user still gets results.
         if pyrosetta_pairs and not run_pyrosetta:
-            n_skipped = len(pyrosetta_pairs)
             warnings.append(
-                f"{n_skipped} pair(s) skipped — CA-CA < "
-                f"{_cfg.DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE:.1f} Å requires "
-                "PyRosetta (set run_pyrosetta=True to enable)."
+                f"{len(pyrosetta_pairs)} close pair(s) — CA-CA < "
+                f"{_cfg.DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE:.1f} Å — scored "
+                "with additive ddG estimate (ddG_A + ddG_B); set "
+                "run_pyrosetta=True for accurate epistasis on close pairs."
             )
-            pyrosetta_pairs = []
 
         # Mid-range accuracy note
         n_mid = sum(1 for p in dynamut2_pairs if p["backend"] == "dynamut2_warned")
@@ -269,7 +298,18 @@ class DoubleMutantBridge:
             )
             scored_pairs.extend(dm_results)
 
-        # ── Step 4: score via PyRosetta (optional) ─────────────────────────────
+            # If majority fell back to additive, add a top-level warning
+            n_additive_dm = sum(
+                1 for p in dm_results if p.get("backend_used") == "additive_fallback"
+            )
+            if len(dynamut2_pairs) > 0 and n_additive_dm > len(dynamut2_pairs) * 0.5:
+                warnings.append(
+                    "DynaMut2 multiple-mutation API is currently unavailable. "
+                    "All scores are additive estimates only. "
+                    "Epistasis detection requires a working prediction_mm endpoint."
+                )
+
+        # ── Step 4: score close pairs (PyRosetta, or additive fallback) ─────────
         if pyrosetta_pairs and run_pyrosetta:
             progress_cb(
                 f"  Scoring {len(pyrosetta_pairs)} close pair(s) via PyRosetta WSL2..."
@@ -281,6 +321,20 @@ class DoubleMutantBridge:
                 scored_pairs.extend(pr_results)
             except Exception as exc:
                 warnings.append(f"PyRosetta scoring failed: {exc!s:.120}")
+        elif pyrosetta_pairs and getattr(_cfg, "DOUBLE_MUTANT_ADDITIVE_FALLBACK", True):
+            # PyRosetta disabled: score close pairs additively rather than drop.
+            progress_cb(
+                f"  Scoring {len(pyrosetta_pairs)} close pair(s) with additive "
+                "fallback (PyRosetta disabled)..."
+            )
+            close_note = (
+                "Close pair (CA-CA < "
+                f"{_cfg.DOUBLE_MUTANT_DISTANCE_THRESHOLD_CLOSE:.1f} Å) scored with "
+                "additive ddG estimate — set run_pyrosetta=True for accurate epistasis."
+            )
+            for p in pyrosetta_pairs:
+                _apply_additive_fallback(p, note=close_note)
+            scored_pairs.extend(pyrosetta_pairs)
 
         if not scored_pairs:
             return ToolStepResult(
@@ -322,6 +376,12 @@ class DoubleMutantBridge:
         for p in pair_dicts:
             be = p.get("backend", "unknown")
             backend_counts[be] = backend_counts.get(be, 0) + 1
+        # Count additive fallbacks separately (they came from dynamut2 routing)
+        n_additive_total = sum(
+            1 for p in scored_pairs if p.get("backend_used") == "additive_fallback"
+        )
+        if n_additive_total:
+            backend_counts["additive_fallback"] = n_additive_total
         scored_set = {p["pair_key"] for p in scored_pairs}
         backend_counts["skipped"] = sum(
             1 for p in pair_dicts if p["pair_key"] not in scored_set
@@ -416,16 +476,14 @@ class DoubleMutantBridge:
                 if func and (pos_a in func_zone or pos_b in func_zone):
                     continue
 
-                # Require at least one beneficial mutation
-                ddg_a = m_a.get("ddg", 0.0)
-                ddg_b = m_b.get("ddg", 0.0)
-                sol_a = _get_camsol(m_a)
-                sol_b = _get_camsol(m_b)
-                has_benefit = (
-                    ddg_a < 0 or ddg_b < 0
-                    or sol_a > 1.0 or sol_b > 1.0
-                )
-                if not has_benefit:
+                # ddG filter: exclude a pair only when BOTH mutations are
+                # clearly destabilising (ddg > threshold). ddg == 0.0 means
+                # DynaMut2 returned neutral/unknown — treat it as acceptable and
+                # never let a single such mutation eliminate a pair.
+                ddg_a = m_a.get("ddg", 0.0) or 0.0
+                ddg_b = m_b.get("ddg", 0.0) or 0.0
+                destab = getattr(_cfg, "DOUBLE_MUTANT_DESTABILISING_DDG", 2.0)
+                if ddg_a > destab and ddg_b > destab:
                     continue
 
                 filtered.append((m_a, m_b))
@@ -607,43 +665,59 @@ class DoubleMutantBridge:
         _cb_lock        = __import__("threading").Lock()
         _consec_fail    = [0]
         _circuit_broken = __import__("threading").Event()
-        _debug_once     = [True]  # print mutations_list content for first pair only
+        _debug_once     = [True]   # print mutations_list content for first pair only
+        _additive_count = [0]      # number of pairs that fell back to additive scoring
+
+        def _additive_fallback(pair: Dict[str, Any]) -> None:
+            """Apply the shared additive estimate and track the fallback count."""
+            _apply_additive_fallback(pair)
+            with _cb_lock:
+                _additive_count[0] += 1
 
         def _score_one(pair: Dict[str, Any]) -> Dict[str, Any]:
-            if _circuit_broken.is_set():
-                return pair
+            # Circuit breaker blocks the API call — but NOT the additive fallback.
+            use_api = not _circuit_broken.is_set()
 
-            # Stagger submissions to avoid rate-limiting on the mm endpoint
-            time.sleep(2)
+            if use_api:
+                # Stagger submissions to avoid rate-limiting on the mm endpoint
+                time.sleep(2)
 
-            # Debug: print the mutations_list content for the first pair submitted
-            if _debug_once[0]:
-                _debug_once[0] = False
-                _ma = pair["mutation_a"]
-                _mb = pair["mutation_b"]
-                _la = f"{_ma.get('chain', 'A')} {_ma['from_aa']}{_ma['position']}{_ma['to_aa']}"
-                _lb = f"{_mb.get('chain', 'A')} {_mb['from_aa']}{_mb['position']}{_mb['to_aa']}"
-                print(
-                    f"[DoubleMutant] mutations_list debug (first pair {pair['pair_key']}):\n"
-                    f"  {_la}\n  {_lb}",
-                    flush=True,
-                )
+                # Debug: print the mutations_list content for the first pair submitted
+                if _debug_once[0]:
+                    _debug_once[0] = False
+                    _ma = pair["mutation_a"]
+                    _mb = pair["mutation_b"]
+                    _la = (f"{_ma.get('chain', 'A')} "
+                           f"{_ma['from_aa']}{_ma['position']}{_ma['to_aa']}")
+                    _lb = (f"{_mb.get('chain', 'A')} "
+                           f"{_mb['from_aa']}{_mb['position']}{_mb['to_aa']}")
+                    print(
+                        f"[DoubleMutant] mutations_list debug "
+                        f"(first pair {pair['pair_key']}):\n  {_la}\n  {_lb}",
+                        flush=True,
+                    )
 
-            per_deadline = time.perf_counter() + _PER_PAIR_TIMEOUT
-            try:
-                res = self._query_dynamut2_mm(pdb_path, pair, per_deadline)
-                pair.update(res)
-                pair["backend_used"] = pair["backend"]  # dynamut2 or dynamut2_warned
-                with _cb_lock:
-                    _consec_fail[0] = 0
-            except Exception as exc:
-                with _cb_lock:
-                    _consec_fail[0] += 1
-                    if _consec_fail[0] >= _CIRCUIT_BREAKER:
-                        _circuit_broken.set()
-                pair["warnings"] = pair.get("warnings", []) + [
-                    f"DynaMut2 failed for {pair['pair_key']}: {str(exc)[:100]}"
-                ]
+                per_deadline = time.perf_counter() + _PER_PAIR_TIMEOUT
+                try:
+                    res = self._query_dynamut2_mm(pdb_path, pair, per_deadline)
+                    pair.update(res)
+                    pair["backend_used"] = pair["backend"]
+                    with _cb_lock:
+                        _consec_fail[0] = 0
+                    return pair   # API succeeded — no fallback needed
+                except Exception as exc:
+                    with _cb_lock:
+                        _consec_fail[0] += 1
+                        if _consec_fail[0] >= _CIRCUIT_BREAKER:
+                            _circuit_broken.set()
+                    pair["warnings"] = pair.get("warnings", []) + [
+                        f"DynaMut2 failed for {pair['pair_key']}: {str(exc)[:100]}"
+                    ]
+                    # Fall through to additive fallback below
+
+            # Additive fallback: API unavailable or circuit breaker tripped
+            if getattr(_cfg, "DOUBLE_MUTANT_ADDITIVE_FALLBACK", True):
+                _additive_fallback(pair)
 
             return pair
 
@@ -651,17 +725,42 @@ class DoubleMutantBridge:
             future_map = {executor.submit(_score_one, p): p for p in pairs}
             done: List[Dict[str, Any]] = []
             for future in as_completed(future_map):
-                result_pair = future.result()
+                try:
+                    result_pair = future.result()
+                except Exception as exc:
+                    # _score_one raised before it could apply fallback; recover the
+                    # original pair from future_map so we can still score it.
+                    result_pair = future_map[future]
+                    result_pair["warnings"] = result_pair.get("warnings", []) + [
+                        f"Unhandled error in _score_one for "
+                        f"{result_pair.get('pair_key', '?')}: {str(exc)[:100]}"
+                    ]
+
                 if result_pair.get("ddg_double") is not None:
                     done.append(result_pair)
-                    progress(
-                        f"  + {result_pair['pair_key']}: "
-                        f"ddG={result_pair['ddg_double']:+.2f} kcal/mol "
-                        f"(epistasis={result_pair['epistasis']:+.2f})"
-                    )
+                    backend_tag = result_pair.get("backend_used", "?")
+                    if backend_tag == "additive_fallback":
+                        progress(
+                            f"  ~ {result_pair['pair_key']}: "
+                            f"additive estimate ddG={result_pair['ddg_double']:+.2f} kcal/mol "
+                            f"(no epistasis)"
+                        )
+                    else:
+                        progress(
+                            f"  + {result_pair['pair_key']}: "
+                            f"ddG={result_pair['ddg_double']:+.2f} kcal/mol "
+                            f"(epistasis={result_pair['epistasis']:+.2f})"
+                        )
                 else:
+                    # ddg_double still None (fallback blocked by config in _score_one,
+                    # or _score_one raised and was recovered above).  Apply additive
+                    # estimate here as the last-resort safety net.
+                    _additive_fallback(result_pair)
+                    done.append(result_pair)
                     progress(
-                        f"  ! {result_pair['pair_key']}: scoring failed — skipped"
+                        f"  ~ {result_pair['pair_key']}: "
+                        f"scoring failed — using additive fallback "
+                        f"ddG={result_pair['ddg_double']:+.2f} kcal/mol"
                     )
 
         if _circuit_broken.is_set():
@@ -1191,17 +1290,35 @@ except Exception as exc:
             + backend_s.get("pyrosetta_required", 0)
             + backend_s.get("skipped", 0)
         )
-        n_scored  = len(pairs)
-        n_skipped = backend_s.get("skipped", 0)
-        n_dm      = backend_s.get("dynamut2", 0) + backend_s.get("dynamut2_warned", 0)
-        n_pr      = backend_s.get("pyrosetta_required", 0)
+        n_scored   = len(pairs)
+        n_skipped  = backend_s.get("skipped", 0)
+        n_dm       = backend_s.get("dynamut2", 0) + backend_s.get("dynamut2_warned", 0)
+        n_pr       = backend_s.get("pyrosetta_required", 0)
+        n_additive = backend_s.get("additive_fallback", 0)
+
+        backend_parts = []
+        if n_dm - n_additive > 0:
+            backend_parts.append(f"{n_dm - n_additive} DynaMut2")
+        if n_pr:
+            backend_parts.append(f"{n_pr} PyRosetta")
+        if n_additive:
+            backend_parts.append(f"{n_additive} additive-estimate [!]")
+        if n_skipped:
+            backend_parts.append(f"{n_skipped} skipped")
+        backend_str = " / ".join(backend_parts) if backend_parts else "none"
 
         lines = [
             f"=== Double Mutant Analysis — {mode.capitalize()} Mode ===",
             f"Pairs evaluated: {n_total} | Scored: {n_scored} | Skipped: {n_skipped}",
-            f"Backend: {n_dm} DynaMut2 / {n_pr} PyRosetta / {n_skipped} skipped",
+            f"Backend: {backend_str}",
             "",
         ]
+        if n_additive:
+            lines.append(
+                f"[!] {n_additive} pair(s) scored additively (API unavailable) — "
+                "epistasis NOT captured for these pairs."
+            )
+            lines.append("")
 
         if top_pairs:
             lines.append(

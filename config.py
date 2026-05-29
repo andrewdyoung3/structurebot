@@ -145,6 +145,21 @@ DOUBLE_MUTANT_MAX_PAIRS: int = int(os.environ.get("DOUBLE_MUTANT_MAX_PAIRS", "50
 # Default number of top-ranked pairs to return from analyze().
 DOUBLE_MUTANT_TOP_N: int = int(os.environ.get("DOUBLE_MUTANT_TOP_N", "10"))
 
+# ΔΔG (kcal/mol) above which a single mutation is considered clearly
+# destabilising. In stability mode a pair is dropped only when BOTH mutations
+# exceed this threshold; ddg == 0.0 (DynaMut2 neutral/unknown) is never filtered.
+DOUBLE_MUTANT_DESTABILISING_DDG: float = float(
+    os.environ.get("DOUBLE_MUTANT_DESTABILISING_DDG", "2.0")
+)
+
+# When True (default), pairs that fail the DynaMut2 mm API fall back to
+# additive ddG scoring (ddG_A + ddG_B) with epistasis set to 0.
+# Set False to skip such pairs entirely rather than using estimates.
+DOUBLE_MUTANT_ADDITIVE_FALLBACK: bool = (
+    os.environ.get("DOUBLE_MUTANT_ADDITIVE_FALLBACK", "true").strip().lower()
+    not in ("0", "false", "no")
+)
+
 # ── ESMFold ───────────────────────────────────────────────────────────────────
 
 # Enable ESMFold foldability checking on top mutation/disulfide candidates.

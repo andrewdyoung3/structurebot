@@ -87,6 +87,42 @@ def test_generate_pairs_stability_includes_non_interface():
     assert len(pairs) == 3, f"Expected 3 pairs from 3 mutations, got {len(pairs)}"
 
 
+def test_ddg_zero_not_filtered_in_stability_mode():
+    """
+    Mutations with ddg=0.0 (DynaMut2 neutral/unknown) must NOT be excluded by
+    the stability-mode ddG filter — neither alone nor when paired together.
+    Only pairs where BOTH mutations are clearly destabilising are dropped.
+    """
+    # All neutral ddg and no solubility benefit → under the old "require a
+    # benefit" filter every pair was dropped; now all should survive.
+    neutral = [
+        _mut(10, ddg=0.0, camsol_delta=0.0),
+        _mut(20, ddg=0.0, camsol_delta=0.0),
+        _mut(30, ddg=0.0, camsol_delta=0.0),
+    ]
+    pairs = BRIDGE.generate_pairs(neutral, "stability")
+    assert len(pairs) == 3, (
+        f"ddg=0.0 mutations should not be filtered; expected 3 pairs, got {len(pairs)}"
+    )
+
+    # A neutral mutation paired with a strongly destabilising one must survive
+    # (only one is destabilising), but two strongly destabilising ones are dropped.
+    mixed = [
+        _mut(10, ddg=0.0, camsol_delta=0.0),   # neutral
+        _mut(20, ddg=5.0, camsol_delta=0.0),   # destabilising
+        _mut(30, ddg=5.0, camsol_delta=0.0),   # destabilising
+    ]
+    pairs = BRIDGE.generate_pairs(mixed, "stability")
+    surviving = {p_key for p_key in (
+        frozenset((a["position"], b["position"])) for a, b in pairs
+    )}
+    assert frozenset((10, 20)) in surviving, "neutral+destabilising pair must survive"
+    assert frozenset((10, 30)) in surviving, "neutral+destabilising pair must survive"
+    assert frozenset((20, 30)) not in surviving, (
+        "pair where BOTH mutations are clearly destabilising should be excluded"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # generate_pairs — epitope mode
 # ══════════════════════════════════════════════════════════════════════════════
@@ -445,36 +481,49 @@ def test_dynamut2_result_parsing_missing_fields():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Close-pair skipping without PyRosetta
+# Close-pair additive fallback without PyRosetta
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_close_pair_skipped_without_pyrosetta(tmp_path):
-    """Close pairs with run_pyrosetta=False → not in results, warning added."""
+def test_pyrosetta_pairs_get_additive_fallback_when_disabled(tmp_path):
+    """
+    Close (pyrosetta_required) pairs with run_pyrosetta=False must be scored
+    with the additive fallback (ddG_A + ddG_B), not silently dropped.
+    """
     pdb = tmp_path / "test.pdb"
     pdb.write_text("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 0.00           C\n")
 
     mutations = [
-        _mut(10, ddg=-1.0),
-        _mut(11, ddg=-1.0),
+        _mut(10, ddg=-1.5),
+        _mut(11, ddg=-0.5),
     ]
 
+    # distance 2.0 Å → both routed to pyrosetta_required; no DynaMut2 pairs.
     with patch.object(BRIDGE, "compute_ca_distance", return_value=2.0), \
          patch.object(BRIDGE, "score_pairs_dynamut2", return_value=[]):
         result = BRIDGE.analyze(
             inputs={
-                "pdb_path":     str(pdb),
-                "mutations":    mutations,
-                "mode":         "stability",
+                "pdb_path":      str(pdb),
+                "mutations":     mutations,
+                "mode":          "stability",
                 "run_pyrosetta": False,
             }
         )
 
     assert result.success
+    pairs = result.data.get("pairs", [])
+    assert len(pairs) == 1, (
+        f"Close pair should be scored additively, not dropped; got {len(pairs)} pairs"
+    )
+    scored = pairs[0]
+    assert scored["backend_used"] == "additive_fallback"
+    assert scored["ddg_double"] == pytest.approx(-2.0)   # -1.5 + -0.5
+    assert scored["epistasis"] == 0.0
+
+    # A warning should still flag that PyRosetta is needed for accurate epistasis.
     warns = result.data.get("warnings", [])
-    skipped_warned = any("skipped" in w.lower() and "pyrosetta" in w.lower() for w in warns)
-    assert skipped_warned, f"Expected PyRosetta skip warning, got: {warns}"
-    # No pairs in results (DynaMut2 returned empty, close pair was skipped)
-    assert len(result.data.get("pairs", [])) == 0
+    assert any("pyrosetta" in w.lower() for w in warns), (
+        f"Expected a PyRosetta-related warning, got: {warns}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -757,3 +806,81 @@ def test_dynamut2_mm_status_error_raises():
     assert raised, "status=ERROR should trigger a RuntimeError"
     assert job_id in error_message, "Error message must contain the job_id"
     assert pair["pair_key"] in error_message, "Error message must contain the pair_key"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Additive fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_routed_pair(pos_a: int, pos_b: int,
+                      ddg_a: float = -1.0, ddg_b: float = -2.0) -> Dict[str, Any]:
+    """Build a minimal routed pair dict for use with score_pairs_dynamut2."""
+    m_a = _mut(pos_a, ddg=ddg_a)
+    m_b = _mut(pos_b, ddg=ddg_b)
+    return {
+        "mutation_a":       m_a,
+        "mutation_b":       m_b,
+        "pair_key":         _pair_key(m_a, m_b),
+        "ca_distance":      15.0,
+        "distance_zone":    "far",
+        "backend":          "dynamut2",
+        "ddg_double":       None,
+        "ddg_additive":     None,
+        "epistasis":        None,
+        "ddg_A":            None,
+        "ddg_B":            None,
+        "avg_distance_api": None,
+        "backend_used":     None,
+        "composite_score":  0.0,
+        "confidence":       "low",
+        "scoring_components": {},
+        "warnings":         [],
+    }
+
+
+def test_additive_fallback_used_when_api_errors():
+    """When _query_dynamut2_mm raises, pair is scored as ddg_A + ddg_B with backend_used='additive_fallback'."""
+    pair = _make_routed_pair(10, 20, ddg_a=-1.0, ddg_b=-2.0)
+
+    with patch.object(BRIDGE, "_query_dynamut2_mm", side_effect=RuntimeError("API down")), \
+         patch("double_mutant_bridge.time.sleep"):
+        results = BRIDGE.score_pairs_dynamut2([pair], "fake.pdb")
+
+    assert len(results) == 1, "Pair should survive as additive fallback, not be dropped"
+    scored = results[0]
+    assert scored["backend_used"] == "additive_fallback"
+    assert scored["ddg_double"] == pytest.approx(-3.0)
+
+
+def test_additive_fallback_warning_added():
+    """Additive fallback appends a warning about API unavailability to the pair."""
+    pair = _make_routed_pair(10, 20, ddg_a=-1.0, ddg_b=-0.5)
+
+    with patch.object(BRIDGE, "_query_dynamut2_mm", side_effect=RuntimeError("timeout")), \
+         patch("double_mutant_bridge.time.sleep"):
+        results = BRIDGE.score_pairs_dynamut2([pair], "fake.pdb")
+
+    assert len(results) == 1
+    warns = results[0].get("warnings", [])
+    assert any("additive" in w.lower() or "unavailable" in w.lower() for w in warns), \
+        f"Expected additive/unavailable warning, got: {warns}"
+
+
+def test_circuit_breaker_does_not_block_additive_fallback():
+    """After circuit breaker trips, remaining pairs still get additive fallback scores."""
+    from double_mutant_bridge import _CIRCUIT_BREAKER
+    n_pairs = _CIRCUIT_BREAKER + 2
+    pairs = [_make_routed_pair(10 * i, 10 * i + 1, ddg_a=-1.0, ddg_b=-1.0)
+             for i in range(1, n_pairs + 1)]
+
+    with patch.object(BRIDGE, "_query_dynamut2_mm", side_effect=RuntimeError("server error")), \
+         patch("double_mutant_bridge.time.sleep"):
+        results = BRIDGE.score_pairs_dynamut2(pairs, "fake.pdb")
+
+    assert len(results) == n_pairs, (
+        f"All {n_pairs} pairs should be scored via additive fallback; got {len(results)}"
+    )
+    for r in results:
+        assert r["backend_used"] == "additive_fallback", (
+            f"Expected additive_fallback for {r['pair_key']}, got {r['backend_used']}"
+        )
