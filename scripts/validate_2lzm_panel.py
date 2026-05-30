@@ -36,6 +36,7 @@ results files under scripts/.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -64,6 +65,35 @@ def _say(msg: str = "") -> None:
         print(msg, flush=True)
     except UnicodeEncodeError:
         print(str(msg).encode("ascii", "replace").decode("ascii"), flush=True)
+
+
+def _inhibit_system_sleep() -> None:
+    """Keep Windows awake for the duration of this (multi-hour) run.
+
+    Requests ES_CONTINUOUS | ES_SYSTEM_REQUIRED so the OS will not sleep or
+    hibernate while the panel is scoring. ES_DISPLAY_REQUIRED is deliberately
+    omitted -- there is no need to keep the monitor on. An atexit handler
+    clears the request (ES_CONTINUOUS alone) when the script finishes or is
+    Ctrl+C'd; the OS also releases it on process exit, so this is belt-and-
+    suspenders. Silent no-op off Windows, and wrapped so it can never crash
+    the run."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        )
+        atexit.register(
+            ctypes.windll.kernel32.SetThreadExecutionState, ES_CONTINUOUS
+        )
+        _say("Sleep inhibited: system will stay awake until this run exits "
+             "(display may still sleep).")
+    except Exception:
+        pass
+
 
 # Single-trajectory baselines for the side-by-side (SOURCED, not invented):
 #   BASELINE_CROSS (cross-protein Benchmark Run 1) is read from the T4 test
@@ -286,6 +316,9 @@ def main() -> int:
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    # Keep the machine awake for the duration of this multi-hour run / resume.
+    _inhibit_system_sleep()
 
     ap = argparse.ArgumentParser(description="2LZM validation-tier confirmation panel.")
     ap.add_argument("--limit", type=int, default=None,
