@@ -344,7 +344,8 @@ def _ddg_confidence_label(spread: Optional[float], n_trajectories: Optional[int]
       "low"                spread >  ROSETTA_SPREAD_LOW_CONFIDENCE
 
     Note: even "high" confidence means trajectory agreement, NOT calibrated
-    accuracy — large-cavity magnitudes are systematically over-predicted.
+    accuracy — magnitudes carry roughly 2-3 kcal/mol uncertainty across all
+    structural categories (not just large cavities).
     """
     if not n_trajectories or n_trajectories <= 1 or spread is None:
         return "single-trajectory"
@@ -1649,8 +1650,9 @@ except Exception as exc:
         (returns a clear error if WSL2/PyRosetta is unavailable).
 
         NOT for full interactive scans — see _run_rosetta_local for the fast
-        single-trajectory production path. Absolute magnitudes remain
-        approximate (large-cavity over-prediction); ranking/sign is reliable.
+        single-trajectory production path. Absolute magnitudes carry roughly
+        2-3 kcal/mol uncertainty across all structural categories; ranking/sign
+        is reliable.
         """
         import config as _cfg
         n   = max(1, int(getattr(_cfg, "ROSETTA_VALIDATION_TRAJECTORIES", 5)))
@@ -1662,8 +1664,8 @@ except Exception as exc:
         _per_min = max(1, round(n * cyc * 0.6))
         _prog(
             f"⚗️  High-accuracy validation: {n} trajectories x {cyc} cycles per "
-            f"mutation, ~{_per_min} min per mutation. Magnitudes remain approximate "
-            "for large-cavity mutations even at this tier — use for confidence "
+            f"mutation, ~{_per_min} min per mutation. Magnitudes carry roughly "
+            "2-3 kcal/mol uncertainty even at this tier — use for confidence "
             "ranking, validate critical predictions experimentally."
         )
 
@@ -1678,9 +1680,9 @@ except Exception as exc:
             result.data.setdefault("warnings", []).append(
                 "High-accuracy validation tier (median of "
                 f"{n} trajectories x {cyc} relax cycles). Absolute ΔΔG remains "
-                "APPROXIMATE — large-cavity mutations are systematically "
-                "over-predicted even at this tier (more cycles only partially "
-                "close the gap). Ranking/sign is reliable; high spread = low "
+                "APPROXIMATE — magnitudes carry roughly 2-3 kcal/mol uncertainty "
+                "across all structural categories even at this tier (more cycles "
+                "only partially close the gap). Ranking/sign is reliable; high spread = low "
                 "confidence = low trust. NOT calibrated — confirm critical "
                 "predictions experimentally."
             )
