@@ -454,6 +454,17 @@ restartable runner `scripts/validate_2lzm_panel.py`. Each mutation took ~26 min;
 panel ran ~4.5 h. This is the re-run flagged as required by the convergence diagnostic above.
 Authoritative numbers are in `scripts/validate_2lzm_results.json` (not committed; gitignored).
 
+> **⚠ CAVEAT — measured on the STRIPPED-WATER path (now NON-default).** These metrics
+> (RMSE 2.73, MAE 2.59, r +0.50, sign 90%) were produced with `ROSETTA_STRIP_WATERS=true`,
+> which was the default *until 2026-05-30*. The default is now **preserve-waters**
+> (`ROSETTA_STRIP_WATERS=False`), which carries crystallographic HOH through to PyRosetta.
+> Preserve-waters is validated on the buried-water target **Barnase T26A** (strip −0.34
+> wrong-sign → preserve +3.47 correct, exp +1.3; a **+3.80 shift**, 216 HOH confirmed
+> reaching the pose), but a **preserve-path re-validation of the full 2LZM panel is
+> PENDING**. The 2LZM panel's surface/cavity mutations are not near buried structural
+> waters, so the effect of preserve-waters on *these* numbers is **unmeasured** — they
+> remain valid for the stripped-water path only.
+
 ### Per-mutation results (median of 5 trajectories)
 
 | Mutation | group | pred (median) | spread (MAD) | exp | error | confidence |
