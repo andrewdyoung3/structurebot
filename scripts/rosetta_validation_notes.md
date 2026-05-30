@@ -517,3 +517,31 @@ now spread across the large-cavity, moderate, and surface groups alike (e.g. sur
 absorbed by median aggregation + longer relax. Absolute magnitudes remain **approximate
 (~±2.7 kcal/mol RMSE)** but are now demonstrably calibrated well enough to clear the revised
 thresholds; ranking and sign remain the trustworthy outputs.
+
+### REU→kcal/mol calibration — audit verdict (2026-05-30): leave uncalibrated
+
+The published ref2015 cartesian_ddg REU→kcal/mol scaling factor (**~2.94**, Park 2016) is
+**protocol-specific** and **does NOT apply** to our pipeline:
+
+- **Our active path is NOT `cartesian_ddg`.** It is a manual symmetric-relax protocol
+  (`rosetta_bridge.py:1449-1464`): clone the relaxed WT → `MutateResidue` → torsion-space
+  `FastRelax`(mutant); independently `FastRelax` a re-cloned WT; subtract full-pose **`ref2015`**
+  total scores; **median over N trajectories**. It uses **`ref2015` in TORSION space**, not
+  `ref2015_cart`, not cartesian minimisation.
+- **Reported "kcal/mol" = raw `ref2015` REU delta, with NO conversion** (implicit factor
+  **1.0**). A grep of `rosetta_bridge.py`, the worker script, and `config.py` confirms there is
+  **no `2.94` / scaling constant anywhere**.
+- **Worked check.** The `predicted_median` values above are the raw REU deltas. Dividing each
+  by 2.94 lowers MAE **2.586 → 1.24** but **over-corrects**: the mean signed error flips from
+  **+1.28 → −0.94** (over- to under-prediction) and the large-cavity mutations are wrecked
+  (e.g. L99A 7.95→2.71 vs exp 5.0; F153A/L118A badly under-predicted). So 2.94 is the **wrong
+  constant** for this protocol.
+- **Magnitudes are genuinely UNCALIBRATED.** The "ranking reliable / magnitudes approximate
+  (~±2.7 kcal/mol)" framing is **accurate, not a placeholder**. ("Calibrated well enough to
+  clear the revised thresholds" in the Conclusion above means *passes the r/RMSE/sign gates*,
+  **not** that REU has been mapped to kcal/mol.) Scaling is a **monotonic** transform, so it is
+  **irrelevant to ranking and sign**.
+- **DECISION: add no scaling factor or fitted calibration.** 2.94 over-corrects, and a 10-point
+  empirical fit would overfit. If calibrated absolute magnitudes ever become a requirement,
+  adopt the **canonical** `cartesian_ddg` (cartesian relax + `ref2015_cart` + averaging + 2.94)
+  wholesale — do not patch a factor onto the torsion-space delta.
