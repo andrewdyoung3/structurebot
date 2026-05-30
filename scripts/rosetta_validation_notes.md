@@ -429,9 +429,80 @@ is **not proven**. A **full 2LZM-panel re-run at the chosen N + cycle count is r
 confirm RMSE** before claiming calibration. Direction (which mutations are more destabilising)
 is trustworthy; the kcal/mol number is not yet.
 
+> **STATUS — DONE/confirmed (2026-05-30).** The required full re-run has been executed at
+> N=5 × 8+8 cycles, median aggregation. See **Validation-Tier 2LZM Panel — Results
+> (2026-05-30)** below: RMSE 2.73, MAE 2.59, r +0.50, sign 90% — all three revised
+> thresholds PASS. RMSE/MAE roughly halve vs single-trajectory while r is unchanged, so
+> the gain is in magnitude (not ranking) and absolute magnitudes are now demonstrably
+> tighter, though still approximate (~±2.7 kcal/mol).
+
 ### Cost note
 
 8+8-cycle trajectories took ~3–5 min each, and one trajectory **stalled ~25 min** before the
 WSL2 worker's 1800 s timeout would have fired (it recovered on its own). N-trajectory median at
 8 cycles is therefore a **validation-tier protocol only — not for interactive scans**; the live
 scan path must stay at the fast single-trajectory (or low-N) setting.
+
+---
+
+## Validation-Tier 2LZM Panel — Results (2026-05-30)
+
+The full 10-mutation 2LZM panel was scored end-to-end at the **validation tier**
+(`RosettaBridge.validate_ddg` → `_run_rosetta_local` with `num_trajectories=5`,
+`relax_cycles=8`, i.e. **N=5 trajectories × 8+8 cycles, median aggregation**) via the
+restartable runner `scripts/validate_2lzm_panel.py`. Each mutation took ~26 min; the whole
+panel ran ~4.5 h. This is the re-run flagged as required by the convergence diagnostic above.
+Authoritative numbers are in `scripts/validate_2lzm_results.json` (not committed; gitignored).
+
+### Per-mutation results (median of 5 trajectories)
+
+| Mutation | group | pred (median) | spread (MAD) | exp | error | confidence |
+|----------|-------|--------------:|-------------:|----:|------:|------------|
+| L99A  | large_cavity | +7.953 | 2.129 | +5.0 | +2.953 | moderate |
+| L133A | large_cavity | +4.014 | 1.761 | +2.7 | +1.314 | moderate |
+| L121A | large_cavity | +5.483 | 0.536 | +2.7 | +2.783 | high |
+| F153A | large_cavity | +1.008 | 1.728 | +3.0 | −1.992 | moderate |
+| V149A | large_cavity | +6.286 | 0.422 | +2.0 | +4.286 | high |
+| L118A | moderate | +0.105 | 1.090 | +2.5 | −2.395 | high |
+| V87M  | moderate | +4.705 | 3.022 | +1.5 | +3.205 | low |
+| S117V | moderate | −1.239 | 1.023 | +0.9 | −2.139 | high |
+| T152S | surface | +3.859 | 1.316 | +0.5 | +3.359 | high |
+| N116D | surface | +1.533 | 2.133 | +0.1 | +1.433 | moderate |
+
+The single sign flip is **S117V** (predicted −1.239, exp +0.9) — a small-magnitude mutation
+near zero, the regime where a ±2 kcal/mol residual most easily crosses sign.
+
+### Metrics block
+
+| metric | this (validation tier) | 1-traj 2LZM** | 1-traj Run1* |
+|--------|-----------------------:|--------------:|-------------:|
+| n mutations | 10 | 10 | 10 |
+| Sign accuracy | **90%** (9/10) | 100% | 60% |
+| MAE (kcal/mol) | **2.586** | 3.92 | 3.823 |
+| RMSE (kcal/mol) | **2.729** | 5.23 | 5.492 |
+| Pearson r | **+0.499** | +0.487 | −0.059 |
+
+\* Run1  = cross-protein Benchmark Run 1 (single trajectory; this file, 2026-05-29).
+\** 2LZM = single-trajectory 2LZM cross-check (Convergence diagnostic / PROJECT_CONTEXT).
+
+**Threshold check (revised thresholds for the current protocol):**
+- Pearson r > 0.30: ✅ PASS (r = +0.499)
+- RMSE < 4.00 kcal/mol: ✅ PASS (RMSE = 2.729)
+- Sign accuracy ≥ 60%: ✅ PASS (90%)
+
+All three revised thresholds PASS.
+
+### Conclusion
+
+The validation tier (N=5 × 8+8 cycles, median) roughly **halves RMSE vs the single-trajectory
+protocol (5.23 → 2.73 kcal/mol) and MAE (3.92 → 2.59)**, while **Pearson r is essentially
+unchanged (~0.49–0.50)** — i.e. the multi-trajectory + extra-cycle fix buys accuracy in
+**magnitude, not ranking** (the single-trajectory protocol already ordered these mutations
+correctly). Decomposing the RMSE: there is a modest **systematic over-prediction of ~+1.3
+kcal/mol** (mean signed error), and the **residual is scatter-dominated (~2.4 kcal/mol)** about
+that offset. Critically, the over-prediction is **no longer large-cavity-specific** — errors are
+now spread across the large-cavity, moderate, and surface groups alike (e.g. surface T152S
++3.36, large-cavity F153A −1.99), so the earlier large-cavity bias has been substantially
+absorbed by median aggregation + longer relax. Absolute magnitudes remain **approximate
+(~±2.7 kcal/mol RMSE)** but are now demonstrably calibrated well enough to clear the revised
+thresholds; ranking and sign remain the trustworthy outputs.
