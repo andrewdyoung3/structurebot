@@ -116,6 +116,19 @@ ROSETTA_SPREAD_LOW_CONFIDENCE: float = float(
     os.environ.get("ROSETTA_SPREAD_LOW_CONFIDENCE", "3.0")
 )
 
+# Strip crystallographic waters (HOH) before PyRosetta scoring.
+#   False (default) = PRESERVE waters: carry crystallographic HOH records
+#       through to PyRosetta. cleanATOM removes ALL HETATM (HOH included);
+#       losing buried structural waters is the suspected cause of wrong-sign
+#       ddG on buried mutations near them (e.g. T26A, G88V).
+#   True            = legacy behaviour: cleanATOM strips everything, no HOH.
+# NOTE: the relaxed-structure cache key is namespaced by this mode, so
+# preserved-water runs never reuse a previously cached stripped-water structure.
+ROSETTA_STRIP_WATERS: bool = (
+    os.environ.get("ROSETTA_STRIP_WATERS", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 # ── venv312 (Python 3.12 + CUDA torch 2.11.0+cu128) ─────────────────────────
 
 # Absolute path to the Python 3.12 virtual-environment interpreter.

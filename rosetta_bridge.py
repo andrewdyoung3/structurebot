@@ -1306,6 +1306,14 @@ class RosettaBridge:
 
         import config as _cfg
         relax_cache_wsl = wsl.translate_path(str(_cfg.ROSETTA_RELAX_CACHE))
+        # Crystallographic-water handling (default: preserve). The worker below
+        # re-appends HOH that cleanATOM strips. Namespace the relax cache key by
+        # mode so preserved-water relaxed structures never reuse a previously
+        # cached stripped-water one; the stripped-water key is byte-identical to
+        # before, so the committed validation numbers stay valid for that path.
+        _strip_waters = bool(getattr(_cfg, "ROSETTA_STRIP_WATERS", False))
+        _strip_py = "True" if _strip_waters else "False"
+        _relax_key = pdb_hash + ("" if _strip_waters else "_wat")
         wsl_results_path = f"/tmp/rosetta_ddg_{pdb_hash}.json"
 
         script = f"""
@@ -1323,7 +1331,8 @@ try:
     pdb_path  = {wsl_pdb!r}
     mutations = json.loads({mut_list_json!r})
     cache_dir = {relax_cache_wsl!r}
-    hash_key  = {pdb_hash!r}
+    hash_key  = {_relax_key!r}
+    strip_waters = {_strip_py}
     relaxed   = os.path.join(cache_dir, f"{{hash_key}}_relaxed.pdb")
 
     os.makedirs(cache_dir, exist_ok=True)
@@ -1336,6 +1345,30 @@ try:
     if os.path.isfile(cleaned_path) and os.path.getsize(cleaned_path) > 100:
         pdb_path = cleaned_path
     print(f"[Rosetta] PDB cleaned → {{pdb_path}}", flush=True)
+
+    # PRESERVE crystallographic waters (default): cleanATOM drops ALL HETATM,
+    # HOH included. When strip_waters is False, re-append the HOH records from
+    # the untouched original PDB so buried structural waters reach the pose
+    # (targets wrong-sign buried ddG, e.g. T26A / G88V). The "_wat" cache-key
+    # suffix keeps these relaxed structures separate from stripped-water ones.
+    if not strip_waters and pdb_path == cleaned_path:
+        try:
+            _hoh = [ln for ln in open({wsl_pdb!r})
+                    if ln[:6] in ("HETATM", "ATOM  ") and ln[17:20].strip() == "HOH"]
+            if _hoh:
+                with open(cleaned_path) as _fh:
+                    _body = [ln for ln in _fh if not ln.startswith("END")]
+                _wat_path = cleaned_path + ".wat.pdb"
+                with open(_wat_path, "w") as _fh:
+                    _fh.writelines(_body)
+                    _fh.writelines(_hoh)
+                    _fh.write("END\\n")
+                pdb_path = _wat_path
+                print(f"[Rosetta] Preserved {{len(_hoh)}} crystallographic water atom(s)", flush=True)
+            else:
+                print("[Rosetta] No crystallographic waters (HOH) in input", flush=True)
+        except Exception as _we:
+            print(f"[Rosetta] Water preservation skipped: {{_we}}", flush=True)
 
     # Validate before loading: pose_from_file infers type from extension/content,
     # so an empty/HTML file or a non-.pdb name raises "Cannot determine file type".
