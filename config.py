@@ -117,16 +117,22 @@ ROSETTA_SPREAD_LOW_CONFIDENCE: float = float(
 )
 
 # Strip crystallographic waters (HOH) before PyRosetta scoring.
-#   False (default) = PRESERVE waters: carry crystallographic HOH records
-#       through to PyRosetta. cleanATOM removes ALL HETATM (HOH included);
-#       losing buried structural waters is the suspected cause of wrong-sign
-#       ddG on buried mutations near them (e.g. T26A, G88V).
-#   True            = legacy behaviour: cleanATOM strips everything, no HOH.
+#   True (default) = STRIP waters: cleanATOM removes ALL HETATM (HOH included).
+#       This is the validated, standard-Rosetta-practice baseline — the ref2015
+#       lk_ball implicit solvent already models surface desolvation, and all
+#       rigorous panel validation (commit cbe327a) was measured on this path.
+#   False           = PRESERVE waters (opt-in): re-append crystallographic HOH
+#       records so buried structural waters reach PyRosetta. Fixes wrong-sign
+#       ddG on buried mutations near them (validated on T26A: +3.80 shift, sign
+#       corrected). WARNING: preserve-ALL-static is a Rosetta anti-pattern
+#       (static waters act as immovable spheres → clash-driven over-
+#       destabilization on non-buried mutations); its panel-level behaviour is
+#       unmeasured. Proper fix = selective buried-only / movable waters (backlog).
 # NOTE: the relaxed-structure cache key is namespaced by this mode, so
 # preserved-water runs never reuse a previously cached stripped-water structure.
 ROSETTA_STRIP_WATERS: bool = (
-    os.environ.get("ROSETTA_STRIP_WATERS", "").strip().lower()
-    in ("1", "true", "yes", "on")
+    os.environ.get("ROSETTA_STRIP_WATERS", "true").strip().lower()
+    not in ("0", "false", "no", "off")
 )
 
 # ── venv312 (Python 3.12 + CUDA torch 2.11.0+cu128) ─────────────────────────
