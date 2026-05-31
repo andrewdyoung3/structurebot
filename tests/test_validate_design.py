@@ -72,10 +72,14 @@ class _FakeRosetta:
 
 
 class _FakeChimerax:
-    """run_command stub: open returns an id, matchmaker returns parseable RMSD."""
-    def __init__(self, rmsd=0.85):
+    """run_command stub: open returns an id, matchmaker returns parseable RMSD.
+
+    *mm_response* overrides the matchmaker response verbatim (used to feed REAL
+    ChimeraX output strings through the parser)."""
+    def __init__(self, rmsd=0.85, mm_response=None):
         self.commands = []
         self._rmsd = rmsd
+        self._mm_response = mm_response
         self._next = 1
 
     def run_command(self, command, timeout=30):
@@ -85,8 +89,9 @@ class _FakeChimerax:
             self._next += 1
             return {"value": f"Opened as #{mid}, 1 model(s)", "error": None}
         if command.startswith("matchmaker"):
-            return {"value": f"RMSD between 36 pruned atom pairs is {self._rmsd} angstroms",
-                    "error": None}
+            val = (self._mm_response if self._mm_response is not None
+                   else f"RMSD between 36 pruned atom pairs is {self._rmsd} angstroms")
+            return {"value": val, "error": None}
         return {"value": "", "error": None}
 
 
@@ -212,6 +217,37 @@ def test_matchmaker_skips_without_bridge():
     out = r._matchmaker_rmsd_live(_fold(ranked="X"), {})
     assert out["rmsd_ca"] is None
     assert "unavailable" in out["note"].lower()
+
+
+# Regression lock against REAL ChimeraX 1.11.1 matchmaker output (verified live
+# 2026-06-01 with 1CRN×2 and two 1HSG copies). The parser must extract the
+# PRUNED-pairs RMSD (core agreement), never the "across all pairs" value.
+@pytest.mark.parametrize("real_response, expected", [
+    # 1CRN opened twice — identical (pruned == all-pairs).
+    ("Matchmaker 1crn, chain A (#1) with 1crn, chain A (#2), sequence alignment "
+     "score = 250\nRMSD between 46 pruned atom pairs is 0.000 angstroms; "
+     "(across all 46 pairs: 0.000)", 0.0),
+    # 1HSG chain B onto chain A across two copies — verified live.
+    ("Matchmaker 1hsg, chain A (#1) with 1hsg, chain B (#2), sequence alignment "
+     "score = 491.1\nRMSD between 99 pruned atom pairs is 0.400 angstroms; "
+     "(across all 99 pairs: 0.400)", 0.4),
+    # Crafted REAL-format case where pruned != all-pairs: parser MUST take pruned
+    # (0.512), NOT the across-all-pairs divergence (1.987).
+    ("RMSD between 80 pruned atom pairs is 0.512 angstroms; "
+     "(across all 99 pairs: 1.987)", 0.512),
+])
+def test_matchmaker_parses_real_chimerax_output_takes_pruned(
+    tmp_path, monkeypatch, real_response, expected
+):
+    ranked = _write_pdb(tmp_path / "ranked.pdb", {"A": 36})
+    cx = _FakeChimerax(mm_response=real_response)
+    r = _router(_FakeRosetta(), chimerax=cx)
+    monkeypatch.setattr(r, "_download_pdb_by_id",
+                        lambda pid: _write_pdb(tmp_path / f"{pid}.pdb", {"A": 36}))
+    out = r._matchmaker_rmsd_live(_fold(ranked=ranked),
+                                  {"rmsd_ref": {"pdb": "1ABC", "chain": "A"}})
+    assert out["rmsd_ca"] == expected      # pruned value, not the across-all-pairs value
+    assert any(c.startswith("matchmaker") for c in out["commands"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
