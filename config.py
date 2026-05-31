@@ -326,6 +326,16 @@ COLABFOLD_CACHE_DIR: Path = Path(
 )
 COLABFOLD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# JAX persistent compilation cache dir — a WSL2 ext4 path (NOT under /mnt/c; the
+# Windows-boundary I/O penalty would defeat the point). The fold result cache
+# (above) only saves IDENTICAL re-folds; this lets XLA reuse compiled executables
+# across the fresh-per-fold worker processes for any matching input shape, so a
+# second fold of a different sequence at the same length skips the ~10-min XLA
+# compile. '~' is expanded inside the worker (it runs in WSL2). String, not Path.
+COLABFOLD_JAX_COMPILE_CACHE_DIR: str = os.environ.get(
+    "COLABFOLD_JAX_COMPILE_CACHE_DIR", "~/.cache/colabfold_jax_compile"
+)
+
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.
 

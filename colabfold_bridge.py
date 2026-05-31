@@ -228,6 +228,7 @@ class ColabFoldBridge:
             result_path=wsl_result, n_models=n_models, n_recycle=n_recycle,
             msa_mode=str(getattr(_cfg, "COLABFOLD_MSA_MODE", "mmseqs2_uniref_env")),
             tmpl_dir=tmpl_wsl_dir,
+            jax_compile_cache_dir=str(getattr(_cfg, "COLABFOLD_JAX_COMPILE_CACHE_DIR", "")),
         )
 
         # Scale the timeout with the workload; floor at COLABFOLD_TIMEOUT.
@@ -347,12 +348,18 @@ class ColabFoldBridge:
         n_recycle:  int,
         msa_mode:   str,
         tmpl_dir:   str,
+        jax_compile_cache_dir: str = "",
     ) -> str:
         """
         Build the standalone WSL2 worker (run via COLABFOLD_PYTHON).
 
         Rules (mirror rosetta_bridge): zero project imports, JSON-file I/O only,
         write the result file even on exception, literal braces doubled ``{{}}``.
+
+        *jax_compile_cache_dir* (WSL2 path, '~' allowed) enables JAX's persistent
+        compilation cache so XLA reuses compiled executables across the
+        fresh-per-fold worker processes — a different sequence of the same length
+        skips the ~10-min recompile. Empty string disables it.
         """
         return f"""
 import json, os, sys, glob, subprocess
@@ -370,6 +377,17 @@ try:
     jobname    = {jobname!r}
     tmpl_dir   = {tmpl_dir!r}
     os.makedirs(out_dir, exist_ok=True)
+
+    # JAX persistent compilation cache (shared across worker processes). AF2
+    # compiles take many seconds, far above jax's min-compile-time threshold, so
+    # they are cached; we set the threshold low explicitly to be version-robust.
+    jax_cache = {jax_compile_cache_dir!r}
+    if jax_cache:
+        jax_cache = os.path.expanduser(jax_cache)
+        os.makedirs(jax_cache, exist_ok=True)
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = jax_cache
+        os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "1"
+        print("[colabfold] JAX compile cache: " + jax_cache, flush=True)
 
     with open(fasta_path, "w") as fh:
         fh.write(">" + jobname + "\\n" + seq_line + "\\n")

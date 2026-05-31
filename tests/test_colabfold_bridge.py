@@ -128,6 +128,40 @@ def test_worker_includes_template_flags_when_given():
     assert _re.search(r"tmpl_dir\s*=\s*'/tmp/colabfold_templates'", s)
 
 
+def test_worker_sets_jax_compilation_cache_dir():
+    s = ColabFoldBridge._build_worker(
+        seq_line="ACDE", jobname="q", out_dir="/tmp/o", fasta_path="/tmp/o/in.fasta",
+        result_path="/tmp/r.json", n_models=1, n_recycle=1,
+        msa_mode="mmseqs2_uniref_env", tmpl_dir="",
+        jax_compile_cache_dir="~/.cache/colabfold_jax_compile",
+    )
+    compile(s, "<worker>", "exec")
+    assert 'os.environ["JAX_COMPILATION_CACHE_DIR"]' in s
+    assert "~/.cache/colabfold_jax_compile" in s
+    # set BEFORE the colabfold_batch subprocess so the child inherits it
+    assert s.index("JAX_COMPILATION_CACHE_DIR") < s.index("subprocess.run")
+    # explicit min-compile-time so caching is version-robust
+    assert "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" in s
+
+
+def test_worker_omits_jax_cache_when_empty():
+    s = ColabFoldBridge._build_worker(
+        seq_line="ACDE", jobname="q", out_dir="/tmp/o", fasta_path="/tmp/o/in.fasta",
+        result_path="/tmp/r.json", n_models=1, n_recycle=1,
+        msa_mode="mmseqs2_uniref_env", tmpl_dir="", jax_compile_cache_dir="",
+    )
+    compile(s, "<worker>", "exec")
+    import re as _re
+    assert _re.search(r"jax_cache\s*=\s*''", s)   # disabled → guarded branch skips
+
+
+def test_predict_passes_jax_cache_from_config(cache_tmp):
+    bridge = ColabFoldBridge()
+    bridge._wsl = _FakeWSL(_ok_payload())
+    bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    assert _cfg.COLABFOLD_JAX_COMPILE_CACHE_DIR in bridge._wsl.scripts[0]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Oligomer input building (colon-join + copy count → multimer)
 # ══════════════════════════════════════════════════════════════════════════════
