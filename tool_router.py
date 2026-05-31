@@ -130,16 +130,22 @@ class ToolRouter:
         "validate_design":   "🧬✅",
     }
 
-    # Validate-design meta-tool: fuses ColabFold confidence + matchmaker RMSD +
-    # Rosetta folding-energy sanity into one evidence-rich report. Kept distinct
-    # from the bare `colabfold` fold and the `validate_ddg` ddG tier (route()).
+    # Validate-design meta-tool: the HEAVY ColabFold+Rosetta orchestrator. It
+    # fires ONLY on explicit high-accuracy phrasing — BARE "validate design" /
+    # "check this design" etc. deliberately fall through to the light
+    # mpnn_esmfold / ESMFold fast screen (its prior behaviour). The "... with
+    # colabfold/alphafold" case is handled separately in _detect (compound).
+    # Checked BEFORE the bare match in route(), so a QUALIFIED phrase like
+    # "high-accuracy validate design" hits the meta-tool while bare
+    # "validate design" does not.
     _VALIDATE_DESIGN_KEYWORDS: tuple = (
-        "validate design", "validate this design", "validate the design",
-        "validate my design", "validate the redesign", "validate this redesign",
-        "evaluate this design", "evaluate the design", "evaluate my design",
-        "check this design", "check the design", "assess this design",
-        "assess the design", "design validation", "full validation",
-        "fully validate", "validate the fold of",
+        "full validation",
+        "full design validation",
+        "high-accuracy validation", "high accuracy validation",
+        "high-confidence validation", "high confidence validation",
+        "high-accuracy validate", "high accuracy validate",
+        "high-confidence validate", "high confidence validate",
+        "thoroughly validate", "thorough validation",
     )
 
     # Explicit ColabFold (AF2) folding keywords — the high-accuracy structure-
@@ -728,6 +734,7 @@ class ToolRouter:
             user_input
             and self._detect_colabfold_intent(user_input)
             and "colabfold" not in tools_needed
+            and "validate_design" not in tools_needed  # meta-tool already claimed it
         )
         if _cf_intent:
             _cf_chain = "A"
@@ -3029,10 +3036,23 @@ class ToolRouter:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _detect_validate_design_intent(self, text: str) -> bool:
-        """True for an explicit 'validate/evaluate/check this design' request."""
+        """
+        True ONLY for explicit high-accuracy validation phrasing:
+          * an explicit qualifier (full / high-accuracy / high-confidence /
+            thorough validation, or '<qualifier> validate'), OR
+          * a 'validate ... with colabfold/alphafold' request.
+        Bare 'validate design' / 'check this design' return False (they revert to
+        the light mpnn_esmfold / ESMFold fast screen).
+        """
         if not text:
             return False
-        return any(kw in text.lower() for kw in self._VALIDATE_DESIGN_KEYWORDS)
+        low = text.lower()
+        if any(kw in low for kw in self._VALIDATE_DESIGN_KEYWORDS):
+            return True
+        # "validate ... with colabfold/alphafold" → explicit high-accuracy path.
+        if "validat" in low and ("colabfold" in low or "alphafold" in low):
+            return True
+        return False
 
     def _parse_validate_design_options(self, text: str) -> Dict[str, Any]:
         """

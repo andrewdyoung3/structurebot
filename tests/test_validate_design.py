@@ -313,21 +313,53 @@ def test_low_plddt_flag_surfaced(tmp_path):
 # Intent + routing
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_intent_positive_negative():
+def test_intent_only_fires_on_explicit_qualifiers():
     r = ToolRouter(bridge=None, session=SessionState())
-    assert r._detect_validate_design_intent("validate this design") is True
-    assert r._detect_validate_design_intent("fully validate the design") is True
+    # Explicit high-accuracy phrasing → meta-tool.
+    assert r._detect_validate_design_intent("run a full validation of the design") is True
+    assert r._detect_validate_design_intent("high-accuracy validation please") is True
+    assert r._detect_validate_design_intent("high-confidence validation") is True
+    assert r._detect_validate_design_intent("thoroughly validate this design") is True
+    assert r._detect_validate_design_intent("high-accuracy validate design") is True   # containment
+    assert r._detect_validate_design_intent("validate this design with colabfold") is True
+    assert r._detect_validate_design_intent("validate the design with alphafold") is True
+    # BARE casual phrasing → NOT the meta-tool (reverts to mpnn_esmfold / ESMFold).
+    assert r._detect_validate_design_intent("validate design") is False
+    assert r._detect_validate_design_intent("validate this design") is False
+    assert r._detect_validate_design_intent("evaluate design") is False
+    assert r._detect_validate_design_intent("check this design") is False
     assert r._detect_validate_design_intent("validate ddg of V82A") is False
     assert r._detect_validate_design_intent("fold MKT as a dimer") is False
 
 
-def test_route_wins_over_mpnn_esmfold_keyword_collision():
-    # 'validate design' is also an mpnn_esmfold keyword; validate_design must win.
+def test_route_meta_tool_on_explicit_trigger():
+    """An EXPLICIT high-accuracy phrase routes to the meta-tool (and still parses
+    the RMSD reference). Even though it names colabfold, the meta-tool wins — the
+    bare colabfold matcher must not re-grab it."""
     r = ToolRouter(bridge=None, session=SessionState())
     routed = r.route({"tools_needed": ["esmfold"], "tool_inputs": {"esmfold": {}}},
-                     user_input="validate this design vs 1HSG chain A")
+                     user_input="high-accuracy validate this design with colabfold vs 1HSG chain A")
     assert routed["tools_needed"] == ["validate_design"]
     assert routed["tool_inputs"]["validate_design"]["rmsd_ref"] == {"pdb": "1HSG", "chain": "A"}
+
+
+def test_anticollision_bare_vs_explicit():
+    """Bare 'validate design' does NOT reach the meta-tool; an explicit
+    'high-accuracy validation' reaches NEITHER mpnn_esmfold NOR bare colabfold."""
+    r = ToolRouter(bridge=None, session=SessionState())
+
+    # Bare phrasing with proteinmpnn context → mpnn_esmfold, NOT validate_design.
+    bare = r.route({"tools_needed": ["proteinmpnn"], "tool_inputs": {"proteinmpnn": {}}},
+                   user_input="validate design")
+    assert "validate_design" not in bare["tools_needed"]
+    assert "mpnn_esmfold" in bare["tools_needed"]
+
+    # Explicit qualifier (no fold/oligomer/colabfold words) → validate_design only.
+    expl = r.route({"tools_needed": ["esmfold"], "tool_inputs": {"esmfold": {}}},
+                   user_input="please run a high-accuracy validation of this design")
+    assert expl["tools_needed"] == ["validate_design"]
+    assert "mpnn_esmfold" not in expl["tools_needed"]
+    assert "colabfold" not in expl["tools_needed"]
 
 
 def test_route_colabfold_not_grabbed_by_validate_design():
