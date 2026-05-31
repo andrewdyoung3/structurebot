@@ -326,6 +326,7 @@ class ColabFoldBridge:
             "cached":         False,
             "eta_s":          eta_s,
             "elapsed_s":      elapsed_s,
+            "gpu_used":       data.get("gpu_used"),   # True/False/None (CPU-fallback flag)
             "source":         "colabfold_wsl2",
         }
         self._save_cache(cache_dir, result)
@@ -443,10 +444,11 @@ try:
              "plddt":    _first("*_plddt.png"),
              "coverage": _first("*_coverage.png")}}
 
+    _gpu = True if "Running on GPU" in log else (False if "Running on CPU" in log else None)
     _write({{"success": True,
              "ranked_pdb_wsl": pdbs[0],
              "plddt": plddt, "pae": pae, "ptm": ptm, "iptm": iptm,
-             "pngs": pngs, "log_tail": log[-1500:]}})
+             "pngs": pngs, "gpu_used": _gpu, "log_tail": log[-1500:]}})
     print("[colabfold] worker done", flush=True)
 
 except Exception as exc:
