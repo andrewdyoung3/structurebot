@@ -37,6 +37,10 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional
 
 PYROSETTA_PYTHON = "/home/andre/pyrosetta_env/bin/python"
+# ColabFold env (WSL2, Python 3.12, hermetic JAX cuda12). Isolated from
+# pyrosetta_env. The colabfold_bridge (future task) will run colabfold_batch via
+# this interpreter; defined here now so that bridge can import it. See §10/§11.
+COLABFOLD_PYTHON = "/home/andre/colabfold_env/bin/python"
 
 # ── WSL availability cache ────────────────────────────────────────────────────
 
