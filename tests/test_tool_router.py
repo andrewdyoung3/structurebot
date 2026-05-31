@@ -500,14 +500,18 @@ def test_structural_integrity_phrase_routes_to_mpnn_esmfold():
     )
 
 
-def test_validate_design_routes_to_mpnn_esmfold():
+def test_proteinmpnn_rewrites_to_mpnn_esmfold():
     """
-    'validate design' with proteinmpnn in translator output must always rewrite
-    to mpnn_esmfold (session not required for 'proteinmpnn' rewriting).
+    A ProteinMPNN-in-pipeline fold-validation request must always rewrite to
+    mpnn_esmfold (session not required for 'proteinmpnn' rewriting).
+
+    NOTE: the phrase 'validate design' was reassigned to the new validate-design
+    meta-tool (it owns that keyword now — see test_validate_design.py), so this
+    test uses the still-valid mpnn_esmfold trigger 'fold design'.
     """
     router       = _make_router()          # no MPNN results in session
     translator_r = _proteinmpnn_translator_result()
-    user_input   = "validate design by folding with ESMFold"
+    user_input   = "fold design with ESMFold"
 
     routed = router.route(translator_r, user_input=user_input)
 

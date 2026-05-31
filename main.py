@@ -748,7 +748,8 @@ class StructureBot:
                     console.print(f"  [info]{msg}[/info]")
 
                 # For long-running pipelines, show elapsed time every 30s
-                _long_tools = {"mutation_scan", "disulfide", "rosetta", "colabfold"}
+                _long_tools = {"mutation_scan", "disulfide", "rosetta", "colabfold",
+                               "validate_design"}
                 _needs_timer = bool(set(tools_needed) & _long_tools)
                 _ticker_label = (
                     "Running " + "/".join(

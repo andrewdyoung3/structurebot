@@ -127,7 +127,20 @@ class ToolRouter:
         "double_mutant":     "⚗️🔗",
         "validate_ddg":      "⚗️✅",
         "colabfold":         "🧬🔮",
+        "validate_design":   "🧬✅",
     }
+
+    # Validate-design meta-tool: fuses ColabFold confidence + matchmaker RMSD +
+    # Rosetta folding-energy sanity into one evidence-rich report. Kept distinct
+    # from the bare `colabfold` fold and the `validate_ddg` ddG tier (route()).
+    _VALIDATE_DESIGN_KEYWORDS: tuple = (
+        "validate design", "validate this design", "validate the design",
+        "validate my design", "validate the redesign", "validate this redesign",
+        "evaluate this design", "evaluate the design", "evaluate my design",
+        "check this design", "check the design", "assess this design",
+        "assess the design", "design validation", "full validation",
+        "fully validate", "validate the fold of",
+    )
 
     # Explicit ColabFold (AF2) folding keywords — the high-accuracy structure-
     # prediction path. Kept tight so it neither swallows nor is swallowed by the
@@ -659,6 +672,32 @@ class ToolRouter:
         tools_needed = translator_result.get("tools_needed") or ["chimerax"]
         tool_inputs  = translator_result.get("tool_inputs") or {}
 
+        # ── Validate-design meta-tool override ─────────────────────────────────
+        # Checked FIRST: "validate design" appears in _MPNN_ESMFOLD_KEYWORDS too,
+        # so this must win and replace tools_needed before that override runs.
+        # Distinct from bare `colabfold` (no fold/oligomer/template trigger) and
+        # from `validate_ddg` (its keywords are about ddG/stability, not design).
+        _vd_intent = bool(
+            user_input
+            and self._detect_validate_design_intent(user_input)
+            and "validate_design" not in tools_needed
+        )
+        if _vd_intent:
+            _vd_chain = "A"
+            for _inp in list(tool_inputs.values()):
+                if isinstance(_inp, dict) and _inp.get("chain"):
+                    _vd_chain = _inp["chain"]
+                    break
+            vd_inputs: Dict[str, Any] = {
+                "model_id":    self._primary_model_id(),
+                "chain":       _vd_chain,
+                "_user_input": user_input,
+            }
+            vd_inputs.update(self._parse_colabfold_options(user_input))  # seq/copies/template/quick
+            vd_inputs.update(self._parse_validate_design_options(user_input))
+            tools_needed = ["validate_design"]
+            tool_inputs  = {"validate_design": vd_inputs}
+
         # ── High-accuracy ddG validation tier override ─────────────────────────
         # Checked FIRST so "validate ddg" / "high-accuracy stability" route to the
         # multi-trajectory validation tier, NOT the fast single-trajectory scan or
@@ -938,6 +977,9 @@ class ToolRouter:
             shape   = "monomer" if copies <= 1 else f"{copies}-copy homo-oligomer"
             tmpl    = " (templated)" if inp.get("template") else ""
             return f"ColabFold AF2 structure prediction — {shape}{tmpl} (remote MSA)"
+        if tool == "validate_design":
+            return ("Validate design — ColabFold confidence + matchmaker RMSD + "
+                    "Rosetta folding-energy sanity (evidence-rich report)")
         if tool == "proteinmpnn":
             return "ProteinMPNN fixed-backbone sequence redesign"
         if tool == "mpnn_esmfold":
@@ -1210,6 +1252,8 @@ class ToolRouter:
                 return self._run_validate_ddg(inputs, user_input=user_input)
             if tool == "colabfold":
                 return self._run_colabfold(inputs, user_input=user_input)
+            if tool == "validate_design":
+                return self._run_validate_design(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -1234,7 +1278,7 @@ class ToolRouter:
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
                     "assembly_analyser, disulfide, proline, glycan, "
                     "glycan_positions, netnglyc, salt_bridge, cavity, "
-                    "double_mutant, validate_ddg, colabfold."
+                    "double_mutant, validate_ddg, colabfold, validate_design."
                 ),
             )
         except Exception as exc:
@@ -2979,6 +3023,501 @@ class ToolRouter:
                     _sub.Popen(["xdg-open", _path])
             except Exception:
                 pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Validate-design meta-tool (thin orchestrator — NOT a new bridge)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _detect_validate_design_intent(self, text: str) -> bool:
+        """True for an explicit 'validate/evaluate/check this design' request."""
+        if not text:
+            return False
+        return any(kw in text.lower() for kw in self._VALIDATE_DESIGN_KEYWORDS)
+
+    def _parse_validate_design_options(self, text: str) -> Dict[str, Any]:
+        """
+        Parse the RMSD reference (fold preservation) and the energy reference
+        (relative stability) — they are SEPARATE. Cross-topology is fine for the
+        RMSD reference (matchmaker on the selected chain); the energy reference is
+        explicit and only ever scored relative when topologies match.
+        """
+        opts: Dict[str, Any] = {}
+        if not text:
+            return opts
+        low = text.lower()
+        # RMSD reference: "vs / against / compare(d) to / relative to PDB XXXX [chain Y]"
+        m = re.search(
+            r"(?:vs\.?|versus|against|compared?\s+to|relative\s+to|compare\s+with|"
+            r"superpose\s+(?:on|onto))\s+(?:pdb\s+)?([0-9][a-z0-9]{3})"
+            r"(?:\s+chain\s+([a-z0-9]))?",
+            low,
+        )
+        if m:
+            opts["rmsd_ref"] = {
+                "pdb": m.group(1).upper(),
+                "chain": (m.group(2).upper() if m.group(2) else None),
+            }
+        # Explicit energy reference → implies a relative-stability request.
+        me = re.search(r"energy\s+reference\s+(?:pdb\s+)?([0-9][a-z0-9]{3})", low)
+        if me:
+            opts["energy_ref"] = me.group(1).upper()
+            opts["requested_relative"] = True
+        # Relative-stability intent without an explicit ref id (decision will
+        # still DECLINE unless a same-topology energy ref is actually resolved).
+        if (("relative" in low and ("energy" in low or "stability" in low))
+                or "energy delta" in low or "stability delta" in low
+                or "compare energy" in low or "compare the energy" in low):
+            opts["requested_relative"] = True
+        return opts
+
+    @staticmethod
+    def _design_energy_decision(
+        design_topology: Optional[tuple],
+        ref_topology:    Optional[tuple],
+        requested_relative: bool,
+        ref_name: str = "the energy reference",
+    ) -> Dict[str, Any]:
+        """
+        PURE honesty logic for the folding-energy axis (no I/O — unit-testable).
+
+        Topology = ``(n_chains, tuple(sorted(per_chain_lengths)))``.
+
+        Returns ``{"mode": ..., "reason": ...}`` where mode is:
+          * "sanity"   — no relative number; report fold-plausibility only.
+          * "relative" — topologies MATCH and a relative score was requested.
+          * "declined" — relative was requested but topologies DON'T match;
+                         NO relative number is emitted and a reason is given.
+        """
+        if not requested_relative or ref_topology is None:
+            return {
+                "mode": "sanity",
+                "reason": (
+                    "No explicit same-topology energy reference — the relaxed ref2015 "
+                    "energy is reported as a fold-PLAUSIBILITY sanity signal (total REU + "
+                    "per-residue density + clash check), NOT a stability-vs-reference claim."
+                ),
+            }
+        if design_topology is not None and design_topology == ref_topology:
+            return {
+                "mode": "relative",
+                "reason": (
+                    f"Topologies match (same chain count and per-chain lengths) — relative "
+                    f"ΔREU vs {ref_name} reported. Ranking-reliable; absolute magnitude "
+                    f"approximate (~±2.7 kcal/mol, see PROJECT_CONTEXT §7 calibration verdict)."
+                ),
+            }
+        d_n, d_lens = design_topology if design_topology else (0, ())
+        r_n, r_lens = ref_topology
+        return {
+            "mode": "declined",
+            "reason": (
+                f"Relative stability vs {ref_name} isn't meaningful — {ref_name} is a "
+                f"{r_n}-mer (chain lengths {list(r_lens)}), the design is a {d_n}-mer "
+                f"(chain lengths {list(d_lens)}). ref2015 totals across different topologies "
+                f"are not comparable; the per-residue energy density is given for the design "
+                f"as a sanity signal instead."
+            ),
+        }
+
+    @staticmethod
+    def _topology_from_fold(fold: Dict[str, Any]) -> Optional[tuple]:
+        """(n_chains, sorted per-chain lengths) for a ColabFold result (homo-oligomer)."""
+        copies = int(fold.get("copies", 1) or 1)
+        length = fold.get("length")
+        if not length:
+            plddt = fold.get("plddt") or {}
+            length = len(plddt) // copies if plddt and copies else (len(plddt) or 0)
+        if not length:
+            return None
+        return (copies, tuple([int(length)] * copies))
+
+    @staticmethod
+    def _topology_from_pdb(pdb_path: Optional[str]) -> Optional[tuple]:
+        """(n_chains, sorted per-chain CA counts) parsed from a PDB file, or None."""
+        if not pdb_path or not Path(pdb_path).is_file():
+            return None
+        per_chain: Dict[str, int] = {}
+        seen: set = set()
+        try:
+            with open(pdb_path, errors="replace") as fh:
+                for line in fh:
+                    if line.startswith(("ATOM", "HETATM")) and line[12:16].strip() == "CA":
+                        ch  = line[21]
+                        key = (ch, line[22:27])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        per_chain[ch] = per_chain.get(ch, 0) + 1
+        except Exception:
+            return None
+        if not per_chain:
+            return None
+        lengths = sorted(per_chain.values())
+        return (len(lengths), tuple(lengths))
+
+    def _acquire_design_fold(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Get the design's ColabFold fold, REUSING an existing result instead of
+        re-folding when possible (guardrail). Priority:
+          1. an explicit ``colabfold_result`` dict (chaining / tests);
+          2. an in-session fold for this model (no re-fold) — enriched from the
+             on-disk full result.json when present;
+          3. fold the given sequence via the bridge (whose hash-cache itself
+             reuses a prior fold → only folds if there genuinely isn't one).
+        """
+        if isinstance(inputs.get("colabfold_result"), dict):
+            r = dict(inputs["colabfold_result"])
+            r.setdefault("success", True)
+            r.setdefault("fold_source", "provided")
+            return r
+
+        model_id = inputs.get("model_id") or self._first_model_id()
+        sequence = inputs.get("sequence")
+
+        if not sequence:
+            sess = self.session.get_colabfold_results(model_id) if self.session else None
+            if sess and sess.get("ranked_pdb"):
+                r = dict(sess)
+                r["success"] = True
+                r["fold_source"] = "reused (session)"
+                self._enrich_fold_from_disk(r)
+                return r
+            return {
+                "success": False,
+                "error": (
+                    "No sequence provided and no in-session ColabFold result for this "
+                    "model. Fold a sequence first (e.g. 'fold <seq> with colabfold'), or "
+                    "give a sequence to validate."
+                ),
+            }
+
+        bridge = self._get_colabfold_bridge()
+        r = dict(bridge.predict(
+            sequence=sequence, copies=int(inputs.get("copies", 1) or 1),
+            template=inputs.get("template"), quick=bool(inputs.get("quick", False)),
+            label=f"design{model_id}",
+        ))
+        r["fold_source"] = "reused (cache)" if r.get("cached") else "folded"
+        return r
+
+    @staticmethod
+    def _enrich_fold_from_disk(r: Dict[str, Any]) -> None:
+        """Backfill pae/per-residue pLDDT/pTM from the on-disk full result.json
+        beside the ranked PDB (the session copy is trimmed). Best-effort."""
+        try:
+            rp = r.get("ranked_pdb")
+            if not rp:
+                return
+            meta = Path(rp).parent / "result.json"
+            if not meta.is_file():
+                return
+            import json as _j
+            full = _j.loads(meta.read_text(encoding="utf-8"))
+            for k in ("pae", "plddt", "ptm", "iptm", "mean_plddt"):
+                if r.get(k) in (None, {}, []) and full.get(k) is not None:
+                    r[k] = full[k]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_model_spec(resp: dict, fallback_id: Optional[str]) -> Optional[str]:
+        """Parse '#N' from a ChimeraX open response; fall back to '#fallback_id'."""
+        val = (resp or {}).get("value")
+        if isinstance(val, str):
+            m = re.search(r"#(\d+)", val)
+            if m:
+                return f"#{m.group(1)}"
+        return f"#{fallback_id}" if fallback_id else None
+
+    def _matchmaker_rmsd_live(
+        self,
+        fold:   Dict[str, Any],
+        inputs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Open the predicted model, apply ColabFold-style pLDDT viz, and superpose
+        it onto the RMSD reference with matchmaker; parse and return Cα RMSD.
+
+        RMSD reference: default = the loaded session primary model; overridable to
+        a named PDB with chain selection (cross-topology is fine here). Degrades
+        gracefully (rmsd=None + note) when ChimeraX or a reference is unavailable.
+        Runs live during execute (the RMSD value needs a live run); the issued
+        commands are returned for transparency.
+        """
+        out: Dict[str, Any] = {"rmsd_ca": None, "reference": None, "commands": [], "note": None}
+        ranked = fold.get("ranked_pdb")
+        if self.bridge is None:
+            out["note"] = "ChimeraX bridge unavailable — RMSD skipped."
+            return out
+        if not ranked or not Path(str(ranked)).is_file():
+            out["note"] = "No ranked PDB available — RMSD skipped."
+            return out
+
+        cmds: List[str] = []
+        try:
+            # Open + colour the predicted model (ColabFold viz, reused).
+            design_guess = str(self.session.next_model_id()) if self.session else None
+            open_cmd = f'open "{Path(ranked).as_posix()}"'
+            r = self.bridge.run_command(open_cmd)
+            cmds.append(open_cmd)
+            design_spec = self._parse_model_spec(r, design_guess)
+            if design_spec:
+                for c in (f"color byattribute bfactor {design_spec} palette alphafold",
+                          f"sequence chain {design_spec}"):
+                    self.bridge.run_command(c)
+                    cmds.append(c)
+
+            # Resolve the reference spec.
+            rmsd_ref = inputs.get("rmsd_ref")
+            ref_spec = None
+            if rmsd_ref and rmsd_ref.get("pdb"):
+                ref_pdb = self._download_pdb_by_id(rmsd_ref["pdb"])
+                if not ref_pdb:
+                    out["note"] = f"Could not fetch RMSD reference {rmsd_ref['pdb']}; RMSD skipped."
+                    out["commands"] = cmds
+                    return out
+                ropen = f'open "{Path(ref_pdb).as_posix()}"'
+                rr = self.bridge.run_command(ropen)
+                cmds.append(ropen)
+                ref_model = self._parse_model_spec(rr, None)
+                ch = rmsd_ref.get("chain")
+                ref_spec = (f"{ref_model}/{ch}" if (ref_model and ch) else ref_model)
+                out["reference"] = (
+                    f"{rmsd_ref['pdb']}" + (f" chain {ch}" if ch else "")
+                )
+            else:
+                # Default: the loaded primary model (assumed already open).
+                primary = self._primary_model_id()
+                if primary and design_spec and str(primary) != design_spec.lstrip("#") \
+                        and self.session and self.session.get_structure(primary):
+                    ch = inputs.get("chain")
+                    ref_spec = f"#{primary}/{ch}" if ch else f"#{primary}"
+                    out["reference"] = f"loaded model #{primary}" + (f" chain {ch}" if ch else "")
+                else:
+                    out["note"] = (
+                        "No RMSD reference (no loaded structure and none specified) — "
+                        "fold preservation not assessed."
+                    )
+
+            if design_spec and ref_spec:
+                mm = f"matchmaker {design_spec} to {ref_spec}"
+                mr = self.bridge.run_command(mm)
+                cmds.append(mm)
+                val = (mr or {}).get("value") or ""
+                m = re.search(r"RMSD between\s+\d+\s+(?:pruned\s+)?atom pairs is\s+([\d.]+)", val)
+                if not m:
+                    m = re.search(r"RMSD[^0-9]*([\d.]+)\s*angstrom", val, re.IGNORECASE)
+                if m:
+                    out["rmsd_ca"] = round(float(m.group(1)), 3)
+                else:
+                    out["note"] = "matchmaker ran but RMSD could not be parsed from the response."
+                self.bridge.run_command(f"view {design_spec}")
+                cmds.append(f"view {design_spec}")
+        except Exception as exc:
+            out["note"] = f"RMSD step error: {exc}"
+        out["commands"] = cmds
+        return out
+
+    def _run_validate_design(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> "ToolStepResult":
+        """
+        Thin orchestrator: fold confidence (ColabFold, reused if present) +
+        fold preservation (matchmaker RMSD) + folding energy (Rosetta relax +
+        ref2015, HONEST: sanity by default, relative only on same-topology, decline
+        cross-topology). EVIDENCE-RICH report; no binary verdict. Stored in
+        session_state.validate_design_results.
+        """
+        import time as _time
+        user_input = user_input or inputs.get("_user_input", "")
+        model_id   = inputs.get("model_id") or self._first_model_id()
+        t0 = _time.perf_counter()
+
+        # ── 1. Fold confidence (reuse-or-fold) ────────────────────────────────────
+        fold = self._acquire_design_fold(inputs)
+        if not fold.get("success"):
+            return ToolStepResult(
+                tool="validate_design", success=False,
+                error=fold.get("error", "could not obtain a fold for the design"),
+                data={"oom_risk": fold.get("oom_risk", False)},
+            )
+
+        plddt_map  = fold.get("plddt") or {}
+        mean_plddt = fold.get("mean_plddt") or (
+            round(sum(plddt_map.values()) / len(plddt_map), 2) if plddt_map else None
+        )
+        fold_flags: List[str] = []
+        if isinstance(mean_plddt, (int, float)) and mean_plddt < 70:
+            fold_flags.append(f"low mean pLDDT ({mean_plddt:.1f} < 70) — low-confidence fold")
+        fold_conf = {
+            "label":            "AF2 fold confidence (ColabFold)",
+            "fold_source":      fold.get("fold_source"),
+            "mean_plddt":       mean_plddt,
+            "per_residue_plddt": plddt_map or None,
+            "pae_available":    fold.get("pae") is not None,
+            "ptm":              fold.get("ptm"),
+            "iptm":             fold.get("iptm"),
+            "ranked_pdb":       fold.get("ranked_pdb"),
+            "flags":            fold_flags,
+        }
+
+        # ── 2. Fold preservation (matchmaker RMSD) ────────────────────────────────
+        rmsd = self._matchmaker_rmsd_live(fold, inputs)
+        rmsd_flags: List[str] = []
+        if isinstance(rmsd.get("rmsd_ca"), (int, float)) and rmsd["rmsd_ca"] > 4.0:
+            rmsd_flags.append(f"high Cα RMSD ({rmsd['rmsd_ca']:.2f} Å > 4 Å) — fold may not be preserved")
+        fold_pres = {
+            "label":     "Fold preservation — matchmaker Cα RMSD vs reference",
+            "rmsd_ca":   rmsd.get("rmsd_ca"),
+            "reference": rmsd.get("reference"),
+            "note":      rmsd.get("note"),
+            "flags":     rmsd_flags,
+        }
+
+        # ── 3. Folding energy (HONEST) ────────────────────────────────────────────
+        rosetta = self._get_rosetta_bridge()
+        energy_flags: List[str] = []
+        energy: Dict[str, Any] = {
+            "label": "Folding energy (Rosetta FastRelax + ref2015)",
+            "mode":  "sanity",
+        }
+        ranked_pdb = fold.get("ranked_pdb")
+        score = rosetta.relax_and_score(ranked_pdb) if ranked_pdb else {"success": False, "error": "no ranked PDB"}
+
+        # Decide sanity / relative / declined (pure logic).
+        requested_relative = bool(inputs.get("requested_relative", False))
+        energy_ref = inputs.get("energy_ref")
+        ref_topo = None
+        ref_name = str(energy_ref) if energy_ref else "the energy reference"
+        energy_ref_pdb = None
+        if requested_relative and energy_ref:
+            energy_ref_pdb = (energy_ref if Path(str(energy_ref)).is_file()
+                              else self._download_pdb_by_id(str(energy_ref)))
+            ref_topo = self._topology_from_pdb(energy_ref_pdb)
+        decision = self._design_energy_decision(
+            self._topology_from_fold(fold), ref_topo, requested_relative, ref_name
+        )
+        energy["mode"]   = decision["mode"]
+        energy["reason"] = decision["reason"]
+
+        if not score.get("success"):
+            energy["available"] = False
+            energy["error"]     = score.get("error")
+            energy_flags.append("Rosetta relax/score unavailable — folding-energy axis not assessed")
+        else:
+            energy.update({
+                "available":           True,
+                "total_reu":           score.get("total_reu"),
+                "per_residue_density": score.get("per_residue_density"),
+                "fa_rep":              score.get("fa_rep"),
+                "clash_ok":            score.get("clash_ok"),
+                "converged":           score.get("converged"),
+                "relaxed_pdb":         score.get("relaxed_pdb"),
+            })
+            if score.get("clash_ok") is False:
+                energy_flags.append("post-relax repulsive energy is high — possible clashes / strained packing")
+            # RELATIVE number ONLY on the relative path (never on declined/sanity).
+            if decision["mode"] == "relative" and energy_ref_pdb:
+                ref_score = rosetta.relax_and_score(energy_ref_pdb)
+                if ref_score.get("success"):
+                    delta = round(score["total_reu"] - ref_score["total_reu"], 3)
+                    energy["relative_delta_reu"]  = delta
+                    energy["reference_total_reu"] = ref_score["total_reu"]
+                    energy["energy_reference"]    = ref_name
+                    energy["relative_note"] = (
+                        "ΔREU = design − reference (negative = design lower-energy). "
+                        "Ranking-reliable; magnitude approximate (~±2.7, §7)."
+                    )
+                    if delta > 5.0:
+                        energy_flags.append(
+                            f"design is much higher-energy than {ref_name} (ΔREU {delta:+.1f})"
+                        )
+                else:
+                    # Could not score the reference → downgrade to sanity, stay honest.
+                    energy["mode"] = "sanity"
+                    energy["reason"] = (
+                        f"Relative comparison requested and topologies matched, but {ref_name} "
+                        f"could not be scored ({ref_score.get('error')}); reporting the design's "
+                        "sanity signal only."
+                    )
+        energy["flags"] = energy_flags
+
+        # ── Assemble evidence-rich report (no binary verdict) ─────────────────────
+        report = {
+            "success":          True,
+            "design": {
+                "sequence_length": fold.get("length"),
+                "copies":          fold.get("copies", 1),
+                "fold_source":     fold.get("fold_source"),
+            },
+            "fold_confidence":  fold_conf,
+            "fold_preservation": fold_pres,
+            "folding_energy":   energy,
+            "artifacts": {
+                "ranked_pdb":  fold.get("ranked_pdb"),
+                "relaxed_pdb": energy.get("relaxed_pdb"),
+                "png_paths":   fold.get("png_paths", {}),
+            },
+            "viz_applied": bool(rmsd.get("commands")),
+            "commands":    rmsd.get("commands", []),
+            "elapsed_s":   round(_time.perf_counter() - t0, 1),
+        }
+        if self.session:
+            self.session.set_validate_design_results(model_id, report)
+
+        # Auto-open the confidence-map PNGs (best-effort).
+        self._open_pngs(fold.get("png_paths", {}))
+
+        # ── Evidence-rich multi-line summary (honesty labels, NO pass/fail) ───────
+        lines: List[str] = ["Validate-design report (evidence — not a verdict):"]
+        _mp = f"{mean_plddt:.1f}" if isinstance(mean_plddt, (int, float)) else "n/a"
+        _ptm = fold.get("ptm"); _iptm = fold.get("iptm")
+        lines.append(
+            f"  • Fold confidence [{fold.get('fold_source')}]: mean pLDDT {_mp}"
+            + (f", pTM {_ptm:.2f}" if isinstance(_ptm, (int, float)) else "")
+            + (f", ipTM {_iptm:.2f}" if isinstance(_iptm, (int, float)) else "")
+            + (f", PAE matrix available" if fold.get("pae") is not None else "")
+        )
+        if fold_pres["rmsd_ca"] is not None:
+            lines.append(f"  • Fold preservation: Cα RMSD {fold_pres['rmsd_ca']:.2f} Å vs {fold_pres['reference']}")
+        else:
+            lines.append(f"  • Fold preservation: not assessed — {fold_pres['note']}")
+        if energy.get("available"):
+            if energy["mode"] == "relative" and "relative_delta_reu" in energy:
+                lines.append(
+                    f"  • Folding energy [RELATIVE]: ΔREU {energy['relative_delta_reu']:+.1f} vs "
+                    f"{energy.get('energy_reference')} (total {energy['total_reu']:.1f} REU; "
+                    f"ranking-reliable, magnitude approximate). {energy['reason']}"
+                )
+            elif energy["mode"] == "declined":
+                lines.append(
+                    f"  • Folding energy [SANITY — relative DECLINED]: total {energy['total_reu']:.1f} REU, "
+                    f"density {energy['per_residue_density']:.2f} REU/res, "
+                    f"clash_ok={energy['clash_ok']}. {energy['reason']}"
+                )
+            else:
+                lines.append(
+                    f"  • Folding energy [SANITY]: total {energy['total_reu']:.1f} REU, "
+                    f"density {energy['per_residue_density']:.2f} REU/res, "
+                    f"clash_ok={energy['clash_ok']}. {energy['reason']}"
+                )
+        else:
+            lines.append(f"  • Folding energy: unavailable — {energy.get('error')}")
+        _allflags = fold_flags + rmsd_flags + energy_flags
+        if _allflags:
+            lines.append("  • Flags: " + "; ".join(_allflags))
+        summary = "\n".join(lines)
+
+        return ToolStepResult(
+            tool="validate_design", success=True,
+            data=report,
+            viz_commands=[],            # viz already applied live (with the RMSD run)
+            viz_explanations=[],
+            summary=summary,
+            elapsed_ms=(_time.perf_counter() - t0) * 1000,
+        )
 
     # ── Bridge accessors (lazy init) ───────────────────────────────────────────
 

@@ -1665,6 +1665,171 @@ except Exception as exc:
             summary          = summary,
         )
 
+    # ── Relax + score an arbitrary structure (no mutation) ──────────────────────
+
+    def relax_and_score(
+        self,
+        pdb_path:          str,
+        relax_cycles:      int = 3,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        FastRelax + ref2015-score an ARBITRARY structure (NO mutation).
+
+        Reuses the SAME building blocks as the ddG path (`cleanATOM` →
+        `pose_from_file` → `FastRelax(ref2015)` → score), minus the
+        MutateResidue/ddG step — it is NOT a new protocol and does NOT touch the
+        ddG path. Used by the validate-design orchestrator as a fold-PLAUSIBILITY
+        sanity signal (total REU + per-residue density + a coarse clash flag),
+        NOT a stability-vs-WT claim.
+
+        Returns (never raises)::
+            {
+              "success":              bool,
+              "total_reu":            float,      # full-pose ref2015 total
+              "n_residues":           int,
+              "per_residue_density":  float,      # total_reu / n_residues
+              "per_residue":          [float,...],# per-residue total energies
+              "fa_rep":               float,      # repulsive term (clash proxy)
+              "clash_ok":             bool,       # fa_rep/residue below a loose bar
+              "converged":            bool,       # relax completed
+              "relaxed_pdb":          str | "",   # Windows path to relaxed model
+              "backend":              "pyrosetta_wsl2",
+              "error":                None | str,
+            }
+        """
+        def _prog(msg: str) -> None:
+            (progress_callback or _safe_print)(msg)
+
+        relax_cycles = max(1, int(relax_cycles))
+
+        def _err(msg: str) -> Dict[str, Any]:
+            return {
+                "success": False, "error": msg, "backend": "pyrosetta_wsl2",
+                "total_reu": None, "n_residues": 0, "per_residue_density": None,
+                "per_residue": [], "fa_rep": None, "clash_ok": None,
+                "converged": False, "relaxed_pdb": "",
+            }
+
+        if not pdb_path or not Path(pdb_path).is_file():
+            return _err(f"structure file not found: {pdb_path}")
+
+        try:
+            from wsl_bridge import WSLBridge
+        except ImportError:
+            return _err("wsl_bridge module not found")
+
+        wsl = WSLBridge()
+        if not wsl.is_available():
+            return _err("WSL2 not available (PyRosetta relax/score runs in WSL2).")
+        if not wsl.check_pyrosetta():
+            return _err("PyRosetta not installed in WSL2.")
+
+        import hashlib, json, tempfile
+        wsl_pdb = wsl.copy_to_wsl(pdb_path)
+        if not wsl_pdb:
+            return _err(f"failed to copy {pdb_path} to WSL2 /tmp")
+
+        h           = hashlib.md5(open(pdb_path, "rb").read()).hexdigest()[:12]
+        wsl_result  = f"/tmp/relax_score_{h}.json"
+        wsl_relaxed = f"/tmp/relax_score_{h}_relaxed.pdb"
+
+        # Standalone worker: zero project imports, JSON-file I/O, writes a result
+        # file even on exception, literal braces doubled.
+        script = f"""
+import json, os
+result_path = {wsl_result!r}
+def _write(d):
+    with open(result_path, "w") as fh:
+        json.dump(d, fh)
+try:
+    import pyrosetta
+    from pyrosetta import init as rosetta_init, pose_from_file
+    from pyrosetta.rosetta.protocols.relax import FastRelax
+    from pyrosetta.rosetta.core.scoring import ScoreType
+    from pyrosetta.toolbox import cleanATOM
+
+    rosetta_init(options="-mute all -ex1 -ex2 -use_input_sc -ignore_unrecognized_res true")
+
+    pdb_path = {wsl_pdb!r}
+    cleaned  = pdb_path.replace(".pdb", "_clean.pdb")
+    if cleaned == pdb_path:
+        cleaned = pdb_path + "_clean.pdb"
+    cleanATOM(pdb_path, cleaned)
+    if os.path.isfile(cleaned) and os.path.getsize(cleaned) > 100:
+        pdb_path = cleaned
+
+    pose = pose_from_file(pdb_path)
+    sfx  = pyrosetta.create_score_function("ref2015")
+    FastRelax(sfx, {relax_cycles}).apply(pose)
+
+    total = float(sfx(pose))
+    nres  = int(pose.total_residue())
+    per_res = [round(float(pose.energies().residue_total_energy(i)), 3)
+               for i in range(1, nres + 1)]
+    fa_rep = float(pose.energies().total_energies()[ScoreType.fa_rep])
+    pose.dump_pdb({wsl_relaxed!r})
+
+    _write({{"success": True, "total_reu": round(total, 3), "n_residues": nres,
+             "per_residue": per_res, "fa_rep": round(fa_rep, 3)}})
+    print("[Rosetta] relax+score done: total %.2f REU, %d residues" % (total, nres), flush=True)
+except Exception as exc:
+    import traceback
+    traceback.print_exc()
+    try:
+        _write({{"success": False, "error": str(exc)}})
+    except Exception:
+        pass
+"""
+
+        _prog(f"⚗️  [Rosetta] Relaxing + scoring structure ({relax_cycles} cycles)...")
+        timeout = max(600, relax_cycles * 90 + 300)
+        run = wsl.run_python_script(script, timeout=timeout)
+        if run.get("stdout"):
+            for line in run["stdout"].splitlines():
+                if line.strip():
+                    _prog(f"  {line.strip()}")
+        if not run["ok"]:
+            why = (run.get("error") or "").strip() or str(run.get("stderr", ""))[:200]
+            return _err(f"WSL2 relax/score failed: {why}")
+
+        win_result = str(Path(tempfile.gettempdir()) / f"relax_score_{h}.json")
+        if not wsl.copy_from_wsl(wsl_result, win_result) or not Path(win_result).is_file():
+            return _err("worker produced no result file")
+        try:
+            with open(win_result, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            return _err(f"could not parse worker output ({exc})")
+        if not data.get("success"):
+            return _err(f"worker error: {str(data.get('error'))[:200]}")
+
+        total = float(data["total_reu"])
+        nres  = int(data["n_residues"]) or 1
+        fa_rep = float(data.get("fa_rep", 0.0))
+        # Copy the relaxed model back (best-effort; not fatal if it fails).
+        win_relaxed = str(Path(tempfile.gettempdir()) / f"relax_score_{h}_relaxed.pdb")
+        relaxed_pdb = win_relaxed if wsl.copy_from_wsl(wsl_relaxed, win_relaxed) \
+            and Path(win_relaxed).is_file() else ""
+
+        # Coarse clash flag: post-relax repulsive energy per residue. This is a
+        # loose sanity bar, NOT a calibrated threshold — surfaced as a signal.
+        clash_ok = (fa_rep / nres) < 5.0
+
+        return {
+            "success":             True,
+            "total_reu":           round(total, 3),
+            "n_residues":          nres,
+            "per_residue_density": round(total / nres, 4),
+            "per_residue":         data.get("per_residue", []),
+            "fa_rep":              round(fa_rep, 3),
+            "clash_ok":            bool(clash_ok),
+            "converged":           True,
+            "relaxed_pdb":         relaxed_pdb,
+            "backend":             "pyrosetta_wsl2",
+            "error":               None,
+        }
+
     # ── High-accuracy validation tier ───────────────────────────────────────────
 
     def validate_ddg(
