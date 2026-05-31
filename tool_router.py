@@ -3249,6 +3249,213 @@ class ToolRouter:
                 return f"#{m.group(1)}"
         return f"#{fallback_id}" if fallback_id else None
 
+    # ── Fold-preservation helpers (pure — unit-testable) ────────────────────────
+
+    @staticmethod
+    def _parse_matchmaker_rmsds(val: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse BOTH RMSDs + pair counts from a ChimeraX matchmaker response:
+          "RMSD between N pruned atom pairs is X angstroms; (across all M pairs: Y)"
+        Returns {pruned_n, pruned_rmsd, total_n, all_pairs_rmsd}. If the
+        "(across all M pairs: Y)" clause is absent (no pruning occurred), falls
+        back to all-pairs == pruned (total_n = pruned_n, all_pairs_rmsd = pruned).
+        Returns None if no RMSD could be parsed at all.
+        """
+        if not val:
+            return None
+        mp = re.search(r"RMSD between\s+(\d+)\s+(?:pruned\s+)?atom pairs is\s+([\d.]+)", val)
+        if not mp:
+            mf = re.search(r"RMSD[^0-9]*([\d.]+)\s*angstrom", val, re.IGNORECASE)
+            if not mf:
+                return None
+            x = round(float(mf.group(1)), 3)
+            return {"pruned_n": None, "pruned_rmsd": x, "total_n": None, "all_pairs_rmsd": x}
+        pruned_n   = int(mp.group(1))
+        pruned_rmsd = round(float(mp.group(2)), 3)
+        ma = re.search(r"across all\s+(\d+)\s+pairs?:?\s*([\d.]+)", val)
+        if ma:
+            total_n = int(ma.group(1))
+            all_pairs = round(float(ma.group(2)), 3)
+        else:
+            total_n = pruned_n
+            all_pairs = pruned_rmsd
+        return {"pruned_n": pruned_n, "pruned_rmsd": pruned_rmsd,
+                "total_n": total_n, "all_pairs_rmsd": all_pairs}
+
+    @staticmethod
+    def _concentration_descriptor(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Free variance-concentration read from the matchmaker numbers. matchmaker's
+        pruning already isolates the divergent subsection, so a big all-pairs−pruned
+        gap from FEW pruned residues = "a lot of variation from a small subsection".
+        Descriptive only — NO threshold pass/fail.
+        """
+        allp   = parsed.get("all_pairs_rmsd")
+        pruned = parsed.get("pruned_rmsd")
+        n      = parsed.get("pruned_n")     # core (kept) pairs
+        m      = parsed.get("total_n")      # all pairs
+        out: Dict[str, Any] = {
+            "gap": None, "pruned_count": n, "total_count": m,
+            "pruned_fraction": None, "descriptor": None,
+        }
+        if allp is None or pruned is None:
+            out["descriptor"] = "single RMSD only (no pruned/all-pairs split available)."
+            return out
+        gap = round(allp - pruned, 3)
+        out["gap"] = gap
+        frac = None
+        if n is not None and m and m > 0:
+            frac = round((m - n) / m, 3)        # fraction of residues pruned out
+            out["pruned_fraction"] = frac
+        # Descriptive read.
+        if gap < 0.3:
+            out["descriptor"] = (
+                f"divergence is low/uniform — all-pairs {allp:.2f} Å vs core {pruned:.2f} Å "
+                f"(gap {gap:.2f} Å); the fit is even across the chain."
+            )
+        elif frac is not None and frac <= 0.25:
+            pct = round(frac * 100)
+            out["descriptor"] = (
+                f"divergence is CONCENTRATED — all-pairs {allp:.2f} Å but core {pruned:.2f} Å; "
+                f"~{pct}% of residues ({m - n}/{m}) drive most of the gap ({gap:.2f} Å), "
+                f"i.e. a localized over-represented subsection."
+            )
+        else:
+            out["descriptor"] = (
+                f"broadly divergent — all-pairs {allp:.2f} Å vs core {pruned:.2f} Å "
+                f"(gap {gap:.2f} Å) with many residues pruned"
+                + (f" ({m - n}/{m})" if (n is not None and m) else "")
+                + "; not a single localized pocket."
+            )
+        return out
+
+    @staticmethod
+    def _ca_coords(pdb_path: str, chain: Optional[str]) -> Dict[int, "Any"]:
+        """{resno: (x,y,z)} for Cα atoms of *chain* (all chains if None). First
+        occurrence per (chain,resno) wins (skips altlocs/duplicates)."""
+        import numpy as _np
+        out: Dict[int, Any] = {}
+        seen: set = set()
+        try:
+            with open(pdb_path, errors="replace") as fh:
+                for line in fh:
+                    if not line.startswith(("ATOM", "HETATM")):
+                        continue
+                    if line[12:16].strip() != "CA":
+                        continue
+                    ch = line[21]
+                    if chain and ch != chain:
+                        continue
+                    try:
+                        resno = int(line[22:26])
+                        xyz = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+                    except ValueError:
+                        continue
+                    key = (ch, resno)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out[resno] = _np.array(xyz, dtype=float)
+        except Exception:
+            return {}
+        return out
+
+    @classmethod
+    def _per_residue_ca_deviation(
+        cls,
+        design_pdb:   str,
+        design_chain: Optional[str],
+        ref_pdb:      str,
+        ref_chain:    Optional[str],
+    ) -> Tuple[Optional[Dict[int, float]], Optional[float]]:
+        """
+        Per-residue Cα deviation (Å) of the design vs reference, over an
+        independent Kabsch superposition of matched Cα (matched by residue
+        number). Returns ({design_resno: deviation}, all_pairs_rmsd) or
+        (None, None). The matchmaker superposition isn't exposed over REST, so
+        this is an independent Cα fit — adequate for localizing the divergence.
+        """
+        import numpy as _np
+        d = cls._ca_coords(design_pdb, design_chain)
+        r = cls._ca_coords(ref_pdb, ref_chain)
+        common = sorted(set(d) & set(r))
+        if len(common) < 3:
+            return None, None
+        P = _np.array([d[i] for i in common])   # design
+        Q = _np.array([r[i] for i in common])   # reference
+        Pc, Qc = P - P.mean(0), Q - Q.mean(0)
+        # Kabsch: rotation fitting P onto Q.
+        H = Pc.T @ Qc
+        U, _S, Vt = _np.linalg.svd(H)
+        dsign = _np.sign(_np.linalg.det(Vt.T @ U.T))
+        D = _np.diag([1.0, 1.0, dsign])
+        R = Vt.T @ D @ U.T
+        P_fit = Pc @ R.T
+        diff = P_fit - Qc
+        per_res = _np.sqrt((diff ** 2).sum(1))
+        dev = {resno: round(float(per_res[i]), 3) for i, resno in enumerate(common)}
+        all_pairs = round(float(_np.sqrt((per_res ** 2).mean())), 3)
+        return dev, all_pairs
+
+    @staticmethod
+    def _topk_deviant(dev: Dict[int, float], chain: Optional[str], k: int = 10) -> List[Dict[str, Any]]:
+        """Top-K most-deviant residues (chain, resno, deviation Å), descending."""
+        if not dev:
+            return []
+        top = sorted(dev.items(), key=lambda kv: kv[1], reverse=True)[:k]
+        return [{"chain": chain or "?", "resno": rn, "deviation": dv} for rn, dv in top]
+
+    # Deviation → colour buckets (blue=low … red=high). Documented scale; >=3.5 Å
+    # caps at red so a few large outliers don't wash out the gradient.
+    _DEVIATION_BUCKETS = (
+        (0.5, "blue"),
+        (1.0, "cornflower blue"),
+        (2.0, "white"),
+        (3.5, "orange"),
+        (float("inf"), "red"),
+    )
+
+    @classmethod
+    def _build_deviation_color_cmds(
+        cls,
+        dev:         Dict[int, float],
+        design_spec: str,
+        chain:       Optional[str],
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Colour the design model by per-residue Cα deviation, reusing the CamSol
+        grouped-run idiom (consecutive same-colour residues → one `color` command).
+        blue=low … red=high (>=3.5 Å). design_spec is the live '#N' model spec.
+        """
+        if not dev:
+            return [], []
+        def _bucket(v: float) -> str:
+            for hi, col in cls._DEVIATION_BUCKETS:
+                if v < hi:
+                    return col
+            return "red"
+        chain_spec = f"/{chain}" if chain else ""
+        base = design_spec if "/" in design_spec else f"{design_spec}{chain_spec}"
+        cmds = [f"color {base} white"]
+        exps = ["Reset to white before per-residue deviation colouring"]
+        runs: List[Tuple[str, List[int]]] = []
+        for resno in sorted(dev):
+            col = _bucket(dev[resno])
+            if runs and runs[-1][0] == col:
+                runs[-1][1].append(resno)
+            else:
+                runs.append((col, [resno]))
+        for col, resnos in runs:
+            if col == "white":
+                continue
+            if len(resnos) > 1 and resnos == list(range(resnos[0], resnos[-1] + 1)):
+                spec = f":{resnos[0]}-{resnos[-1]}"
+            else:
+                spec = ":" + ",".join(str(r) for r in resnos)
+            cmds.append(f"color {design_spec}{spec} {col}")
+            exps.append(f"Colour {spec} {col} (Cα deviation bucket)")
+        return cmds, exps
+
     def _matchmaker_rmsd_live(
         self,
         fold:   Dict[str, Any],
@@ -3287,32 +3494,37 @@ class ToolRouter:
                     self.bridge.run_command(c)
                     cmds.append(c)
 
-            # Resolve the reference spec.
-            rmsd_ref = inputs.get("rmsd_ref")
-            ref_spec = None
+            # Resolve the reference spec AND a LOCAL reference PDB path (the
+            # latter for the offline per-residue Cα Kabsch).
+            rmsd_ref      = inputs.get("rmsd_ref")
+            ref_spec      = None
+            ref_pdb_path  = None
+            ref_chain     = None
+            design_chain  = inputs.get("design_chain", "A")  # ColabFold monomer → chain A
             if rmsd_ref and rmsd_ref.get("pdb"):
-                ref_pdb = self._download_pdb_by_id(rmsd_ref["pdb"])
-                if not ref_pdb:
+                ref_pdb_path = self._download_pdb_by_id(rmsd_ref["pdb"])
+                if not ref_pdb_path:
                     out["note"] = f"Could not fetch RMSD reference {rmsd_ref['pdb']}; RMSD skipped."
                     out["commands"] = cmds
                     return out
-                ropen = f'open "{Path(ref_pdb).as_posix()}"'
+                ropen = f'open "{Path(ref_pdb_path).as_posix()}"'
                 rr = self.bridge.run_command(ropen)
                 cmds.append(ropen)
                 ref_model = self._parse_model_spec(rr, None)
-                ch = rmsd_ref.get("chain")
-                ref_spec = (f"{ref_model}/{ch}" if (ref_model and ch) else ref_model)
+                ref_chain = rmsd_ref.get("chain")
+                ref_spec = (f"{ref_model}/{ref_chain}" if (ref_model and ref_chain) else ref_model)
                 out["reference"] = (
-                    f"{rmsd_ref['pdb']}" + (f" chain {ch}" if ch else "")
+                    f"{rmsd_ref['pdb']}" + (f" chain {ref_chain}" if ref_chain else "")
                 )
             else:
                 # Default: the loaded primary model (assumed already open).
                 primary = self._primary_model_id()
                 if primary and design_spec and str(primary) != design_spec.lstrip("#") \
                         and self.session and self.session.get_structure(primary):
-                    ch = inputs.get("chain")
-                    ref_spec = f"#{primary}/{ch}" if ch else f"#{primary}"
-                    out["reference"] = f"loaded model #{primary}" + (f" chain {ch}" if ch else "")
+                    ref_chain = inputs.get("chain")
+                    ref_spec = f"#{primary}/{ref_chain}" if ref_chain else f"#{primary}"
+                    out["reference"] = f"loaded model #{primary}" + (f" chain {ref_chain}" if ref_chain else "")
+                    ref_pdb_path = self._ensure_pdb_file(primary)
                 else:
                     out["note"] = (
                         "No RMSD reference (no loaded structure and none specified) — "
@@ -3324,13 +3536,47 @@ class ToolRouter:
                 mr = self.bridge.run_command(mm)
                 cmds.append(mm)
                 val = (mr or {}).get("value") or ""
-                m = re.search(r"RMSD between\s+\d+\s+(?:pruned\s+)?atom pairs is\s+([\d.]+)", val)
-                if not m:
-                    m = re.search(r"RMSD[^0-9]*([\d.]+)\s*angstrom", val, re.IGNORECASE)
-                if m:
-                    out["rmsd_ca"] = round(float(m.group(1)), 3)
+                parsed = self._parse_matchmaker_rmsds(val)
+                if parsed:
+                    # HEADLINE = all-pairs (honest "did the fold drift overall").
+                    out["rmsd_ca"]        = parsed["all_pairs_rmsd"]
+                    out["all_pairs_rmsd"] = parsed["all_pairs_rmsd"]
+                    out["pruned_rmsd"]    = parsed["pruned_rmsd"]
+                    out["pruned_n"]       = parsed["pruned_n"]
+                    out["total_n"]        = parsed["total_n"]
+                    conc = self._concentration_descriptor(parsed)
+                    out["gap"]             = conc["gap"]
+                    out["pruned_fraction"] = conc["pruned_fraction"]
+                    out["concentration"]   = conc["descriptor"]
                 else:
                     out["note"] = "matchmaker ran but RMSD could not be parsed from the response."
+
+                # ── Localize: per-residue Cα deviation + colour the design model ──
+                if ref_pdb_path and Path(str(ref_pdb_path)).is_file():
+                    dev, dev_allpairs = self._per_residue_ca_deviation(
+                        ranked, design_chain, ref_pdb_path, ref_chain
+                    )
+                    if dev:
+                        out["per_residue_deviation"] = dev
+                        out["per_residue_all_pairs_rmsd"] = dev_allpairs
+                        out["top_deviant_residues"] = self._topk_deviant(dev, design_chain, k=10)
+                        ccmds, _cexp = self._build_deviation_color_cmds(
+                            dev, design_spec, design_chain
+                        )
+                        for c in ccmds:
+                            self.bridge.run_command(c)
+                            cmds.append(c)
+                        out["colored_by_deviation"] = bool(ccmds)
+                    else:
+                        out["per_residue_note"] = (
+                            "per-residue deviation unavailable (could not match >=3 Cα "
+                            "between design and reference chains)."
+                        )
+                else:
+                    out["per_residue_note"] = (
+                        "per-residue deviation skipped (no local reference PDB)."
+                    )
+
                 self.bridge.run_command(f"view {design_spec}")
                 cmds.append(f"view {design_spec}")
         except Exception as exc:
@@ -3383,17 +3629,36 @@ class ToolRouter:
             "flags":            fold_flags,
         }
 
-        # ── 2. Fold preservation (matchmaker RMSD) ────────────────────────────────
+        # ── 2. Fold preservation (matchmaker all-pairs RMSD + concentration + where) ─
         rmsd = self._matchmaker_rmsd_live(fold, inputs)
         rmsd_flags: List[str] = []
         if isinstance(rmsd.get("rmsd_ca"), (int, float)) and rmsd["rmsd_ca"] > 4.0:
-            rmsd_flags.append(f"high Cα RMSD ({rmsd['rmsd_ca']:.2f} Å > 4 Å) — fold may not be preserved")
+            rmsd_flags.append(
+                f"high all-pairs Cα RMSD ({rmsd['rmsd_ca']:.2f} Å > 4 Å) — fold may not be preserved"
+            )
+        _gap = rmsd.get("gap")
+        _frac = rmsd.get("pruned_fraction")
+        if isinstance(_gap, (int, float)) and _gap >= 0.3 and isinstance(_frac, (int, float)) and _frac <= 0.25:
+            rmsd_flags.append(
+                f"divergence concentrated in ~{round(_frac*100)}% of residues "
+                f"(all-pairs−core gap {_gap:.2f} Å)"
+            )
         fold_pres = {
-            "label":     "Fold preservation — matchmaker Cα RMSD vs reference",
-            "rmsd_ca":   rmsd.get("rmsd_ca"),
-            "reference": rmsd.get("reference"),
-            "note":      rmsd.get("note"),
-            "flags":     rmsd_flags,
+            "label":               "Fold preservation — matchmaker Cα RMSD vs reference (headline = all-pairs)",
+            "rmsd_ca":             rmsd.get("rmsd_ca"),            # all-pairs (headline)
+            "all_pairs_rmsd":      rmsd.get("all_pairs_rmsd"),
+            "pruned_rmsd":         rmsd.get("pruned_rmsd"),        # core (pruned) — flatters agreement
+            "pruned_n":            rmsd.get("pruned_n"),
+            "total_n":             rmsd.get("total_n"),
+            "pruned_fraction":     rmsd.get("pruned_fraction"),
+            "gap":                 rmsd.get("gap"),
+            "concentration":       rmsd.get("concentration"),
+            "top_deviant_residues": rmsd.get("top_deviant_residues"),
+            "per_residue_deviation": rmsd.get("per_residue_deviation"),
+            "colored_by_deviation": rmsd.get("colored_by_deviation", False),
+            "reference":           rmsd.get("reference"),
+            "note":                rmsd.get("note") or rmsd.get("per_residue_note"),
+            "flags":               rmsd_flags,
         }
 
         # ── 3. Folding energy (HONEST) ────────────────────────────────────────────
@@ -3501,7 +3766,21 @@ class ToolRouter:
             + (f", PAE matrix available" if fold.get("pae") is not None else "")
         )
         if fold_pres["rmsd_ca"] is not None:
-            lines.append(f"  • Fold preservation: Cα RMSD {fold_pres['rmsd_ca']:.2f} Å vs {fold_pres['reference']}")
+            _pru = fold_pres.get("pruned_rmsd")
+            _pru_s = f" / core(pruned) {_pru:.2f} Å" if isinstance(_pru, (int, float)) else ""
+            lines.append(
+                f"  • Fold preservation: all-pairs Cα RMSD {fold_pres['rmsd_ca']:.2f} Å"
+                f"{_pru_s} vs {fold_pres['reference']}"
+            )
+            if fold_pres.get("concentration"):
+                lines.append(f"      ↳ {fold_pres['concentration']}")
+            _topk = fold_pres.get("top_deviant_residues") or []
+            if _topk:
+                _shown = ", ".join(f"{d['chain']}{d['resno']} {d['deviation']:.1f}Å" for d in _topk[:5])
+                lines.append(f"      ↳ most-deviant residues: {_shown}"
+                             + (" …" if len(_topk) > 5 else "")
+                             + ("  [design coloured by per-residue deviation in ChimeraX]"
+                                if fold_pres.get("colored_by_deviation") else ""))
         else:
             lines.append(f"  • Fold preservation: not assessed — {fold_pres['note']}")
         if energy.get("available"):

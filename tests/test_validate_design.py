@@ -23,15 +23,28 @@ from session_state import SessionState
 
 # ── Helpers: tiny PDBs + fakes ──────────────────────────────────────────────────
 
+def _atom_line(serial: int, chain: str, resno: int, x: float, y: float, z: float) -> str:
+    """Column-exact PDB ATOM record (Cα), so _ca_coords' fixed-column slicing
+    (chain[21], resSeq[22:26], x[30:38], y[38:46], z[46:54]) reads it correctly."""
+    ln = list(" " * 66)
+    ln[0:6]   = "ATOM  "
+    ln[6:11]  = f"{serial:>5}"
+    ln[12:16] = " CA "
+    ln[17:20] = "ALA"
+    ln[21]    = chain
+    ln[22:26] = f"{resno:>4}"
+    ln[30:38] = f"{x:>8.3f}"
+    ln[38:46] = f"{y:>8.3f}"
+    ln[46:54] = f"{z:>8.3f}"
+    return "".join(ln)
+
+
 def _write_pdb(path: Path, chains: dict) -> str:
-    """chains = {'A': n_residues, ...} → a minimal CA-only PDB. Returns the path."""
+    """chains = {'A': n_residues, ...} → a minimal CA-only PDB (Cα at (i,0,0))."""
     lines, serial = [], 1
     for ch, n in chains.items():
         for i in range(1, n + 1):
-            lines.append(
-                f"ATOM  {serial:>5}  CA  ALA {ch}{i:>4}      "
-                f"{i:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00 50.00           C"
-            )
+            lines.append(_atom_line(serial, ch, i, float(i), 0.0, 0.0))
             serial += 1
     lines.append("END")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -220,24 +233,24 @@ def test_matchmaker_skips_without_bridge():
 
 
 # Regression lock against REAL ChimeraX 1.11.1 matchmaker output (verified live
-# 2026-06-01 with 1CRN×2 and two 1HSG copies). The parser must extract the
-# PRUNED-pairs RMSD (core agreement), never the "across all pairs" value.
-@pytest.mark.parametrize("real_response, expected", [
-    # 1CRN opened twice — identical (pruned == all-pairs).
+# 2026-06-01 with 1CRN×2 and two 1HSG copies). HEADLINE is now ALL-PAIRS RMSD
+# (the honest overall-drift number); the pruned (core) RMSD is still captured.
+@pytest.mark.parametrize("real_response, all_pairs, pruned", [
+    # 1CRN opened twice — identical (all-pairs == pruned).
     ("Matchmaker 1crn, chain A (#1) with 1crn, chain A (#2), sequence alignment "
      "score = 250\nRMSD between 46 pruned atom pairs is 0.000 angstroms; "
-     "(across all 46 pairs: 0.000)", 0.0),
+     "(across all 46 pairs: 0.000)", 0.0, 0.0),
     # 1HSG chain B onto chain A across two copies — verified live.
     ("Matchmaker 1hsg, chain A (#1) with 1hsg, chain B (#2), sequence alignment "
      "score = 491.1\nRMSD between 99 pruned atom pairs is 0.400 angstroms; "
-     "(across all 99 pairs: 0.400)", 0.4),
-    # Crafted REAL-format case where pruned != all-pairs: parser MUST take pruned
-    # (0.512), NOT the across-all-pairs divergence (1.987).
+     "(across all 99 pairs: 0.400)", 0.4, 0.4),
+    # Crafted REAL-format case where pruned != all-pairs: headline now takes the
+    # ALL-PAIRS value (1.987); pruned (0.512) still captured.
     ("RMSD between 80 pruned atom pairs is 0.512 angstroms; "
-     "(across all 99 pairs: 1.987)", 0.512),
+     "(across all 99 pairs: 1.987)", 1.987, 0.512),
 ])
-def test_matchmaker_parses_real_chimerax_output_takes_pruned(
-    tmp_path, monkeypatch, real_response, expected
+def test_matchmaker_headline_is_all_pairs(
+    tmp_path, monkeypatch, real_response, all_pairs, pruned
 ):
     ranked = _write_pdb(tmp_path / "ranked.pdb", {"A": 36})
     cx = _FakeChimerax(mm_response=real_response)
@@ -246,8 +259,102 @@ def test_matchmaker_parses_real_chimerax_output_takes_pruned(
                         lambda pid: _write_pdb(tmp_path / f"{pid}.pdb", {"A": 36}))
     out = r._matchmaker_rmsd_live(_fold(ranked=ranked),
                                   {"rmsd_ref": {"pdb": "1ABC", "chain": "A"}})
-    assert out["rmsd_ca"] == expected      # pruned value, not the across-all-pairs value
+    assert out["rmsd_ca"] == all_pairs          # headline = all-pairs (overall drift)
+    assert out["all_pairs_rmsd"] == all_pairs
+    assert out["pruned_rmsd"] == pruned         # core still captured (don't regress)
     assert any(c.startswith("matchmaker") for c in out["commands"])
+
+
+def test_matchmaker_concentration_on_divergent_case(tmp_path, monkeypatch):
+    """The crafted divergent case → concentration fields computed: gap 1.475,
+    pruned_fraction (99-80)/99 ≈ 0.192, CONCENTRATED descriptor."""
+    ranked = _write_pdb(tmp_path / "ranked.pdb", {"A": 36})
+    cx = _FakeChimerax(mm_response="RMSD between 80 pruned atom pairs is 0.512 "
+                                   "angstroms; (across all 99 pairs: 1.987)")
+    r = _router(_FakeRosetta(), chimerax=cx)
+    monkeypatch.setattr(r, "_download_pdb_by_id",
+                        lambda pid: _write_pdb(tmp_path / f"{pid}.pdb", {"A": 36}))
+    out = r._matchmaker_rmsd_live(_fold(ranked=ranked),
+                                  {"rmsd_ref": {"pdb": "1ABC", "chain": "A"}})
+    assert out["pruned_n"] == 80 and out["total_n"] == 99
+    assert out["gap"] == 1.475
+    assert out["pruned_fraction"] == round(19 / 99, 3)
+    assert "concentrated" in out["concentration"].lower()
+
+
+# ── Pure parse / concentration / top-K / colouring ──────────────────────────────
+
+def test_parse_both_rmsds_and_fallback():
+    p = ToolRouter._parse_matchmaker_rmsds(
+        "RMSD between 80 pruned atom pairs is 0.512 angstroms; (across all 99 pairs: 1.987)")
+    assert p == {"pruned_n": 80, "pruned_rmsd": 0.512, "total_n": 99, "all_pairs_rmsd": 1.987}
+    # No "(across all ...)" clause → all-pairs falls back to pruned.
+    p2 = ToolRouter._parse_matchmaker_rmsds("RMSD between 46 atom pairs is 0.300 angstroms")
+    assert p2 == {"pruned_n": 46, "pruned_rmsd": 0.3, "total_n": 46, "all_pairs_rmsd": 0.3}
+    assert ToolRouter._parse_matchmaker_rmsds("no rmsd here") is None
+
+
+def test_concentration_descriptor_buckets():
+    # Concentrated: big gap, few pruned.
+    conc = ToolRouter._concentration_descriptor(
+        {"all_pairs_rmsd": 1.987, "pruned_rmsd": 0.512, "pruned_n": 80, "total_n": 99})
+    assert conc["gap"] == 1.475 and conc["pruned_fraction"] == round(19 / 99, 3)
+    assert "concentrated" in conc["descriptor"].lower()
+    # Low/uniform: tiny gap.
+    low = ToolRouter._concentration_descriptor(
+        {"all_pairs_rmsd": 0.40, "pruned_rmsd": 0.40, "pruned_n": 99, "total_n": 99})
+    assert low["gap"] == 0.0 and "low/uniform" in low["descriptor"].lower()
+    # Broadly divergent: big gap, many pruned.
+    broad = ToolRouter._concentration_descriptor(
+        {"all_pairs_rmsd": 3.0, "pruned_rmsd": 1.0, "pruned_n": 40, "total_n": 100})
+    assert "broadly divergent" in broad["descriptor"].lower()
+
+
+def test_topk_deviant_selection():
+    dev = {1: 0.1, 2: 5.0, 3: 0.2, 4: 3.1, 5: 0.0}
+    top = ToolRouter._topk_deviant(dev, "A", k=2)
+    assert [d["resno"] for d in top] == [2, 4]
+    assert top[0]["deviation"] == 5.0 and top[0]["chain"] == "A"
+    assert ToolRouter._topk_deviant({}, "A") == []
+
+
+def test_deviation_color_cmds_reuse_grouped_idiom():
+    cmds, _ = ToolRouter._build_deviation_color_cmds(
+        {1: 0.1, 2: 0.1, 3: 4.0, 4: 4.0, 5: 0.1}, "#7", "A")
+    assert cmds[0] == "color #7/A white"          # reset like CamSol
+    assert "color #7:1-2 blue" in cmds            # grouped run (low → blue)
+    assert "color #7:3-4 red" in cmds             # grouped run (high → red)
+
+
+def test_per_residue_kabsch_localizes_displaced_residue(tmp_path):
+    """One displaced Cα → that residue is the top deviant; the rest ~0."""
+    # Design: residues on the x-axis; bump residue 5 off-axis by 3 Å in y.
+    def _pdb(path, bump=False):
+        lines = []
+        for i in range(1, 11):
+            y = 3.0 if (bump and i == 5) else 0.0
+            lines.append(_atom_line(i, "A", i, float(i), y, 0.0))
+        lines.append("END")
+        Path(path).write_text("\n".join(lines) + "\n")
+        return str(path)
+    design = _pdb(tmp_path / "d.pdb", bump=True)
+    ref    = _pdb(tmp_path / "r.pdb", bump=False)
+    dev, allp = ToolRouter._per_residue_ca_deviation(design, "A", ref, "A")
+    assert dev is not None
+    top = ToolRouter._topk_deviant(dev, "A", k=1)[0]
+    assert top["resno"] == 5                        # the displaced residue
+    assert top["deviation"] > 1.0                   # clearly nonzero
+    assert allp is not None and allp > 0
+    # Other residues much smaller than the bumped one.
+    others = [v for k, v in dev.items() if k != 5]
+    assert max(others) < top["deviation"]
+
+
+def test_per_residue_needs_three_matches(tmp_path):
+    d = _write_pdb(tmp_path / "d.pdb", {"A": 2})
+    r = _write_pdb(tmp_path / "r.pdb", {"A": 2})
+    dev, allp = ToolRouter._per_residue_ca_deviation(d, "A", r, "A")
+    assert dev is None and allp is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
