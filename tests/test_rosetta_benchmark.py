@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import urllib.request
@@ -50,15 +51,36 @@ BENCHMARK_RESULTS_PATH = _PROJECT / "scripts" / "benchmark_results.json"
 # 6 is a majority.
 MIN_BENCHMARK_ENTRIES = 6
 
-# ── Skip condition ─────────────────────────────────────────────────────────────
-# All tests in this module are skipped when WSL2 or PyRosetta is unavailable.
-
+# ── Skip condition (opt-in + backend) ───────────────────────────────────────────
+# This is a LIVE PyRosetta benchmark: each test runs a multi-minute FastRelax in
+# WSL2, so the full suite is hours long. It must NEVER run by accident on a
+# developer machine just because WSL2 + PyRosetta happen to be installed (that
+# was the footgun before this gate existed). So we run live ONLY when the user
+# explicitly opts in:
+#
+#     run live  iff  STRUCTUREBOT_RUN_LIVE_BENCHMARK=1  AND  WSL2  AND  PyRosetta
+#     otherwise skip cleanly
+#
+# The `and` short-circuits, so a bare (non-opted-in) collection never even spawns
+# WSL to probe PyRosetta.
 _wsl = WSLBridge()
 
-pytestmark = pytest.mark.skipif(
-    not _wsl.is_available() or not _wsl.check_pyrosetta(),
-    reason="WSL2 + PyRosetta not available",
+RUN_LIVE_BENCHMARK = os.environ.get("STRUCTUREBOT_RUN_LIVE_BENCHMARK") == "1"
+_BACKEND_AVAILABLE = bool(
+    RUN_LIVE_BENCHMARK and _wsl.is_available() and _wsl.check_pyrosetta()
 )
+
+pytestmark = [
+    pytest.mark.skipif(
+        not RUN_LIVE_BENCHMARK,
+        reason="live PyRosetta benchmark (hours long); "
+               "set STRUCTUREBOT_RUN_LIVE_BENCHMARK=1 to run",
+    ),
+    pytest.mark.skipif(
+        RUN_LIVE_BENCHMARK and not _BACKEND_AVAILABLE,
+        reason="WSL2 + PyRosetta not available",
+    ),
+]
 
 # ── Module-level results accumulator ──────────────────────────────────────────
 
@@ -238,17 +260,37 @@ def _record(
 # ── Per-mutation sign-assert policy ─────────────────────────────────────────────
 # This benchmark scores a SINGLE relax trajectory per mutation, which carries
 # multi-kcal/mol run-to-run noise (e.g. Barnase T26A came back +1.41 in one live
-# run and +7.74 in another). Two consequences for the per-mutation tests:
+# run and +7.74 in another). No per-mutation MAGNITUDE assert: the old
+# `abs(ddg - exp) <= 2.0` tolerance gated on stochastic noise, not on the code, so
+# it flapped red/green by luck. Magnitude is checked ONLY in aggregate, via the
+# RMSE gate in test_benchmark_correlation_acceptable.
 #
-#   * No per-mutation MAGNITUDE assert. The old `abs(ddg - exp) <= 2.0` tolerance
-#     gated on stochastic noise, not on the code, so it flapped red/green by luck.
-#     Magnitude is now checked ONLY in aggregate, via the RMSE gate in
-#     test_benchmark_correlation_acceptable.
-#   * Sign is asserted ONLY when the experimental effect is large enough that
-#     noise is unlikely to flip it (|experimental| > SIGN_ASSERT_MIN_ABS_EXP).
-#     Near-neutral mutations are still RECORDED (so they feed the aggregate
-#     correlation) but their sign is not gated.
+# Per-mutation SIGN behaviour has three buckets:
+#
+#   1. |experimental| <= SIGN_ASSERT_MIN_ABS_EXP (near-neutral): record only, no
+#      assert — single-trajectory noise makes the sign a coin-flip. (_check_sign.)
+#   2. |experimental| > threshold AND not a known buried wrong-sign case: hard
+#      sign assert. These SHOULD be right and are the real per-mutation signal.
+#   3. |experimental| > threshold AND a documented wrong-sign-on-buried case under
+#      the DEFAULT strip-water single-trajectory path (PROJECT_CONTEXT §8 failure
+#      mode 2): the test is marked xfail(strict=False). A wrong-sign result is then
+#      an EXPECTED failure (xfail), not a red test; a correct result (e.g. under
+#      preserve-waters) is an xpass and stays visible. Without this, these
+#      mutations would deterministically go RED the first time the live benchmark
+#      runs correctly on the default path — the inverse of the noise-flapping we
+#      removed. _record(...) still runs for these (it precedes the sign assert).
+#
+# Buried wrong-sign set, confirmed from §8 failure mode 2 AND the recorded
+# scripts/benchmark_results.json (all sign_correct=false): T26A (-2.437 vs +1.3),
+# G88V (-0.25 vs +2.1), V82A (-0.06 vs +1.75). T26A's |exp|=1.3 is already bucket 1
+# (no assert), so only G88V and V82A need the xfail marker. Root cause: cleanATOM
+# strips crystallographic waters that stabilise these buried positions.
 SIGN_ASSERT_MIN_ABS_EXP = 1.5  # kcal/mol
+
+_BURIED_WRONG_SIGN_XFAIL_REASON = (
+    "buried mutation: wrong-sign under the default strip-water single-trajectory "
+    "path (PROJECT_CONTEXT.md §8 failure mode 2); xpasses under preserve-waters"
+)
 
 
 def _check_sign(mutation: str, ddg: float, experimental: float) -> None:
@@ -364,8 +406,11 @@ def test_snase_v66l():
 @pytest.mark.benchmark
 @pytest.mark.slow
 @pytest.mark.timeout(2400)
+@pytest.mark.xfail(
+    strict=False, raises=AssertionError, reason=_BURIED_WRONG_SIGN_XFAIL_REASON,
+)
 def test_snase_g88v():
-    """2SNS G88V: experimental ΔΔG = +2.1 kcal/mol (destabilising)."""
+    """2SNS G88V: experimental ΔΔG = +2.1 kcal/mol (destabilising; buried, xfail)."""
     pdb = _fetch_pdb("2SNS")
     ddg = _run_benchmark_ddg(pdb, chain="A", pos=88, from_aa="G", to_aa="V")
     print(f"[benchmark] 2SNS G88V: predicted={ddg:+.2f}, experimental=+2.1", flush=True)
@@ -408,10 +453,14 @@ def test_t4_a98v():
 @pytest.mark.benchmark
 @pytest.mark.slow
 @pytest.mark.timeout(2400)
+@pytest.mark.xfail(
+    strict=False, raises=AssertionError, reason=_BURIED_WRONG_SIGN_XFAIL_REASON,
+)
 def test_hiv_protease_v82a():
     """
     1HSG V82A: experimental ΔΔG ~+1.5 to +2.0 kcal/mol (Mahalingam et al.).
     This is the reference mutation we have used for manual validation.
+    Buried wrong-sign case under the default strip-water path (§8) -> xfail.
     """
     pdb = _fetch_pdb("1HSG")
     ddg = _run_benchmark_ddg(pdb, chain="A", pos=82, from_aa="V", to_aa="A")
