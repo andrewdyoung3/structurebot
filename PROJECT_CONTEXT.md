@@ -464,6 +464,14 @@ Realistic thresholds for the current single-trajectory protocol: `r > 0.30`, `RM
 | 1 | **ColabFold bridge** (`colabfold_bridge.py`; env now ready) | AF2-quality folding for designed sequences; template-guided mode validates ProteinMPNN designs (WT as template). **Environment DONE** — isolated WSL2 Py-3.12 `~/colabfold_env`, GPU+sm_120 verified, weights cached. Bridge follows the WSL2 worker-script pattern (mirror `rosetta_bridge.py` / `wsl_bridge.PYROSETTA_PYTHON`; a `COLABFOLD_PYTHON` constant is already added). Remote MSA server (no local DBs) |
 | 2 | **RFdiffusion activation** (stub at `rfdiffusion_bridge.py`) | De novo backbone generation; completes the design loop (RFdiffusion → ProteinMPNN → ColabFold). **SEPARATE env** (do NOT couple to ColabFold): its own WSL2 env, torch/SE3-Transformer stack, ~20 GB weights; Blackwell sm_120 torch support is its own problem to solve at build time |
 
+### ColabFold bridge v1 — design note (build in progress, `feat/colabfold-bridge`)
+
+**Option A — standalone bridge** (the fused "validate design" meta-tool is explicitly NOT this task). `colabfold_bridge.py` mirrors `rosetta_bridge._run_rosetta_local`: an f-string worker run via `COLABFOLD_PYTHON` in WSL2 (Ubuntu-24.04), zero project imports, JSON-file I/O in `/tmp`, copy results back to a Windows cache dir, `stdin=DEVNULL`/`CREATE_NO_WINDOW` inherited from `wsl_bridge`.
+
+- **Scope (v1):** sequence→structure prediction; explicit sequence input; `copies` (1=monomer; >1 = colon-joined homo-oligomer + multimer model); optional template (PDB id/path → ColabFold custom-template mode, de novo when absent); `num_models` (default 5), `num_recycle` (default 3), `quick` preset (1/1). **Remote MSA server** (default; no local DBs). Outputs: ranked PDB(s), mean + per-residue pLDDT, PAE matrix, pTM (+ipTM for oligomers), PAE/pLDDT/coverage PNG paths. **Cache** by `hash(seq+copies+template+num_models+num_recycle)`. Confidence-map viz in ChimeraX (native AlphaFold pLDDT palette + Sequence Viewer + PNG auto-open), optional matchmaker-RMSD vs a compare_to structure. Rough **ETA** (residues×models×recycles, compiled-this-session flag) beside a live elapsed counter.
+- **DEFERRED (NOT in v1):** the fused **validate-design meta-tool** (ColabFold + Rosetta energy + matchmaker in one); **MPNN-result sequence auto-pull** (v1 takes explicit sequences only); **batch top-N folding**; **generalizing the ETA counter to all long tools**; **amber relax** (`--amber`); **single_sequence MSA mode**.
+- **Laptop-GPU multimer caveat:** AlphaFold attention memory scales ~ (total residues)²; oligomers are guarded by a **total-residue budget** `COLABFOLD_MAX_TOTAL_RESIDUES` (conservative default ~1500). Over budget → do not launch; return a clear OOM-risk message (names residue count + budget, suggests fewer copies / shorter / different GPU). A real runtime CUDA OOM is caught and surfaced with the same guidance, not a raw traceback. **Large homo-tetramers are expected to OOM and fail gracefully**; the budget is provisional and to be **recalibrated empirically** via a later stress test.
+
 ### Backlog
 
 | Item | Rationale |
@@ -475,6 +483,7 @@ Realistic thresholds for the current single-trajectory protocol: `r > 0.30`, `RM
 | **Mid-execution ESC / cancellation** | Long-running tools (PyRosetta ~15 min, ColabFold ~5 min) have no cancellation; needs a background-thread pattern |
 | **Double mutant — real PyRosetta close-pair scoring** | Close pairs (<4 Å) get an *additive* estimate when `run_pyrosetta=False` (can't capture epistasis); real close-pair scoring is now worthwhile since the ddG protocol is settled |
 | **GlycosuitDB lookup** | Expression-system glycan characterisation for engineered sequons (CHO, HEK293, E. coli, …) |
+| **Remote/cloud or alternate-GPU ColabFold handoff** | For folds exceeding `COLABFOLD_MAX_TOTAL_RESIDUES` (e.g. large homo-tetramers that OOM the laptop GPU): hand off to a remote/cloud GPU or a larger local card. The total-residue budget guard is the intended trigger point; the exact boundary is to be found empirically via a later multimer stress test, then the budget recalibrated. See §9 ColabFold bridge v1 multimer caveat |
 
 ---
 
