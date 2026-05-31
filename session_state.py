@@ -250,6 +250,9 @@ class SessionState:
         # NetNGlyc OST recognition results: model_id → annotated candidate list
         # Populated by _run_netnglyc() / _run_glycan_positions() in tool_router.
         self.netnglyc_results:    Dict[str, Any] = {}
+        # ColabFold structure-prediction results: model_id → trimmed result dict
+        # Populated by ToolRouter._run_colabfold() after a successful fold.
+        self.colabfold_results:   Dict[str, Any] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -676,6 +679,16 @@ class SessionState:
         """Return stored double mutant results for a model, or None."""
         return self.double_mutant_results.get(str(model_id))
 
+    # ── ColabFold structure-prediction result tracking ────────────────────────
+
+    def set_colabfold_results(self, model_id: str, result: Dict[str, Any]) -> None:
+        """Store ColabFold fold results (trimmed) for a model."""
+        self.colabfold_results[str(model_id)] = result
+
+    def get_colabfold_results(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return stored ColabFold results for a model, or None."""
+        return self.colabfold_results.get(str(model_id))
+
     # ── Rosetta relax cache tracking ──────────────────────────────────────────
 
     def set_relax_cache(self, pdb_hash: str, relaxed_path: str) -> None:
@@ -891,6 +904,7 @@ class SessionState:
             "cavity_results":         self.cavity_results,
             "double_mutant_results":  self.double_mutant_results,
             "netnglyc_results":       self.netnglyc_results,
+            "colabfold_results":      self.colabfold_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -922,6 +936,7 @@ class SessionState:
         state.cavity_results         = data.get("cavity_results", {})
         state.double_mutant_results  = data.get("double_mutant_results", {})
         state.netnglyc_results       = data.get("netnglyc_results", {})
+        state.colabfold_results      = data.get("colabfold_results", {})
         return state
 
     @classmethod
@@ -1039,6 +1054,7 @@ class SessionState:
             "cavity_results":         self.cavity_results,
             "double_mutant_results":  self.double_mutant_results,
             "netnglyc_results":       self.netnglyc_results,
+            "colabfold_results":      self.colabfold_results,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -1066,3 +1082,4 @@ class SessionState:
         self.cavity_results         = snap.get("cavity_results", {})
         self.double_mutant_results  = copy.deepcopy(snap.get("double_mutant_results", {}))
         self.netnglyc_results       = copy.deepcopy(snap.get("netnglyc_results", {}))
+        self.colabfold_results      = copy.deepcopy(snap.get("colabfold_results", {}))

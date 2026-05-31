@@ -179,9 +179,10 @@ class _ElapsedTicker:
             results = scanner.scan(...)
     """
 
-    def __init__(self, prefix: str, interval: int = 30):
+    def __init__(self, prefix: str, interval: int = 30, eta_s: float = 0.0):
         self._prefix   = prefix
         self._interval = interval
+        self._eta_s    = max(0.0, float(eta_s))   # 0 = unknown; omit ETA from the line
         self._start    = time.time()
         self._stop     = threading.Event()
         self._thread   = threading.Thread(target=self._run, daemon=True)
@@ -198,7 +199,14 @@ class _ElapsedTicker:
         while not self._stop.wait(timeout=self._interval):
             elapsed = int(time.time() - self._start)
             mins, secs = divmod(elapsed, 60)
-            msg = f"  {self._prefix}... ({mins:02d}:{secs:02d} elapsed)"
+            # When an approximate ETA is known, show "elapsed / ~ETA" so a long
+            # fold reads as progress rather than a hang.
+            if self._eta_s > 0:
+                em, es = divmod(int(self._eta_s), 60)
+                tail = f" / ~{em:02d}:{es:02d} est"
+            else:
+                tail = ""
+            msg = f"  {self._prefix}... ({mins:02d}:{secs:02d} elapsed{tail})"
             try:
                 print(msg, flush=True)
             except Exception:
@@ -740,7 +748,7 @@ class StructureBot:
                     console.print(f"  [info]{msg}[/info]")
 
                 # For long-running pipelines, show elapsed time every 30s
-                _long_tools = {"mutation_scan", "disulfide", "rosetta"}
+                _long_tools = {"mutation_scan", "disulfide", "rosetta", "colabfold"}
                 _needs_timer = bool(set(tools_needed) & _long_tools)
                 _ticker_label = (
                     "Running " + "/".join(
@@ -748,8 +756,24 @@ class StructureBot:
                     )
                 )
 
+                # ColabFold: surface a rough ETA beside the elapsed counter when
+                # the sequence is known up front (approximate; see ColabFoldBridge).
+                _eta_s = 0.0
+                if "colabfold" in tools_needed:
+                    try:
+                        _cf_in = (result.get("tool_inputs") or {}).get("colabfold", {})
+                        _seq   = _cf_in.get("sequence") or ""
+                        _cop   = int(_cf_in.get("copies", 1) or 1)
+                        if _seq:
+                            from colabfold_bridge import ColabFoldBridge
+                            _eta_s = ColabFoldBridge().estimate_runtime_s(
+                                len(_seq) * _cop, 5, 3
+                            )
+                    except Exception:
+                        _eta_s = 0.0
+
                 if _needs_timer:
-                    _ticker = _ElapsedTicker(_ticker_label, interval=30)
+                    _ticker = _ElapsedTicker(_ticker_label, interval=30, eta_s=_eta_s)
                     _ticker.start()
                 else:
                     _ticker = None

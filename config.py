@@ -21,6 +21,14 @@ REST_HOST: str = os.environ.get("CHIMERAX_HOST", "127.0.0.1")
 REST_PORT: int = int(os.environ.get("CHIMERAX_PORT", "60001"))
 REST_TIMEOUT: int = int(os.environ.get("CHIMERAX_TIMEOUT", "10"))
 
+# When a structure is opened, also open the Sequence Viewer for its chain(s) so
+# loaded PDBs show their sequence by default (applies to ALL opens, not just
+# ColabFold). Set CHIMERAX_SHOW_SEQUENCE_ON_OPEN=false to disable.
+CHIMERAX_SHOW_SEQUENCE_ON_OPEN: bool = (
+    os.environ.get("CHIMERAX_SHOW_SEQUENCE_ON_OPEN", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
 # claude-sonnet-4-6 is the current recommended model.
@@ -282,6 +290,41 @@ NETNGLYC_ENABLED: bool = (
 # How many top glycan-position candidates to annotate via NetNGlyc after a
 # projection-aware scan (_run_glycan_positions in tool_router.py).
 NETNGLYC_TOP_N: int = int(os.environ.get("NETNGLYC_TOP_N", "5"))
+
+# ── ColabFold (WSL2 ~/colabfold_env, AF2-quality folding) ───────────────────────
+# v1 standalone bridge. Runs colabfold_batch inside the isolated WSL2 ColabFold
+# env (wsl_bridge.COLABFOLD_PYTHON) using the REMOTE MSA server (no local DBs).
+
+# Number of AF2 models to run (1-5). More models = better ranking, slower.
+COLABFOLD_NUM_MODELS: int = int(os.environ.get("COLABFOLD_NUM_MODELS", "5"))
+
+# Number of recycles per model. More recycles = better convergence, slower.
+COLABFOLD_NUM_RECYCLE: int = int(os.environ.get("COLABFOLD_NUM_RECYCLE", "3"))
+
+# MSA mode passed to colabfold_batch. Default uses the remote MMseqs2 server
+# (no hundreds-of-GB local databases). "single_sequence" (DEFERRED) skips MSA.
+COLABFOLD_MSA_MODE: str = os.environ.get("COLABFOLD_MSA_MODE", "mmseqs2_uniref_env").strip()
+
+# Total-residue budget (len(sequence) x copies). AlphaFold attention memory
+# scales ~ (total residues)^2, so oligomers OOM the laptop GPU quickly. Above
+# this budget the bridge refuses to launch and returns an OOM-risk message
+# rather than crashing. Conservative default; recalibrate empirically (see
+# PROJECT_CONTEXT §9 ColabFold multimer caveat + the remote-GPU-handoff backlog).
+COLABFOLD_MAX_TOTAL_RESIDUES: int = int(
+    os.environ.get("COLABFOLD_MAX_TOTAL_RESIDUES", "1500")
+)
+
+# Base WSL2 process timeout (seconds). The bridge scales this up with
+# total_residues x num_models x num_recycle; this is the floor (covers the
+# one-time weight download + first sm_120 XLA compile).
+COLABFOLD_TIMEOUT: int = int(os.environ.get("COLABFOLD_TIMEOUT", "1800"))
+
+# Cache dir for completed folds, keyed by hash(seq+copies+template+models+recycle).
+# A re-fold of an identical input returns the cached ranked PDB instantly.
+COLABFOLD_CACHE_DIR: Path = Path(
+    os.environ.get("COLABFOLD_CACHE_DIR", str(_BASE / "cache" / "colabfold"))
+)
+COLABFOLD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── .env.local loader ─────────────────────────────────────────────────────────
 # Called by main.py at startup BEFORE any other imports that read env vars.

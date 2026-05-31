@@ -126,6 +126,24 @@ class ToolRouter:
         "cavity":            "🕳",
         "double_mutant":     "⚗️🔗",
         "validate_ddg":      "⚗️✅",
+        "colabfold":         "🧬🔮",
+    }
+
+    # Explicit ColabFold (AF2) folding keywords — the high-accuracy structure-
+    # prediction path. Kept tight so it neither swallows nor is swallowed by the
+    # esmfold / mpnn_esmfold pipeline (see route()).
+    _COLABFOLD_KEYWORDS: tuple = (
+        "colabfold", "alphafold", "alpha fold", "af2",
+    )
+
+    # Oligomer words → homo-oligomer copy count (used for both intent + parsing).
+    _OLIGOMER_COPIES: Dict[str, int] = {
+        "monomer": 1, "monomeric": 1,
+        "dimer": 2, "homodimer": 2, "dimeric": 2,
+        "trimer": 3, "homotrimer": 3, "trimeric": 3,
+        "tetramer": 4, "homotetramer": 4, "tetrameric": 4,
+        "pentamer": 5, "pentameric": 5,
+        "hexamer": 6, "hexameric": 6,
     }
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
@@ -394,6 +412,7 @@ class ToolRouter:
         self._salt_bridge_bridge:      Optional[Any] = None
         self._cavity_bridge:           Optional[Any] = None
         self._double_mutant_bridge:    Optional[Any] = None
+        self._colabfold_bridge:        Optional[Any] = None
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -661,6 +680,31 @@ class ToolRouter:
                 }
             }
 
+        # ── ColabFold intent override ──────────────────────────────────────────
+        # Explicit high-accuracy folding path (AF2 via the WSL2 ColabFold env).
+        # Fires only on explicit keywords (colabfold/alphafold, "fold … as a
+        # <oligomer>", or "use PDB XXXX as template to fold"), so it neither
+        # swallows nor is swallowed by the esmfold / mpnn_esmfold pipeline.
+        _cf_intent = bool(
+            user_input
+            and self._detect_colabfold_intent(user_input)
+            and "colabfold" not in tools_needed
+        )
+        if _cf_intent:
+            _cf_chain = "A"
+            for _inp in list(tool_inputs.values()):
+                if isinstance(_inp, dict) and _inp.get("chain"):
+                    _cf_chain = _inp["chain"]
+                    break
+            cf_inputs: Dict[str, Any] = {
+                "model_id":    self._primary_model_id(),
+                "chain":       _cf_chain,
+                "_user_input": user_input,
+            }
+            cf_inputs.update(self._parse_colabfold_options(user_input))
+            tools_needed = ["colabfold"]
+            tool_inputs  = {"colabfold": cf_inputs}
+
         # ── Proline intent override ────────────────────────────────────────────
         # Check BEFORE building step_info so the icon/description are correct.
         if user_input and self._detect_proline_intent(user_input):
@@ -888,6 +932,12 @@ class ToolRouter:
             inp = tool_inputs.get("esmfold", {})
             mid = inp.get("model_id") or self._first_model_id()
             return f"ESMFold foldability prediction — #{mid} (ESM Atlas API)"
+        if tool == "colabfold":
+            inp     = tool_inputs.get("colabfold", {})
+            copies  = inp.get("copies", 1)
+            shape   = "monomer" if copies <= 1 else f"{copies}-copy homo-oligomer"
+            tmpl    = " (templated)" if inp.get("template") else ""
+            return f"ColabFold AF2 structure prediction — {shape}{tmpl} (remote MSA)"
         if tool == "proteinmpnn":
             return "ProteinMPNN fixed-backbone sequence redesign"
         if tool == "mpnn_esmfold":
@@ -1158,6 +1208,8 @@ class ToolRouter:
                 return self._run_double_mutant(inputs, user_input=user_input)
             if tool == "validate_ddg":
                 return self._run_validate_ddg(inputs, user_input=user_input)
+            if tool == "colabfold":
+                return self._run_colabfold(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -1182,7 +1234,7 @@ class ToolRouter:
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
                     "assembly_analyser, disulfide, proline, glycan, "
                     "glycan_positions, netnglyc, salt_bridge, cavity, "
-                    "double_mutant, validate_ddg."
+                    "double_mutant, validate_ddg, colabfold."
                 ),
             )
         except Exception as exc:
@@ -2645,6 +2697,289 @@ class ToolRouter:
 
         return cmds, exps
 
+    # ── ColabFold intent detection + option parsing ────────────────────────────
+
+    def _detect_colabfold_intent(self, text: str) -> bool:
+        """
+        True only for an EXPLICIT high-accuracy folding request:
+          * 'colabfold' / 'alphafold' / 'af2' anywhere, OR
+          * 'fold … as a <oligomer>' (oligomer word present with a fold verb), OR
+          * 'use PDB XXXX as template to fold …' (template + fold).
+        Intentionally tight so generic 'fold sequence' / 'fold design' stays with
+        the ESMFold / MPNN+ESMFold pipeline.
+        """
+        if not text:
+            return False
+        low = text.lower()
+        if any(kw in low for kw in self._COLABFOLD_KEYWORDS):
+            return True
+        _has_fold = "fold" in low or "predict" in low or "structure" in low
+        if _has_fold and any(w in low for w in self._OLIGOMER_COPIES):
+            return True
+        if "template" in low and "fold" in low:
+            return True
+        return False
+
+    def _parse_colabfold_options(self, text: str) -> Dict[str, Any]:
+        """
+        Parse copies (oligomer word), an optional template PDB id, an optional
+        explicit sequence, and a 'quick' preset flag from the user text.
+        """
+        opts: Dict[str, Any] = {}
+        if not text:
+            return opts
+        low = text.lower()
+
+        # copies ← first oligomer word found
+        for word, n in self._OLIGOMER_COPIES.items():
+            if re.search(rf"\b{word}\b", low):
+                opts["copies"] = n
+                break
+
+        # template ← "use PDB XXXX as template" / "template XXXX" (4-char id)
+        m = re.search(
+            r"(?:pdb\s+)?\b([0-9][a-z0-9]{3})\b\s+as\s+(?:a\s+)?template", low
+        ) or re.search(r"template[:\s]+(?:pdb\s+)?\b([0-9][a-z0-9]{3})\b", low)
+        if m:
+            opts["template"] = m.group(1).upper()
+
+        # quick preset
+        if "quick" in low or "fast fold" in low or "rough fold" in low:
+            opts["quick"] = True
+
+        # explicit sequence ← a long run of standard one-letter codes (>=20 aa)
+        m = re.search(r"\b([ACDEFGHIKLMNPQRSTVWY]{20,})\b", text.upper())
+        if m:
+            opts["sequence"] = m.group(1)
+
+        return opts
+
+    # ── ColabFold dispatch ──────────────────────────────────────────────────────
+
+    def _run_colabfold(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> "ToolStepResult":
+        """
+        Run AF2 structure prediction via the WSL2 ColabFold env and build viz.
+
+        Resolves the sequence (explicit input/parsed sequence, else the loaded
+        structure's chain — MPNN-result auto-pull is DEFERRED), folds via
+        ColabFoldBridge, stores a trimmed result in session_state.colabfold_results,
+        and builds ChimeraX confidence-map viz (open ranked PDB → native AlphaFold
+        pLDDT palette → Sequence Viewer → optional matchmaker RMSD vs compare_to).
+        Opens the PAE/pLDDT/coverage PNGs in the OS image viewer (best-effort).
+        """
+        import time as _time
+
+        user_input = user_input or inputs.get("_user_input", "")
+        model_id   = inputs.get("model_id") or self._first_model_id()
+        copies     = int(inputs.get("copies", 1) or 1)
+        template   = inputs.get("template")
+        quick      = bool(inputs.get("quick", False))
+
+        # ── Resolve sequence ──────────────────────────────────────────────────────
+        sequence = inputs.get("sequence") or self._fetch_sequence(
+            model_id, inputs.get("chain")
+        )
+        if not sequence:
+            return ToolStepResult(
+                tool="colabfold", success=False,
+                error=(
+                    "ColabFold needs an amino-acid sequence. Provide one explicitly "
+                    "(e.g. 'fold MKT... as a dimer with colabfold'), or load a "
+                    "structure first so its chain sequence can be used."
+                ),
+            )
+
+        # ── Resolve optional template (PDB id → local file) ────────────────────────
+        template_path: Optional[str] = None
+        if template:
+            if Path(str(template)).is_file():
+                template_path = str(template)
+            else:
+                template_path = self._download_pdb_by_id(str(template))
+                if not template_path:
+                    return ToolStepResult(
+                        tool="colabfold", success=False,
+                        error=(
+                            f"Could not obtain template '{template}'. Provide a 4-char "
+                            "PDB id (downloadable from RCSB) or a local .pdb path."
+                        ),
+                    )
+
+        bridge = self._get_colabfold_bridge()
+
+        # num_models/num_recycle default to config inside the bridge when None;
+        # quick=True overrides both to 1/1 there.
+        t0 = _time.perf_counter()
+        result = bridge.predict(
+            sequence=sequence, copies=copies, template=template_path,
+            num_models=None, num_recycle=None, quick=quick,
+            label=f"model{model_id}",
+        )
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+        if not result.get("success"):
+            return ToolStepResult(
+                tool="colabfold", success=False,
+                error=result.get("error", "ColabFold prediction failed"),
+                data={"oom_risk": result.get("oom_risk", False)},
+                elapsed_ms=elapsed_ms,
+            )
+
+        # ── Store a trimmed result in session (omit the heavy PAE matrix) ──────────
+        trimmed = {
+            k: result[k] for k in (
+                "ranked_pdb", "mean_plddt", "ptm", "iptm", "length", "copies",
+                "total_residues", "num_models", "num_recycle", "png_paths",
+                "cached", "source",
+            ) if k in result
+        }
+        self.session.set_colabfold_results(model_id, trimmed)
+
+        # ── Open the confidence-map PNGs in the OS viewer (best-effort) ─────────────
+        self._open_pngs(result.get("png_paths", {}))
+
+        # ── Build ChimeraX viz (open ranked PDB → pLDDT palette → seq → matchmaker) ─
+        viz_cmds, viz_exps = self._build_colabfold_viz(result, inputs, model_id)
+
+        mean_plddt = result["mean_plddt"]
+        conf = "very high" if mean_plddt > 90 else "high" if mean_plddt > 70 else \
+               "low" if mean_plddt > 50 else "very low"
+        ptm = result.get("ptm")
+        iptm = result.get("iptm")
+        _shape = "monomer" if result["copies"] <= 1 else f"{result['copies']}-mer"
+        summary = (
+            f"ColabFold ({_shape}): mean pLDDT {mean_plddt:.1f} ({conf} confidence)"
+            + (f", pTM {ptm:.2f}" if isinstance(ptm, (int, float)) else "")
+            + (f", ipTM {iptm:.2f}" if isinstance(iptm, (int, float)) else "")
+            + (" [cached]" if result.get("cached") else "")
+            + f".\n  Ranked model: {result.get('ranked_pdb', '?')}"
+        )
+        return ToolStepResult(
+            tool="colabfold", success=True,
+            data=result,
+            viz_commands=viz_cmds,
+            viz_explanations=viz_exps,
+            summary=summary,
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _build_colabfold_viz(
+        self,
+        result:   Dict[str, Any],
+        inputs:   Dict[str, Any],
+        model_id: str,
+    ) -> tuple:
+        """
+        ChimeraX commands: open the ranked PDB as a NEW model, colour it by the
+        native AlphaFold pLDDT palette (B-factor holds pLDDT), open the Sequence
+        Viewer, and — when a compare_to structure resolves — superpose with
+        matchmaker. The new model id is taken from session.next_model_id(), which
+        is exactly what main.py assigns to the open command it later state-tracks.
+        """
+        ranked = result.get("ranked_pdb", "")
+        if not ranked:
+            return [], []
+
+        new_id = str(self.session.next_model_id())
+        pdb_posix = Path(ranked).as_posix()
+
+        cmds: List[str] = []
+        exps: List[str] = []
+
+        cmds.append(f'open "{pdb_posix}"')
+        exps.append(f"Open the ColabFold ranked model as #{new_id}")
+        # Native AlphaFold pLDDT colouring (canonical blue→orange palette over the
+        # B-factor column, where ColabFold stores per-residue pLDDT).
+        cmds.append(f"color byattribute bfactor #{new_id} palette alphafold")
+        exps.append("Colour by pLDDT using the native AlphaFold palette (blue=confident)")
+        cmds.append(f"cartoon #{new_id}")
+        exps.append("Cartoon representation for the predicted model")
+        cmds.append(f"sequence chain #{new_id}")
+        exps.append("Open the Sequence Viewer for the predicted chain(s)")
+
+        # ── Optional structural comparison (matchmaker RMSD) ────────────────────────
+        ref_spec = self._resolve_colabfold_compare_to(inputs, exclude_model=new_id)
+        if ref_spec:
+            cmds.append(f"matchmaker #{new_id} to {ref_spec}")
+            exps.append(
+                f"Superpose the predicted model onto {ref_spec} (matchmaker RMSD "
+                "reported in ChimeraX log)"
+            )
+        cmds.append(f"view #{new_id}")
+        exps.append("Fit the predicted model in view")
+        return cmds, exps
+
+    def _resolve_colabfold_compare_to(
+        self,
+        inputs:        Dict[str, Any],
+        exclude_model: str,
+    ) -> Optional[str]:
+        """
+        Resolve the compare_to reference for matchmaker.
+
+        Default: the currently-loaded primary model (if any), as a ``#id`` spec,
+        with optional chain. Overridable via inputs['compare_to'] = a ``#id``/
+        ``#id/chain`` spec or a model id. Returns None when nothing to compare to
+        (e.g. the predicted model is the only structure).
+        """
+        compare_to = inputs.get("compare_to")
+        if compare_to:
+            spec = str(compare_to).strip()
+            return spec if spec.startswith("#") else f"#{spec}"
+        # Default = the existing primary model, if one is loaded and it isn't the
+        # model we just predicted.
+        try:
+            primary = self._primary_model_id()
+        except Exception:
+            primary = None
+        if primary and str(primary) != str(exclude_model) and self.session.get_structure(primary):
+            chain = inputs.get("chain")
+            return f"#{primary}/{chain}" if chain else f"#{primary}"
+        return None
+
+    def _download_pdb_by_id(self, pdb_id: str) -> Optional[str]:
+        """Download a 4-char PDB id from RCSB into cache/ and return the local path."""
+        if not re.match(r"^[A-Za-z0-9]{4}$", pdb_id):
+            return None
+        cache_dir = Path("cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        local = cache_dir / f"{pdb_id.upper()}.pdb"
+        if local.is_file():
+            return str(local)
+        try:
+            import requests
+            resp = requests.get(
+                f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb", timeout=30
+            )
+            resp.raise_for_status()
+            local.write_bytes(resp.content)
+            return str(local)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _open_pngs(png_paths: Dict[str, str]) -> None:
+        """Open the confidence-map PNGs in the OS default image viewer (best-effort)."""
+        import os as _os
+        import sys as _sys
+        import subprocess as _sub
+        for _kind, _path in (png_paths or {}).items():
+            if not _path or not Path(_path).is_file():
+                continue
+            try:
+                if _sys.platform == "win32":
+                    _os.startfile(_path)             # type: ignore[attr-defined]
+                elif _sys.platform == "darwin":
+                    _sub.Popen(["open", _path])
+                else:
+                    _sub.Popen(["xdg-open", _path])
+            except Exception:
+                pass
+
     # ── Bridge accessors (lazy init) ───────────────────────────────────────────
 
     def _get_assembly_analyser(self):
@@ -2697,6 +3032,12 @@ class ToolRouter:
             from double_mutant_bridge import DoubleMutantBridge
             self._double_mutant_bridge = DoubleMutantBridge()
         return self._double_mutant_bridge
+
+    def _get_colabfold_bridge(self):
+        if self._colabfold_bridge is None:
+            from colabfold_bridge import ColabFoldBridge
+            self._colabfold_bridge = ColabFoldBridge()
+        return self._colabfold_bridge
 
     def _get_camsol_bridge(self):
         if self._camsol_bridge is None:

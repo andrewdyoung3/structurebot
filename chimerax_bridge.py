@@ -398,7 +398,49 @@ class ChimeraXBridge:
             results.append({"command": cmd, "result": result})
             if result.get("error"):
                 break  # halt on first failure; let caller handle retry
+            # Auto-open the Sequence Viewer for newly opened structures so loaded
+            # PDBs show their sequence by default (config-gated). Fire-and-forget:
+            # it does NOT add to `results`, so the one-entry-per-command contract
+            # and the on-first-error halt above are both preserved.
+            self._maybe_show_sequence_on_open(cmd, result)
         return results
+
+    # ── Sequence-on-open ──────────────────────────────────────────────────────
+
+    def _maybe_show_sequence_on_open(self, command: str, result: dict) -> None:
+        """
+        After a successful structure ``open``, open the ChimeraX Sequence Viewer
+        for the new model so its sequence is shown by default.
+
+        Gated by config.CHIMERAX_SHOW_SEQUENCE_ON_OPEN (default True). Best-effort:
+        only fires when the opened model id can be parsed from the open response
+        (``#N``); never raises and never affects the run_commands result list.
+        Skips session opens and image/data files.
+        """
+        try:
+            import config as _cfg
+            if not getattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", True):
+                return
+        except Exception:
+            return
+
+        low = command.strip().lower()
+        if not low.startswith("open "):
+            return
+        if "session" in low or low.endswith((".cxs", ".png", ".jpg", ".jpeg")):
+            return
+
+        # Parse the opened model id from the response (e.g. "...#1, ... model(s)").
+        value = result.get("value")
+        if not isinstance(value, str):
+            return
+        m = re.search(r"#(\d+)", value)
+        if not m:
+            return
+        try:
+            self.run_command(f"sequence chain #{m.group(1)}")
+        except Exception:
+            pass  # sequence viewer is non-essential; never disrupt the batch
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 

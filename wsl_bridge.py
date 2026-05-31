@@ -312,11 +312,20 @@ class WSLBridge:
 
     def run_python_script(
         self,
-        script:  str,
-        timeout: int = 600,
+        script:     str,
+        timeout:    int = 600,
+        python_bin: str = PYROSETTA_PYTHON,
     ) -> Dict[str, Any]:
         """
-        Write *script* to a temp file and run it inside WSL2 with python3.
+        Write *script* to a temp file and run it inside WSL2 with a Python
+        interpreter.
+
+        Parameters
+        ----------
+        python_bin : WSL2 path to the Python interpreter. Defaults to
+                     ``PYROSETTA_PYTHON`` (backward compatible); pass
+                     ``COLABFOLD_PYTHON`` to run inside the isolated ColabFold
+                     env instead.
 
         Returns the same dict as run_command().
         """
@@ -336,12 +345,24 @@ class WSLBridge:
 
         try:
             wsl_path = self.translate_path(win_path)
-            return self.run_command(f"{PYROSETTA_PYTHON} '{wsl_path}'", timeout=timeout)
+            return self.run_command(f"{python_bin} '{wsl_path}'", timeout=timeout)
         finally:
             try:
                 os.unlink(win_path)
             except OSError:
                 pass
+
+    def check_colabfold(self) -> bool:
+        """Return True if the ColabFold env interpreter + colabfold_batch exist in WSL2."""
+        if not self.is_available():
+            return False
+        # -x on the interpreter; colabfold_batch lives alongside it in the env bin.
+        _cf_batch = COLABFOLD_PYTHON.rsplit("/", 1)[0] + "/colabfold_batch"
+        result = self.run_command(
+            f"test -x {COLABFOLD_PYTHON} && test -x {_cf_batch} && echo {chr(79)+chr(75)}",
+            timeout=30,
+        )
+        return result["ok"] and "OK" in result["stdout"]
 
     # ── Status ────────────────────────────────────────────────────────────────
 
