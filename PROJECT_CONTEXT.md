@@ -8,8 +8,8 @@ section and append a new entry." -->
 
 | Field | Value |
 |-------|-------|
-| Generated | 2026-05-31 (checkpoint; hand-curated analytical sections preserved — not a full regenerate) |
-| Test count at generation | 535 collected / 523 passing (12 benchmark tests skip without WSL2+PyRosetta) |
+| Generated | 2026-05-31 (full resync after ColabFold env + bridge v1 + JAX compile cache + stack merged to `main`; hand-curated §7/§8 analytical text and the full §13 changelog preserved verbatim) |
+| Test count at generation | **572 collected / 559 passing / 13 skipped** (12 PyRosetta benchmark tests skip without `STRUCTUREBOT_RUN_LIVE_BENCHMARK=1`+WSL2+PyRosetta; 1 ColabFold live fold skips without `STRUCTUREBOT_RUN_LIVE_COLABFOLD=1`) |
 | Regenerate with | `claude "Read PROJECT_CONTEXT.md for regeneration instructions, then regenerate it in full by reading the entire codebase. Preserve the Changelog section and append a new entry."` |
 
 This file is the single source of truth for project state. It should be regenerated after every build session. All source of truth lives in the `.py` files, not here.
@@ -37,8 +37,9 @@ main.py / StructureBot
   │        Block 1: STATIC prompt (cached, ephemeral cache_control)
   │        Block 2: DYNAMIC session context (uncached, changes per turn)
   │  3. ToolRouter.route()      ← augments result, no execution
-  │     Intent overrides (in order): double_mutant → mpnn_esmfold → glycan_positions
-  │     → netnglyc → glycan → salt_bridge → cavity → double_mutant (final check)
+  │     Intent overrides (in order): validate_ddg → colabfold → proline → mpnn_esmfold
+  │     → glycan_positions → netnglyc → glycan → salt_bridge → cavity → double_mutant
+  │     → mutation_scan (fallback, last)
   │  4. User confirmation / auto-proceed countdown
   │  5. ChimeraXBridge.run_commands()  ← initial viz commands
   │  6. ToolRouter.execute()    ← computational pipeline
@@ -55,6 +56,7 @@ main.py / StructureBot
   │     ├─ SaltBridgeBridge     ← BioPython + FreeSASA
   │     ├─ CavityBridge         ← BioPython ShrakeRupley
   │     ├─ ProteinMPNNBridge    ← subprocess: protein_mpnn_run.py
+  │     ├─ ColabFoldBridge      ← WSL2 ~/colabfold_env worker (AF2, remote MSA)
   │     └─ RFdiffusionBridge    ← STUB (not activated)
   │  7. ChimeraXBridge.run_commands()  ← viz commands from tools
   │  8. SessionState.add_to_history()
@@ -268,7 +270,7 @@ Epitope keywords: `"epitope"`, `"binding"`, `"interface"`, `"preserve"`, `"targe
 
 ## 6. Test Suite Summary
 
-**Non-benchmark suite: 556 passed + 1 skipped** (2026-05-31; `pytest tests/ --ignore=tests/test_rosetta_benchmark.py -q`, ~44s). The 1 skip is the opt-in live ColabFold fold. The 12 PyRosetta benchmark tests skip unless `STRUCTUREBOT_RUN_LIVE_BENCHMARK=1` + WSL2 + PyRosetta. **`tests/test_colabfold_bridge.py` (33 tests)**: worker schema/compile + remote-MSA & template flags, oligomer colon-join, total-residue guard (incl. copy counting), result parsing (pLDDT/PAE/pTM/ipTM), runtime-OOM + worker-error surfacing, cache hit/miss + key sensitivity, ETA scaling, intent detection (positive/negative, no esmfold hijack), routing + option parsing, viz construction (open/alphafold-palette/sequence/matchmaker), ChimeraX sequence-on-open hook, env-absent skip paths; one opt-in live monomer fold (`STRUCTUREBOT_RUN_LIVE_COLABFOLD=1`). All WSL/ChimeraX calls mocked — no live fold in CI.
+**Total: 572 collected | 559 passing | 13 skipped** (2026-05-31, real `pytest` run). Non-benchmark suite `pytest tests/ --ignore=tests/test_rosetta_benchmark.py -q` → **559 passed + 1 skipped** (~42s); the 1 skip is the opt-in live ColabFold fold. The 12 PyRosetta benchmark tests skip unless `STRUCTUREBOT_RUN_LIVE_BENCHMARK=1` + WSL2 + PyRosetta. **`tests/test_colabfold_bridge.py` (37 collected = 36 passing + 1 opt-in live skip)**: worker schema/compile + remote-MSA & template flags, **JAX compile-cache env wiring** (set before the subprocess; omitted when empty; predict passes the config dir), oligomer colon-join, total-residue guard (incl. copy counting), result parsing (pLDDT/PAE/pTM/ipTM), runtime-OOM + worker-error surfacing, cache hit/miss + key sensitivity, ETA scaling, intent detection (positive/negative, no esmfold hijack), routing + option parsing, viz construction (open/alphafold-palette/sequence/matchmaker), ChimeraX sequence-on-open hook, env-absent skip paths; one opt-in live monomer fold (`STRUCTUREBOT_RUN_LIVE_COLABFOLD=1`). All WSL/ChimeraX calls mocked — no live fold in CI.
 
 Run commands:
 ```bash
@@ -293,6 +295,7 @@ pytest tests/test_rosetta_benchmark.py -m benchmark -v -s -k "t4_l99a"
 | Test file | Tests | What it covers |
 |-----------|-------|----------------|
 | `test_glycan_bridge.py` | 56 | N-glycan sequon detection, SASA scoring, engineered sequon suggestion, NetNGlyc integration |
+| `test_colabfold_bridge.py` | 37 | ColabFold v1: worker compile + remote-MSA/template/JAX-compile-cache flags, oligomer colon-join, total-residue guard, pLDDT/PAE/pTM/ipTM parsing, OOM/error surfacing, result-cache hit/miss + key sensitivity, ETA, intent + routing + option parsing (no esmfold hijack), viz construction, sequence-on-open hook, env-absent skips; 1 opt-in live monomer fold (skipped in CI) |
 | `test_tool_router.py` | 62 | Route dispatch, MPNN+ESMFold routing, FASTA export, active-site commands, double mutant routing, tool icon registry |
 | `test_double_mutant_bridge.py` | 42 | Pair generation (stability and epitope modes), distance routing, DynaMut2 `prediction_mm` result parsing, PyRosetta worker schema, composite scoring formulas, epistasis sign convention, max-pairs cap, ddG-filter neutrality (`ddg=0.0` not excluded), additive fallback (API failure, circuit-breaker survival, close-pair-without-PyRosetta) |
 | `test_proline_bridge.py` | 35 | φ-angle scoring, functional residue exclusion, DSSP fallback, BioPython parsing |
@@ -341,6 +344,7 @@ The following results have been confirmed working against **1HSG** (HIV-1 protea
 | Salt bridge analysis | Asp/Glu↔Arg/Lys/His contacts within 4 Å on chain A |
 | Cavity detection | Internal voids in chain A ranked by burial depth and size |
 | Double mutant bridge | **Validated end-to-end** (live): scan → "suggest double mutant combinations" produces the 171→79 candidate funnel, routes/sco­res pairs, and prints the Rich Panel + ChimeraX viz. 42 unit tests pass; stability filter yields the full candidate set (~79 pairs vs the prior collapse to 2); close pairs scored additively when PyRosetta disabled |
+| ColabFold bridge v1 | **Validated end-to-end** (live, WSL2 GPU): villin HP36 (36 aa, remote MSA, GPU confirmed) → mean pLDDT 82.4, pTM 0.44, ranked PDB + PAE/pLDDT/coverage PNGs + scores JSON parsed by the real worker. **JAX compile cache** measured cold 538s → warm 287s (~47% faster, same-length different sequence; partial — shape-dependent, see §8). 37 unit tests (all mocked). Env: `~/colabfold_env` (Py 3.12, jax 0.5.3, colabfold 1.6.1) |
 
 **PyRosetta Benchmark Run 1 (2026-05-29)** — 11 mutations from ProThermDB:
 
@@ -461,18 +465,27 @@ Realistic thresholds for the current single-trajectory protocol: `r > 0.30`, `RM
 
 ### Immediate next
 
+**✅ DONE — ColabFold bridge v1** (`colabfold_bridge.py`, merged to `main` @ `b1cdb8d`): standalone AF2 folding via the WSL2 `~/colabfold_env`, remote MSA, copies/oligomer + multimer, optional template, total-residue guard, input-hash result cache, **JAX persistent compile cache** (~47% cold-fold speedup), ChimeraX confidence-map viz + matchmaker, 37 tests, live-validated (HP36 pLDDT 82.4). See §3/§7.
+
 | Priority | Item | Rationale |
 |----------|------|-----------|
-| 1 | **ColabFold bridge** (`colabfold_bridge.py`; env now ready) | AF2-quality folding for designed sequences; template-guided mode validates ProteinMPNN designs (WT as template). **Environment DONE** — isolated WSL2 Py-3.12 `~/colabfold_env`, GPU+sm_120 verified, weights cached. Bridge follows the WSL2 worker-script pattern (mirror `rosetta_bridge.py` / `wsl_bridge.PYROSETTA_PYTHON`; a `COLABFOLD_PYTHON` constant is already added). Remote MSA server (no local DBs) |
+| 1 | **Validate-design meta-tool** (thin orchestrator — NOT a new bridge) | Agreed design below. Fuses ColabFold fold-confidence + ChimeraX matchmaker RMSD + Rosetta relax/ref2015 energy into one evidence-rich report for "is this designed sequence a good fold?" |
 | 2 | **RFdiffusion activation** (stub at `rfdiffusion_bridge.py`) | De novo backbone generation; completes the design loop (RFdiffusion → ProteinMPNN → ColabFold). **SEPARATE env** (do NOT couple to ColabFold): its own WSL2 env, torch/SE3-Transformer stack, ~20 GB weights; Blackwell sm_120 torch support is its own problem to solve at build time |
 
-### ColabFold bridge v1 — design note (build in progress, `feat/colabfold-bridge`)
+### Validate-design meta-tool — agreed design (immediate next)
 
-**Option A — standalone bridge** (the fused "validate design" meta-tool is explicitly NOT this task). `colabfold_bridge.py` mirrors `rosetta_bridge._run_rosetta_local`: an f-string worker run via `COLABFOLD_PYTHON` in WSL2 (Ubuntu-24.04), zero project imports, JSON-file I/O in `/tmp`, copy results back to a Windows cache dir, `stdin=DEVNULL`/`CREATE_NO_WINDOW` inherited from `wsl_bridge`.
+A **thin orchestrator** (a `tool_router` dispatch + result-assembly method, **not** a new bridge — it composes existing bridges). Inputs: a designed sequence (or a reused in-session ColabFold result) + a reference structure. Three evidence sources:
 
-- **Scope (v1):** sequence→structure prediction; explicit sequence input; `copies` (1=monomer; >1 = colon-joined homo-oligomer + multimer model); optional template (PDB id/path → ColabFold custom-template mode, de novo when absent); `num_models` (default 5), `num_recycle` (default 3), `quick` preset (1/1). **Remote MSA server** (default; no local DBs). Outputs: ranked PDB(s), mean + per-residue pLDDT, PAE matrix, pTM (+ipTM for oligomers), PAE/pLDDT/coverage PNG paths. **Cache** by `hash(seq+copies+template+num_models+num_recycle)`. Confidence-map viz in ChimeraX (native AlphaFold pLDDT palette + Sequence Viewer + PNG auto-open), optional matchmaker-RMSD vs a compare_to structure. Rough **ETA** (residues×models×recycles, compiled-this-session flag) beside a live elapsed counter.
-- **DEFERRED (NOT in v1):** the fused **validate-design meta-tool** (ColabFold + Rosetta energy + matchmaker in one); **MPNN-result sequence auto-pull** (v1 takes explicit sequences only); **batch top-N folding**; **generalizing the ETA counter to all long tools**; **amber relax** (`--amber`); **single_sequence MSA mode**.
-- **Laptop-GPU multimer caveat:** AlphaFold attention memory scales ~ (total residues)²; oligomers are guarded by a **total-residue budget** `COLABFOLD_MAX_TOTAL_RESIDUES` (conservative default ~1500). Over budget → do not launch; return a clear OOM-risk message (names residue count + budget, suggests fewer copies / shorter / different GPU). A real runtime CUDA OOM is caught and surfaced with the same guidance, not a raw traceback. **Large homo-tetramers are expected to OOM and fail gracefully**; the budget is provisional and to be **recalibrated empirically** via a later stress test.
+1. **ColabFold** — fold confidence (mean/per-residue pLDDT, pTM/ipTM, PAE). **Reuse an existing in-session `colabfold_results` fold instead of re-folding** when one matches; only fold if absent.
+2. **ChimeraX matchmaker** — superpose the predicted model onto the reference; report RMSD (+ aligned-residue count).
+3. **Rosetta** — FastRelax + `ref2015` total energy of the predicted model.
+
+**Energy-reporting rule (important):**
+- **Default = clash-free / low-energy SANITY check** — report the relaxed total energy as a "structure is physically reasonable / not clashing" signal, NOT a stability claim.
+- **Like-for-like RELATIVE score** (design vs reference Δenergy) **only when topologies match** (matchmaker RMSD low / same fold) **or on explicit request**.
+- **DECLINE a cross-topology absolute stability number** and **state why** (ref2015 deltas across different folds are not comparable; our ddG path is uncalibrated — see §7). Surface the sanity signal instead.
+
+**Reports are EVIDENCE-RICH:** surface ALL underlying outputs (pLDDT map, PAE, RMSD, per-term energies, the per-source warnings) rather than collapsing to a verdict; the **interpretive natural-language summary is DEFERRED** to a later iteration. Mirrors the existing error-first / `ToolStepResult` + viz idiom; no new venv or external dependency.
 
 ### Backlog
 
@@ -485,7 +498,12 @@ Realistic thresholds for the current single-trajectory protocol: `r > 0.30`, `RM
 | **Mid-execution ESC / cancellation** | Long-running tools (PyRosetta ~15 min, ColabFold ~5 min) have no cancellation; needs a background-thread pattern |
 | **Double mutant — real PyRosetta close-pair scoring** | Close pairs (<4 Å) get an *additive* estimate when `run_pyrosetta=False` (can't capture epistasis); real close-pair scoring is now worthwhile since the ddG protocol is settled |
 | **GlycosuitDB lookup** | Expression-system glycan characterisation for engineered sequons (CHO, HEK293, E. coli, …) |
-| **Remote/cloud or alternate-GPU ColabFold handoff** | For folds exceeding `COLABFOLD_MAX_TOTAL_RESIDUES` (e.g. large homo-tetramers that OOM the laptop GPU): hand off to a remote/cloud GPU or a larger local card. The total-residue budget guard is the intended trigger point; the exact boundary is to be found empirically via a later multimer stress test, then the budget recalibrated. See §9 ColabFold bridge v1 multimer caveat |
+| **Remote/cloud or alternate-GPU ColabFold handoff** | For folds exceeding `COLABFOLD_MAX_TOTAL_RESIDUES` (e.g. large homo-tetramers that OOM the laptop GPU): hand off to a remote/cloud GPU or a larger local card. The total-residue budget guard is the intended trigger point; the exact boundary is to be found empirically via a later multimer stress test, then the budget recalibrated |
+| **Warm persistent ColabFold worker** | The JAX compile cache makes cross-fold recompiles *partial* (shapes differ with MSA depth); a long-lived warm worker process (one JAX session serving multiple folds) would **fully elide** recompile within a session. Bigger lift than the on-disk cache; superfor repeated interactive folds |
+| **ColabFold batch top-N folding** | Fold several candidate sequences in one invocation (e.g. top-N ProteinMPNN designs) rather than one predict() per call |
+| **ColabFold MPNN-result sequence auto-pull** | v1 takes explicit sequences only; auto-pull the top design sequences from `session.proteinmpnn_results`/`mpnn_esmfold_results` so "fold the top design" needs no paste |
+| **ColabFold `single_sequence` MSA mode** | Skip the remote MSA for speed on sequences where an MSA adds little (e.g. de novo designs); a `COLABFOLD_MSA_MODE=single_sequence` path |
+| **ColabFold amber relax** (`--amber`) | Optional post-prediction Amber relaxation of the ranked model for cleaner geometry |
 
 ---
 
@@ -628,6 +646,7 @@ A `.gitignore` is now in place. **Untracked** (intentionally not committed): `ca
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-05-31 | 572 (559✓/13s) | chore(release)+docs: **ColabFold feature stack merged to `main` + full PROJECT_CONTEXT resync**. Consolidates this session's ColabFold work (each step has its own row below): (1) **env stand-up** — isolated WSL2 Py-3.12 `~/colabfold_env`, hermetic CUDA, jax 0.5.3 pinned for sm_120, GPU-validated (`3d03f39`); (2) **bridge v1** — standalone `colabfold_bridge.py` + router/viz/config/tests, remote MSA, residue guard, result cache, ChimeraX confidence-map viz + matchmaker, sequence-on-open flag (`07fe737`); (3) **JAX persistent compile cache** — ~47% cold-fold speedup, partial/shape-dependent (`b1cdb8d`). The linear stack (`fix/double-mutant-ddg-filter` → `feat/colabfold-env` → `feat/colabfold-bridge`) was **fast-forward-merged to `main`** (no squash, full history preserved) and the three feature branches deleted local+origin. Real suite at resync: **572 collected / 559 passing / 13 skipped** (12 benchmark + 1 opt-in live ColabFold). Doc-only resync of the meta header + §2/§3/§6/§7/§9/§10/§11/§12 code-derived sections; §7/§8 ddG/water/calibration/2LZM analytical text and all prior §13 rows preserved verbatim. **Next: validate-design meta-tool** (thin orchestrator — ColabFold confidence + matchmaker RMSD + Rosetta sanity energy; §9). |
 | 2026-05-31 | 559 | perf(colabfold): **JAX persistent compilation cache** in the ColabFold worker. The bridge spawns a fresh WSL worker per fold, so every fold previously paid the full ~10-min XLA compile and the result cache only saved IDENTICAL re-folds. The worker now sets `JAX_COMPILATION_CACHE_DIR` (+ `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1`, version-robust) on the `colabfold_batch` process — a WSL2 ext4 dir (`COLABFOLD_JAX_COMPILE_CACHE_DIR`, default `~/.cache/colabfold_jax_compile`, NOT under /mnt/c) created if absent — so XLA reuses compiled executables across processes for matching input shapes. Env var set BEFORE the subprocess (child inherits it). **Live measured** (opt-in, two DIFFERENT 36-aa monomers, fresh processes, to isolate the compile cache from the result cache): seq1 **cold 538s** → seq2 same-length **warm 287s**, **Δ 250s (~47% faster)**. Partial (not the full compile elided) because AF2 feature shapes depend on MSA depth, which differs per sequence → partial recompile (recorded honestly in §8). Tests: +3 in `tests/test_colabfold_bridge.py` (worker sets the cache env before the subprocess; omitted when empty; predict passes the config value) → **559 passed + 1 skipped**. §3/§8/§13 updated. |
 | 2026-05-31 | 556 | feat(colabfold): **ColabFold bridge v1 (standalone, Option A)** — `colabfold_bridge.py` + router/viz/config/tests (`feat/colabfold-bridge`). `ColabFoldBridge.predict()` runs an f-string worker via `wsl_bridge.COLABFOLD_PYTHON` in WSL2 (remote MSA, no local DBs; mirrors `rosetta_bridge._run_rosetta_local`): writes FASTA, runs `colabfold_batch`, parses the output dir, returns ranked PDB + mean/per-residue pLDDT + PAE + pTM(/ipTM) + PNG paths; **input-hash cache** `cache/colabfold_{hash}/`; **total-residue guard** `COLABFOLD_MAX_TOTAL_RESIDUES` (pre-launch refusal + runtime CUDA-OOM catch → clear message, never a raw traceback); copies→colon-joined homo-oligomer (multimer); optional custom template; `quick` 1/1 preset; rough ETA. **Router**: explicit `colabfold`/`alphafold`/"fold … as `<oligomer>`"/template-fold intent (won't swallow or be swallowed by esmfold/mpnn_esmfold), `_run_colabfold` dispatch, `session_state.colabfold_results` (persisted), icon 🧬🔮. **Viz**: open ranked PDB → native AlphaFold pLDDT palette (`color byattribute bfactor … palette alphafold`) → Sequence Viewer → optional `matchmaker` RMSD vs compare_to (default loaded primary), PNG auto-open; model id via `session.next_model_id()`. New `CHIMERAX_SHOW_SEQUENCE_ON_OPEN` (default on) opens the Sequence Viewer for ALL opens (chimerax_bridge.run_commands, fire-and-forget, contract-preserving). `wsl_bridge.run_python_script` gained a backward-compatible `python_bin` param + `check_colabfold()`; `_ElapsedTicker` gained an approximate `eta_s`. **Tests**: +`tests/test_colabfold_bridge.py` (33, all WSL/ChimeraX mocked — no CI fold); non-benchmark suite **556 passed + 1 skipped**; benchmark module still skips cleanly (12). **Optional live monomer fold RAN** end-to-end through the real bridge (opt-in): villin HP36, GPU confirmed, mean pLDDT 82.4, pTM 0.44, 616 s — validated the real output parsing. DEFERRED (see §9): fused validate-design meta-tool, MPNN auto-pull, batch top-N, amber relax, single_sequence, generalized ETA. §3/§6/§9/§10/§11/§12 updated. |
 | 2026-05-31 | 523 | docs(colabfold): record ColabFold bridge v1 design note before build (STEP 0 of `feat/colabfold-bridge`; §9). Scope, DEFERRED items, laptop-GPU multimer caveat (`COLABFOLD_MAX_TOTAL_RESIDUES` budget; large tetramers expected to OOM gracefully; recalibrate empirically), and the remote/alternate-GPU handoff backlog item — committed durably before the long build. |
