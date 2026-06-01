@@ -142,6 +142,114 @@ def _sequence_recovery(wt: str, designed: str) -> float:
     return round(matches / max(len(wt), len(designed)), 4)
 
 
+# ── Persistent design cache (so a redesign is never lost) ───────────────────────
+
+import datetime as _dt
+
+
+def write_designs_fasta(
+    model_id:  str,
+    wt_seq:    str,
+    sequences: List[Dict[str, Any]],
+    backend:   str = "proteinmpnn",
+) -> Path:
+    """
+    Persist a run's designs (WT first, then all designs with score/recovery in the
+    header) to ``cache/proteinmpnn/<model>_<timestamp>.fa``. Survives session loss
+    and the deleted temp dir; re-readable with :func:`read_designs_fasta`.
+    """
+    cache_dir = Path(_cfg.PROTEINMPNN_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ts   = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = cache_dir / f"model{model_id}_{ts}.fa"
+    lines = [f">wildtype model={model_id} backend={backend} length={len(wt_seq)}", wt_seq]
+    for i, s in enumerate(sequences, 1):
+        lines.append(
+            f">design_{i} score={s.get('score', 0.0)} recovery={s.get('recovery', 0.0)} "
+            f"mutations={len(s.get('mutations', []))}"
+        )
+        lines.append(s.get("sequence", ""))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def latest_cached_fasta(model_id: Optional[str] = None) -> Optional[Path]:
+    """Most recent cached design FASTA (optionally for *model_id*), or None."""
+    cache_dir = Path(_cfg.PROTEINMPNN_CACHE_DIR)
+    if not cache_dir.is_dir():
+        return None
+    pattern = f"model{model_id}_*.fa" if model_id is not None else "*.fa"
+    hits = sorted(cache_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return hits[0] if hits else None
+
+
+def read_designs_fasta(path: Path) -> Dict[str, Any]:
+    """
+    Parse a cached design FASTA (written by :func:`write_designs_fasta`) back into
+    the result_data shape {wildtype_sequence, sequences:[{sequence,score,recovery,
+    mutations}], backend}. The first entry is the WT; recovery/mutations are
+    recomputed vs the WT so they're always consistent.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    entries: List[Tuple[str, str]] = []
+    header, seq = "", []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(">"):
+            if header and seq:
+                entries.append((header[1:], "".join(seq)))
+            header, seq = line, []
+        elif line:
+            seq.append(line)
+    if header and seq:
+        entries.append((header[1:], "".join(seq)))
+    if not entries:
+        return {"sequences": [], "wildtype_sequence": "", "backend": "proteinmpnn"}
+
+    def _clean(s: str) -> str:
+        return re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", s.upper())
+
+    wt_header, wt_seq = entries[0]
+    wt_seq = _clean(wt_seq)
+    backend_m = re.search(r"backend=(\S+)", wt_header)
+    backend = backend_m.group(1) if backend_m else "proteinmpnn"
+    designs: List[Dict[str, Any]] = []
+    for hdr, s in entries[1:]:
+        s = _clean(s)
+        score_m = re.search(r"score=([-\d.]+)", hdr)
+        designs.append({
+            "sequence":  s,
+            "score":     round(float(score_m.group(1)), 4) if score_m else 0.0,
+            "recovery":  _sequence_recovery(wt_seq, s),
+            "mutations": _diff_sequences(wt_seq, s),
+        })
+    designs.sort(key=lambda x: x["score"])
+    return {"sequences": designs, "wildtype_sequence": wt_seq,
+            "fixed_positions": [], "backend": backend}
+
+
+def build_alignment_fasta(
+    wt_seq:       str,
+    top_seq:      str,
+    out_path:     Path,
+    wt_label:     str = "wildtype",
+    design_label: str = "redesign_top",
+) -> Path:
+    """
+    Write a 2-sequence, ungapped 1:1 alignment FASTA (WT then top redesign) for
+    ChimeraX's Sequence Viewer. MPNN is fixed-backbone (same length, no indels),
+    so the columns map 1:1. Pads the shorter to equal length defensively.
+    """
+    n = max(len(wt_seq), len(top_seq))
+    wt = wt_seq.ljust(n, "-")
+    tp = top_seq.ljust(n, "-")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(
+        f">{wt_label}\n{wt}\n>{design_label}\n{tp}\n", encoding="utf-8"
+    )
+    return Path(out_path)
+
+
 # ── Visualization ─────────────────────────────────────────────────────────────
 
 def _build_recovery_viz(
@@ -341,6 +449,21 @@ class ProteinMPNNBridge:
             sum(s["recovery"] for s in sequences) / n_seqs
             if sequences else 0
         )
+        result_data["chain"] = chain_id   # so the alignment/viewer targets the right chain
+
+        # Persist to the project cache so the design survives even when the session
+        # is never saved (no per-turn autosave) and the temp FASTA above is deleted.
+        # Recorded into result_data so the session store carries the path too.
+        if sequences and wt_seq:
+            try:
+                fa = write_designs_fasta(
+                    model_id, wt_seq, sequences,
+                    result_data.get("backend", "proteinmpnn"),
+                )
+                result_data["fasta_path"] = str(fa)
+                print(f"  ProteinMPNN: designs cached to {fa}", flush=True)
+            except Exception as exc:
+                print(f"  ProteinMPNN: could not write design cache FASTA: {exc}", flush=True)
 
         # Cache in session
         if session is not None:
@@ -413,10 +536,12 @@ class ProteinMPNNBridge:
                 f"  Fixed positions held: {len(fixed_positions)} residue(s)"
             )
         if top_muts:
-            mut_str = ", ".join(top_muts[:8])
-            if len(top_muts) > 8:
-                mut_str += f" (+{len(top_muts) - 8} more)"
-            lines.append(f"  Top mutations: {mut_str}")
+            # Full change set — no truncation (the design must never be hidden).
+            lines.append(f"  Top mutations ({len(top_muts)}): {', '.join(top_muts)}")
+        lines.append(
+            "  → 'show the alignment' for a numbered WT-vs-redesign view "
+            "(+ interactive ChimeraX Sequence Viewer)."
+        )
 
         lines.append("")
         lines.append("Suggested next steps:")
@@ -424,7 +549,6 @@ class ProteinMPNNBridge:
         lines.append("  2. Screen for expression and solubility in E. coli")
         lines.append("  3. Combine with solubility mutations from CamSol/ESM scan")
 
-        lines = lines[:15]
         return "\n".join(lines)
 
     def _run_proteinmpnn(
