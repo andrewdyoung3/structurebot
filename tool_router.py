@@ -4290,6 +4290,160 @@ class ToolRouter:
         out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return f"Sequences saved to {out_path}"
 
+    # ── Live-selection commands (the ChimeraX selection as a first-class input) ─
+
+    _SELECTION_REPORT_PHRASES = (
+        "what's selected", "whats selected", "what is selected",
+        "what residues are selected", "what's the selection", "whats the selection",
+        "show the selection", "show selection", "describe the selection",
+        "describe selection", "report the selection", "current selection",
+        "list the selection", "the current selection",
+    )
+    _SELECTION_SCAN_PHRASES = (
+        "scan the selection", "scan selection", "scan the selected",
+        "analyze the selection", "analyse the selection",
+        "analyze the selected", "analyse the selected",
+        "solubility of the selection", "camsol the selection",
+        "score the selection", "score the selected",
+    )
+    _SELECTION_REDESIGN_PHRASES = (
+        "redesign the selection", "redesign the selected", "redesign selection",
+        "design the selection", "design the selected residues",
+        "mpnn the selection", "mpnn the selected",
+    )
+
+    def _detect_selection_intent(self, user_input: str) -> Optional[str]:
+        """Return 'report' | 'scan' | 'redesign' for a selection-consuming phrasing,
+        else None (the caller falls through to the LLM)."""
+        low = user_input.lower().strip()
+        if any(p in low for p in self._SELECTION_REPORT_PHRASES):
+            return "report"
+        if any(p in low for p in self._SELECTION_SCAN_PHRASES):
+            return "scan"
+        if any(p in low for p in self._SELECTION_REDESIGN_PHRASES):
+            return "redesign"
+        return None
+
+    def handle_selection_command(self, user_input: str) -> Optional[str]:
+        """
+        Poll-on-command fast-path: when the user asks to act on "the selection",
+        read the LIVE ChimeraX selection over REST and either report it or feed it
+        into the matching tool. Returns a printable string, or None to fall through.
+
+        Empty selection is a graceful, friendly message — never an error.
+        """
+        intent = self._detect_selection_intent(user_input)
+        if intent is None:
+            return None
+        if getattr(self, "bridge", None) is None:
+            return ("[warn]ChimeraX is not connected.[/warn] Open it, select residues, "
+                    "then try again.")
+
+        from selection import read_selection
+        sel = read_selection(self.bridge.run_command)
+        if sel.is_empty:
+            return ("[warn]Nothing is selected in ChimeraX.[/warn]\n"
+                    "[dim]Ctrl-click residues in the 3D view (or drag across them in the "
+                    "Sequence Viewer), then run the command again.[/dim]")
+
+        if intent == "report":
+            return self._format_selection_report(sel)
+        if intent == "scan":
+            return self._scan_selection_camsol(sel)
+        if intent == "redesign":
+            return self._redesign_selection(sel)
+        return None
+
+    def _chain_resnums(self, model_id: str, chain: str) -> List[int]:
+        """Ordered residue numbers of a loaded chain (via `info residues #M/CH`),
+        parsed with the same selection parser. [] on failure."""
+        try:
+            from selection import parse_selection_text
+            res = self.bridge.run_command(f"info residues #{model_id}/{chain}")
+            text = res.get("value") if isinstance(res, dict) else ""
+            refs = parse_selection_text(text or "", default_model=str(model_id))
+            return sorted({r for _, c, r, _ in refs if c == chain})
+        except Exception:
+            return []
+
+    def _format_selection_report(self, sel) -> str:
+        by = sel.by_chain()
+        lines = [f"[hi]Current ChimeraX selection[/hi] — [bold]{sel.count}[/bold] "
+                 f"residue(s) across {len(by)} chain(s):"]
+        for chain, rns in by.items():
+            spec = self._compact_resspec(rns)
+            lines.append(f"  chain [bold]{chain}[/bold]: {len(rns)} residue(s)  "
+                         f"([dim]{spec}[/dim])")
+        lines.append("[dim]→ 'scan the selection' (solubility) or 'redesign the "
+                     "selection' (ProteinMPNN) act on exactly these residues.[/dim]")
+        return "\n".join(lines)
+
+    def _scan_selection_camsol(self, sel) -> str:
+        """Run CamSol on the selected chain(s) and report/colour EXACTLY the
+        selected residues (their per-residue solubility), nothing else."""
+        from proteinmpnn_bridge import chain_resnum_to_seqpos
+        from camsol_bridge import _assign_colour
+        bridge = self._get_camsol_bridge()
+        lines = ["[hi]CamSol solubility — selected residues only[/hi]:"]
+        color_cmds: List[str] = []
+        any_scored = False
+        for chain, sel_resnums in sel.by_chain().items():
+            model_id = (sel.models[0] if sel.models else None) or self._first_model_id()
+            seq = self._fetch_sequence(model_id, chain)
+            if not seq:
+                lines.append(f"  chain {chain}: [warn]no sequence available[/warn]")
+                continue
+            ordered = self._chain_resnums(model_id, chain) or list(range(1, len(seq) + 1))
+            pos1 = chain_resnum_to_seqpos(ordered)          # resnum -> 1-based position
+            res = bridge.analyze(seq, model_id=model_id, chain=chain,
+                                 start_resno=ordered[0], session=self.session)
+            scores = res.data.get("scores", {}) if res.success else {}
+            scores_list = [scores[k] for k in sorted(scores)]   # 0-indexed by position
+            band: Dict[str, List[int]] = {}
+            for r in sel_resnums:
+                p = pos1.get(r)
+                sc = scores_list[p - 1] if (p and 1 <= p <= len(scores_list)) else None
+                if sc is None:
+                    lines.append(f"  {chain}:{r}  (not scored)")
+                    continue
+                any_scored = True
+                tag = "aggregation-prone" if sc < -0.5 else ("soluble" if sc > 0.5 else "neutral")
+                lines.append(f"  {chain}:{r}  z={sc:+.2f}  [{tag}]")
+                band.setdefault(_assign_colour(sc), []).append(r)
+            for colour, rs in band.items():
+                if colour == "white":
+                    continue
+                color_cmds.append(
+                    f"color #{model_id}/{chain}:{self._compact_resspec(rs)} {colour}")
+        if color_cmds:
+            try:
+                self.bridge.run_commands(color_cmds)
+                lines.append("[dim]Selected residues coloured in 3D by solubility "
+                             "(red=aggregation-prone … blue=soluble).[/dim]")
+            except Exception:
+                pass
+        if not any_scored:
+            lines.append("[dim](no residues could be scored)[/dim]")
+        return "\n".join(lines)
+
+    def _redesign_selection(self, sel) -> str:
+        """Feed the live selection into ProteinMPNN as its designable set."""
+        chain = sel.chains[0]
+        model_id = (sel.models[0] if sel.models else None) or self._first_model_id()
+        result = self._run_proteinmpnn({
+            "model_id": model_id, "chain_id": chain,
+            "design_positions": sel.resnums(chain),
+        })
+        if result.viz_commands:
+            try:
+                self.bridge.run_commands(result.viz_commands)
+            except Exception:
+                pass
+        if not result.success:
+            return f"[warn]{result.error or 'ProteinMPNN failed'}[/warn]"
+        return (f"[ok]ProteinMPNN redesigned the {len(sel.resnums(chain))} selected "
+                f"residue(s) on chain {chain}.[/ok]\n{result.summary or ''}")
+
     def handle_sequence_display_command(self, user_input: str) -> Optional[str]:
         """
         Handle "show designed sequences" and similar commands without LLM translation.

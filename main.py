@@ -565,6 +565,12 @@ class StructureBot:
             console.print(seq_msg)
             return
 
+        # ── Live-selection fast-path (act on the current ChimeraX selection) ───
+        sel_msg = self.router.handle_selection_command(user_input)
+        if sel_msg:
+            console.print(sel_msg)
+            return
+
         self._handle_request(user_input)
 
     # ── Script runner ─────────────────────────────────────────────────────────

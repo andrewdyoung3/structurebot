@@ -51,6 +51,7 @@ def _make_mock_bot() -> StructureBot:
     # Default: no active-site / sequence-display short-circuits
     bot.router.handle_active_site_command.return_value    = None
     bot.router.handle_sequence_display_command.return_value = None
+    bot.router.handle_selection_command.return_value      = None
 
     return bot
 
