@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from translator import CommandTranslator as Translator
+from translator import CommandTranslator as Translator, RefusalError
 
 # -- Helpers -------------------------------------------------------------------
 
@@ -189,6 +189,73 @@ def test_call_api_stop_reason_in_error() -> None:
                     f"got: {exc}")
 
 
+# -- C. Over-eager refusal handling (false positives on benign design) ---------
+
+_BENIGN = "redesign the dimer interface residues to be hydrophilic, no cysteines"
+
+_VALID_JSON = (
+    '{"commands": ["select #1/A"], "explanations": ["x"], "warnings": [], '
+    '"clarification_needed": null, "confidence": "high", '
+    '"tools_needed": ["proteinmpnn"], "tool_inputs": {}}'
+)
+
+
+def test_benign_design_request_not_flagged() -> None:
+    """
+    A benign protein-engineering request that gets ONE transient empty/declined
+    response must NOT be flagged: the automatic retry succeeds and a normal result
+    is returned (no RefusalError).
+    """
+    print("\n=== C. over-eager refusal handling ===")
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+
+    empty = MagicMock(content=[], stop_reason="refusal")
+    good  = MagicMock(content=[MagicMock(text=_VALID_JSON)], stop_reason="end_turn")
+
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.side_effect = [empty, good]   # 1st empty, retry OK
+        result = t.translate(_BENIGN, session)
+
+    assert result.get("commands") == ["select #1/A"], (
+        f"benign request should translate after retry, got {result!r}")
+    assert mock_client.messages.create.call_count == 2, "should retry exactly once"
+    _ok("benign design request not flagged (retry rescued it)")
+
+
+def test_call_api_retries_once_then_refuses() -> None:
+    """Two consecutive empty responses → RefusalError, after exactly 2 calls."""
+    t = _make_translator()
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = MagicMock(
+            content=[], stop_reason="refusal")
+        try:
+            t._call_api([{"type": "text", "text": "system"}])
+            _fail("retries then refuses", "no exception raised")
+            return
+        except RefusalError as exc:
+            _assert(mock_client.messages.create.call_count == 2,
+                    "retried exactly once before refusing",
+                    f"got {mock_client.messages.create.call_count} calls")
+            # Transparent: shows the REAL stop_reason, does NOT claim a safety filter.
+            _assert("stop_reason" in str(exc) and "refusal" in str(exc),
+                    "refusal message surfaces the real stop_reason", f"got: {exc}")
+            _assert("safety filter" not in str(exc).lower(),
+                    "refusal message does NOT assume a safety filter", f"got: {exc}")
+
+
+def test_system_prompt_frames_routine_design_as_legitimate() -> None:
+    """The static prompt frames routine protein-engineering as standard, so the
+    model doesn't over-refuse it."""
+    prompt = _make_translator()._static_block.lower()
+    assert "standard computational structural biology" in prompt
+    assert "do not decline" in prompt or "do not refuse" in prompt
+    for term in ("interface", "hydrophilic", "cysteine", "epitope"):
+        assert term in prompt, f"scope note should mention {term!r}"
+    _ok("system prompt frames routine design operations as legitimate")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -207,6 +274,11 @@ def main() -> int:
     test_call_api_empty_content_raises_value_error()
     test_call_api_non_empty_content_returns_text()
     test_call_api_stop_reason_in_error()
+
+    # C. over-eager refusal handling
+    test_benign_design_request_not_flagged()
+    test_call_api_retries_once_then_refuses()
+    test_system_prompt_frames_routine_design_as_legitimate()
 
     print()
     print("=" * 60)

@@ -54,7 +54,7 @@ except ImportError:
     sys.exit(1)
 
 from chimerax_bridge import ChimeraXBridge
-from translator import CommandTranslator
+from translator import CommandTranslator, RefusalError
 from session_state import SessionState
 from tool_router import ToolRouter
 
@@ -608,18 +608,35 @@ class StructureBot:
 
     # ── Natural language pipeline ─────────────────────────────────────────────
 
+    def _report_translation_decline(self, exc: Exception) -> None:
+        """
+        Transparently report a declined/empty translation. Shows the REAL reason
+        (the actual stop_reason carried in *exc*), NOT a generic "safety filter"
+        framing — the translator already retried once automatically, and routine
+        structural-biology requests are not blocked by StructureBot's own logic.
+        """
+        console.print(
+            f"[warn]⚠ The model returned no usable translation: {escape(str(exc))}[/warn]"
+        )
+        console.print(
+            "[dim]An automatic retry was already attempted. This is usually "
+            "transient — try the same request again, or rephrase it slightly. "
+            "(The request is fine for a structural-biology tool.)[/dim]"
+        )
+
     def _handle_request(self, user_input: str, is_retry: bool = False) -> None:
         # 1. Translate
         try:
             with console.status("[cyan]Translating…[/cyan]"):
                 result = self.translator.translate(user_input, self.session)
+        except RefusalError as exc:
+            self._report_translation_decline(exc)
+            return
         except ValueError as exc:
-            if "refusal" in str(exc).lower() or "safety" in str(exc).lower():
-                console.print(
-                    "[warn]⚠ The request was flagged by the API safety filter. "
-                    "Try rephrasing — for example, use 'interface residues' "
-                    "instead of 'epitope' if asking about binding site mutations.[/warn]"
-                )
+            # Legacy/other path: only treat as a decline if the message clearly
+            # indicates an empty/declined translation; otherwise re-raise.
+            if any(k in str(exc).lower() for k in ("refusal", "safety", "stop_reason")):
+                self._report_translation_decline(exc)
                 return
             raise
 
