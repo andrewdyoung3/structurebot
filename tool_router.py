@@ -4437,7 +4437,8 @@ class ToolRouter:
         """
         if self.bridge is None:
             return ("  (ChimeraX not connected — run while ChimeraX is open to get the "
-                    "interactive Sequence Viewer: select a column → highlights the 3D residue.)")
+                    "interactive Sequence Viewer: changed columns highlighted; select a "
+                    "column → highlights the 3D residue.)")
         try:
             from proteinmpnn_bridge import build_alignment_fasta
             import config as _cfg
@@ -4445,22 +4446,61 @@ class ToolRouter:
             build_alignment_fasta(wt, design, out,
                                   wt_label="WT", design_label="redesign_top")
             posix = Path(out).as_posix()
+
+            changed   = self._alignment_rows(wt, design)            # 1-based changed columns
+            n         = min(len(wt), len(design))
+            conserved = [i for i in range(1, n + 1) if i not in set(changed)]
+            spec = f"#{model_id}/{chain}"
+
             cmds = [
-                f'open "{posix}"',                      # opens the Sequence Viewer + auto-associates WT↔chain
-                f"sequence associate #{model_id}/{chain}",  # force-associate the chain to the alignment
+                f'open "{posix}"',                       # opens the Sequence Viewer + auto-associates WT↔chain
+                f"sequence associate {spec}",            # force-associate the chain to the alignment
+                # ── Auto-decorate (one consistent story across sequence + 3D) ──
+                # ChimeraX 1.11.1 has no `sequence region`/`sequence color` command,
+                # so we (a) colour the 3D STRUCTURE with the MPNN convention
+                # (changed=tomato, conserved=cornflower blue), and (b) SELECT the
+                # changed residues — through the WT association the Sequence Viewer
+                # mirrors this as a highlighted region over exactly the changed
+                # columns. The auto-shown conservation header also marks them.
+                f"cartoon {spec}",
+                f"color {spec} white",
             ]
+            if conserved:
+                cmds.append(f"color {spec}:{self._compact_resspec(conserved)} cornflower blue")
+            if changed:
+                cmds.append(f"color {spec}:{self._compact_resspec(changed)} tomato")
+                cmds.append(f"select {spec}:{self._compact_resspec(changed)}")
+
             ran_ok = True
             for c in cmds:
                 r = self.bridge.run_command(c)
                 if isinstance(r, dict) and r.get("error"):
                     ran_ok = False
             if ran_ok:
-                return ("  [green]Interactive alignment open in ChimeraX[/green] — select a "
-                        f"column in the Sequence Viewer to highlight the chain {chain} residue "
-                        "in 3D (and vice versa). The WT row is associated with the structure.")
+                return (f"  [green]Interactive alignment open in ChimeraX[/green] — "
+                        f"{len(changed)} changed columns highlighted in the Sequence Viewer "
+                        f"and coloured [red]tomato[/red] on chain {chain} in 3D (conserved = "
+                        "cornflower blue). Select a column → highlights the 3D residue (and "
+                        "vice versa); the WT row is associated with the structure.")
             return f"  (Alignment FASTA written to {out}; open it in ChimeraX to interact.)"
         except Exception as exc:
             return f"  (Could not open the ChimeraX Sequence Viewer: {exc})"
+
+    @staticmethod
+    def _compact_resspec(positions: List[int]) -> str:
+        """Compact a sorted 1-based position list into a ChimeraX spec, e.g.
+        [1,2,3,5,8,9] → '1-3,5,8-9'."""
+        if not positions:
+            return ""
+        ps = sorted(set(positions))
+        runs, start, prev = [], ps[0], ps[0]
+        for p in ps[1:]:
+            if p == prev + 1:
+                prev = p
+            else:
+                runs.append((start, prev)); start = prev = p
+        runs.append((start, prev))
+        return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 

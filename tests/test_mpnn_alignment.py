@@ -171,6 +171,32 @@ def test_sequence_viewer_commands_constructed(cache_tmp):
     assert (cache_tmp / "alignment_model1.fa").is_file()
 
 
+def test_sequence_viewer_auto_decoration_targets_changed_columns(cache_tmp):
+    """Auto-decoration: 3D structure coloured (tomato changed / cornflower blue
+    conserved, the MPNN convention) and the changed columns SELECTED — targeting
+    EXACTLY the changed positions (2, 10, 21 for _WT vs _TOP)."""
+    calls = []
+    class _FakeCx:
+        def run_command(self, cmd, timeout=30):
+            calls.append(cmd); return {"value": "", "error": None}
+    r = ToolRouter(bridge=_FakeCx(), session=SessionState())
+    r._open_mpnn_sequence_viewer(_WT, _TOP, "1", "A")
+    changed_spec = "2,10,21"     # the diff positions
+    assert f"color #1/A:{changed_spec} tomato" in calls        # changed → tomato
+    assert f"select #1/A:{changed_spec}" in calls              # changed columns highlighted
+    assert any(c.startswith("color #1/A:") and "cornflower blue" in c for c in calls)  # conserved
+    # order: structure must be reset to white, then coloured, before select
+    assert calls.index("color #1/A white") < calls.index(f"color #1/A:{changed_spec} tomato")
+    assert calls.index(f"color #1/A:{changed_spec} tomato") < calls.index(f"select #1/A:{changed_spec}")
+
+
+def test_compact_resspec():
+    assert ToolRouter._compact_resspec([1, 2, 3, 5, 8, 9, 10]) == "1-3,5,8-10"
+    assert ToolRouter._compact_resspec([2, 10, 21]) == "2,10,21"
+    assert ToolRouter._compact_resspec([]) == ""
+    assert ToolRouter._compact_resspec([7]) == "7"
+
+
 def test_sequence_viewer_no_bridge_returns_hint():
     r = ToolRouter(bridge=None, session=SessionState())
     note = r._open_mpnn_sequence_viewer(_WT, _TOP, "1", "A")
