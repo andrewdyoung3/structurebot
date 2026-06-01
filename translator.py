@@ -179,6 +179,23 @@ TRANSLATION RULES
     NEVER use `lighting preset publication` — that preset does not exist.
 14. Electrostatics → `coulombic`; hydrophobicity → `mlp`.
 15. Never emit Python, shell, or OS commands — only ChimeraX commands.
+16. ZONE / "within N Å" SELECTIONS — use ChimeraX zone OPERATORS, never the
+    Chimera-1 `zone` command. `zone #1/B 4.5` is OLD Chimera-1 syntax and is
+    INVALID in ChimeraX 1.11 (it yields an empty selection). Use the zone
+    operators `:<` (whole-RESIDUE zone) and `@<` (individual-ATOM zone), combined
+    with `&` (intersection) and `~` (negation):
+      a) Residues of chain A within 4.5 Å of chain B (an interface):
+           select #1/B :<4.5 & #1/A
+           info residues sel
+      b) Residues within 4 Å of a ligand (e.g. MK1), excluding the ligand itself:
+           select :MK1 :<4 & ~:MK1
+           info residues sel
+      c) ATOMS within 3 Å of that ligand (atom-level zone):
+           select :MK1 @<3 & ~:MK1
+    Pattern: `<reference> :<<dist> & <target>` selects whole residues of the
+    target within <dist> of the reference (`@<` for atoms). Follow a residue zone
+    with `info residues sel` so the matched residues are reported. NEVER emit
+    `zone ...`.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS

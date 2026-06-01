@@ -189,6 +189,31 @@ def test_call_api_stop_reason_in_error() -> None:
                     f"got: {exc}")
 
 
+# -- C. Zone-operator guidance (within N Å → `:<`, never Chimera-1 `zone`) -----
+
+def test_within_zone_uses_operator_not_chimera1_zone() -> None:
+    """
+    A "residues within N Å of chain X" request must map to the ChimeraX zone
+    OPERATOR `:<` (residue zone) / `@<` (atom zone), NOT the invalid Chimera-1
+    `zone` command. We assert the static system prompt teaches exactly that, with
+    real asserts so the test gates.
+    """
+    print("\n=== C. zone-operator guidance ===")
+    prompt = _make_translator()._static_block
+    low = prompt.lower()
+
+    # "within N Å of chain B" → residue-zone operator `:<`, NOT `zone`
+    assert "select #1/B :<4.5 & #1/A" in prompt, "interface :< example missing"
+    assert "info residues sel" in prompt, "residue-zone report command missing"
+    assert ":<" in prompt and "@<" in prompt, "zone operators (:< / @<) missing"
+    assert ":mk1 :<4 & ~:mk1" in low, "ligand residue-zone example missing"
+
+    # The Chimera-1 `zone` command must be flagged invalid and forbidden.
+    assert "chimera-1" in low and "invalid" in low, "`zone` not flagged invalid"
+    assert "`zone ...`" in prompt, "`zone` not explicitly forbidden"
+    _ok("within-N-Å maps to `:<` operator, `zone` flagged invalid")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -207,6 +232,9 @@ def main() -> int:
     test_call_api_empty_content_raises_value_error()
     test_call_api_non_empty_content_returns_text()
     test_call_api_stop_reason_in_error()
+
+    # C. zone-operator guidance
+    test_within_zone_uses_operator_not_chimera1_zone()
 
     print()
     print("=" * 60)
