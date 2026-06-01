@@ -234,6 +234,29 @@ class ToolRouter:
         "show", "output", "print", "list", "display", "what",
     )
 
+    # Phrasings that mean "RUN/RE-RUN a redesign" — a display request must never
+    # match these (re-running is stochastic and overwrites the design).
+    _MPNN_RUN_TRIGGERS: tuple = (
+        "with proteinmpnn", "with protein mpnn", "with mpnn", "with ligandmpnn",
+        "using proteinmpnn", "using mpnn", "run proteinmpnn", "run mpnn",
+        "redesign chain", "redesign the chain", "redesign again", "rerun", "re-run",
+        "another design", "new design", "design again", "redesign the dimer",
+        "redesign the interface", "redesign selected", "make it hydrophilic",
+        "make it hydrophobic",
+    )
+    _MPNN_DISPLAY_VERBS: tuple = (
+        "show", "output", "print", "display", "list", "what", "see", "view",
+        "give", "tell", "get",
+    )
+    # Phrasings that ask for the WT-vs-redesign ALIGNMENT / change set.
+    _MPNN_ALIGNMENT_KEYWORDS: tuple = (
+        "alignment", "wt vs", "wildtype vs", "vs wildtype", "vs wt",
+        "compare to wildtype", "compared to wildtype", "compare to wt",
+        "what changed", "what positions changed", "which positions changed",
+        "show the changes", "the changes", "show the redesign", "redesign view",
+        "what mutations", "mutations made", "side by side", "side-by-side",
+    )
+
     _FASTA_EXPORT_KEYWORDS: tuple = (
         "export sequences",
         "save sequences",
@@ -4197,38 +4220,84 @@ class ToolRouter:
         if any(kw in lower for kw in self._FASTA_EXPORT_KEYWORDS):
             return self._export_sequences_fasta()
 
-        # 1. Exact keyword match
-        matched = any(kw in lower for kw in self._SEQUENCE_DISPLAY_KEYWORDS)
-
-        # 2. Fuzzy match — plural "sequences" + a display verb
-        if not matched:
-            if "sequences" in lower and any(
-                v in lower for v in self._SEQUENCE_DISPLAY_VERBS
+        intent = self._detect_mpnn_display_intent(user_input)
+        if intent is None:
+            # Back-compat: the original plural-keyword / fuzzy rule still counts as
+            # a 'sequence' display request.
+            if any(kw in lower for kw in self._SEQUENCE_DISPLAY_KEYWORDS) or (
+                "sequences" in lower and any(v in lower for v in self._SEQUENCE_DISPLAY_VERBS)
             ):
-                matched = True
+                intent = "sequence"
 
-        if not matched:
+        if intent is None:
+            return None   # not a display request — let the LLM handle it (incl. runs)
+
+        model_id = self._first_model_id()
+        mpnn_data, src = self._resolve_mpnn_data(model_id)
+        if not mpnn_data:
+            # A DISPLAY request with no design anywhere must NOT fall through to a
+            # fresh MPNN run — inform instead.
+            return ("No ProteinMPNN design found in this session or the cache "
+                    "(cache/proteinmpnn/). Run a redesign first, e.g. "
+                    "'redesign chain A with ProteinMPNN'.")
+
+        if intent == "alignment":
+            return self._show_mpnn_alignment(mpnn_data, model_id, src)
+        return self._show_designed_sequences(mpnn_data=mpnn_data, model_id=model_id)
+
+    def _detect_mpnn_display_intent(self, text: str) -> Optional[str]:
+        """
+        Classify a redesign-DISPLAY request (never a run): 'alignment', 'sequence',
+        or None. Run/re-run phrasings ('redesign chain A with MPNN') return None so
+        they fall through to the normal pipeline.
+        """
+        if not text:
             return None
+        low = text.lower()
+        if any(t in low for t in self._MPNN_RUN_TRIGGERS):
+            return None
+        if any(k in low for k in self._MPNN_ALIGNMENT_KEYWORDS):
+            return "alignment"
+        has_verb = any(v in low for v in self._MPNN_DISPLAY_VERBS)
+        has_noun = any(n in low for n in (
+            "sequence", "sequences", "redesign", "redesigned", "designed",
+            "the design", "mpnn", "mutation",
+        ))
+        if has_verb and has_noun:
+            return "sequence"
+        return None
 
-        model_id = self._primary_model_id()
-        if self.session.get_proteinmpnn_result(model_id) is None:
-            return None   # no results yet — let the LLM respond
-
-        return self._show_designed_sequences()
-
-    def _show_designed_sequences(self) -> str:
+    def _resolve_mpnn_data(self, model_id: Optional[str] = None):
         """
-        Build a human-readable display of ProteinMPNN designed sequences
-        from the current session.
-
-        Returns a multi-line string ready for console.print(), or an
-        informative error message if no MPNN results are in the session.
+        Return the most recent ProteinMPNN result WITHOUT re-running: prefer the
+        in-session result, fall back to the latest persisted cache FASTA. Returns
+        (mpnn_data | None, source_str).
         """
-        model_id  = self._first_model_id()
-        mpnn_data = self.session.get_proteinmpnn_result(model_id)
+        model_id = model_id or self._first_model_id()
+        data = self.session.get_proteinmpnn_result(model_id)
+        if data:
+            return data, "session"
+        # Fall back to the on-disk design cache (survives an unsaved session).
+        try:
+            from proteinmpnn_bridge import latest_cached_fasta, read_designs_fasta
+            fa = latest_cached_fasta(model_id) or latest_cached_fasta()
+            if fa:
+                return read_designs_fasta(fa), f"cache:{fa.name}"
+        except Exception:
+            pass
+        return None, "none"
+
+    def _show_designed_sequences(self, mpnn_data=None, model_id=None) -> str:
+        """
+        Build a human-readable display of ProteinMPNN designed sequences,
+        retrieving (never re-running) from the session or the persistent cache.
+        """
+        model_id  = model_id or self._first_model_id()
+        if mpnn_data is None:
+            mpnn_data, _src = self._resolve_mpnn_data(model_id)
         if not mpnn_data:
             return (
-                "No ProteinMPNN results in session. "
+                "No ProteinMPNN design found (session or cache). "
                 "Run a sequence redesign first "
                 "(e.g. 'redesign chain A with ProteinMPNN')."
             )
@@ -4263,9 +4332,7 @@ class ToolRouter:
                     pass
 
             n_muts      = len(mutations)
-            mut_display = ", ".join(mutations[:8])
-            if n_muts > 8:
-                mut_display += f" (+{n_muts - 8} more)"
+            mut_display = ", ".join(mutations)   # full set — never hide the design
 
             lines.append(f"  Design {i}/{n_sequences}")
             lines.append(f"    Score:     {score:.3f}")
@@ -4278,6 +4345,122 @@ class ToolRouter:
             lines.append("")
 
         return "\n".join(lines)
+
+    # ── WT-vs-redesign alignment (console + interactive ChimeraX) ────────────────
+
+    def _show_mpnn_alignment(self, mpnn_data, model_id: str, src: str) -> str:
+        """
+        Render the numbered WT-vs-top-redesign console alignment AND (best-effort,
+        if ChimeraX is up) open the interactive ChimeraX Sequence Viewer associated
+        with the loaded chain. Retrieval only — never re-runs MPNN.
+        """
+        seqs = mpnn_data.get("sequences") or []
+        wt   = mpnn_data.get("wildtype_sequence") or ""
+        if not seqs or not wt:
+            return "No ProteinMPNN design available to align."
+        top   = seqs[0]
+        chain = mpnn_data.get("chain", "A")
+        console_view = self._build_mpnn_alignment_console(
+            wt, top.get("sequence", ""), top, model_id, chain, src
+        )
+        viz_note = self._open_mpnn_sequence_viewer(
+            wt, top.get("sequence", ""), model_id, chain
+        )
+        return console_view + ("\n" + viz_note if viz_note else "")
+
+    @staticmethod
+    def _alignment_rows(wt: str, design: str) -> List[int]:
+        """1-based positions where design differs from WT (over the common length)."""
+        return [i for i, (w, d) in enumerate(zip(wt, design), 1) if w != d]
+
+    def _build_mpnn_alignment_console(
+        self, wt: str, design: str, top: Dict[str, Any],
+        model_id: str, chain: str, src: str, width: int = 50,
+    ) -> str:
+        """
+        Numbered, Rich-marked WT-vs-redesign alignment in residue numbering
+        (1-based, consistent with the recovery viz), in blocks of *width*, every
+        changed column flagged. No truncation.
+        """
+        n = min(len(wt), len(design))
+        changed = set(self._alignment_rows(wt, design))
+        mutations = list(top.get("mutations") or [
+            f"{wt[i-1]}{i}{design[i-1]}" for i in sorted(changed)
+        ])
+        rec = top.get("recovery")
+        out: List[str] = [
+            f"[bold]WT vs ProteinMPNN redesign[/bold] — model #{model_id} chain {chain}  "
+            f"[dim](source: {src})[/dim]",
+            f"  length {n} · [red]{len(changed)} changed[/red] · "
+            + (f"recovery {rec:.1%}" if isinstance(rec, (int, float)) else "")
+            + "   (numbering = 1-based residue position)",
+            "",
+        ]
+        for start in range(0, n, width):
+            end = min(start + width, n)
+            ruler = "".join(
+                ("|" if (p % 10 == 0) else (":" if (p % 5 == 0) else "."))
+                for p in range(start + 1, end + 1)
+            )
+            wt_row, de_row, mark = [], [], []
+            for p in range(start + 1, end + 1):
+                w, d = wt[p - 1], design[p - 1]
+                if p in changed:
+                    wt_row.append(w)
+                    de_row.append(f"[bold red]{d}[/bold red]")
+                    mark.append("^")
+                else:
+                    wt_row.append(w)
+                    de_row.append(d)
+                    mark.append(" ")
+            lbl = f"{start + 1:>5}"
+            out.append(f"  pos {lbl} {ruler}")
+            out.append(f"  WT      {''.join(wt_row)}")
+            out.append(f"  design  {''.join(de_row)}")
+            out.append(f"          {''.join(mark)}")
+            out.append("")
+        out.append(f"  [bold]Changes ({len(mutations)}):[/bold] " + ", ".join(mutations))
+        return "\n".join(out)
+
+    def _open_mpnn_sequence_viewer(
+        self, wt: str, design: str, model_id: str, chain: str,
+    ) -> Optional[str]:
+        """
+        Build a 2-sequence ungapped FASTA (WT + top redesign) and open it in
+        ChimeraX's Sequence Viewer associated with the loaded chain, so selecting a
+        column selects the 3D residue (and vice versa). Best-effort; returns a note.
+
+        Association subtlety: the redesign is heavily changed (> ChimeraX's ~10%
+        auto-association threshold) so the redesign row won't auto-associate, but
+        the WT row (identical to chain A) does, and the ungapped 1:1 columns still
+        map to the correct 3D residues through it.
+        """
+        if self.bridge is None:
+            return ("  (ChimeraX not connected — run while ChimeraX is open to get the "
+                    "interactive Sequence Viewer: select a column → highlights the 3D residue.)")
+        try:
+            from proteinmpnn_bridge import build_alignment_fasta
+            import config as _cfg
+            out = Path(_cfg.PROTEINMPNN_CACHE_DIR) / f"alignment_model{model_id}.fa"
+            build_alignment_fasta(wt, design, out,
+                                  wt_label="WT", design_label="redesign_top")
+            posix = Path(out).as_posix()
+            cmds = [
+                f'open "{posix}"',                      # opens the Sequence Viewer + auto-associates WT↔chain
+                f"sequence associate #{model_id}/{chain}",  # force-associate the chain to the alignment
+            ]
+            ran_ok = True
+            for c in cmds:
+                r = self.bridge.run_command(c)
+                if isinstance(r, dict) and r.get("error"):
+                    ran_ok = False
+            if ran_ok:
+                return ("  [green]Interactive alignment open in ChimeraX[/green] — select a "
+                        f"column in the Sequence Viewer to highlight the chain {chain} residue "
+                        "in 3D (and vice versa). The WT row is associated with the structure.")
+            return f"  (Alignment FASTA written to {out}; open it in ChimeraX to interact.)"
+        except Exception as exc:
+            return f"  (Could not open the ChimeraX Sequence Viewer: {exc})"
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 

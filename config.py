@@ -163,6 +163,17 @@ PROTEINMPNN_DIR: str = os.environ.get(
     str(Path(__file__).parent / "ProteinMPNN"),
 )
 
+# Persistent cache for ProteinMPNN designs. The bridge runs in a deleted
+# tempfile.TemporaryDirectory(), and the interactive session is only saved on a
+# clean quit (no per-turn autosave), so designs evaporated. Every run now also
+# writes its full FASTA (all designs + WT, scores in headers) here so a design is
+# never lost and can be retrieved/aligned without re-running (re-running is
+# stochastic and overwrites the design).
+PROTEINMPNN_CACHE_DIR: Path = Path(
+    os.environ.get("PROTEINMPNN_CACHE_DIR", str(_BASE / "cache" / "proteinmpnn"))
+)
+PROTEINMPNN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable

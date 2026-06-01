@@ -604,16 +604,19 @@ def test_dispatch_esmfold_no_redirect_without_session():
 # 10. handle_sequence_display_command / _show_designed_sequences
 # ════════════════════════════════════════════════════════════════════════════════
 
-def test_handle_sequence_display_returns_none_without_session():
+def test_handle_sequence_display_no_design_informs_not_reruns(monkeypatch, tmp_path):
     """
-    handle_sequence_display_command must return None when the session has
-    no ProteinMPNN results, even if the phrase matches.
+    A DISPLAY phrasing with no design anywhere (session + cache empty) must return
+    an informative message — NOT None — so the request never falls through to a
+    fresh stochastic MPNN run (the original loss bug). Cache pointed at an empty
+    temp dir for hermeticity.
     """
+    import config
+    monkeypatch.setattr(config, "PROTEINMPNN_CACHE_DIR", tmp_path)
     router = _make_router()
     result = router.handle_sequence_display_command("show designed sequences")
-    assert result is None, (
-        "Should return None (no MPNN results) so the LLM handles the request"
-    )
+    assert result is not None
+    assert "no proteinmpnn design" in result.lower()
 
 
 def test_handle_sequence_display_returns_none_for_non_display_phrase():
@@ -654,15 +657,17 @@ def test_show_designed_sequences_format():
     assert "L2A" in output or "1" in output   # mutation or count
 
 
-def test_show_designed_sequences_no_results():
+def test_show_designed_sequences_no_results(monkeypatch, tmp_path):
     """
-    _show_designed_sequences() when no MPNN results in session returns an
-    informative error message (not an exception).
+    _show_designed_sequences() with no MPNN result in the session OR cache returns
+    an informative message (not an exception). Cache pointed at an empty temp dir.
     """
+    import config
+    monkeypatch.setattr(config, "PROTEINMPNN_CACHE_DIR", tmp_path)
     router = _make_router()
     output = router._show_designed_sequences()
     assert isinstance(output, str)
-    assert "No ProteinMPNN results" in output
+    assert "No ProteinMPNN design found" in output
 
 
 # ════════════════════════════════════════════════════════════════════════════════
