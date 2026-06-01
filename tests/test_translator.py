@@ -18,7 +18,11 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from translator import CommandTranslator as Translator, RefusalError
+from translator import (
+    CommandTranslator as Translator,
+    RefusalError,
+    _sanitize_zone_syntax,
+)
 
 # -- Helpers -------------------------------------------------------------------
 
@@ -256,6 +260,101 @@ def test_system_prompt_frames_routine_design_as_legitimate() -> None:
     _ok("system prompt frames routine design operations as legitimate")
 
 
+# -- D. Chimera-1 zone-syntax guard (invalid in ChimeraX 1.11) -----------------
+
+_ZONE_JSON = (
+    '{"commands": ["select #1/A & (zone #1/B 4.5)", "info residues sel"], '
+    '"explanations": ["interface", "list"], "warnings": [], '
+    '"clarification_needed": null, "confidence": "high", '
+    '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+)
+
+
+def test_zone_guard_rewrites_bare_and_parenthesised() -> None:
+    print("\n=== D. zone-syntax guard ===")
+    # bare form
+    cmds, _, notes = _sanitize_zone_syntax(["select zone #1/B 4.5 & #1/A"], [""])
+    _assert(cmds == ["select #1/B :<4.5 & #1/A"],
+            "bare zone rewritten to :<", f"got {cmds}")
+    # parenthesised form (the regression seen live)
+    cmds2, _, notes2 = _sanitize_zone_syntax(["select #1/A & (zone #1/B 4.5)"], [""])
+    _assert(cmds2 == ["select #1/A & (#1/B :<4.5)"],
+            "parenthesised (zone …) rewritten, parens kept", f"got {cmds2}")
+    _assert(all("zone" not in c for c in cmds + cmds2), "no `zone` keyword remains")
+    _assert(bool(notes) and bool(notes2), "both rewrites logged in notes")
+
+
+def test_zone_guard_leaves_valid_and_volume_zone() -> None:
+    valid = ["select #1/B :<4.5 & #1/A", "info residues sel"]
+    cmds, _, notes = _sanitize_zone_syntax(valid, ["", ""])
+    _assert(cmds == valid and notes == [], "valid :< left untouched", f"got {cmds}")
+    vz, _, vnotes = _sanitize_zone_syntax(["volume zone #1 4.5"], [""])
+    _assert(vz == ["volume zone #1 4.5"] and vnotes == [],
+            "volume zone preserved", f"got {vz}")
+
+
+def test_zone_guard_drops_unrewritable() -> None:
+    cmds, exps, notes = _sanitize_zone_syntax(
+        ["select zone sel", "info residues sel"], ["bad", "list"])
+    _assert(cmds == ["info residues sel"], "unrewritable zone dropped", f"got {cmds}")
+    _assert(exps == ["list"], "dropped command's explanation removed")
+    _assert(any("Dropped" in n for n in notes), "drop logged", f"got {notes}")
+
+
+def test_translate_rewrites_zone_end_to_end() -> None:
+    """A model emitting the parenthesised Chimera-1 zone is corrected before
+    return: interface request → `:<` + `& #1/A`, `info residues sel` survives."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "1IL8 loaded as #1 (chains A, B)."
+    resp = MagicMock(content=[MagicMock(text=_ZONE_JSON)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = resp
+        result = t.translate(
+            "select the residues at the dimer interface on chain A", session)
+    cmds = result.get("commands", [])
+    _assert(cmds[0] == "select #1/A & (#1/B :<4.5)",
+            "interface select uses :< not zone", f"got {cmds}")
+    _assert(all("zone" not in c for c in cmds), "no `zone` survives")
+    _assert("info residues sel" in cmds, "`info residues sel` preserved")
+    _assert(any("Rewrote" in w for w in result.get("warnings", [])),
+            "rewrite surfaced as a warning")
+
+
+def test_system_prompt_documents_zone_and_hide() -> None:
+    prompt = _make_translator()._static_block
+    low = prompt.lower()
+    _assert(":<" in prompt and "@<" in prompt, "prompt documents :< / @< operators")
+    _assert("info residues sel" in prompt, "prompt lists via `info residues sel`")
+    _assert("never" in low and "zone" in low, "prompt forbids Chimera-1 `zone`")
+    # BUG 2: hide/show must target the representation, not bare atoms.
+    _assert("hide #1/b cartoon" in low or "hide #1/b target ac" in low,
+            "prompt shows hide targeting the cartoon/representation")
+
+
+def test_hide_chain_targets_representation() -> None:
+    """'hide chain B' must target the cartoon (not a bare `hide #1/B`, which
+    only hides atoms and leaves the ribbon visible)."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "1IL8 loaded as #1 (chains A, B)."
+    hide_json = (
+        '{"commands": ["hide #1/B cartoon"], "explanations": ["hide B ribbon"], '
+        '"warnings": [], "clarification_needed": null, "confidence": "high", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    resp = MagicMock(content=[MagicMock(text=hide_json)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = resp
+        result = t.translate("hide chain B", session)
+    cmds = result.get("commands", [])
+    joined = " ".join(cmds).lower()
+    _assert(cmds == ["hide #1/B cartoon"], "hide targets cartoon", f"got {cmds}")
+    _assert("cartoon" in joined or "target a" in joined,
+            "representation named (cartoon / target ac), not bare hide")
+    _assert(cmds != ["hide #1/B"], "not a bare atoms-only hide")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -279,6 +378,14 @@ def main() -> int:
     test_benign_design_request_not_flagged()
     test_call_api_retries_once_then_refuses()
     test_system_prompt_frames_routine_design_as_legitimate()
+
+    # D. zone-syntax guard + hide/show representation
+    test_zone_guard_rewrites_bare_and_parenthesised()
+    test_zone_guard_leaves_valid_and_volume_zone()
+    test_zone_guard_drops_unrewritable()
+    test_translate_rewrites_zone_end_to_end()
+    test_system_prompt_documents_zone_and_hide()
+    test_hide_chain_targets_representation()
 
     print()
     print("=" * 60)

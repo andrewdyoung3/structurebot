@@ -86,6 +86,60 @@ class RefusalError(ValueError):
     can show a user-friendly message instead of propagating a traceback.
     """
 
+
+# ── Chimera-1 zone-syntax guard ─────────────────────────────────────────────────
+# `zone <spec> <dist>` is Chimera-1 syntax, invalid in ChimeraX 1.11 (which uses
+# the zone OPERATORS `:<` / `@<`).  This deterministic guard rewrites any such
+# command the model still emits, so invalid syntax can never reach ChimeraX:
+#   select zone #1/B 4.5 & #1/A      →  select #1/B :<4.5 & #1/A
+#   select #1/A & (zone #1/B 4.5)    →  select #1/A & (#1/B :<4.5)
+# The `\S+` spec group stops at whitespace, so a trailing ')' stays put.
+_ZONE_CMD_RE = re.compile(r"\bzone\s+(\S+)\s+([0-9]*\.?[0-9]+)")
+# `volume zone <spec> <dist>` IS a real ChimeraX command (density-map masking) —
+# never touch it.
+_VOLUME_ZONE_RE = re.compile(r"\bvolume\s+zone\b")
+
+
+def _sanitize_zone_syntax(
+    commands: list, explanations: list
+) -> tuple:
+    """
+    Rewrite Chimera-1 ``zone <spec> <dist>`` (bare or parenthesised) to the
+    ChimeraX ``<spec> :<<dist>`` residue-zone operator.  Returns
+    (new_commands, new_explanations, notes).
+
+    A command whose ``zone`` cannot be safely rewritten is DROPPED (with a note)
+    rather than sent on as invalid syntax.  ``volume zone`` is left untouched.
+    """
+    new_cmds: list = []
+    new_exps: list = []
+    notes:    list = []
+    for i, cmd in enumerate(commands):
+        exp = explanations[i] if i < len(explanations) else ""
+        if _VOLUME_ZONE_RE.search(cmd):           # real command — leave as-is
+            new_cmds.append(cmd)
+            new_exps.append(exp)
+            continue
+        rewritten = _ZONE_CMD_RE.sub(r"\1 :<\2", cmd)
+        if rewritten != cmd:
+            notes.append(
+                f"Rewrote Chimera-1 zone syntax to the ChimeraX operator: "
+                f"{cmd!r} → {rewritten!r}"
+            )
+            print(f"  [zone-guard] {cmd!r} → {rewritten!r}", flush=True)
+            cmd = rewritten
+        if re.search(r"\bzone\b", cmd):           # still unsafe → drop it
+            notes.append(
+                f"Dropped an invalid Chimera-1 `zone` command "
+                f"(no safe ChimeraX rewrite): {cmd!r}"
+            )
+            print(f"  [zone-guard] dropped unrewritable {cmd!r}", flush=True)
+            continue
+        new_cmds.append(cmd)
+        new_exps.append(exp)
+    return new_cmds, new_exps, notes
+
+
 # ── Static system block (cached) ───────────────────────────────────────────────
 
 _STATIC_SYSTEM = """\
@@ -205,6 +259,35 @@ TRANSLATION RULES
     NEVER use `lighting preset publication` — that preset does not exist.
 14. Electrostatics → `coulombic`; hydrophobicity → `mlp`.
 15. Never emit Python, shell, or OS commands — only ChimeraX commands.
+16. ZONE / "within N Å" / proximity / interface SELECTIONS — use ChimeraX zone
+    OPERATORS, never the Chimera-1 `zone` command. `zone <spec> <dist>` (e.g.
+    `select zone #1/B 4.5 & #1/A`, or `select #1/A & (zone #1/B 4.5)`) is OLD
+    Chimera-1 syntax and is INVALID in ChimeraX 1.11 — it raises "Expected a
+    keyword" / "Expected an objects specifier" and silently selects nothing.
+    NEVER emit `zone` / `select zone …`. The zone OPERATORS attach a distance
+    to a spec:
+      `:<dist` = whole RESIDUES within dist   `:>dist` = residues beyond dist
+      `@<dist` = individual ATOMS within dist  `@>dist` = atoms beyond dist
+    A proximity/interface selection is ONE command — do NOT decompose it.
+    Worked examples:
+      • chain-A residues within 4.5 Å of chain B (an interface):
+          select #1/B :<4.5 & #1/A
+          info residues sel
+      • residues within 5 Å of a ligand LIG in chain A:
+          select /A:LIG :<5
+          info residues sel
+      • atoms within 4 Å of the current selection:
+          select sel @<4
+    Pattern: `<reference> :<<dist> & <target>`. To list/report the selected
+    residues use `info residues sel` — NOT `info sel`, which lists atoms.
+17. HIDE / SHOW a chain or selection — target the DISPLAYED REPRESENTATION, not
+    just atoms. A bare `hide #1/B` only hides atoms/bonds, so a cartoon/ribbon
+    stays fully visible (no visible effect). Name the representation:
+      • hide chain B (shown as cartoon):   hide #1/B cartoon
+      • hide everything for chain B:        hide #1/B target ac   (atoms+cartoon)
+      • show chain B's cartoon again:       show #1/B cartoon
+    Use the same rule for `show`. When unsure which representation is on, prefer
+    `target ac` so both atoms and cartoon are affected.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
@@ -648,6 +731,16 @@ class CommandTranslator:
             self._history.append({"role": "assistant", "content": raw2})
             result = self._parse_response(raw2)
             result.pop("_parse_failed", None)
+
+        # Deterministic guard: never let Chimera-1 `zone` syntax reach ChimeraX,
+        # regardless of what the model emitted (belt-and-suspenders to rule 16).
+        new_cmds, new_exps, zone_notes = _sanitize_zone_syntax(
+            result.get("commands") or [], result.get("explanations") or []
+        )
+        if zone_notes:
+            result["commands"]     = new_cmds
+            result["explanations"] = new_exps
+            result["warnings"]     = (result.get("warnings") or []) + zone_notes
 
         return result
 
