@@ -184,6 +184,20 @@ def build_omit_aas(
     return "".join(sorted(omit))
 
 
+def chain_resnum_to_seqpos(ordered_resnums) -> Dict[int, int]:
+    """
+    Map each PDB residue number to its 1-based position within the chain's
+    residue list (the order they appear).  This is the canonical conversion
+    ProteinMPNN's ``--fixed_positions_jsonl`` needs (positions are 1-based chain
+    order, NOT PDB residue numbers), and is reused by the Sequence-Viewer SCF
+    layer (which then subtracts 1 for SCF's 0-based alignment positions).
+
+    *ordered_resnums* is the chain's residue numbers in sequence order (handles
+    chains that don't start at 1 and that have numbering gaps).
+    """
+    return {int(r): i + 1 for i, r in enumerate(ordered_resnums)}
+
+
 def _chain_positions_and_cys(pdb_path: str, chain: str) -> Tuple[List[int], List[int]]:
     """
     Return (all_residue_numbers, native_cysteine_numbers) for *chain*.
@@ -625,7 +639,7 @@ class ProteinMPNNBridge:
         # 2..72) would otherwise fix the wrong residues — letting --omit_AAs C
         # mutate the native cysteines it was meant to protect.
         if all_positions:
-            resnum_to_seqpos = {r: i + 1 for i, r in enumerate(all_positions)}
+            resnum_to_seqpos = chain_resnum_to_seqpos(all_positions)
             fixed_seqpos = sorted(
                 resnum_to_seqpos[r] for r in fixed if r in resnum_to_seqpos
             )

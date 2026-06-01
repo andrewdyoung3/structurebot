@@ -174,6 +174,13 @@ PROTEINMPNN_CACHE_DIR: Path = Path(
 )
 PROTEINMPNN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Sequence-Viewer integration scratch (.scf coloring files + their runscript
+# loaders) — see sequence_viewer.py. Forward-slash paths only (ChimeraX).
+SEQVIEW_CACHE_DIR: Path = Path(
+    os.environ.get("SEQVIEW_CACHE_DIR", str(_BASE / "cache" / "seqview"))
+)
+SEQVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable
