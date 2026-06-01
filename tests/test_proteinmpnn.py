@@ -511,7 +511,7 @@ def _capture(b: ProteinMPNNBridge, pdb_path: Path,
     the fixed-positions JSONL content (the temp file is deleted before
     analyze() returns, so it must be read inside the fake subprocess).
     """
-    cap: Dict[str, Any] = {"cmd": [], "fixed": None}
+    cap: Dict[str, Any] = {"cmd": [], "fixed": None, "bias": None}
     fasta = ">WT\nAAAAAA\n>score=-1.0, sample=1\nAAAAAC\n"
 
     def fake_run(cmd, **kw):
@@ -519,6 +519,9 @@ def _capture(b: ProteinMPNNBridge, pdb_path: Path,
         if "--fixed_positions_jsonl" in cmd:
             fp = cmd[cmd.index("--fixed_positions_jsonl") + 1]
             cap["fixed"] = _json.loads(Path(fp).read_text())
+        if "--bias_AA_jsonl" in cmd:
+            bp = cmd[cmd.index("--bias_AA_jsonl") + 1]
+            cap["bias"] = _json.loads(Path(bp).read_text())
         out = Path(cmd[cmd.index("--out_folder") + 1])
         seqs = out / "seqs"
         seqs.mkdir(parents=True, exist_ok=True)
@@ -683,6 +686,43 @@ def test_unconstrained_request_stays_vanilla() -> None:
             "no fixed positions when nothing is restricted or preserved")
 
 
+def test_selected_set_plus_omit_and_bias_argv() -> None:
+    """
+    The structured 1IL8-style request — design ONLY the selected residues,
+    exclude cysteine (hard), bias hydrophilic (soft) — must put
+    --fixed_positions_jsonl (fixing everything OUTSIDE the selection) AND
+    --omit_AAs C AND --bias_AA_jsonl on the command line together.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "sel.pdb"
+        pdb.write_text(
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 0)
+            + _atom(2, "CA", "ALA", "A", 2, 3, 0, 0)
+            + _atom(3, "CA", "ALA", "A", 3, 6, 0, 0)
+            + _atom(4, "CA", "ALA", "A", 4, 9, 0, 0) + "TER\n",
+            encoding="utf-8",
+        )
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {
+            "design_positions": [2, 3],            # only the "selected" residues
+            "omit_aas":         "C",               # hard: no new cysteine
+            "bias_aas":         ["D", "E", "K"],   # soft: hydrophilic bias
+        })
+
+    _assert(cap["result"].success, "selected+omit+bias run succeeded",
+            f"error: {cap['result'].error}")
+    _assert("--fixed_positions_jsonl" in cap["cmd"], "fixed-positions JSONL present")
+    fixed_a = (cap["fixed"] or {}).get(pdb.stem, {}).get("A", [])
+    _assert(sorted(fixed_a) == [1, 4],
+            "fixes everything OUTSIDE the selected set {2,3}", f"got {fixed_a}")
+    _assert(_omit_value(cap["cmd"]) == "C", "--omit_AAs C present",
+            f"got {_omit_value(cap['cmd'])!r}")
+    _assert("--bias_AA_jsonl" in cap["cmd"], "--bias_AA_jsonl present")
+    _assert(cap["bias"] == {"D": 1.5, "E": 1.5, "K": 1.5},
+            "bias file biases each hydrophilic AA positively", f"got {cap['bias']}")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -738,6 +778,7 @@ def main() -> int:
     test_restricted_design_with_no_target_errors()
     test_native_cysteines_preserved()
     test_unconstrained_request_stays_vanilla()
+    test_selected_set_plus_omit_and_bias_argv()
 
     print()
     print("=" * 60)

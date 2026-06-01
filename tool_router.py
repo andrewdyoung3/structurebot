@@ -89,6 +89,12 @@ class ToolStepResult:
 
 # ── Router ─────────────────────────────────────────────────────────────────────
 
+# Hydrophilic residues to bias toward when the request asks for a hydrophilic
+# (more soluble / more polar) redesign — used when the translator emits
+# `bias_toward: "hydrophilic"` instead of an explicit `bias_amino_acids` list.
+_HYDROPHILIC_AAS = "DENQHKRST"
+
+
 class ToolRouter:
     """
     Routes translator output through the correct computational tools.
@@ -1234,7 +1240,7 @@ class ToolRouter:
                         })
                 return self._run_esmfold(inputs)
             if tool == "proteinmpnn":
-                return self._run_proteinmpnn(inputs, user_input=user_input)
+                return self._run_proteinmpnn(inputs)
             if tool == "mpnn_esmfold":
                 return self._run_mpnn_esmfold(inputs)
             if tool == "rfdiffusion":
@@ -2082,37 +2088,38 @@ class ToolRouter:
                 elapsed_ms=elapsed_ms,
             )
 
-    @staticmethod
-    def _parse_mpnn_constraints(user_input: str) -> Dict[str, Any]:
+    def _read_selected_residues(self, model_id: str, chain_id: str) -> List[int]:
         """
-        Parse design constraints from the natural-language request so they
-        actually reach ProteinMPNN (interface-only redesign, AA exclusions).
+        Read the LIVE ChimeraX selection and return the selected residue numbers
+        on *chain_id* of *model_id*.
 
-        Returns only the keys it detects, so explicit tool_inputs win on merge.
+        Uses ``info residues sel & #<model>/<chain>`` whose output lines look like
+        ``residue id /A:8 name GLN index 7`` — we extract the PDB residue numbers.
+        Returns [] on any failure (caller decides the fallback).
         """
-        text = (user_input or "").lower()
-        out: Dict[str, Any] = {}
-        if any(k in text for k in ("interface", "dimer interface", "binding interface")):
-            out["interface_design"] = True
-        if any(k in text for k in (
-            "no cystein", "no cys", "without cystein", "avoid cystein",
-            "exclude cystein", "free of cystein",
-        )):
-            out["no_cysteines"] = True
-        if any(k in text for k in (
-            "hydrophilic", "more soluble", "increase solubility",
-            "improve solubility", "more polar",
-        )):
-            out["hydrophilic"] = True
-        return out
+        try:
+            cmd = f"info residues sel & #{model_id}/{chain_id}"
+            res = self.bridge.run_command(cmd)
+            text = (res.get("value") or "") if isinstance(res, dict) else ""
+            nums = [
+                int(m.group(1))
+                for m in re.finditer(rf"/{re.escape(chain_id)}:(-?\d+)\b", text)
+            ]
+            return sorted(set(nums))
+        except Exception:
+            return []
 
-    def _run_proteinmpnn(
-        self,
-        inputs:     Dict[str, Any],
-        user_input: str = "",
-    ) -> ToolStepResult:
-        """Run ProteinMPNN fixed-backbone sequence redesign."""
-        user_input = user_input or inputs.get("_user_input", "")
+    def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
+        """
+        Run ProteinMPNN fixed-backbone sequence redesign.
+
+        Consumes the STRUCTURED constraint fields the translator emits
+        (``exclude_amino_acids``, ``bias_amino_acids``, ``design_mode``,
+        ``use_selection``) — no natural-language re-parsing — and resolves the
+        designable set from the LIVE ChimeraX selection when the request is
+        selection-scoped, falling back to a direct interface computation, and
+        NEVER silently to a whole-chain redesign.
+        """
         bridge   = self._get_proteinmpnn_bridge()
         model_id = inputs.get("model_id") or self._first_model_id()
         chain_id = inputs.get("chain_id") or inputs.get("chain", "A")
@@ -2130,17 +2137,60 @@ class ToolRouter:
                 ),
             )
 
-        # ── Parsed NL constraints (explicit tool_inputs override) ──────────────
-        parsed = self._parse_mpnn_constraints(user_input)
-        interface_design = bool(inputs.get("interface_design", parsed.get("interface_design", False)))
+        # ── Structured constraint fields (straight from the translator) ────────
+        # The model is not perfectly consistent about field names, so accept the
+        # observed synonyms rather than re-parsing the NL text.
+        exclude_aas = (inputs.get("exclude_amino_acids")
+                       or inputs.get("omit_amino_acids") or [])
+        omit_aas = "".join(sorted({
+            ch.upper() for aa in exclude_aas for ch in str(aa) if ch.isalpha()
+        }))
+
+        bias_aas = [str(a).upper() for a in (inputs.get("bias_amino_acids") or [])
+                    if str(a).strip()]
+        bias_toward = str(inputs.get("bias_toward") or "").lower()
+        if not bias_aas and "hydrophil" in bias_toward:
+            bias_aas = list(_HYDROPHILIC_AAS)   # D E N Q H K R S T
+
+        # design_scope is the canonical key (see translator prompt); design_mode
+        # and the boolean flags below are tolerated synonyms.
+        design_mode = (str(inputs.get("design_scope") or "")
+                       + " " + str(inputs.get("design_mode") or "")).lower()
+        partner_chain = (inputs.get("partner_chain")
+                         or inputs.get("interface_partner_chain"))
         design_positions = inputs.get("design_positions")
+        # A SCOPED (selection / interface-only) redesign — detected robustly,
+        # since the model is inconsistent about exact field names.  Any boolean
+        # "design only the selection/interface" flag, an interface/selection
+        # design_mode, an explicit position list, or a named partner chain all
+        # mean "do NOT redesign the whole chain".
+        scoped = bool(
+            design_positions
+            or partner_chain
+            or inputs.get("use_selection")
+            or inputs.get("design_only_interface")
+            or inputs.get("redesign_selected")
+            or inputs.get("selected_only")
+            or "interface" in design_mode
+            or "select" in design_mode
+        )
+
+        # ── Designable set: explicit > live selection > interface > (error) ────
+        interface_design = bool(inputs.get("interface_design"))
+        if scoped and not design_positions:
+            # The user's live ChimeraX selection is the ground truth for "the
+            # selected residues"; if none was captured, compute the interface
+            # directly from coordinates (deterministic, never whole-chain).
+            design_positions = self._read_selected_residues(model_id, chain_id)
+            if not design_positions:
+                interface_design = True
 
         # ── Legacy "protect cached interface residues" path ────────────────────
-        # Only when NOT doing a restricted (interface / explicit) design — those
-        # paths fix the complement themselves, so reusing protected residues here
-        # would double-fix and zero out the designable set.
+        # Only for an UNRESTRICTED design (no selection / interface / explicit set);
+        # restricted paths fix the complement themselves.
         fixed_positions: List[int] = inputs.get("fixed_positions") or []
-        if not fixed_positions and not interface_design and not design_positions:
+        if (not fixed_positions and not scoped
+                and not design_positions and not interface_design):
             interface_data = self.session.get_interface_residues(model_id)
             if interface_data:
                 fixed_positions = (
@@ -2155,13 +2205,12 @@ class ToolRouter:
             "fixed_positions":  fixed_positions,
             "num_sequences":    int(inputs.get("num_sequences", 8)),
             "temperature":      float(inputs.get("temperature", 0.1)),
-            # Design-scope + AA constraints (explicit > parsed-from-NL)
-            "interface_design": interface_design,
+            # Design-scope + AA constraints (structured fields, consumed directly)
             "design_positions": design_positions,
-            "partner_chain":    inputs.get("partner_chain"),
-            "no_cysteines":     bool(inputs.get("no_cysteines", parsed.get("no_cysteines", False))),
-            "hydrophilic":      bool(inputs.get("hydrophilic", parsed.get("hydrophilic", False))),
-            "omit_aas":         inputs.get("omit_aas", ""),
+            "interface_design": interface_design,
+            "partner_chain":    partner_chain,
+            "omit_aas":         omit_aas,
+            "bias_aas":         bias_aas,
         }
         return bridge.analyze(full_inputs, session=self.session)
 

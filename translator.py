@@ -140,6 +140,22 @@ tool_inputs: dict of tool-specific parameters, e.g.:
   {{"esm":    {{"model_id": "1", "chain": "A"}}}}
   When not using extra tools, set tool_inputs to {{}}.
 
+  proteinmpnn — use EXACTLY these keys (do not invent synonyms):
+    {{"proteinmpnn": {{
+        "model_id": "1", "chain": "A",
+        "design_scope": "selected" | "interface" | "chain",
+        "partner_chain": "B",
+        "exclude_amino_acids": ["C"],
+        "bias_amino_acids": ["D","E","N","Q","H","K","R","S","T"]
+    }}}}
+    • design_scope "selected" = redesign only the residues the user has SELECTED
+      in ChimeraX; "interface" = redesign only the chain/partner_chain interface;
+      "chain" = the whole chain. Use "selected" whenever the request says "the
+      selected residues"; use "interface" for interface/dimer-interface requests.
+    • exclude_amino_acids = HARD exclusions ("no cysteines" → ["C"]).
+    • bias_amino_acids = SOFT preference ("hydrophilic" → the polar/charged set
+      D E N Q H K R S T). Omit keys that don't apply.
+
 If the request cannot be safely translated without more information:
 {{
   "commands":            [],

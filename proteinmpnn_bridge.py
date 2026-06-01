@@ -154,6 +154,11 @@ def _sequence_recovery(wt: str, designed: str) -> float:
 # Hydrophobic residues to omit when the user asks for a hydrophilic surface.
 _HYDROPHOBIC_AAS = "FILMVWY"
 
+# Positive log-bias applied to each requested amino acid via --bias_AA_jsonl.
+# A SOFT preference (e.g. "hydrophilic bias"), not a hard omit — ProteinMPNN may
+# still pick another residue where the backbone strongly prefers it.
+_BIAS_WEIGHT = 1.5
+
 
 def build_omit_aas(
     no_cysteines: bool = False,
@@ -497,12 +502,16 @@ class ProteinMPNNBridge:
                 tool="proteinmpnn", success=False, error=str(exc),
             )
 
+        bias_aas = [str(a).upper() for a in (inputs.get("bias_aas") or [])
+                    if str(a).strip()]
+
         try:
             return self._run_inference(
                 pdb_path        = resolved_pdb,
                 chain_id        = chain_id,
                 fixed_positions = fixed_positions,
                 omit_aas        = omit_aas,
+                bias_aas        = bias_aas,
                 num_sequences   = num_sequences,
                 temperature     = temperature,
                 session         = session,
@@ -608,6 +617,21 @@ class ProteinMPNNBridge:
         if preserve_cys:
             fixed |= set(native_cys)
 
+        # ProteinMPNN's --fixed_positions_jsonl indexes positions by their
+        # 1-based ORDER within the chain's residue list, NOT by PDB residue
+        # number.  All sets above are in PDB-resnum space (live selection,
+        # BioPython interface/cys, session residues), so convert here.  Chains
+        # that don't start at 1 or have gaps (e.g. 1IL8 chain A is numbered
+        # 2..72) would otherwise fix the wrong residues — letting --omit_AAs C
+        # mutate the native cysteines it was meant to protect.
+        if all_positions:
+            resnum_to_seqpos = {r: i + 1 for i, r in enumerate(all_positions)}
+            fixed_seqpos = sorted(
+                resnum_to_seqpos[r] for r in fixed if r in resnum_to_seqpos
+            )
+            return fixed_seqpos, omit_aas
+
+        # Parse failed — fall back to passing positions through unchanged.
         return sorted(fixed), omit_aas
 
     # ── Internal inference ─────────────────────────────────────────────────────
@@ -622,6 +646,7 @@ class ProteinMPNNBridge:
         session:         Any,
         model_id:        str,
         omit_aas:        str = "",
+        bias_aas:        Optional[List[str]] = None,
     ) -> ToolStepResult:
         """Run ProteinMPNN via subprocess and parse the FASTA output."""
         import time
@@ -634,7 +659,7 @@ class ProteinMPNNBridge:
                 result_data = self._run_proteinmpnn(
                     pdb_path, chain_id, fixed_positions,
                     num_sequences, temperature, out_path,
-                    omit_aas=omit_aas,
+                    omit_aas=omit_aas, bias_aas=bias_aas,
                 )
             else:
                 result_data = self._run_ligandmpnn(
@@ -763,6 +788,7 @@ class ProteinMPNNBridge:
         temperature:     float,
         out_path:        Path,
         omit_aas:        str = "",
+        bias_aas:        Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Call protein_mpnn_run.py and parse the FASTA output.
@@ -788,6 +814,16 @@ class ProteinMPNNBridge:
             with open(fixed_json_path, "w") as fh:
                 fh.write(json.dumps(fixed_data) + "\n")
 
+        # Build amino-acid bias JSON (soft preference, e.g. hydrophilic).
+        # ProteinMPNN --bias_AA_jsonl format: a one-line dict {"D": 1.5, ...}.
+        bias_json_path: Optional[str] = None
+        if bias_aas:
+            bias_data = {a.upper(): _BIAS_WEIGHT for a in bias_aas if str(a).strip()}
+            if bias_data:
+                bias_json_path = (out_path / "bias_AA.jsonl").as_posix()
+                with open(bias_json_path, "w") as fh:
+                    fh.write(json.dumps(bias_data) + "\n")
+
         # ProteinMPNN auto-detects weights via rfind("/") which fails on Windows
         # (backslash paths → rfind returns -1 → truncates filename).
         # Supply --path_to_model_weights explicitly, with a trailing slash.
@@ -806,9 +842,11 @@ class ProteinMPNNBridge:
         if fixed_json_path:
             cmd += ["--fixed_positions_jsonl", fixed_json_path]
         if omit_aas:
-            # Global amino-acid exclusion (e.g. "C" for no-cysteines,
-            # "CFILMVWY" for a hydrophilic surface redesign).
+            # Hard global amino-acid exclusion (e.g. "C" so no NEW cysteines).
             cmd += ["--omit_AAs", omit_aas]
+        if bias_json_path:
+            # Soft amino-acid preference (e.g. hydrophilic bias).
+            cmd += ["--bias_AA_jsonl", bias_json_path]
 
         subprocess.run(
             cmd, check=True, capture_output=True,
