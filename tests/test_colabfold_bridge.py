@@ -21,7 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config as _cfg
-from colabfold_bridge import ColabFoldBridge
+from colabfold_bridge import ColabFoldBridge, _format_worker_failure
 from tool_router import ToolRouter
 from session_state import SessionState
 from chimerax_bridge import ChimeraXBridge
@@ -259,6 +259,71 @@ def test_worker_error_payload_surfaced(cache_tmp):
     res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
     assert res["success"] is False
     assert "no rank_001" in res["error"]
+
+
+# ── Failure-path error reporting (the REAL cause, not the benign tail) ──────────
+
+# Realistic colabfold_batch output: the REAL Python traceback is in stdout, while
+# stderr ENDS with a benign TF/oneDNN line (the noise the old single-tail surfaced).
+_REAL_TRACEBACK_STDOUT = (
+    "2026 Query 1/1: bench_1CRN (length 46)\n"
+    "Traceback (most recent call last):\n"
+    '  File ".../colabfold/batch.py", line 1, in run\n'
+    "RuntimeError: THE REAL CAUSE — model params failed to load\n"
+)
+_BENIGN_STDERR = (
+    "some earlier warning\n"
+    "I0000 00:00:1780262789.707871 386 port.cc:153] oneDNN custom operations are on. "
+    "You may see slightly different numerical results ... set TF_ENABLE_ONEDNN_OPTS=0.\n"
+)
+
+
+def test_format_worker_failure_surfaces_real_cause_not_benign_tail():
+    err = _format_worker_failure(
+        "colabfold_batch exited non-zero", 1,
+        _REAL_TRACEBACK_STDOUT, _BENIGN_STDERR,
+    )
+    # The REAL cause (from stdout) must be present...
+    assert "THE REAL CAUSE — model params failed to load" in err
+    assert "RuntimeError" in err
+    # ...with BOTH streams labelled separately (so neither buries the other).
+    assert "--- STDOUT (last 60 lines) ---" in err
+    assert "--- STDERR (last 60 lines) ---" in err
+    assert "exit 1" in err
+    # The benign oneDNN line is still shown (under its STDERR label), but it is no
+    # longer the ONLY thing surfaced.
+    assert "oneDNN" in err and err.strip() != _BENIGN_STDERR.strip()
+
+
+def test_worker_uses_both_stream_labels_not_single_tail():
+    """The standalone worker must mirror the both-stream-labelled failure format
+    and NOT the old single concatenated `log[-3000:]` tail."""
+    s = ColabFoldBridge._build_worker(
+        seq_line="ACDE", jobname="q", out_dir="/tmp/o", fasta_path="/tmp/o/in.fasta",
+        result_path="/tmp/r.json", n_models=5, n_recycle=3,
+        msa_mode="mmseqs2_uniref_env", tmpl_dir="",
+    )
+    assert "STDOUT (last 60 lines)" in s and "STDERR (last 60 lines)" in s
+    assert "log[-3000:]" not in s            # old single-tail truncation gone
+    assert "stdout_tail" in s and "stderr_tail" in s
+
+
+def test_bridge_propagates_full_worker_error_not_300_clip(cache_tmp):
+    """The bridge must surface the full labelled worker error (real cause), not a
+    300-char clip of the benign tail."""
+    big_error = _format_worker_failure(
+        "colabfold_batch exited non-zero", 1,
+        _REAL_TRACEBACK_STDOUT + ("x" * 500), _BENIGN_STDERR,
+    )
+    bridge = ColabFoldBridge()
+    bridge._wsl = _FakeWSL({"success": False, "error": big_error, "oom": False,
+                            "returncode": 1, "stdout_tail": _REAL_TRACEBACK_STDOUT,
+                            "stderr_tail": _BENIGN_STDERR})
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    assert res["success"] is False
+    assert "THE REAL CAUSE" in res["error"]            # real cause propagated
+    assert len(res["error"]) > 300                     # not the old 300-char clip
+    assert res.get("stderr_tail") and res.get("returncode") == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════

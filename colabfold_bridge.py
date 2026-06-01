@@ -67,6 +67,32 @@ def _pprint(msg: str) -> None:
         print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
+def _format_worker_failure(
+    reason:     str,
+    returncode: Optional[int],
+    stdout:     str,
+    stderr:     str,
+    lines:      int = 60,
+) -> str:
+    """
+    Format a colabfold_batch failure surfacing the REAL cause.
+
+    Shows the last *lines* of stdout AND stderr **separately labelled**, so a real
+    Python traceback (in either stream) is never buried behind a benign TF/oneDNN
+    stderr line — the old single concatenated `log[-3000:]` tail's failure mode.
+
+    The standalone WSL worker (which cannot import this module) mirrors this exact
+    structure inline in ``_build_worker``; keep the two in sync.
+    """
+    def _tail(s: str) -> str:
+        return "\n".join((s or "").splitlines()[-lines:])
+    return (
+        f"{reason} (colabfold_batch exit {returncode}).\n"
+        f"--- STDOUT (last {lines} lines) ---\n{_tail(stdout)}\n"
+        f"--- STDERR (last {lines} lines) ---\n{_tail(stderr)}"
+    )
+
+
 # ── Module constants ────────────────────────────────────────────────────────────
 
 _VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
@@ -276,10 +302,17 @@ class ColabFoldBridge:
             return self._error(f"could not parse worker output ({exc})")
 
         if "error" in data and not data.get("success"):
+            # Surface the full (labelled stdout+stderr tails) worker error — the
+            # real traceback, not a 300-char clip of the benign noise.
             return self._error(
-                f"ColabFold worker error: {str(data['error'])[:300]}",
+                f"ColabFold worker error: {str(data['error'])[:4000]}",
                 oom_risk=bool(data.get("oom")),
-                extra={"elapsed_s": elapsed_s, "eta_s": eta_s},
+                extra={
+                    "elapsed_s": elapsed_s, "eta_s": eta_s,
+                    "returncode": data.get("returncode"),
+                    "stdout_tail": data.get("stdout_tail"),
+                    "stderr_tail": data.get("stderr_tail"),
+                },
             )
 
         # ── Copy ranked PDB + PNGs back to the Windows cache dir ────────────────────
@@ -405,18 +438,36 @@ try:
     print("[colabfold] " + " ".join(cmd), flush=True)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    log = (proc.stdout or "") + "\\n" + (proc.stderr or "")
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    log = stdout + "\\n" + stderr
     if "Running on GPU" in log:
         print("[colabfold] GPU confirmed", flush=True)
     elif "Running on CPU" in log:
         print("[colabfold] WARNING: running on CPU", flush=True)
 
-    if proc.returncode != 0:
+    def _tail(s, n):
+        return "\\n".join(s.splitlines()[-n:])
+
+    def _fail(reason):
+        # Surface the REAL error: BOTH streams' tails, separately labelled, so a
+        # real traceback isn't buried behind a benign TF/oneDNN stderr line (which
+        # the old single concatenated tail did). colabfold_batch writes its Python
+        # traceback to one of the two streams; show enough of each to capture it.
         low = log.lower()
         oom = any(k in low for k in
                   ("out of memory", "resource_exhausted", "cuda_error_out_of_memory"))
-        _write({{"success": False, "error": log[-3000:], "oom": oom}})
+        err = (reason + " (colabfold_batch exit " + str(proc.returncode) + ").\\n"
+               + "--- STDOUT (last 60 lines) ---\\n" + _tail(stdout, 60) + "\\n"
+               + "--- STDERR (last 60 lines) ---\\n" + _tail(stderr, 60))
+        _write({{"success": False, "error": err, "oom": oom,
+                 "returncode": proc.returncode,
+                 "stdout_tail": _tail(stdout, 120),
+                 "stderr_tail": _tail(stderr, 120)}})
         sys.exit(0)
+
+    if proc.returncode != 0:
+        _fail("colabfold_batch exited non-zero")
 
     # rank_001 = top-ranked model. Prefer relaxed if present, else unrelaxed.
     pdbs = (sorted(glob.glob(os.path.join(out_dir, "*_relaxed_rank_001_*.pdb")))
@@ -424,10 +475,7 @@ try:
             or sorted(glob.glob(os.path.join(out_dir, "*_rank_001_*.pdb"))))
     scores = sorted(glob.glob(os.path.join(out_dir, "*_scores_rank_001_*.json")))
     if not pdbs or not scores:
-        _write({{"success": False,
-                 "error": "no rank_001 outputs found in " + out_dir + "; log:\\n" + log[-1500:],
-                 "oom": False}})
-        sys.exit(0)
+        _fail("no rank_001 outputs found in " + out_dir)
 
     with open(scores[0]) as fh:
         sc = json.load(fh)
