@@ -473,6 +473,216 @@ def test_generate_summary_fixed_positions() -> None:
             "summary mentions fixed positions")
 
 
+# -- H. Constraint passing (the design actually honours the request) -----------
+#
+# Regression for the bug where the bridge ran an UNCONSTRAINED whole-chain
+# redesign: --omit_AAs was never passed, and "design only the interface" had no
+# mechanism, so parsed NL constraints never reached protein_mpnn_run.py.
+
+import json as _json
+from proteinmpnn_bridge import (
+    build_omit_aas,
+    compute_interface_positions,
+    _chain_positions_and_cys,
+)
+
+
+def _atom(serial: int, name: str, resn: str, chain: str,
+          resi: int, x: float, y: float, z: float) -> str:
+    """One PDB ATOM line in the lenient format BioPython parses fine."""
+    return ("ATOM  %5d  %-3s %3s %s%4d    %8.3f%8.3f%8.3f  1.00 10.00\n"
+            % (serial, name, resn, chain, resi, x, y, z))
+
+
+def _stub_bridge(tmp: Path) -> ProteinMPNNBridge:
+    """A bridge wired to build commands WITHOUT a real ProteinMPNN clone."""
+    b = ProteinMPNNBridge()
+    b._available = True
+    b._backend   = "proteinmpnn"
+    b._dir       = tmp
+    b._script    = tmp / "protein_mpnn_run.py"
+    return b
+
+
+def _capture(b: ProteinMPNNBridge, pdb_path: Path,
+             extra: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run analyze() with subprocess mocked; capture the built command line and
+    the fixed-positions JSONL content (the temp file is deleted before
+    analyze() returns, so it must be read inside the fake subprocess).
+    """
+    cap: Dict[str, Any] = {"cmd": [], "fixed": None}
+    fasta = ">WT\nAAAAAA\n>score=-1.0, sample=1\nAAAAAC\n"
+
+    def fake_run(cmd, **kw):
+        cap["cmd"] = list(cmd)
+        if "--fixed_positions_jsonl" in cmd:
+            fp = cmd[cmd.index("--fixed_positions_jsonl") + 1]
+            cap["fixed"] = _json.loads(Path(fp).read_text())
+        out = Path(cmd[cmd.index("--out_folder") + 1])
+        seqs = out / "seqs"
+        seqs.mkdir(parents=True, exist_ok=True)
+        (seqs / f"{pdb_path.stem}.fa").write_text(fasta, encoding="utf-8")
+
+    inp: Dict[str, Any] = {
+        "pdb_path": str(pdb_path), "chain_id": "A",
+        "num_sequences": 1, "temperature": 0.1, "model_id": "1",
+    }
+    inp.update(extra)
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch.object(_pmpnn_mod, "write_designs_fasta",
+                      MagicMock(return_value=Path("x.fa"))):
+        cap["result"] = b.analyze(inp, session=None)
+    return cap
+
+
+def _omit_value(cmd: List[str]) -> Optional[str]:
+    return cmd[cmd.index("--omit_AAs") + 1] if "--omit_AAs" in cmd else None
+
+
+def test_build_omit_aas_helper() -> None:
+    print("\n=== H. Constraint passing ===")
+    _assert(build_omit_aas(no_cysteines=True) == "C",
+            "no_cysteines -> 'C'", f"got {build_omit_aas(no_cysteines=True)!r}")
+    hydro = build_omit_aas(hydrophilic=True)
+    _assert(set(hydro) == set("CFILMVWY"),
+            "hydrophilic -> hydrophobics + C", f"got {hydro!r}")
+    _assert(build_omit_aas() == "", "no constraints -> empty omit string")
+
+
+def test_interface_request_restricts_designable() -> None:
+    """An interface request designs ONLY the interface (everything else fixed)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "iface.pdb"
+        pdb.write_text(
+            # Chain A residues 1/2/3; only A:2 sits near chain B (3 Å) → interface
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 20)
+            + _atom(2, "CA", "ALA", "A", 2, 0, 0, 0)
+            + _atom(3, "CA", "ALA", "A", 3, 0, 0, 40)
+            + _atom(4, "CA", "ALA", "B", 1, 3, 0, 0)
+            + "TER\n",
+            encoding="utf-8",
+        )
+        # Sanity: the interface helper itself isolates position 2.
+        iface = compute_interface_positions(str(pdb), "A", cutoff=4.5)
+        _assert(iface == [2], "interface helper finds only A:2", f"got {iface}")
+
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {"interface_design": True})
+
+    _assert(cap["result"].success, "interface design succeeded",
+            f"error: {cap['result'].error}")
+    _assert("--fixed_positions_jsonl" in cap["cmd"],
+            "fixed-positions JSONL passed for interface design")
+    fixed_a = (cap["fixed"] or {}).get(pdb.stem, {}).get("A", [])
+    _assert(sorted(fixed_a) == [1, 3],
+            "everything EXCEPT the interface (A:2) is fixed",
+            f"got fixed={fixed_a}")
+    _assert(2 not in fixed_a, "interface residue A:2 stays designable")
+
+
+def test_no_cysteines_passes_omit_C() -> None:
+    """'no cysteines' puts --omit_AAs C on the command line."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "nc.pdb"
+        pdb.write_text(
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 0)
+            + _atom(2, "CA", "ALA", "A", 2, 3, 0, 0) + "TER\n",
+            encoding="utf-8",
+        )
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {"no_cysteines": True})
+
+    _assert(cap["result"].success, "no-cysteines run succeeded",
+            f"error: {cap['result'].error}")
+    _assert(_omit_value(cap["cmd"]) == "C",
+            "--omit_AAs C present", f"got {_omit_value(cap['cmd'])!r}")
+
+
+def test_hydrophilic_passes_omit_set() -> None:
+    """'hydrophilic' omits the hydrophobics (and C)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "hp.pdb"
+        pdb.write_text(
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 0)
+            + _atom(2, "CA", "ALA", "A", 2, 3, 0, 0) + "TER\n",
+            encoding="utf-8",
+        )
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {"hydrophilic": True})
+
+    val = _omit_value(cap["cmd"])
+    _assert(val is not None and set("FILMVWYC").issubset(set(val)),
+            "--omit_AAs carries the hydrophilic omit set", f"got {val!r}")
+
+
+def test_restricted_design_with_no_target_errors() -> None:
+    """Interface request with no partner chain ERRORS — no whole-chain fallback."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "single.pdb"
+        pdb.write_text(
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 0)
+            + _atom(2, "CA", "ALA", "A", 2, 3, 0, 0) + "TER\n",
+            encoding="utf-8",
+        )
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {"interface_design": True})
+
+    _assert(not cap["result"].success,
+            "single-chain interface request fails instead of designing all")
+    _assert("designable" in (cap["result"].error or "").lower()
+            or "whole chain" in (cap["result"].error or "").lower(),
+            "error explains the empty designable set",
+            f"error: {cap['result'].error!r}")
+    _assert(cap["cmd"] == [], "subprocess never invoked on the error path")
+
+
+def test_native_cysteines_preserved() -> None:
+    """A whole-chain redesign holds native cysteines fixed (disulfides safe)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "cys.pdb"
+        pdb.write_text(
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 0)
+            + _atom(2, "CA", "CYS", "A", 2, 3, 0, 0)
+            + _atom(3, "CA", "ALA", "A", 3, 6, 0, 0) + "TER\n",
+            encoding="utf-8",
+        )
+        # Helper agrees there is a native Cys at position 2.
+        _, cys = _chain_positions_and_cys(str(pdb), "A")
+        _assert(cys == [2], "native Cys detected at A:2", f"got {cys}")
+
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {})   # plain whole-chain redesign, no restriction
+
+    _assert(cap["result"].success, "whole-chain redesign succeeded")
+    fixed_a = (cap["fixed"] or {}).get(pdb.stem, {}).get("A", [])
+    _assert(fixed_a == [2], "native Cys A:2 held fixed", f"got fixed={fixed_a}")
+
+
+def test_unconstrained_request_stays_vanilla() -> None:
+    """No constraints + no native Cys → no omit list, no fixed positions."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        pdb = tmp / "plain.pdb"
+        pdb.write_text(
+            _atom(1, "CA", "ALA", "A", 1, 0, 0, 0)
+            + _atom(2, "CA", "VAL", "A", 2, 3, 0, 0) + "TER\n",
+            encoding="utf-8",
+        )
+        b = _stub_bridge(tmp)
+        cap = _capture(b, pdb, {})
+
+    _assert(cap["result"].success, "vanilla redesign succeeded")
+    _assert("--omit_AAs" not in cap["cmd"], "no --omit_AAs when nothing excluded")
+    _assert("--fixed_positions_jsonl" not in cap["cmd"],
+            "no fixed positions when nothing is restricted or preserved")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -519,6 +729,15 @@ def main() -> int:
     test_generate_summary_mentions_next_steps()
     test_generate_summary_empty_sequences()
     test_generate_summary_fixed_positions()
+
+    # H. Constraint passing
+    test_build_omit_aas_helper()
+    test_interface_request_restricts_designable()
+    test_no_cysteines_passes_omit_C()
+    test_hydrophilic_passes_omit_set()
+    test_restricted_design_with_no_target_errors()
+    test_native_cysteines_preserved()
+    test_unconstrained_request_stays_vanilla()
 
     print()
     print("=" * 60)

@@ -1234,7 +1234,7 @@ class ToolRouter:
                         })
                 return self._run_esmfold(inputs)
             if tool == "proteinmpnn":
-                return self._run_proteinmpnn(inputs)
+                return self._run_proteinmpnn(inputs, user_input=user_input)
             if tool == "mpnn_esmfold":
                 return self._run_mpnn_esmfold(inputs)
             if tool == "rfdiffusion":
@@ -2082,8 +2082,37 @@ class ToolRouter:
                 elapsed_ms=elapsed_ms,
             )
 
-    def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
+    @staticmethod
+    def _parse_mpnn_constraints(user_input: str) -> Dict[str, Any]:
+        """
+        Parse design constraints from the natural-language request so they
+        actually reach ProteinMPNN (interface-only redesign, AA exclusions).
+
+        Returns only the keys it detects, so explicit tool_inputs win on merge.
+        """
+        text = (user_input or "").lower()
+        out: Dict[str, Any] = {}
+        if any(k in text for k in ("interface", "dimer interface", "binding interface")):
+            out["interface_design"] = True
+        if any(k in text for k in (
+            "no cystein", "no cys", "without cystein", "avoid cystein",
+            "exclude cystein", "free of cystein",
+        )):
+            out["no_cysteines"] = True
+        if any(k in text for k in (
+            "hydrophilic", "more soluble", "increase solubility",
+            "improve solubility", "more polar",
+        )):
+            out["hydrophilic"] = True
+        return out
+
+    def _run_proteinmpnn(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
         """Run ProteinMPNN fixed-backbone sequence redesign."""
+        user_input = user_input or inputs.get("_user_input", "")
         bridge   = self._get_proteinmpnn_bridge()
         model_id = inputs.get("model_id") or self._first_model_id()
         chain_id = inputs.get("chain_id") or inputs.get("chain", "A")
@@ -2101,10 +2130,17 @@ class ToolRouter:
                 ),
             )
 
-        # ── Fixed positions: explicit > session interface residues ─────────────
+        # ── Parsed NL constraints (explicit tool_inputs override) ──────────────
+        parsed = self._parse_mpnn_constraints(user_input)
+        interface_design = bool(inputs.get("interface_design", parsed.get("interface_design", False)))
+        design_positions = inputs.get("design_positions")
+
+        # ── Legacy "protect cached interface residues" path ────────────────────
+        # Only when NOT doing a restricted (interface / explicit) design — those
+        # paths fix the complement themselves, so reusing protected residues here
+        # would double-fix and zero out the designable set.
         fixed_positions: List[int] = inputs.get("fixed_positions") or []
-        if not fixed_positions:
-            # Use interface / active-site residues cached by the assembly analyser
+        if not fixed_positions and not interface_design and not design_positions:
             interface_data = self.session.get_interface_residues(model_id)
             if interface_data:
                 fixed_positions = (
@@ -2113,12 +2149,19 @@ class ToolRouter:
                 )
 
         full_inputs: Dict[str, Any] = {
-            "model_id":        model_id,
-            "pdb_path":        pdb_path,
-            "chain_id":        chain_id,
-            "fixed_positions": fixed_positions,
-            "num_sequences":   int(inputs.get("num_sequences", 8)),
-            "temperature":     float(inputs.get("temperature", 0.1)),
+            "model_id":         model_id,
+            "pdb_path":         pdb_path,
+            "chain_id":         chain_id,
+            "fixed_positions":  fixed_positions,
+            "num_sequences":    int(inputs.get("num_sequences", 8)),
+            "temperature":      float(inputs.get("temperature", 0.1)),
+            # Design-scope + AA constraints (explicit > parsed-from-NL)
+            "interface_design": interface_design,
+            "design_positions": design_positions,
+            "partner_chain":    inputs.get("partner_chain"),
+            "no_cysteines":     bool(inputs.get("no_cysteines", parsed.get("no_cysteines", False))),
+            "hydrophilic":      bool(inputs.get("hydrophilic", parsed.get("hydrophilic", False))),
+            "omit_aas":         inputs.get("omit_aas", ""),
         }
         return bridge.analyze(full_inputs, session=self.session)
 

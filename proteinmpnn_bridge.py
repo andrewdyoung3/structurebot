@@ -142,6 +142,118 @@ def _sequence_recovery(wt: str, designed: str) -> float:
     return round(matches / max(len(wt), len(designed)), 4)
 
 
+# ── Design-constraint resolution ────────────────────────────────────────────────
+# ProteinMPNN designs every position by default.  To honour parsed NL constraints
+# ("redesign the interface residues", "no cysteines", "hydrophilic") we must turn
+# them into concrete subprocess flags:
+#   • design ONLY a subset  → fix every OTHER position (--fixed_positions_jsonl)
+#   • exclude amino acids    → --omit_AAs <letters>  (global omission)
+# These run before inference; if a restricted design resolves to nothing we raise
+# rather than silently redesign the whole chain.
+
+# Hydrophobic residues to omit when the user asks for a hydrophilic surface.
+_HYDROPHOBIC_AAS = "FILMVWY"
+
+
+def build_omit_aas(
+    no_cysteines: bool = False,
+    hydrophilic:  bool = False,
+    extra:        str  = "",
+) -> str:
+    """
+    Assemble the --omit_AAs letter string from parsed constraints.
+
+      no_cysteines → omit C
+      hydrophilic  → omit the hydrophobics (F I L M V W Y) AND C
+      extra        → any explicitly-requested letters (case-insensitive)
+
+    Returns a sorted, de-duplicated upper-case string (e.g. "C", "CFILMVWY"),
+    or "" when nothing is excluded.
+    """
+    omit = {c for c in (extra or "").upper() if c.isalpha()}
+    if no_cysteines:
+        omit.add("C")
+    if hydrophilic:
+        omit.update(_HYDROPHOBIC_AAS)
+        omit.add("C")
+    return "".join(sorted(omit))
+
+
+def _chain_positions_and_cys(pdb_path: str, chain: str) -> Tuple[List[int], List[int]]:
+    """
+    Return (all_residue_numbers, native_cysteine_numbers) for *chain*.
+
+    Robust to parse failures (returns empty lists) so callers degrade to the
+    legacy whole-chain behaviour rather than crashing.
+    """
+    try:
+        from Bio.PDB import PDBParser              # type: ignore
+        from Bio.PDB.Polypeptide import is_aa      # type: ignore
+        structure = PDBParser(QUIET=True).get_structure("s", pdb_path)
+        model = next(iter(structure))
+        if chain not in {c.id for c in model}:
+            return [], []
+        positions: List[int] = []
+        cys:       List[int] = []
+        for res in model[chain]:
+            if not is_aa(res, standard=True):
+                continue
+            num = int(res.id[1])
+            positions.append(num)
+            if res.get_resname() == "CYS":
+                cys.append(num)
+        return sorted(positions), sorted(cys)
+    except Exception:
+        return [], []
+
+
+def compute_interface_positions(
+    pdb_path:       str,
+    design_chain:   str,
+    partner_chains: Optional[Any] = None,
+    cutoff:         float = 4.5,
+) -> List[int]:
+    """
+    Compute interface residues on *design_chain*: those with any atom within
+    *cutoff* Å of any atom on a partner chain.  Computed directly from
+    coordinates (BioPython) — independent of any ChimeraX selection.
+
+    *partner_chains* may be a chain id, an iterable of ids, or None (= every
+    other chain in the first model).  Returns sorted residue numbers (empty on
+    any failure or when there is no partner).
+    """
+    try:
+        from Bio.PDB import PDBParser, NeighborSearch  # type: ignore
+        from Bio.PDB.Polypeptide import is_aa          # type: ignore
+        structure = PDBParser(QUIET=True).get_structure("s", pdb_path)
+        model = next(iter(structure))
+        chain_ids = {c.id for c in model}
+        if design_chain not in chain_ids:
+            return []
+        if partner_chains is None:
+            partner_ids = {cid for cid in chain_ids if cid != design_chain}
+        elif isinstance(partner_chains, str):
+            partner_ids = {partner_chains}
+        else:
+            partner_ids = set(partner_chains)
+        partner_ids &= chain_ids
+        partner_atoms = [
+            a for c in model if c.id in partner_ids for a in c.get_atoms()
+        ]
+        if not partner_atoms:
+            return []
+        ns = NeighborSearch(partner_atoms)
+        interface: List[int] = []
+        for res in model[design_chain]:
+            if not is_aa(res, standard=True):
+                continue
+            if any(ns.search(atom.coord, cutoff) for atom in res):
+                interface.append(int(res.id[1]))
+        return sorted(interface)
+    except Exception:
+        return []
+
+
 # ── Persistent design cache (so a redesign is never lost) ───────────────────────
 
 import datetime as _dt
@@ -369,15 +481,28 @@ class ProteinMPNNBridge:
             )
 
         chain_id        = inputs.get("chain_id") or inputs.get("chain", "A")
-        fixed_positions = inputs.get("fixed_positions", [])
         num_sequences   = int(inputs.get("num_sequences", 8))
         temperature     = float(inputs.get("temperature", 0.1))
+        resolved_pdb    = Path(pdb_path).resolve().as_posix()  # absolute + POSIX
+
+        # Turn parsed NL constraints into concrete fixed positions + omit list.
+        # A restricted design that resolves to nothing raises here (no silent
+        # whole-chain fallback).
+        try:
+            fixed_positions, omit_aas = self._resolve_design_constraints(
+                resolved_pdb, chain_id, inputs,
+            )
+        except ValueError as exc:
+            return ToolStepResult(
+                tool="proteinmpnn", success=False, error=str(exc),
+            )
 
         try:
             return self._run_inference(
-                pdb_path        = Path(pdb_path).resolve().as_posix(),  # absolute + POSIX
+                pdb_path        = resolved_pdb,
                 chain_id        = chain_id,
                 fixed_positions = fixed_positions,
+                omit_aas        = omit_aas,
                 num_sequences   = num_sequences,
                 temperature     = temperature,
                 session         = session,
@@ -410,6 +535,81 @@ class ProteinMPNNBridge:
             return f"directory set ({self._dir}) but weights/script not found"
         return "not configured (set PROTEINMPNN_DIR in .env.local)"
 
+    # ── Constraint resolution ──────────────────────────────────────────────────
+    def _resolve_design_constraints(
+        self,
+        pdb_path: str,
+        chain_id: str,
+        inputs:   Dict[str, Any],
+    ) -> Tuple[List[int], str]:
+        """
+        Translate parsed NL constraints into (fixed_positions, omit_aas).
+
+        Designable set (design ONLY these → fix everything else on the chain):
+          • inputs["design_positions"]  — explicit residue numbers, OR
+          • inputs["interface_design"]  — compute the chain/partner interface
+            directly from coordinates (BioPython), OR
+          • neither                     — whole chain is designable (legacy)
+
+        Native structural cysteines are held fixed by default
+        (inputs["preserve_native_cys"], default True) so disulfides are not
+        designed away unless explicitly requested.
+
+        AA exclusions (inputs no_cysteines / hydrophilic / omit_aas) become the
+        --omit_AAs letter string.
+
+        Raises ValueError if a restricted design was requested but no designable
+        position remains — we never silently fall back to a whole-chain redesign.
+        """
+        legacy_fixed = [int(p) for p in (inputs.get("fixed_positions") or [])]
+        omit_aas = build_omit_aas(
+            no_cysteines=bool(inputs.get("no_cysteines")),
+            hydrophilic=bool(inputs.get("hydrophilic")),
+            extra=str(inputs.get("omit_aas", "")),
+        )
+
+        design_positions = inputs.get("design_positions")
+        interface_design = bool(inputs.get("interface_design"))
+        preserve_cys     = bool(inputs.get("preserve_native_cys", True))
+
+        all_positions, native_cys = _chain_positions_and_cys(pdb_path, chain_id)
+        pos_set = set(all_positions)
+
+        designable: Optional[List[int]] = None  # None == whole chain
+        source = ""
+        if design_positions:
+            requested = {int(p) for p in design_positions}
+            designable = sorted(requested & pos_set) if pos_set else sorted(requested)
+            source = "selected"
+        elif interface_design:
+            designable = compute_interface_positions(
+                pdb_path, chain_id,
+                partner_chains=inputs.get("partner_chain"),
+                cutoff=float(inputs.get("interface_cutoff", 4.5)),
+            )
+            source = "interface"
+
+        # Never design native cysteines away unless explicitly asked.
+        if preserve_cys and native_cys and designable is not None:
+            designable = [p for p in designable if p not in native_cys]
+
+        if (design_positions or interface_design) and not designable:
+            raise ValueError(
+                f"No designable {source} positions found on chain {chain_id} "
+                f"(after excluding native cysteines). Refusing to silently "
+                f"redesign the whole chain — check the chain id, partner chain, "
+                f"or selection, or relax the constraint."
+            )
+
+        fixed = set(legacy_fixed)
+        if designable is not None:
+            # Design ONLY the designable set → fix every other chain position.
+            fixed |= (pos_set - set(designable))
+        if preserve_cys:
+            fixed |= set(native_cys)
+
+        return sorted(fixed), omit_aas
+
     # ── Internal inference ─────────────────────────────────────────────────────
 
     def _run_inference(
@@ -421,6 +621,7 @@ class ProteinMPNNBridge:
         temperature:     float,
         session:         Any,
         model_id:        str,
+        omit_aas:        str = "",
     ) -> ToolStepResult:
         """Run ProteinMPNN via subprocess and parse the FASTA output."""
         import time
@@ -433,11 +634,13 @@ class ProteinMPNNBridge:
                 result_data = self._run_proteinmpnn(
                     pdb_path, chain_id, fixed_positions,
                     num_sequences, temperature, out_path,
+                    omit_aas=omit_aas,
                 )
             else:
                 result_data = self._run_ligandmpnn(
                     pdb_path, chain_id, fixed_positions,
                     num_sequences, temperature, out_path,
+                    omit_aas=omit_aas,
                 )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -559,6 +762,7 @@ class ProteinMPNNBridge:
         num_sequences:   int,
         temperature:     float,
         out_path:        Path,
+        omit_aas:        str = "",
     ) -> Dict[str, Any]:
         """
         Call protein_mpnn_run.py and parse the FASTA output.
@@ -601,6 +805,10 @@ class ProteinMPNNBridge:
         ]
         if fixed_json_path:
             cmd += ["--fixed_positions_jsonl", fixed_json_path]
+        if omit_aas:
+            # Global amino-acid exclusion (e.g. "C" for no-cysteines,
+            # "CFILMVWY" for a hydrophilic surface redesign).
+            cmd += ["--omit_AAs", omit_aas]
 
         subprocess.run(
             cmd, check=True, capture_output=True,
@@ -623,6 +831,7 @@ class ProteinMPNNBridge:
         num_sequences:   int,
         temperature:     float,
         out_path:        Path,
+        omit_aas:        str = "",
     ) -> Dict[str, Any]:
         """
         Call LigandMPNN run.py and parse the FASTA output.
@@ -638,6 +847,8 @@ class ProteinMPNNBridge:
             "--temperature", str(temperature),
             "--chains_to_design", chain_id,
         ]
+        if omit_aas:
+            cmd += ["--omit_AA", omit_aas]   # LigandMPNN flag (global exclusion)
 
         subprocess.run(
             cmd, check=True, capture_output=True,
