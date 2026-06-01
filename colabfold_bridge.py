@@ -423,6 +423,17 @@ try:
         os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "1"
         print("[colabfold] JAX compile cache: " + jax_cache, flush=True)
 
+    # XLA memory allocator — required on the memory-capped WSL2 env. The default
+    # BFC GPU client preallocates a giant pinned-HOST staging pool (~4x VRAM, ~48
+    # GiB here) that exceeds WSL2's ~15 GiB cap and SIGSEGVs for any fold beyond
+    # the 1-model/1-recycle quick preset. The "platform" allocator (+ no
+    # preallocate) allocates on demand instead, so a default 5-model/3-recycle
+    # fold runs in ~2-3 GiB host RSS on-GPU. Set via env (the child inherits it),
+    # not a settings change. See PROJECT_CONTEXT.md §8.
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+    print("[colabfold] XLA allocator: platform (no preallocate) — WSL2 mem cap", flush=True)
+
     with open(fasta_path, "w") as fh:
         fh.write(">" + jobname + "\\n" + seq_line + "\\n")
 

@@ -295,6 +295,21 @@ def test_format_worker_failure_surfaces_real_cause_not_benign_tail():
     assert "oneDNN" in err and err.strip() != _BENIGN_STDERR.strip()
 
 
+def test_worker_sets_xla_platform_allocator():
+    """The worker must set the on-demand XLA allocator env vars so a default
+    5-model fold doesn't preallocate the giant pinned-host pool that SIGSEGVs on
+    the memory-capped WSL2 env (PROJECT_CONTEXT §8)."""
+    s = ColabFoldBridge._build_worker(
+        seq_line="ACDE", jobname="q", out_dir="/tmp/o", fasta_path="/tmp/o/in.fasta",
+        result_path="/tmp/r.json", n_models=5, n_recycle=3,
+        msa_mode="mmseqs2_uniref_env", tmpl_dir="",
+    )
+    assert 'os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")' in s
+    assert 'os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")' in s
+    # set BEFORE colabfold_batch is launched so the child inherits them
+    assert s.index("XLA_PYTHON_CLIENT_ALLOCATOR") < s.index("subprocess.run")
+
+
 def test_worker_uses_both_stream_labels_not_single_tail():
     """The standalone worker must mirror the both-stream-labelled failure format
     and NOT the old single concatenated `log[-3000:]` tail."""
