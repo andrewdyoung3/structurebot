@@ -227,3 +227,62 @@ def left_click_select_command(enable: bool) -> str:
     enable=False → `mousemode left rotate` (restore the default).
     """
     return "mousemode left select" if enable else "mousemode left rotate"
+
+
+# ── Deterministic layout + presentation ─────────────────────────────────────────
+# Config-driven command lists (config.CHIMERAX_*), applied by StructureBot — NOT
+# LLM-generated, NOT the built-in `preset`.  apply_* run them error-first so a
+# single failing command logs and the rest continue (an open is never aborted).
+
+def lean_layout_commands(enabled: Optional[bool] = None) -> List[str]:
+    """The once-per-session lean-window-layout commands (or [] when disabled)."""
+    import config
+    if enabled is None:
+        enabled = getattr(config, "CHIMERAX_LEAN_LAYOUT", True)
+    return list(config.CHIMERAX_LEAN_LAYOUT_COMMANDS) if enabled else []
+
+
+def default_presentation_commands(enabled: Optional[bool] = None) -> List[str]:
+    """The per-open default-presentation commands (or [] when disabled)."""
+    import config
+    if enabled is None:
+        enabled = getattr(config, "CHIMERAX_DEFAULT_PRESENTATION", True)
+    return list(config.CHIMERAX_DEFAULT_PRESENTATION_COMMANDS) if enabled else []
+
+
+def _run_error_first(run_command, commands: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Run *commands* in order via *run_command* (a callable cmd -> dict-or-anything).
+    A command that raises OR returns a dict with a truthy ``error`` is recorded as
+    failed and execution CONTINUES.  Returns (attempted, failed).
+    """
+    attempted: List[str] = []
+    failed:    List[str] = []
+    for c in commands:
+        attempted.append(c)
+        try:
+            r = run_command(c)
+            if isinstance(r, dict) and r.get("error"):
+                failed.append(c)
+        except Exception:
+            failed.append(c)
+    return attempted, failed
+
+
+def apply_lean_layout(
+    run_command, enabled: Optional[bool] = None,
+) -> Tuple[List[str], List[str]]:
+    """Apply the lean window layout error-first.  Returns (attempted, failed).
+
+    The once-per-session guard lives in the caller (e.g. the bridge), so this can
+    be unit-tested directly; pass *enabled* to override the config switch.
+    """
+    return _run_error_first(run_command, lean_layout_commands(enabled))
+
+
+def apply_default_presentation(
+    run_command, enabled: Optional[bool] = None,
+) -> Tuple[List[str], List[str]]:
+    """Apply the per-open default presentation error-first.  Returns
+    (attempted, failed)."""
+    return _run_error_first(run_command, default_presentation_commands(enabled))

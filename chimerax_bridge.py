@@ -100,6 +100,8 @@ class ChimeraXBridge:
         self.run_url: str = f"{self.base_url}/run"
         self._process: Optional[subprocess.Popen] = None
         self._command_queue: queue.Queue = queue.Queue()
+        # Once-per-session guard for the lean window layout (Log/CLI/Toolbar hidden).
+        self._lean_layout_applied: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -398,49 +400,73 @@ class ChimeraXBridge:
             results.append({"command": cmd, "result": result})
             if result.get("error"):
                 break  # halt on first failure; let caller handle retry
-            # Auto-open the Sequence Viewer for newly opened structures so loaded
-            # PDBs show their sequence by default (config-gated). Fire-and-forget:
-            # it does NOT add to `results`, so the one-entry-per-command contract
-            # and the on-first-error halt above are both preserved.
-            self._maybe_show_sequence_on_open(cmd, result)
+            # Deterministic, config-driven post-open hooks. All fire-and-forget:
+            # they do NOT add to `results`, so the one-entry-per-command contract
+            # and the on-first-error halt above are both preserved. Order matters:
+            # default presentation runs AFTER load and BEFORE any later analysis
+            # colouring (which arrives in a separate request and overrides the
+            # by-chain baseline); then the once-per-session lean layout; then the
+            # Sequence Viewer is opened + associated.
+            model_id = self._opened_model_id(cmd, result)
+            if model_id is not None:
+                self._maybe_apply_presentation_on_open()
+                self._maybe_apply_lean_layout()
+                self._maybe_show_sequence_on_open(model_id)
         return results
 
-    # ── Sequence-on-open ──────────────────────────────────────────────────────
+    # ── Post-open hooks ────────────────────────────────────────────────────────
 
-    def _maybe_show_sequence_on_open(self, command: str, result: dict) -> None:
+    @staticmethod
+    def _opened_model_id(command: str, result: dict) -> Optional[str]:
         """
-        After a successful structure ``open``, open the ChimeraX Sequence Viewer
-        for the new model so its sequence is shown by default.
+        Return the model id (digits, as a string) if *command* was a successful
+        structure ``open`` whose response named a ``#N`` model — else None. Skips
+        session restores and image/data files. Shared by all post-open hooks.
+        """
+        low = command.strip().lower()
+        if not low.startswith("open "):
+            return None
+        if "session" in low or low.endswith((".cxs", ".png", ".jpg", ".jpeg")):
+            return None
+        value = result.get("value")
+        if not isinstance(value, str):
+            return None
+        m = re.search(r"#(\d+)", value)
+        return m.group(1) if m else None
 
-        Gated by config.CHIMERAX_SHOW_SEQUENCE_ON_OPEN (default True). Best-effort:
-        only fires when the opened model id can be parsed from the open response
-        (``#N``); never raises and never affects the run_commands result list.
-        Skips session opens and image/data files.
-        """
+    def _maybe_show_sequence_on_open(self, model_id: str) -> None:
+        """Open + associate the Sequence Viewer for the new model (config-gated by
+        CHIMERAX_SHOW_SEQUENCE_ON_OPEN). Best-effort; never disrupts the batch."""
         try:
             import config as _cfg
             if not getattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", True):
                 return
-        except Exception:
-            return
-
-        low = command.strip().lower()
-        if not low.startswith("open "):
-            return
-        if "session" in low or low.endswith((".cxs", ".png", ".jpg", ".jpeg")):
-            return
-
-        # Parse the opened model id from the response (e.g. "...#1, ... model(s)").
-        value = result.get("value")
-        if not isinstance(value, str):
-            return
-        m = re.search(r"#(\d+)", value)
-        if not m:
-            return
-        try:
-            self.run_command(f"sequence chain #{m.group(1)}")
+            from sequence_viewer import ensure_sequence_viewer_commands
+            for c in ensure_sequence_viewer_commands(model_id):
+                self.run_command(c)
         except Exception:
             pass  # sequence viewer is non-essential; never disrupt the batch
+
+    def _maybe_apply_presentation_on_open(self) -> None:
+        """Apply the deterministic default presentation (config-gated) right after
+        a structure loads, before any analysis colouring. Error-first."""
+        try:
+            from sequence_viewer import apply_default_presentation
+            apply_default_presentation(self.run_command)
+        except Exception:
+            pass
+
+    def _maybe_apply_lean_layout(self) -> None:
+        """Apply the lean window layout ONCE per ChimeraX session (config-gated).
+        The guard is set before running so a partial failure never causes a retry."""
+        if self._lean_layout_applied:
+            return
+        self._lean_layout_applied = True
+        try:
+            from sequence_viewer import apply_lean_layout
+            apply_lean_layout(self.run_command)
+        except Exception:
+            pass
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 

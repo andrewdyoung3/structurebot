@@ -25,6 +25,10 @@ from sequence_viewer import (
     build_scf_runscript,
     ensure_sequence_viewer_commands,
     left_click_select_command,
+    lean_layout_commands,
+    default_presentation_commands,
+    apply_lean_layout,
+    apply_default_presentation,
     _clamp8,
 )
 
@@ -185,6 +189,104 @@ def test_camsol_emits_sequence_viewer_viz(monkeypatch) -> None:
                 "wrote a non-empty .scf", f"got {scfs}")
 
 
+# -- E. Lean layout + default presentation -------------------------------------
+
+class _RecordingRunner:
+    """Records commands; optionally fails (raise or error-dict) on one command."""
+    def __init__(self, fail_on=None, mode="raise"):
+        self.calls = []
+        self.fail_on = fail_on
+        self.mode = mode
+
+    def __call__(self, cmd, timeout=30):
+        self.calls.append(cmd)
+        if cmd == self.fail_on:
+            if self.mode == "raise":
+                raise RuntimeError("boom")
+            return {"value": None, "error": "nope"}
+        return {"value": "", "error": None}
+
+
+def test_layout_and_presentation_command_lists() -> None:
+    print("\n=== E. layout + presentation ===")
+    import config as _cfg
+    _assert(lean_layout_commands() == list(_cfg.CHIMERAX_LEAN_LAYOUT_COMMANDS),
+            "lean_layout_commands == config list, in order")
+    _assert(default_presentation_commands() == list(_cfg.CHIMERAX_DEFAULT_PRESENTATION_COMMANDS),
+            "default_presentation_commands == config list, in order")
+    _assert(lean_layout_commands()[0] == "tool hide Log", "layout starts with tool hide Log")
+    _assert(default_presentation_commands()[-1] == "view",
+            "presentation ends with view")
+
+
+def test_apply_runs_all_in_order() -> None:
+    r = _RecordingRunner()
+    attempted, failed = apply_default_presentation(r)
+    _assert(r.calls == default_presentation_commands() and failed == [],
+            "apply_default_presentation runs every command in order, no failures",
+            f"got {r.calls}")
+    r2 = _RecordingRunner()
+    apply_lean_layout(r2)
+    _assert(r2.calls == lean_layout_commands(), "apply_lean_layout runs layout in order")
+
+
+def test_disable_override_paths() -> None:
+    _assert(lean_layout_commands(enabled=False) == [], "layout disabled -> []")
+    _assert(default_presentation_commands(enabled=False) == [],
+            "presentation disabled -> []")
+    r = _RecordingRunner()
+    apply_default_presentation(r, enabled=False)
+    apply_lean_layout(r, enabled=False)
+    _assert(r.calls == [], "apply_* with enabled=False run nothing")
+
+
+def test_failing_command_does_not_abort() -> None:
+    # A raising command in the middle must NOT stop the rest.
+    r = _RecordingRunner(fail_on="color bychain", mode="raise")
+    attempted, failed = apply_default_presentation(r)
+    _assert(attempted == default_presentation_commands(),
+            "all presentation commands attempted despite a mid-list failure",
+            f"got {attempted}")
+    _assert(failed == ["color bychain"], "the failing command is recorded",
+            f"got {failed}")
+    _assert("view" in r.calls, "commands AFTER the failure still ran")
+    # An error-dict (not a raise) is also treated as a failure, not a stop.
+    r2 = _RecordingRunner(fail_on="set bgColor black", mode="error")
+    _, failed2 = apply_default_presentation(r2)
+    _assert(failed2 == ["set bgColor black"] and r2.calls == default_presentation_commands(),
+            "error-dict failure recorded, rest still run")
+
+
+def test_bridge_lean_layout_once_per_session(monkeypatch) -> None:
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+    monkeypatch.setattr(b, "run_command",
+                        lambda c, timeout=30: (calls.append(c),
+                                               {"value": "Opened #1", "error": None})[1])
+    # Two opens in one session → layout applied exactly once.
+    b.run_commands(["open 1hsg"])
+    b.run_commands(["open 2lyz"])
+    n_layout = sum(calls.count(c) for c in lean_layout_commands())
+    _assert(n_layout == len(lean_layout_commands()),
+            "lean layout applied exactly once across two opens", f"got {n_layout}")
+    _assert(b._lean_layout_applied, "guard flag set after first open")
+
+
+def test_bridge_presentation_per_open(monkeypatch) -> None:
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+    monkeypatch.setattr(b, "run_command",
+                        lambda c, timeout=30: (calls.append(c),
+                                               {"value": "Opened #1", "error": None})[1])
+    b.run_commands(["open 1hsg"])
+    b.run_commands(["open 2lyz"])
+    # presentation (e.g. `cartoon`) runs once per open → twice
+    _assert(calls.count("cartoon") == 2, "presentation applied per-open (twice)",
+            f"got {calls.count('cartoon')}")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -199,7 +301,11 @@ def main() -> int:
     test_scf_runscript_writes_loader_and_command()
     test_ensure_viewer_commands()
     test_left_click_toggle()
-    print("\n(test_camsol_emits_sequence_viewer_viz needs pytest's monkeypatch)")
+    test_layout_and_presentation_command_lists()
+    test_apply_runs_all_in_order()
+    test_disable_override_paths()
+    test_failing_command_does_not_abort()
+    print("\n(test_camsol_* and test_bridge_* need pytest's monkeypatch)")
     print("\n" + "=" * 60)
     print(f"Results: {_results['pass']} passed, {_results['fail']} failed")
     return 0 if _results["fail"] == 0 else 1

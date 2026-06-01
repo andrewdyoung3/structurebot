@@ -29,6 +29,46 @@ CHIMERAX_SHOW_SEQUENCE_ON_OPEN: bool = (
     not in ("0", "false", "no", "off")
 )
 
+# ── Deterministic ChimeraX layout + presentation ──────────────────────────────
+# Config-driven command lists applied by StructureBot (NOT LLM-generated, NOT the
+# built-in `preset`). All tokens verified against ChimeraX 1.11.1.
+
+# LEAN LAYOUT — applied ONCE per ChimeraX session (first open). Hides the Log,
+# Command Line Interface and Toolbar panels for a clean window; KEEPS the menubar
+# and title bar. The Sequence Viewer (opened via sequence_viewer.ensure_sequence_
+# viewer_commands) docks at the top by default. REST command/runscript coloring +
+# selection keep working with the CLI hidden (verified). Disable with
+# CHIMERAX_LEAN_LAYOUT=false.
+CHIMERAX_LEAN_LAYOUT: bool = (
+    os.environ.get("CHIMERAX_LEAN_LAYOUT", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+CHIMERAX_LEAN_LAYOUT_COMMANDS: list = [
+    "tool hide Log",
+    'tool hide "Command Line Interface"',
+    "tool hide Toolbar",
+]
+
+# DEFAULT PRESENTATION — applied per structure open, AFTER load and BEFORE any
+# analysis colouring (CamSol/ESM/MPNN override the by-chain baseline; SCF sequence
+# regions still land). Disable with CHIMERAX_DEFAULT_PRESENTATION=false.
+CHIMERAX_DEFAULT_PRESENTATION: bool = (
+    os.environ.get("CHIMERAX_DEFAULT_PRESENTATION", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+CHIMERAX_DEFAULT_PRESENTATION_COMMANDS: list = [
+    "hide solvent atoms",
+    "cartoon",
+    "show ligand atoms",
+    "style ligand stick",
+    "color bychain",
+    "color ligand byhetero",
+    "set bgColor black",
+    "lighting soft",
+    "graphics silhouettes true",
+    "view",
+]
+
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
 # claude-sonnet-4-6 is the current recommended model.
