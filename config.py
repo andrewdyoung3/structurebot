@@ -75,6 +75,11 @@ CHIMERAX_DEFAULT_PRESENTATION_COMMANDS: list = [
 # Upgrade to claude-opus-4-7 for the hardest multi-step reasoning tasks.
 ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
+# NL→ChimeraX translation backend (pluggable). "claude" is the only backend
+# today (the Anthropic API); the interface is a foundation for a future local
+# model. Unknown values fall back to "claude".
+TRANSLATOR_BACKEND: str = os.environ.get("TRANSLATOR_BACKEND", "claude").strip().lower()
+
 # Maximum number of user/assistant exchange *pairs* kept in rolling history.
 # Each turn consumes input tokens; prompt caching absorbs the static block cost.
 MAX_CONVERSATION_HISTORY: int = int(os.environ.get("MAX_CONVERSATION_HISTORY", "6"))

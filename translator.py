@@ -643,11 +643,96 @@ def _load_command_reference() -> str:
     return "(chimerax_commands.md not found — add it to the project root)"
 
 
+# ── Pluggable LLM backend ───────────────────────────────────────────────────────
+# The prompt assembly, JSON schema and parsing live ONCE on CommandTranslator
+# (the single shared place). A backend orchestrates one translation using those
+# shared primitives — so a future backend (e.g. a local model) reuses the exact
+# same prompt/schema and only swaps the model call.  The deterministic guards
+# (e.g. _sanitize_zone_syntax) are applied by CommandTranslator AFTER the backend
+# returns, so they are backend-agnostic; a backend returns the parsed-but-
+# unguarded normalized dict.
+
+class TranslatorBackend:
+    """
+    Interface for an NL→ChimeraX translation backend.
+
+    ``translate(translator, user_input, session)`` returns the SAME normalized
+    translation dict that ``CommandTranslator.translate`` returns
+    (``commands`` / ``explanations`` / ``warnings`` / ``clarification_needed`` /
+    ``confidence`` / ``tools_needed`` / ``tool_inputs``), built from the given
+    translator's shared prompt + parsing helpers.  Everything downstream is
+    unchanged regardless of which backend produced it.
+    """
+    name: str = "base"
+
+    def translate(self, translator: "CommandTranslator",
+                  user_input: str, session) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class ClaudeBackend(TranslatorBackend):
+    """
+    Default backend — the Anthropic Claude API.  Wraps the current logic
+    verbatim, using the translator's shared system prompt
+    (``_build_system_blocks``) and primitives (``_pre_screen`` / ``_call_api`` /
+    ``_parse_response`` / ``_history`` / ``client``).
+    """
+    name = "claude"
+
+    def translate(self, translator: "CommandTranslator",
+                  user_input: str, session) -> Dict[str, Any]:
+        system_blocks = translator._build_system_blocks(session)
+
+        # Short-circuit for requests that bypass the API entirely.
+        pre = translator._pre_screen(user_input)
+        if pre is not None:
+            translator._history.append({"role": "user",      "content": user_input})
+            translator._history.append({"role": "assistant",  "content": "{}"})
+            return pre
+
+        translator._history.append({"role": "user", "content": user_input})
+        raw = translator._call_api(system_blocks)
+        translator._history.append({"role": "assistant", "content": raw})
+
+        result = translator._parse_response(raw)
+
+        # Retry once if JSON parsing failed.
+        if result.get("_parse_failed"):
+            retry_msg = (
+                "Your previous response was not valid JSON. "
+                "Respond with ONLY a JSON object matching the schema, no other text."
+            )
+            translator._history.append({"role": "user", "content": retry_msg})
+            raw2 = translator._call_api(system_blocks)
+            translator._history.append({"role": "assistant", "content": raw2})
+            result = translator._parse_response(raw2)
+            result.pop("_parse_failed", None)
+
+        return result
+
+
+_BACKENDS = {"claude": ClaudeBackend}
+
+
+def make_backend(name: str) -> TranslatorBackend:
+    """
+    Return the translation backend for *name* (``config.TRANSLATOR_BACKEND``).
+    Only ``"claude"`` exists today; an unknown name falls back to it.
+    """
+    cls = _BACKENDS.get((name or "claude").strip().lower())
+    if cls is None:
+        sys.stderr.write(
+            f"[translator] unknown TRANSLATOR_BACKEND {name!r}; using 'claude'.\n")
+        cls = ClaudeBackend
+    return cls()
+
+
 # ── Translator ─────────────────────────────────────────────────────────────────
 
 class CommandTranslator:
     """
-    Converts natural language into ChimeraX commands using the Anthropic API.
+    Converts natural language into ChimeraX commands via a pluggable LLM backend
+    (default: the Anthropic Claude API — see TRANSLATOR_BACKEND / ClaudeBackend).
 
     Conversation history is maintained across turns so follow-up requests
     ("now do the same for chain B") work without re-stating context.
@@ -672,6 +757,13 @@ class CommandTranslator:
         # Pre-format the static block once; it never changes during a session.
         self._static_block: str = _STATIC_SYSTEM.format(command_reference=self._ref)
 
+        # Pluggable translation backend (default: Claude). The backend reuses the
+        # shared prompt/parsing on this translator; the Claude primitives
+        # (client / _call_api / _pre_screen / _static_block) stay here unchanged.
+        self._backend: TranslatorBackend = make_backend(
+            getattr(config, "TRANSLATOR_BACKEND", "claude")
+        )
+
     # ── Public ─────────────────────────────────────────────────────────────────
 
     def translate(self, user_input: str, session: SessionState) -> Dict[str, Any]:
@@ -688,7 +780,30 @@ class CommandTranslator:
                 "confidence":          "high" | "medium" | "low",
             }
         """
-        system_blocks = [
+        # The selected backend produces the normalized translation; the
+        # deterministic guards below are backend-agnostic.
+        result = self._backend.translate(self, user_input, session)
+
+        # Deterministic guard: never let Chimera-1 `zone` syntax reach ChimeraX,
+        # regardless of which backend / model emitted it (belt-and-suspenders to
+        # rule 16).
+        new_cmds, new_exps, zone_notes = _sanitize_zone_syntax(
+            result.get("commands") or [], result.get("explanations") or []
+        )
+        if zone_notes:
+            result["commands"]     = new_cmds
+            result["explanations"] = new_exps
+            result["warnings"]     = (result.get("warnings") or []) + zone_notes
+
+        return result
+
+    def _build_system_blocks(self, session: SessionState) -> list:
+        """
+        Assemble the system prompt blocks (the single shared prompt every backend
+        reuses): a cached static block (role + rules + command reference) and an
+        uncached dynamic block with the current session state.
+        """
+        return [
             # Block 1: large static content — cached after first call
             {
                 "type":          "text",
@@ -706,43 +821,6 @@ class CommandTranslator:
                 ),
             },
         ]
-
-        # Short-circuit for requests that bypass the API entirely
-        pre = self._pre_screen(user_input)
-        if pre is not None:
-            self._history.append({"role": "user",      "content": user_input})
-            self._history.append({"role": "assistant",  "content": "{}"}  )  # placeholder
-            return pre
-
-        self._history.append({"role": "user", "content": user_input})
-        raw = self._call_api(system_blocks)
-        self._history.append({"role": "assistant", "content": raw})
-
-        result = self._parse_response(raw)
-
-        # Retry once if JSON parsing failed
-        if result.get("_parse_failed"):
-            retry_msg = (
-                "Your previous response was not valid JSON. "
-                "Respond with ONLY a JSON object matching the schema, no other text."
-            )
-            self._history.append({"role": "user", "content": retry_msg})
-            raw2 = self._call_api(system_blocks)
-            self._history.append({"role": "assistant", "content": raw2})
-            result = self._parse_response(raw2)
-            result.pop("_parse_failed", None)
-
-        # Deterministic guard: never let Chimera-1 `zone` syntax reach ChimeraX,
-        # regardless of what the model emitted (belt-and-suspenders to rule 16).
-        new_cmds, new_exps, zone_notes = _sanitize_zone_syntax(
-            result.get("commands") or [], result.get("explanations") or []
-        )
-        if zone_notes:
-            result["commands"]     = new_cmds
-            result["explanations"] = new_exps
-            result["warnings"]     = (result.get("warnings") or []) + zone_notes
-
-        return result
 
     def translate_error_fix(
         self,

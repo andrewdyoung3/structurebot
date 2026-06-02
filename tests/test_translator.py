@@ -355,6 +355,38 @@ def test_hide_chain_targets_representation() -> None:
     _assert(cmds != ["hide #1/B"], "not a bare atoms-only hide")
 
 
+# -- E. Pluggable backend (Claude default; same normalized shape) --------------
+
+def test_default_backend_is_claude() -> None:
+    print("\n=== E. pluggable backend ===")
+    from translator import ClaudeBackend, TranslatorBackend
+    t = _make_translator()
+    _assert(isinstance(t._backend, ClaudeBackend),
+            "default backend is ClaudeBackend", f"got {type(t._backend).__name__}")
+    _assert(isinstance(t._backend, TranslatorBackend),
+            "ClaudeBackend implements the TranslatorBackend interface")
+    _assert(t._backend.name == "claude", "backend name is 'claude'")
+
+
+def test_backend_translate_returns_normalized_shape() -> None:
+    """translate() routes through the backend and returns the SAME normalized
+    structured object downstream depends on (mock the API — no live call)."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+    good = MagicMock(content=[MagicMock(text=_VALID_JSON)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = good
+        result = t.translate("color chain A red", session)
+    for key in ("commands", "explanations", "warnings", "clarification_needed",
+                "confidence", "tools_needed", "tool_inputs"):
+        _assert(key in result, f"normalized result has '{key}'")
+    _assert(result["commands"] == ["select #1/A"],
+            "backend produced the parsed commands", f"got {result.get('commands')}")
+    _assert(mock_client.messages.create.called,
+            "default backend used the Claude client")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -386,6 +418,10 @@ def main() -> int:
     test_translate_rewrites_zone_end_to_end()
     test_system_prompt_documents_zone_and_hide()
     test_hide_chain_targets_representation()
+
+    # E. pluggable backend
+    test_default_backend_is_claude()
+    test_backend_translate_returns_normalized_shape()
 
     print()
     print("=" * 60)
