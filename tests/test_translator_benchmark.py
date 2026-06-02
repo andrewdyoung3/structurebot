@@ -41,18 +41,22 @@ def test_run_translator_benchmark():
     import translator_corpus as corpus
     import translator_benchmark as bm
 
-    comp = bm.run_comparison(("claude", "ollama"))
+    # Runs per case — default 1 for the test smoke; set STRUCTUREBOT_BENCHMARK_RUNS
+    # (or use `python translator_benchmark.py --runs 5`) for the official mean±range.
+    runs = int(os.environ.get("STRUCTUREBOT_BENCHMARK_RUNS", "1"))
+    comp = bm.run_comparison(("claude", "ollama"), runs=runs)
     bm.print_rich(comp, model_label=config.OLLAMA_MODEL)
     paths = bm.write_artifacts(comp, model_label=config.OLLAMA_MODEL)
     print(f"\nArtifacts written: {paths['md']} · {paths['csv']}")
 
-    n = len(corpus.CORPUS)
+    n = len(corpus.EVAL_CORPUS)
     for backend in ("claude", "ollama"):
-        assert len(comp[backend]["rows"]) == n, f"{backend} did not run every case"
+        for rows in comp[backend]["runs"]:
+            assert len(rows) == n, f"{backend} did not run every eval case"
 
-    # Harness-health guardrail (NOT a model gate): the reference backend should
-    # be schema-valid throughout and clear a generous bar — if Claude looks bad,
-    # the harness/corpus is broken, not the model.
+    # Harness-health guardrail (NOT a model gate): the reference backend should be
+    # schema-valid throughout and clear a generous bar — if Claude looks bad, the
+    # harness/corpus is broken, not the model.
     claude = comp["claude"]["summary"]
-    assert claude["schema_rate"] == 1.0, "reference (Claude) schema-validity < 100% → harness/corpus bug"
-    assert claude["full_rate"] >= 0.8, f"reference (Claude) pass-rate {claude['full_rate']:.0%} too low → corpus mis-calibrated"
+    assert claude["schema"]["mean"] == 1.0, "reference (Claude) schema-validity < 100% → harness/corpus bug"
+    assert claude["full"]["mean"] >= 0.8, f"reference (Claude) pass-rate {claude['full']['mean']:.0%} too low → corpus mis-calibrated"

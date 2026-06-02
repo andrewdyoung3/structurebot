@@ -145,51 +145,114 @@ def aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def run_comparison(backends=("claude", "ollama"),
+def _mm(vals: List[float]) -> Dict[str, float]:
+    """mean / min / max of a per-run rate list."""
+    vals = list(vals) or [0.0]
+    return {"mean": statistics.mean(vals), "min": min(vals), "max": max(vals)}
+
+
+def aggregate_runs(run_rows: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """
+    Aggregate N runs (each a full pass over the corpus) into the HONEST summary:
+    per-backend **mean pass-rate with min/max range over the N runs**, plus
+    per-category mean±range. The pass bar is the MEAN over N≥5 runs — single-shot
+    numbers are never used for comparisons (the local model is non-deterministic
+    even at temperature 0).
+    """
+    run_rows = [rs for rs in run_rows if rs]
+    n_cases = len(run_rows[0]) if run_rows else 0
+
+    def _per_run_rate(rows, key):
+        return (sum(r[key] for r in rows) / len(rows)) if rows else 0.0
+
+    def _per_run_routing(rows):
+        rr = [r for r in rows if r["routing_ok"] is not None]
+        return (sum(r["routing_ok"] for r in rr) / len(rr)) if rr else 0.0
+
+    full = _mm([_per_run_rate(rs, "full_pass") for rs in run_rows])
+    raw  = _mm([_per_run_rate(rs, "raw_pass")  for rs in run_rows])
+    schema = _mm([_per_run_rate(rs, "schema_valid") for rs in run_rows])
+    routing = _mm([_per_run_routing(rs) for rs in run_rows])
+    lat = [r["latency_s"] for rs in run_rows for r in rs] or [0.0]
+
+    cat_names = sorted({r["category"] for rs in run_rows for r in rs})
+    by_category: Dict[str, Any] = {}
+    for cat in cat_names:
+        full_cr, raw_cr = [], []
+        for rs in run_rows:
+            crows = [r for r in rs if r["category"] == cat]
+            cn = len(crows) or 1
+            full_cr.append(sum(r["full_pass"] for r in crows) / cn)
+            raw_cr.append(sum(r["raw_pass"] for r in crows) / cn)
+        by_category[cat] = {
+            "n":    len([r for r in run_rows[0] if r["category"] == cat]) if run_rows else 0,
+            "full": _mm(full_cr),
+            "raw":  _mm(raw_cr),
+        }
+
+    return {
+        "n_runs": len(run_rows), "n_cases": n_cases,
+        "full": full, "raw": raw, "schema": schema, "routing": routing,
+        "latency_mean": statistics.mean(lat), "latency_median": statistics.median(lat),
+        "latency_max": max(lat),
+        "n_errors": sum(1 for rs in run_rows for r in rs if r["error"]),
+        "by_category": by_category,
+    }
+
+
+def run_comparison(backends=("claude", "ollama"), runs: int = 1,
+                   cases: Optional[List[corpus.CorpusCase]] = None,
                    translator: Optional[CommandTranslator] = None) -> Dict[str, Any]:
-    """Run each backend over the corpus; return {backend: {rows, summary}}."""
+    """
+    Run each backend over the corpus *runs* times; return
+    {backend: {"runs": [rows, …], "summary": aggregate_runs(...)}}.
+    The pass bar = mean over N≥5 runs on the held-out EVAL_CORPUS.
+    """
+    cases = cases if cases is not None else corpus.EVAL_CORPUS
+    t = translator or CommandTranslator(
+        api_key=os.environ.get("ANTHROPIC_API_KEY") or "sk-ant-benchmark-dummy")
     out: Dict[str, Any] = {}
     for b in backends:
-        rows = run_backend(b, translator=translator)
-        out[b] = {"rows": rows, "summary": aggregate(rows)}
+        run_rows = [run_backend(b, cases=cases, translator=t) for _ in range(max(1, runs))]
+        out[b] = {"runs": run_rows, "summary": aggregate_runs(run_rows)}
     return out
 
 
-# ── Reporting ───────────────────────────────────────────────────────────────────
+# ── Reporting (mean ± range over N runs) ─────────────────────────────────────────
+def _pct_range(d: Dict[str, float]) -> str:
+    return f"{d['mean']*100:.0f}% [{d['min']*100:.0f}–{d['max']*100:.0f}]"
+
+
 def build_markdown(comparison: Dict[str, Any], model_label: str = "") -> str:
     backends = list(comparison)
-    L: List[str] = []
-    L.append(f"# Translator backend benchmark — {_dt.date.today().isoformat()}")
-    if model_label:
-        L.append(f"\n_Ollama model: **{model_label}**_  ·  corpus: {len(corpus.CORPUS)} cases, "
-                 f"{len(corpus.categories())} categories. FULL = post-guard "
-                 f"(`translate()`); RAW = pre-guard (`backend.translate()`).")
-    L.append("\n## Overall\n")
+    S = {b: comparison[b]["summary"] for b in backends}
+    n_runs = S[backends[0]]["n_runs"] if backends else 0
+    n_cases = S[backends[0]]["n_cases"] if backends else 0
+    L: List[str] = [f"# Translator backend benchmark — {_dt.date.today().isoformat()}"]
+    L.append(f"\n_Ollama model: **{model_label or config.OLLAMA_MODEL}**_  ·  "
+             f"eval corpus: {n_cases} cases × {len(corpus.categories())} categories  ·  "
+             f"**N = {n_runs} runs** (mean [min–max]). FULL = post-guard (`translate()`); "
+             f"RAW = pre-guard (`backend.translate()`). Bar = mean over N≥5.")
+    L.append("\n## Overall (mean [min–max] over N runs)\n")
     L.append("| Metric | " + " | ".join(backends) + " |")
     L.append("|--------|" + "|".join(["---"] * len(backends)) + "|")
-    def _row(label, fn):
-        return "| " + label + " | " + " | ".join(fn(comparison[b]["summary"]) for b in backends) + " |"
-    L.append(_row("Pass-rate (FULL, post-guard)",
-                  lambda s: f"{s['full_rate']*100:.0f}% ({s['full_pass']}/{s['n']})"))
-    L.append(_row("Pass-rate (RAW, pre-guard)",
-                  lambda s: f"{s['raw_rate']*100:.0f}% ({s['raw_pass']}/{s['n']})"))
-    L.append(_row("Schema-valid",
-                  lambda s: f"{s['schema_rate']*100:.0f}%"))
-    L.append(_row("Tool-routing accuracy",
-                  lambda s: f"{s['routing_rate']*100:.0f}% ({s['routing_ok']}/{s['routing_n']})"))
-    L.append(_row("Latency median (s)", lambda s: f"{s['latency_median']:.1f}"))
-    L.append(_row("Latency max (s)",    lambda s: f"{s['latency_max']:.1f}"))
-    L.append(_row("Errors",             lambda s: str(s["n_errors"])))
-
-    L.append("\n## Per-category (FULL · RAW pass)\n")
-    L.append("| Category | " + " | ".join(backends) + " |")
+    L.append("| Pass-rate FULL (post-guard) | " + " | ".join(_pct_range(S[b]["full"]) for b in backends) + " |")
+    L.append("| Pass-rate RAW (pre-guard) | "  + " | ".join(_pct_range(S[b]["raw"])  for b in backends) + " |")
+    L.append("| Schema-valid | "               + " | ".join(_pct_range(S[b]["schema"]) for b in backends) + " |")
+    L.append("| Tool-routing accuracy | "      + " | ".join(_pct_range(S[b]["routing"]) for b in backends) + " |")
+    L.append("| Latency median (s) | "         + " | ".join(f"{S[b]['latency_median']:.1f}" for b in backends) + " |")
+    L.append("| Latency max (s) | "            + " | ".join(f"{S[b]['latency_max']:.1f}" for b in backends) + " |")
+    L.append("| Errors (total) | "             + " | ".join(str(S[b]["n_errors"]) for b in backends) + " |")
+    L.append("\n## Per-category — FULL mean [min–max] · RAW mean [min–max]\n")
+    L.append("| Category (n) | " + " | ".join(backends) + " |")
     L.append("|----------|" + "|".join(["---"] * len(backends)) + "|")
     for cat in corpus.categories():
         cells = []
         for b in backends:
-            c = comparison[b]["summary"]["by_category"].get(cat, {"n": 0, "full": 0, "raw": 0})
-            cells.append(f"{c['full']}/{c['n']} · {c['raw']}/{c['n']}")
-        L.append(f"| {cat} | " + " | ".join(cells) + " |")
+            c = S[b]["by_category"].get(cat)
+            cells.append(f"{_pct_range(c['full'])} · {_pct_range(c['raw'])}" if c else "—")
+        n = S[backends[0]]["by_category"].get(cat, {}).get("n", 0)
+        L.append(f"| {cat} ({n}) | " + " | ".join(cells) + " |")
     return "\n".join(L) + "\n"
 
 
@@ -202,12 +265,13 @@ def write_artifacts(comparison: Dict[str, Any], model_label: str = "",
     md_path.write_text(build_markdown(comparison, model_label), encoding="utf-8")
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["backend", "id", "category", "raw_pass", "full_pass",
+        w.writerow(["backend", "run", "id", "category", "raw_pass", "full_pass",
                     "schema_valid", "routing_ok", "latency_s", "error"])
         for b, data in comparison.items():
-            for r in data["rows"]:
-                w.writerow([b, r["id"], r["category"], r["raw_pass"], r["full_pass"],
-                            r["schema_valid"], r["routing_ok"], r["latency_s"], r["error"] or ""])
+            for ri, rows in enumerate(data["runs"]):
+                for r in rows:
+                    w.writerow([b, ri, r["id"], r["category"], r["raw_pass"], r["full_pass"],
+                                r["schema_valid"], r["routing_ok"], r["latency_s"], r["error"] or ""])
     return {"md": md_path, "csv": csv_path}
 
 
@@ -219,26 +283,27 @@ def print_rich(comparison: Dict[str, Any], model_label: str = "") -> None:
         print(build_markdown(comparison, model_label)); return
     con = Console()
     backends = list(comparison)
-    t = Table(title=f"Translator backend benchmark (Ollama: {model_label or config.OLLAMA_MODEL})")
+    S = {b: comparison[b]["summary"] for b in backends}
+    n_runs = S[backends[0]]["n_runs"] if backends else 0
+    t = Table(title=f"Translator benchmark — {model_label or config.OLLAMA_MODEL}, N={n_runs} (mean [min–max])")
     t.add_column("Metric")
     for b in backends:
         t.add_column(b, justify="right")
-    S = {b: comparison[b]["summary"] for b in backends}
-    t.add_row("Pass FULL (post-guard)", *[f"{S[b]['full_rate']*100:.0f}% ({S[b]['full_pass']}/{S[b]['n']})" for b in backends])
-    t.add_row("Pass RAW (pre-guard)",   *[f"{S[b]['raw_rate']*100:.0f}% ({S[b]['raw_pass']}/{S[b]['n']})" for b in backends])
-    t.add_row("Schema-valid",           *[f"{S[b]['schema_rate']*100:.0f}%" for b in backends])
-    t.add_row("Tool-routing",           *[f"{S[b]['routing_rate']*100:.0f}% ({S[b]['routing_ok']}/{S[b]['routing_n']})" for b in backends])
+    t.add_row("Pass FULL (post-guard)", *[_pct_range(S[b]["full"]) for b in backends])
+    t.add_row("Pass RAW (pre-guard)",   *[_pct_range(S[b]["raw"]) for b in backends])
+    t.add_row("Schema-valid",           *[_pct_range(S[b]["schema"]) for b in backends])
+    t.add_row("Tool-routing",           *[_pct_range(S[b]["routing"]) for b in backends])
     t.add_row("Latency median (s)",     *[f"{S[b]['latency_median']:.1f}" for b in backends])
     con.print(t)
-    ct = Table(title="Per-category (FULL/total · RAW/total)")
+    ct = Table(title="Per-category — FULL · RAW (mean [min–max])")
     ct.add_column("Category")
     for b in backends:
         ct.add_column(b)
     for cat in corpus.categories():
         cells = []
         for b in backends:
-            c = S[b]["by_category"].get(cat, {"n": 0, "full": 0, "raw": 0})
-            cells.append(f"{c['full']}/{c['n']} · {c['raw']}/{c['n']}")
+            c = S[b]["by_category"].get(cat)
+            cells.append(f"{_pct_range(c['full'])} · {_pct_range(c['raw'])}" if c else "—")
         ct.add_row(cat, *cells)
     con.print(ct)
 
@@ -248,11 +313,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Translator backend benchmark (Claude vs Ollama).")
     ap.add_argument("--backends", default="claude,ollama",
                     help="comma list of registered backends to compare")
+    ap.add_argument("--runs", type=int, default=5,
+                    help="runs per case (mean over N>=5 is the comparison bar)")
     ap.add_argument("--model", default=None, help="override OLLAMA_MODEL for this run")
     args = ap.parse_args()
     if args.model:
         config.OLLAMA_MODEL = args.model
-    comp = run_comparison(tuple(b.strip() for b in args.backends.split(",") if b.strip()))
+    comp = run_comparison(tuple(b.strip() for b in args.backends.split(",") if b.strip()),
+                          runs=args.runs)
     print_rich(comp, model_label=config.OLLAMA_MODEL)
     paths = write_artifacts(comp, model_label=config.OLLAMA_MODEL)
     print(f"\nArtifacts: {paths['md']} · {paths['csv']}")
