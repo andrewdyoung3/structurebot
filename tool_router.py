@@ -94,6 +94,14 @@ class ToolStepResult:
 # `bias_toward: "hydrophilic"` instead of an explicit `bias_amino_acids` list.
 _HYDROPHILIC_AAS = "DENQHKRST"
 
+# GPU-heavy bridges. Before dispatching any of these, the local-LLM translator is
+# freed from VRAM (translator.ensure_translator_unloaded) so it never contends
+# with a fold/design run for GPU memory. No-op under the Claude backend.
+_GPU_BRIDGE_TOOLS = frozenset({
+    "proteinmpnn", "mpnn_esmfold", "rfdiffusion", "colabfold",
+    "validate_design", "esmfold", "esm",
+})
+
 
 class ToolRouter:
     """
@@ -1215,6 +1223,17 @@ class ToolRouter:
             keywords, redirect to _run_glycan() (N-glycosylation site scan).
         These guards fire if route() was not called with user_input.
         """
+        # VRAM invariant: before any GPU-heavy bridge, free the local LLM
+        # translator from VRAM (no-op under Claude / when nothing is loaded).
+        # The explicit guard — not the idle timer — is the contract that prevents
+        # a mid-run OOM from the translator contending with a fold.
+        if tool in _GPU_BRIDGE_TOOLS:
+            try:
+                from translator import ensure_translator_unloaded
+                ensure_translator_unloaded()
+            except Exception:
+                pass
+
         try:
             if tool == "camsol":
                 return self._run_camsol(inputs)

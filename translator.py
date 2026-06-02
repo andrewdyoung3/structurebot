@@ -711,7 +711,126 @@ class ClaudeBackend(TranslatorBackend):
         return result
 
 
-_BACKENDS = {"claude": ClaudeBackend}
+# JSON schema for Ollama's structured output — EXACTLY the normalized 7-key
+# translation object (the shared schema; NOT a fork of the prompt text).
+TRANSLATION_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "commands":             {"type": "array", "items": {"type": "string"}},
+        "explanations":         {"type": "array", "items": {"type": "string"}},
+        "warnings":             {"type": "array", "items": {"type": "string"}},
+        "clarification_needed": {"type": ["string", "null"]},
+        "confidence":           {"type": "string", "enum": ["high", "medium", "low"]},
+        "tools_needed":         {"type": "array", "items": {"type": "string"}},
+        "tool_inputs":          {"type": "object"},
+    },
+    "required": ["commands", "explanations", "warnings", "clarification_needed",
+                 "confidence", "tools_needed", "tool_inputs"],
+}
+
+# Module flag: an Ollama model MAY be resident in VRAM. Set after ANY Ollama
+# request (forced backend OR a Claude→Ollama fallback both set it), so
+# ensure_translator_unloaded() unloads correctly even under TRANSLATOR_BACKEND
+# ="claude" when a fallback loaded the local model.
+_OLLAMA_MAY_BE_LOADED = False
+
+
+class OllamaBackend(TranslatorBackend):
+    """
+    Local-LLM backend via Ollama (benchmark + fallback role; Claude stays the
+    default). Same interface and SAME normalized output as ClaudeBackend: reuses
+    the translator's shared prompt (`_build_system_blocks`) and normalization
+    (`_parse_response`) — no prompt fork.
+
+    Output mechanism (locked): **schema-constrained JSON** via Ollama's native
+    `/api/chat` `format` (NOT the model's tool-call template); `temperature=0`
+    for determinism; `keep_alive` for explicit VRAM unload control. The
+    deterministic guards (`_sanitize_zone_syntax`) run later in
+    `CommandTranslator.translate`, identically for both backends.
+    """
+    name = "ollama"
+
+    def translate(self, translator: "CommandTranslator",
+                  user_input: str, session) -> Dict[str, Any]:
+        # Same pre-screen short-circuit as Claude (backend-agnostic routing).
+        pre = translator._pre_screen(user_input)
+        if pre is not None:
+            translator._history.append({"role": "user",      "content": user_input})
+            translator._history.append({"role": "assistant",  "content": "{}"})
+            return pre
+
+        system_text = self._system_text(translator, session)
+        translator._history.append({"role": "user", "content": user_input})
+        content = self._chat(system_text, translator._history)
+        translator._history.append({"role": "assistant", "content": content})
+        return translator._parse_response(content)
+
+    @staticmethod
+    def _system_text(translator: "CommandTranslator", session) -> str:
+        # Flatten the shared system blocks into one system message (Ollama has no
+        # cache_control blocks). SAME prompt text — no fork.
+        return "\n\n".join(
+            b["text"] for b in translator._build_system_blocks(session))
+
+    @staticmethod
+    def _chat(system_text: str, history: list) -> str:
+        global _OLLAMA_MAY_BE_LOADED
+        import requests
+        payload = {
+            "model":      config.OLLAMA_MODEL,
+            "messages":   [{"role": "system", "content": system_text}] + list(history),
+            "format":     TRANSLATION_JSON_SCHEMA,   # constrained JSON, not tool-calls
+            "stream":     False,
+            "think":      False,   # direct schema JSON, no chain-of-thought (faster, cleaner)
+            "options":    {"temperature": 0, "num_ctx": int(config.OLLAMA_NUM_CTX)},
+            "keep_alive": config.OLLAMA_KEEP_ALIVE,
+        }
+        resp = requests.post(
+            f"{config.OLLAMA_BASE_URL}/api/chat",
+            json=payload, timeout=int(config.OLLAMA_TIMEOUT),
+        )
+        _OLLAMA_MAY_BE_LOADED = True   # a request was issued — model may be resident
+        resp.raise_for_status()
+        return (resp.json().get("message", {}) or {}).get("content", "") or ""
+
+
+def ensure_translator_unloaded() -> None:
+    """
+    Free the Ollama translator model from VRAM (native unload via keep_alive=0).
+
+    INVARIANT — call this BEFORE any GPU-heavy bridge run (ColabFold /
+    ProteinMPNN / RFdiffusion-later) so the local LLM never contends with a fold
+    for VRAM (a mid-run OOM is the failure mode this prevents). Cheap +
+    idempotent; a NO-OP when no Ollama model has been loaded this session (e.g.
+    Claude-only — nothing local is resident).
+    """
+    global _OLLAMA_MAY_BE_LOADED
+    if not _OLLAMA_MAY_BE_LOADED:
+        return
+    try:
+        import requests
+        requests.post(
+            f"{config.OLLAMA_BASE_URL}/api/chat",
+            json={"model": config.OLLAMA_MODEL, "messages": [], "keep_alive": 0},
+            timeout=10,
+        )
+    except Exception:
+        pass   # best-effort; the keep_alive timer is the backstop
+    finally:
+        _OLLAMA_MAY_BE_LOADED = False
+
+
+# Claude API failures that justify a fallback (real transport/auth/quota issues,
+# NOT a successful-but-imperfect or refused response). APITimeoutError is a
+# subclass of APIConnectionError; AuthenticationError/RateLimitError of APIStatusError.
+_CLAUDE_FALLBACK_ERRORS = (
+    anthropic.APIConnectionError,
+    anthropic.AuthenticationError,
+    anthropic.RateLimitError,
+)
+
+
+_BACKENDS = {"claude": ClaudeBackend, "ollama": OllamaBackend}
 
 
 def make_backend(name: str) -> TranslatorBackend:
@@ -782,7 +901,7 @@ class CommandTranslator:
         """
         # The selected backend produces the normalized translation; the
         # deterministic guards below are backend-agnostic.
-        result = self._backend.translate(self, user_input, session)
+        result = self._translate_via_backend(user_input, session)
 
         # Deterministic guard: never let Chimera-1 `zone` syntax reach ChimeraX,
         # regardless of which backend / model emitted it (belt-and-suspenders to
@@ -796,6 +915,33 @@ class CommandTranslator:
             result["warnings"]     = (result.get("warnings") or []) + zone_notes
 
         return result
+
+    def _translate_via_backend(self, user_input: str, session) -> Dict[str, Any]:
+        """
+        Run the active backend, with the LOCKED one-directional fallback:
+
+        - active backend == "claude": on a REAL Claude API failure
+          (connection/timeout/auth/rate-limit) AND config.TRANSLATOR_FALLBACK,
+          fall back to the local Ollama backend. Any other error (e.g. a
+          RefusalError from an empty/declined-but-successful response) propagates
+          unchanged — never a fallback trigger.
+        - active backend == "ollama" (forced/benchmark): NEVER falls back to
+          Claude; its error surfaces (benchmark honesty).
+        """
+        try:
+            return self._backend.translate(self, user_input, session)
+        except _CLAUDE_FALLBACK_ERRORS as exc:
+            if not (self._backend.name == "claude"
+                    and getattr(config, "TRANSLATOR_FALLBACK", True)):
+                raise
+            # ClaudeBackend appended the user turn before failing; drop that
+            # dangling turn so the fallback doesn't double-append it.
+            if self._history and self._history[-1].get("role") == "user":
+                self._history.pop()
+            sys.stderr.write(
+                f"[translator] Claude API failure ({type(exc).__name__}); "
+                "falling back to the local Ollama backend.\n")
+            return make_backend("ollama").translate(self, user_input, session)
 
     def _build_system_blocks(self, session: SessionState) -> list:
         """
@@ -977,6 +1123,14 @@ class CommandTranslator:
         # Ensure tool_inputs is a dict
         if not isinstance(result["tool_inputs"], dict):
             result["tool_inputs"] = {}
+
+        # Defensive: the string-list fields MUST contain only strings. A weaker
+        # local model can emit a stray non-string element (e.g. a nested object)
+        # even under constrained decoding; downstream + the guards assume strings.
+        # (Claude output is already well-formed, so this is a no-op there.)
+        for _k in ("commands", "explanations", "warnings"):
+            v = result.get(_k)
+            result[_k] = [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
         # Pad short explanations list
         while len(result["explanations"]) < len(result["commands"]):

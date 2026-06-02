@@ -75,10 +75,39 @@ CHIMERAX_DEFAULT_PRESENTATION_COMMANDS: list = [
 # Upgrade to claude-opus-4-7 for the hardest multi-step reasoning tasks.
 ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-# NL→ChimeraX translation backend (pluggable). "claude" is the only backend
-# today (the Anthropic API); the interface is a foundation for a future local
-# model. Unknown values fall back to "claude".
+# NL→ChimeraX translation backend (pluggable). "claude" (Anthropic API, default)
+# or "ollama" (local model). Unknown values fall back to "claude".
 TRANSLATOR_BACKEND: str = os.environ.get("TRANSLATOR_BACKEND", "claude").strip().lower()
+
+# One-directional fallback: when TRANSLATOR_BACKEND="claude" and the Claude API
+# fails with a REAL API-failure (connection-unreachable / timeout / auth /
+# rate-limit), fall back to the local Ollama backend. A successful-but-imperfect
+# Claude response is used as-is (never a fallback trigger). A forced
+# TRANSLATOR_BACKEND="ollama" NEVER falls back to Claude (benchmark honesty).
+TRANSLATOR_FALLBACK: bool = (
+    os.environ.get("TRANSLATOR_FALLBACK", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
+# ── Ollama local LLM backend (benchmark + fallback; see translator.OllamaBackend)
+OLLAMA_BASE_URL: str = os.environ.get(
+    "OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+# Exact model+tag — pulled and verified to serve schema-constrained structured
+# output. Qwen3 8B: strong tool-calling, native Ollama structured-output, fits
+# the 16 GB RTX 5070 Ti comfortably.
+OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+# Context window. CONSERVATIVE by default. ⚠ Over-sizing num_ctx beyond the
+# available VRAM makes Ollama SILENTLY spill the model to CPU — which not only
+# slows generation but DEGRADES structured-output (constrained-decoding)
+# reliability. Raise only with real VRAM headroom for this model + context.
+OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+# Idle keep-alive before Ollama unloads the model from VRAM. SHORT by default so
+# VRAM frees quickly for GPU bridges; the explicit
+# translator.ensure_translator_unloaded() is the real contract — do NOT rely on
+# this idle timer alone (a mid-run OOM is the failure mode to prevent).
+OLLAMA_KEEP_ALIVE: str = os.environ.get("OLLAMA_KEEP_ALIVE", "30s")
+# Per-request HTTP timeout (a cold model load on first call can be slow).
+OLLAMA_TIMEOUT: int = int(os.environ.get("OLLAMA_TIMEOUT", "180"))
 
 # Maximum number of user/assistant exchange *pairs* kept in rolling history.
 # Each turn consumes input tokens; prompt caching absorbs the static block cost.
