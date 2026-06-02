@@ -54,14 +54,16 @@ class Check:
 
     def evaluate(self, result: Dict[str, Any]) -> bool:
         cmds  = [c for c in (result.get("commands") or []) if isinstance(c, str)]
-        # EXACT tool names — the real router matches `tool == "camsol"` (no
-        # lowercasing), so "CamSol"/"ChimeraX" must NOT count as a match.
-        tools = {t for t in (result.get("tools_needed") or []) if isinstance(t, str)}
+        # Case-INSENSITIVE tool match — kept in lockstep with the real router
+        # (`tool_router._dispatch_tool`, which now lowercases the tool before
+        # matching), so "CamSol"/"ESM" resolve in both. The honest-scorer
+        # invariant is "scorer matches the real router".
+        tools = {t.lower() for t in (result.get("tools_needed") or []) if isinstance(t, str)}
         k = self.kind
         if k == "tools_any":
-            return any(a in tools for a in self.arg)
+            return any(str(a).lower() in tools for a in self.arg)
         if k == "tools_all":
-            return all(a in tools for a in self.arg)
+            return all(str(a).lower() in tools for a in self.arg)
         if k == "cmd_re":
             return any(re.search(self.arg, c, re.I) for c in cmds)
         if k == "no_cmd_re":
@@ -328,6 +330,55 @@ EXAMPLE_POOL: List[CorpusCase] = [
 
 # Back-compat alias (the benchmark + tests reference the eval set).
 CORPUS = EVAL_CORPUS
+
+
+# ── Targeted few-shot (LOCAL backend only) ──────────────────────────────────────
+# Worked input→correct-7-key-dict demos for the categories the local model
+# ACTUALLY fails on the N=5 baseline (camsol/selection_scope/mpnn/esm — NOT the
+# already-passing hide_show/zone). Sourced ONLY from EXAMPLE_POOL (never
+# EVAL_CORPUS — a test enforces this), so the held-out eval set stays clean.
+FEW_SHOT_CATEGORIES = ("camsol", "selection_scope", "mpnn", "esm")
+
+def _out(tools, tool_inputs):
+    return {"commands": [], "explanations": [], "warnings": [],
+            "clarification_needed": None, "confidence": "high",
+            "tools_needed": tools, "tool_inputs": tool_inputs}
+
+# Verified correct outputs for the chosen EXAMPLE_POOL prompts (a test asserts
+# each passes its example case's checks).
+FEW_SHOT_OUTPUTS: Dict[str, Dict[str, Any]] = {
+    "ex_camsol_1": _out(["camsol"],       {"camsol": {"model_id": "1", "chain": "B"}}),
+    "ex_camsol_2": _out(["camsol"],       {"camsol": {"model_id": "1", "chain": "B"}}),
+    "ex_mpnn_1":   _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "B"}}),
+    "ex_mpnn_2":   _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "A"}}),
+    "ex_sel_1":    _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "A", "design_scope": "selected"}}),
+    "ex_sel_2":    _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "A"}}),
+    "ex_esm_1":    _out(["esm"],          {"esm": {"model_id": "1", "chain": "B"}}),
+    "ex_esm_2":    _out(["esm"],          {"esm": {"model_id": "1", "chain": "B"}}),
+}
+
+
+def few_shot_pairs(categories=FEW_SHOT_CATEGORIES) -> List[Tuple[str, Dict[str, Any]]]:
+    """[(prompt, correct_output_dict)] for *categories*, pulled ONLY from
+    EXAMPLE_POOL (never EVAL_CORPUS)."""
+    by_id = {c.id: c for c in EXAMPLE_POOL}
+    pairs: List[Tuple[str, Dict[str, Any]]] = []
+    for cid, output in FEW_SHOT_OUTPUTS.items():
+        c = by_id.get(cid)
+        if c is not None and c.category in categories:
+            pairs.append((c.prompt, output))
+    return pairs
+
+
+def few_shot_messages(categories=FEW_SHOT_CATEGORIES) -> List[Dict[str, str]]:
+    """The few-shot demo as alternating user/assistant chat messages (the model
+    sees input → correct JSON pairs before the real request)."""
+    import json
+    msgs: List[Dict[str, str]] = []
+    for prompt, output in few_shot_pairs(categories):
+        msgs.append({"role": "user", "content": prompt})
+        msgs.append({"role": "assistant", "content": json.dumps(output)})
+    return msgs
 
 
 # ── Scoring ─────────────────────────────────────────────────────────────────────

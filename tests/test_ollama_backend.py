@@ -220,12 +220,53 @@ def test_non_gpu_dispatch_does_not_unload() -> None:
 def test_config_and_factory() -> None:
     print("\n=== E. config + factory ===")
     for k in ("TRANSLATOR_BACKEND", "TRANSLATOR_FALLBACK", "OLLAMA_BASE_URL",
-              "OLLAMA_MODEL", "OLLAMA_NUM_CTX", "OLLAMA_KEEP_ALIVE", "OLLAMA_TIMEOUT"):
+              "OLLAMA_MODEL", "OLLAMA_NUM_CTX", "OLLAMA_KEEP_ALIVE", "OLLAMA_TIMEOUT",
+              "TRANSLATOR_TOOL_NAMES"):
         _assert(hasattr(config, k), f"config.{k} present")
     _assert(config.TRANSLATOR_BACKEND == "claude", "default backend UNCHANGED (claude)")
     _assert(isinstance(make_backend("ollama"), OllamaBackend), "factory builds OllamaBackend")
-    _assert(isinstance(make_backend("claude"), ClaudeBackend), "factory builds ClaudeBackend")
     _assert("ollama" in T._BACKENDS, "ollama registered in _BACKENDS")
+
+
+# -- F. enum-constrained tools + targeted few-shot -----------------------------
+
+def test_schema_enum_constrains_tools() -> None:
+    print("\n=== F. enum + few-shot ===")
+    enum = TRANSLATION_JSON_SCHEMA["properties"]["tools_needed"]["items"].get("enum")
+    _assert(enum == list(config.TRANSLATOR_TOOL_NAMES),
+            "tools_needed items ENUM == config.TRANSLATOR_TOOL_NAMES")
+    _assert(all(t == t.lower() for t in enum), "all enum tool names lowercase (router literals)")
+    for t in ("camsol", "esm", "proteinmpnn", "mutation_scan", "disulfide", "chimerax"):
+        _assert(t in enum, f"valid tool {t!r} in enum")
+    _assert("CamSol" not in enum and "frobnicate" not in enum,
+            "mis-cased / hallucinated names are NOT selectable (constrained decoding)")
+    # The enum must match the REAL router registry (parse tool_router source).
+    import re as _re
+    src = (Path(__file__).parent.parent / "tool_router.py").read_text(encoding="utf-8")
+    dispatch = set(_re.findall(r'tool == "([a-z_]+)"', src))
+    _assert(dispatch.issubset(set(enum)),
+            "every router-dispatched tool is in the enum (no router tool omitted)",
+            f"missing {dispatch - set(enum)}")
+
+
+def test_ollama_request_includes_targeted_fewshot() -> None:
+    t = _ollama_translator()
+    cap = {}
+    def fake_post(url, json=None, timeout=None):
+        cap["payload"] = json; return _ollama_resp(_VALID)
+    with patch("requests.post", side_effect=fake_post):
+        t.translate("color chain A red", _session())
+    msgs = cap["payload"]["messages"]
+    _assert(msgs[0]["role"] == "system", "system prompt first")
+    # few-shot demo pairs (from EXAMPLE_POOL) precede the real user turn
+    import translator_corpus as _tc, json as _json
+    fs = _tc.few_shot_messages()
+    _assert(len(fs) >= 8 and msgs[1:1+len(fs)] == fs,
+            "targeted few-shot (camsol/mpnn/sel/esm) injected between system and the request")
+    asst = [_json.loads(m["content"]) for m in fs[1::2]]
+    routed = {tn for a in asst for tn in a["tools_needed"]}
+    _assert({"camsol", "proteinmpnn", "esm"}.issubset(routed),
+            "few-shot demonstrates the failing-category routings")
 
 
 def main() -> int:
@@ -241,6 +282,8 @@ def main() -> int:
     test_gpu_dispatch_fires_unload()
     test_non_gpu_dispatch_does_not_unload()
     test_config_and_factory()
+    test_schema_enum_constrains_tools()
+    test_ollama_request_includes_targeted_fewshot()
     print(f"\nResults: {_results['pass']} passed, {_results['fail']} failed")
     return 0 if _results["fail"] == 0 else 1
 

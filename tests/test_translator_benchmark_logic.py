@@ -11,7 +11,7 @@ opt-in (tests/test_translator_benchmark.py).
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import requests as _requests
 
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import translator_corpus as corpus
 import translator_benchmark as bm
 from translator import CommandTranslator
+from tool_router import ToolRouter, ToolStepResult
 
 PASS, FAIL = "[PASS]", "[FAIL]"
 _results = {"pass": 0, "fail": 0}
@@ -68,15 +69,59 @@ def test_eval_example_disjoint() -> None:
 
 # -- B. scorer + ROUTER CASE-SENSITIVITY ---------------------------------------
 
-def test_scorer_router_case_sensitivity() -> None:
-    print("\n=== B. scorer / case-sensitivity ===")
+def test_scorer_case_insensitive_matches_router() -> None:
+    print("\n=== B. scorer / case-INSENSITIVITY (matches the router) ===")
     case = next(c for c in corpus.EVAL_CORPUS if c.id == "camsol_scan")  # tools_any camsol
     _assert(corpus.score_case(case, _result(tools=["chimerax", "camsol"]))[0],
-            "exact 'camsol' → pass (matches the router literal)")
-    _assert(not corpus.score_case(case, _result(tools=["CamSol"]))[0],
-            "'CamSol' (wrong case) → FAIL (router is case-sensitive; would not route)")
+            "'camsol' → pass")
+    _assert(corpus.score_case(case, _result(tools=["CamSol"]))[0],
+            "'CamSol' → PASS (scorer is case-insensitive, in lockstep with the router)")
+    _assert(corpus.score_case(case, _result(tools=["ESM"]))[0] is False,
+            "wrong tool ('ESM') still fails the camsol check")
     _assert(not corpus.score_case(case, _result(tools=["chimerax"]))[0],
             "missing camsol → fail")
+
+
+def test_router_and_scorer_case_consistent() -> None:
+    """The honest-scorer invariant: scorer matches the real router. Both must
+    resolve a wrong-cased tool name."""
+    r = ToolRouter(bridge=MagicMock(), session=MagicMock())
+    with patch.object(r, "_run_camsol",
+                      return_value=ToolStepResult(tool="camsol", success=True)) as m:
+        r._dispatch_tool("CamSol", {})       # wrong case
+    _assert(m.called, "router._dispatch_tool routes 'CamSol' → camsol (case-insensitive)")
+    case = next(c for c in corpus.EVAL_CORPUS if c.id == "camsol_scan")
+    _assert(corpus.score_case(case, _result(tools=["CamSol"]))[0],
+            "scorer ALSO accepts 'CamSol' (router + scorer consistent)")
+
+
+def test_few_shot_example_pool_only() -> None:
+    """Few-shot demos come ONLY from EXAMPLE_POOL (zero EVAL_CORPUS leakage) and
+    target only the failing categories; each output is a verified gold label."""
+    eval_p = {c.prompt.strip().lower() for c in corpus.EVAL_CORPUS}
+    ex_by_prompt = {c.prompt.strip().lower(): c for c in corpus.EXAMPLE_POOL}
+    pairs = corpus.few_shot_pairs()
+    _assert(len(pairs) >= 8, "few-shot has demos", f"n={len(pairs)}")
+    for prompt, output in pairs:
+        p = prompt.strip().lower()
+        _assert(p in ex_by_prompt, f"few-shot prompt sourced from EXAMPLE_POOL: {prompt!r}")
+        _assert(p not in eval_p, f"few-shot prompt NOT in EVAL_CORPUS (no leakage): {prompt!r}")
+        c = ex_by_prompt[p]
+        _assert(c.category in corpus.FEW_SHOT_CATEGORIES,
+                f"few-shot category is a failing one: {c.category}")
+        _assert(corpus.score_case(c, output)[0],
+                f"few-shot OUTPUT is a verified correct label for {c.id}")
+
+
+def test_few_shot_message_assembly() -> None:
+    import json as _json
+    msgs = corpus.few_shot_messages()
+    _assert(len(msgs) == 2 * len(corpus.few_shot_pairs()), "alternating user/assistant pairs")
+    _assert(msgs[0]["role"] == "user" and msgs[1]["role"] == "assistant", "user then assistant")
+    for m in msgs[1::2]:
+        obj = _json.loads(m["content"])
+        _assert("tools_needed" in obj and isinstance(obj["tools_needed"], list),
+                "assistant content is a valid translation JSON")
 
 
 def test_check_kinds() -> None:
@@ -190,7 +235,9 @@ def test_markdown_report_builds() -> None:
 def main() -> int:
     print("=" * 60); print("tests/test_translator_benchmark_logic.py"); print("=" * 60)
     test_corpus_loads_and_balanced(); test_eval_example_disjoint()
-    test_scorer_router_case_sensitivity(); test_check_kinds()
+    test_scorer_case_insensitive_matches_router(); test_router_and_scorer_case_consistent()
+    test_few_shot_example_pool_only(); test_few_shot_message_assembly()
+    test_check_kinds()
     test_full_vs_raw_guard_split(); test_schema_validity()
     test_single_pass_bucketing(); test_nrun_aggregation_math()
     test_markdown_report_builds()

@@ -1154,7 +1154,10 @@ class ToolRouter:
           "pipeline_error"       — first error message, or None
         """
         tools_needed = routed_result.get("tools_needed") or ["chimerax"]
-        tool_inputs  = routed_result.get("tool_inputs") or {}
+        # Case-insensitive tool_inputs lookup (mirrors the case-insensitive
+        # dispatch) so "CamSol"-keyed inputs still reach the camsol bridge.
+        tool_inputs  = {str(k).strip().lower(): v
+                        for k, v in (routed_result.get("tool_inputs") or {}).items()}
         # user_input stored by route() for the proline guard
         user_input   = routed_result.get("_user_input", "")
 
@@ -1164,7 +1167,8 @@ class ToolRouter:
         tool_summaries: Dict[str, str] = {}
         pipeline_error: Optional[str] = None
 
-        for tool in tools_needed:
+        for _raw_tool in tools_needed:
+            tool = str(_raw_tool).strip().lower()   # case-insensitive routing
             if tool == "chimerax":
                 # ChimeraX execution is handled by main.py; skip here
                 step_results.append({
@@ -1223,6 +1227,11 @@ class ToolRouter:
             keywords, redirect to _run_glycan() (N-glycosylation site scan).
         These guards fire if route() was not called with user_input.
         """
+        # Case-INSENSITIVE tool resolution: the registry literals below are
+        # lowercase, so a local model emitting "CamSol"/"ESM" still routes. The
+        # benchmark scorer matches case-insensitively too (kept in lockstep).
+        tool = (tool or "").strip().lower()
+
         # VRAM invariant: before any GPU-heavy bridge, free the local LLM
         # translator from VRAM (no-op under Claude / when nothing is loaded).
         # The explicit guard — not the idle timer — is the contract that prevents

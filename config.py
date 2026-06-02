@@ -79,6 +79,19 @@ ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # or "ollama" (local model). Unknown values fall back to "claude".
 TRANSLATOR_BACKEND: str = os.environ.get("TRANSLATOR_BACKEND", "claude").strip().lower()
 
+# Canonical valid tool names — the EXACT (lowercase) literals the router
+# dispatches on (`tool_router._dispatch_tool`). Used to ENUM-constrain the Ollama
+# backend's `tools_needed` output (constrained decoding cannot then emit a
+# misspelled / hallucinated / wrong-cased tool). A test asserts this matches the
+# router registry. Keep sorted + in sync with `_dispatch_tool`.
+TRANSLATOR_TOOL_NAMES: list = [
+    "assembly_analyser", "camsol", "cavity", "chimerax", "colabfold",
+    "disulfide", "double_mutant", "esm", "esmfold", "glycan",
+    "glycan_positions", "mpnn_esmfold", "mutation_scan", "netnglyc",
+    "proline", "proteinmpnn", "rfdiffusion", "rosetta", "salt_bridge",
+    "validate_ddg", "validate_design",
+]
+
 # One-directional fallback: when TRANSLATOR_BACKEND="claude" and the Claude API
 # fails with a REAL API-failure (connection-unreachable / timeout / auth /
 # rate-limit), fall back to the local Ollama backend. A successful-but-imperfect
@@ -96,11 +109,17 @@ OLLAMA_BASE_URL: str = os.environ.get(
 # output. Qwen3 8B: strong tool-calling, native Ollama structured-output, fits
 # the 16 GB RTX 5070 Ti comfortably.
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
-# Context window. CONSERVATIVE by default. ⚠ Over-sizing num_ctx beyond the
-# available VRAM makes Ollama SILENTLY spill the model to CPU — which not only
-# slows generation but DEGRADES structured-output (constrained-decoding)
-# reliability. Raise only with real VRAM headroom for this model + context.
-OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+# Context window. StructureBot's system prompt (role + rules + the full ChimeraX
+# command reference) is ~7.5k tokens, plus the targeted few-shot (~0.5k) — so it
+# must be ≥ ~10k or Ollama SILENTLY TRUNCATES the prompt (the model never sees the
+# rules/few-shot → routing collapses). 16384 fits the prompt + few-shot + room to
+# generate, and the 8B's KV cache at 16k still fits the 16 GB RTX 5070 Ti.
+# ⚠ Over-sizing num_ctx BEYOND VRAM makes Ollama spill to CPU — slow AND degrades
+# constrained-decoding reliability; tune to your GPU.
+OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+# Output token cap. Generous so the full 7-key JSON (commands + tool_inputs)
+# never truncates mid-generation; the `format` grammar stops it well before this.
+OLLAMA_NUM_PREDICT: int = int(os.environ.get("OLLAMA_NUM_PREDICT", "1024"))
 # Idle keep-alive before Ollama unloads the model from VRAM. SHORT by default so
 # VRAM frees quickly for GPU bridges; the explicit
 # translator.ensure_translator_unloaded() is the real contract — do NOT rely on

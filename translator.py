@@ -713,6 +713,10 @@ class ClaudeBackend(TranslatorBackend):
 
 # JSON schema for Ollama's structured output — EXACTLY the normalized 7-key
 # translation object (the shared schema; NOT a fork of the prompt text).
+# `tools_needed` items are ENUM-constrained to the real router registry
+# (config.TRANSLATOR_TOOL_NAMES) so constrained decoding cannot emit a
+# misspelled / hallucinated / wrong-cased tool — it must pick from the valid set.
+# (Claude does not use this schema, so its path is unaffected.)
 TRANSLATION_JSON_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -721,7 +725,9 @@ TRANSLATION_JSON_SCHEMA: Dict[str, Any] = {
         "warnings":             {"type": "array", "items": {"type": "string"}},
         "clarification_needed": {"type": ["string", "null"]},
         "confidence":           {"type": "string", "enum": ["high", "medium", "low"]},
-        "tools_needed":         {"type": "array", "items": {"type": "string"}},
+        "tools_needed":         {"type": "array",
+                                 "items": {"type": "string",
+                                           "enum": list(config.TRANSLATOR_TOOL_NAMES)}},
         "tool_inputs":          {"type": "object"},
     },
     "required": ["commands", "explanations", "warnings", "clarification_needed",
@@ -773,16 +779,45 @@ class OllamaBackend(TranslatorBackend):
             b["text"] for b in translator._build_system_blocks(session))
 
     @staticmethod
+    def _few_shot() -> list:
+        """Targeted few-shot demos (LOCAL backend only) for the categories the
+        local model fails — sourced from the disjoint EXAMPLE_POOL. Best-effort:
+        no demos if the corpus module is unavailable."""
+        try:
+            from translator_corpus import few_shot_messages
+            return few_shot_messages()
+        except Exception:
+            return []
+
+    @staticmethod
     def _chat(system_text: str, history: list) -> str:
         global _OLLAMA_MAY_BE_LOADED
         import requests
+        # Few-shot demos sit between the system prompt and the real turn; they are
+        # NOT persisted into translator._history (so they don't accumulate).
+        messages = ([{"role": "system", "content": system_text}]
+                    + OllamaBackend._few_shot() + list(history))
         payload = {
             "model":      config.OLLAMA_MODEL,
-            "messages":   [{"role": "system", "content": system_text}] + list(history),
+            "messages":   messages,
             "format":     TRANSLATION_JSON_SCHEMA,   # constrained JSON, not tool-calls
             "stream":     False,
             "think":      False,   # direct schema JSON, no chain-of-thought (faster, cleaner)
-            "options":    {"temperature": 0, "num_ctx": int(config.OLLAMA_NUM_CTX)},
+            # EXPLICIT sampling — never inherit modelfile/global defaults silently
+            # (a silent throttle is indistinguishable from a weak model). Greedy +
+            # no repeat penalty (the latter distorts the repeated braces/quotes/keys
+            # of constrained JSON), no top-p/top-k clipping, fixed seed for
+            # reproducibility, and a generous output cap so the 7-key JSON never
+            # truncates mid-generation.
+            "options": {
+                "temperature":    0,
+                "top_p":          1.0,
+                "top_k":          0,
+                "repeat_penalty": 1.0,
+                "seed":           0,
+                "num_predict":    int(config.OLLAMA_NUM_PREDICT),
+                "num_ctx":        int(config.OLLAMA_NUM_CTX),
+            },
             "keep_alive": config.OLLAMA_KEEP_ALIVE,
         }
         resp = requests.post(
