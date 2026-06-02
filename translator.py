@@ -1033,12 +1033,13 @@ class CommandTranslator:
         lower = user_input.lower()
         if any(kw in lower for kw in self._RFD_KEYWORDS):
             return {
-                "commands":     [],
-                "explanations": [],
-                "warnings":     [],
-                "confidence":   "high",
-                "tools_needed": ["rfdiffusion"],
-                "tool_inputs":  {"rfdiffusion": {"mode": "binder"}},
+                "commands":             [],
+                "explanations":         [],
+                "warnings":             [],
+                "clarification_needed": None,   # fully-normalized 7-key result
+                "confidence":           "high",
+                "tools_needed":         ["rfdiffusion"],
+                "tool_inputs":          {"rfdiffusion": {"mode": "binder"}},
             }
         return None
 
