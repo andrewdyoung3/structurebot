@@ -343,6 +343,64 @@ def test_solvent_excluded_from_selection_reader():
     assert "HOH" in eh.SOLVENT_RESNAMES and "WAT" in eh.SOLVENT_RESNAMES
 
 
+def test_parse_selection_chain_qualified_and_backcompat():
+    txt = ("residue id #1/A:25 name LEU index 1\n"
+           "residue id #1/B:25 name LEU index 2\n"
+           "residue id #1/A:902 name HOH index 3")
+    # chain-qualified: A:25 and B:25 stay DISTINCT; HOH dropped
+    assert eh.parse_selection(txt) == {("A", 25), ("B", 25)}
+    assert eh.parse_selection(txt, chain="A") == {("A", 25)}
+    # back-compat wrapper still collapses to bare resnums
+    assert eh._parse_info_residues(txt) == {25}
+
+
+def test_effect_selection_qualified_distinguishes_chains():
+    case = eh.EvalCase("q", "zone", 2, "compound", "x",
+                       gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
+                       gold_functionality=eh.GoldFunctionality(
+                           "effect", {"probe": "selection_resnums", "chain": None,
+                                      "expected": ["A:25", "B:25"]}),
+                       gold_usability=eh.GoldUsability("execute"))
+    tr = _tr(tools=["chimerax"], commands=["select x", "info residues sel"])
+    good = MockProbe(sel_output="residue id #1/A:25 name LEU index 1\nresidue id #1/B:25 name LEU index 2")
+    assert eh.score_functionality(case, tr, probe=good).passed
+    bad = MockProbe(sel_output="residue id #1/A:25 name LEU index 1")   # B:25 missing
+    assert not eh.score_functionality(case, tr, probe=bad).passed
+    # legacy bare-int expected still works (back-compat)
+    legacy = eh.EvalCase("L", "zone", 1, "direct", "x",
+                         gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
+                         gold_functionality=eh.GoldFunctionality(
+                             "effect", {"probe": "selection_resnums", "chain": "A", "expected": [25]}),
+                         gold_usability=eh.GoldUsability("execute"))
+    assert eh.score_functionality(legacy, tr, probe=good).passed
+
+
+def test_residue_color_solid_rgb_tolerance():
+    case = eh.EvalCase("col", "viz", 1, "direct", "Colour A red.",
+                       gold_accuracy=eh.GoldAccuracy(tools="chimerax",
+                                                     required_args={"chain": "A", "color": "red"}),
+                       gold_functionality=eh.GoldFunctionality(
+                           "effect", {"probe": "residue_color", "expected": "red", "chain": "A"}),
+                       gold_usability=eh.GoldUsability("execute"))
+    tr = _tr(tools=["chimerax"], commands=["color #1/A red"])
+    assert eh.score_functionality(case, tr, probe=lambda c: "rgb(252,3,1)").passed      # within tol of red
+    assert not eh.score_functionality(case, tr, probe=lambda c: "rgb(0,0,255)").passed  # blue != red
+
+
+def test_residue_color_scheme_is_accuracy_only():
+    case = eh.EvalCase("sch", "viz", 2, "inferential", "Colour by chain.",
+                       gold_accuracy=eh.GoldAccuracy(tools="chimerax",
+                                                     required_args={"command_contains_any": ["color bychain"]}),
+                       gold_functionality=eh.GoldFunctionality(
+                           "effect", {"probe": "residue_color", "expected": "bychain", "chain": "*"}),
+                       gold_usability=eh.GoldUsability("execute"))
+    tr = _tr(tools=["chimerax"], commands=["color bychain"])
+    fr = eh.score_functionality(case, tr, probe=lambda c: "anything")
+    assert fr.applicable is False                          # scheme → F normalised out
+    sc = eh.score_case(case, tr, probe=lambda c: "anything")
+    assert not sc.functionality.applicable and sc.accuracy.applicable and sc.fully_correct
+
+
 def test_selection_spec_shapes_and_strict_raise():
     assert eh.selection_spec(None) is None
     assert eh.selection_spec("#1/A:40-42") == "#1/A:40-42"

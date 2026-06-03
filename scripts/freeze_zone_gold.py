@@ -53,9 +53,17 @@ def make_probe(bridge):
 
 
 def canonical_select(case):
-    """Canonical gold selection command = command_contains_any[0], wrapped in
-    `select …` unless it is already a select command."""
-    expr = case["gold_accuracy"]["required_args"]["command_contains_any"][0].strip()
+    """The FREEZE selection command. Prefer an explicit `assertion.freeze_command`
+    (the protein-scoped form — `(/B & ~solvent) :<4` etc. — so a whole-chain
+    distance reference does not pull in residues that merely sit near a crystal
+    water; the result-side solvent exclusion can't fix a reference-side water).
+    Falls back to `command_contains_any[0]` when no freeze_command is set. This
+    DECOUPLES the freeze command from Accuracy — `command_contains_any` still
+    accepts the natural forms (with or without ~solvent), so the model is not
+    required to write ~solvent to pass Accuracy."""
+    a = case["gold_functionality"]["assertion"]
+    expr = (a.get("freeze_command")
+            or case["gold_accuracy"]["required_args"]["command_contains_any"][0]).strip()
     if expr.lower().startswith(("select", "~select")):
         return expr
     return f"select {expr}"
@@ -72,7 +80,10 @@ def freeze(manifest_path, dry_run=False):
     frozen, suspects = 0, []
     for case in man["cases"]:
         a = (case.get("gold_functionality") or {}).get("assertion", {})
-        if a.get("probe") != "selection_resnums" or a.get("expected") != PENDING:
+        # (Re)freeze EVERY selection_resnums case — the gold is a deterministic
+        # consequence of the structure, so re-running is idempotent; this also
+        # re-freezes cases already frozen in an earlier (resnum-only) format.
+        if a.get("probe") != "selection_resnums":
             continue
         chain = a.get("chain")
         cmd = canonical_select(case)
@@ -86,22 +97,24 @@ def freeze(manifest_path, dry_run=False):
             probe(oc)
 
         # Run the canonical gold selection, then read it back through the scorer's
-        # OWN parser (chain filter included) — gold == measurement, one path.
+        # OWN parser (chain-qualified, solvent-excluded) — gold == measurement, one
+        # path. Stored chain-qualified ("A:25") so A:25 and B:25 stay distinct.
         probe(cmd)
         out = probe("info residues sel")
-        resnums = sorted(eh._parse_info_residues(out, chain=chain))
+        pairs = eh.parse_selection(out, chain=chain)
+        qualified = [f"{ch}:{rn}" for ch, rn in sorted(pairs)]
 
-        tiny = len(resnums) < _MIN_PLAUSIBLE
+        tiny = len(qualified) < _MIN_PLAUSIBLE
         if tiny:
-            suspects.append((case["id"], len(resnums)))
+            suspects.append((case["id"], len(qualified)))
         print(f"\n[{case['id']}]  {a.get('structure')}  chain={chain}")
         print(f"    criterion : {a.get('criterion', '')}")
         print(f"    precond   : {pre}")
         print(f"    command   : {cmd}")
-        print(f"    -> {len(resnums)} residues: {resnums}" + ("   <-- EMPTY/TINY" if tiny else ""))
+        print(f"    -> {len(qualified)} residues: {qualified}" + ("   <-- EMPTY/TINY" if tiny else ""))
 
         if not dry_run:
-            a["expected"] = resnums
+            a["expected"] = qualified
             frozen += 1
 
     if dry_run:

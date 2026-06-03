@@ -732,15 +732,39 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
     kind = spec.get("probe")
     if kind == "selection_resnums":
         out = probe("info residues sel")
-        got = _parse_info_residues(out, chain=spec.get("chain"))
-        want = set(spec.get("expected") or [])
+        raw_want = spec.get("expected") or []
+        if _is_qualified(raw_want):
+            # chain-qualified comparison (distinguishes A:25 from B:25)
+            want = _qualified_pairs(raw_want)
+            got = parse_selection(out, chain=spec.get("chain"))
+            fmt = lambda s: sorted(f"{c}:{r}" for c, r in s)
+        else:
+            # legacy bare-resnum comparison (back-compat)
+            want = set(int(x) for x in raw_want)
+            got = _parse_info_residues(out, chain=spec.get("chain"))
+            fmt = sorted
         return DimResult(True, got == want, float(got == want),
-                         {"mode": "effect", "probe": kind, "got": sorted(got), "want": sorted(want)})
+                         {"mode": "effect", "probe": kind, "got": fmt(got), "want": fmt(want)})
     if kind == "residue_color":
-        out = probe(spec.get("query", "info"))
-        want_rgb = spec.get("expected_rgb")
-        ok = bool(want_rgb) and all(str(v) in out for v in want_rgb)
-        return DimResult(True, ok, float(ok), {"mode": "effect", "probe": kind, "out": out[:200]})
+        expected = str(spec.get("expected", "")).lower()
+        # SCHEME colours (bychain/rainbow/byhetero/bfactor) have no single RGB → the
+        # functionality dimension is NOT applicable (accuracy still scores the case;
+        # the aggregate normalises F out). Richer per-scheme structural checks are a
+        # §9 follow-up.
+        if expected in COLOR_SCHEMES:
+            return DimResult(applicable=False, passed=True, partial=1.0,
+                             detail={"mode": "effect", "probe": kind, "scheme": expected,
+                                     "note": "accuracy-only (scheme colour has no single RGB)"})
+        want_rgb = spec.get("expected_rgb") or NAMED_RGB.get(expected)
+        if want_rgb is None:                       # unknown colour → don't assert a bogus RGB
+            return DimResult(applicable=False, passed=True, partial=1.0,
+                             detail={"mode": "effect", "probe": kind, "reason": f"no RGB for {expected!r}"})
+        atomspec = spec.get("atomspec") or (f"/{spec['chain']}" if spec.get("chain") not in (None, "*") else "sel")
+        out = probe(spec.get("query") or f"info atomattr {atomspec} attribute color")
+        got = _parse_rgb(out)
+        ok = got is not None and all(abs(g - w) <= _RGB_TOL for g, w in zip(got, want_rgb))
+        return DimResult(True, ok, float(ok),
+                         {"mode": "effect", "probe": kind, "want_rgb": list(want_rgb), "got_rgb": got})
     if kind == "representation":
         out = probe(spec.get("query", "info"))
         token = str(spec.get("expected", ""))
@@ -760,17 +784,74 @@ _SEL_RE = re.compile(r"residue id\s+(?:#(\d+))?/([^:\s]+):(-?\d+)\s+name\s+(\S+)
 # selection (one shared reader), so neither side is penalised for waters.
 SOLVENT_RESNAMES = frozenset({"HOH", "WAT", "DOD", "H2O", "SOL", "TIP", "TIP3", "TIP4"})
 
-def _parse_info_residues(text: str, chain: Optional[str] = None) -> set:
-    """Parse ChimeraX `info residues sel` output → set of resnums (optionally one
-    chain). Solvent residues are excluded (see SOLVENT_RESNAMES)."""
-    nums: set = set()
+def parse_selection(text: str, chain: Optional[str] = None) -> set:
+    """THE shared selection reader → a set of (chain, resnum) PAIRS (solvent
+    excluded). Keying by (chain, resnum) — not resnum alone — keeps same-numbered
+    residues on different chains distinct (1HSG is a homodimer: chains A and B are
+    both numbered 1–99, so a resnum-only key collapses them). Used by BOTH the freeze
+    and the effect scorer, so the frozen gold and the model's measured selection are
+    read identically. `chain` filters to one chain when set."""
+    pairs: set = set()
     for m in _SEL_RE.finditer(text or ""):
         ch, resnum, resname = m.group(2), int(m.group(3)), m.group(4)
         if resname.upper() in SOLVENT_RESNAMES:
             continue
         if chain is None or ch == chain:
-            nums.add(resnum)
-    return nums
+            pairs.add((ch, resnum))
+    return pairs
+
+
+def _parse_info_residues(text: str, chain: Optional[str] = None) -> set:
+    """Back-compat wrapper over `parse_selection` → a set of bare resnums (chains
+    dropped). Retained for callers/tests that key by resnum only."""
+    return {rn for _ch, rn in parse_selection(text, chain)}
+
+
+def _qualified_pairs(expected: Any) -> set:
+    """Normalise a chain-qualified expected list → {(chain, resnum)}. Accepts
+    "A:25" strings and ["A", 25] pairs."""
+    out: set = set()
+    for x in (expected or []):
+        if isinstance(x, (list, tuple)) and len(x) == 2:
+            out.add((str(x[0]), int(x[1])))
+        elif isinstance(x, str) and ":" in x:
+            ch, rn = x.split(":", 1)
+            out.add((ch.strip(), int(rn)))
+    return out
+
+
+def _is_qualified(expected: Any) -> bool:
+    """True when the expected list is chain-qualified ("A:25" / ["A",25]) rather
+    than legacy bare resnums."""
+    return bool(expected) and any(
+        isinstance(x, (list, tuple)) or (isinstance(x, str) and ":" in x)
+        for x in expected)
+
+
+# ── residue_color probe constants ────────────────────────────────────────────────
+# Canonical ChimeraX/SVG RGB for the readable colour names the corpus uses. Compared
+# within a small tolerance to absorb rounding. The gold keeps the human-readable name.
+NAMED_RGB: Dict[str, Tuple[int, int, int]] = {
+    "red": (255, 0, 0), "blue": (0, 0, 255), "green": (0, 128, 0),
+    "gray": (128, 128, 128), "grey": (128, 128, 128),
+    "yellow": (255, 255, 0), "teal": (0, 128, 128),
+}
+# Scheme/gradient colourings — a single RGB is meaningless, so functionality is
+# accuracy-only for these (the F-dim is normalised out of the aggregate).
+COLOR_SCHEMES = frozenset({"bychain", "rainbow", "byhetero", "bfactor"})
+_RGB_TOL = 12
+
+def _parse_rgb(text: str) -> Optional[Tuple[int, int, int]]:
+    """Best-effort parse of the first 0–255 RGB triple from a ChimeraX colour probe
+    (handles "rgb(255,0,0)", "255 0 0", "(1.0, 0.0, 0.0)" 0–1 floats, etc.)."""
+    if not text:
+        return None
+    floats = re.findall(r"-?\d*\.\d+", text)
+    if len(floats) >= 3 and all(0.0 <= abs(float(f)) <= 1.0 for f in floats[:3]):
+        return tuple(int(round(float(f) * 255)) for f in floats[:3])  # 0–1 floats
+    ints = [int(n) for n in re.findall(r"\b(\d{1,3})\b", text)]
+    ints = [n for n in ints if 0 <= n <= 255]
+    return tuple(ints[:3]) if len(ints) >= 3 else None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
