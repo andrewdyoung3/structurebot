@@ -715,6 +715,22 @@ class ToolRouter:
         tools_needed = translator_result.get("tools_needed") or ["chimerax"]
         tool_inputs  = translator_result.get("tool_inputs") or {}
 
+        # ── Intent-override PRECEDENCE lock ────────────────────────────────────
+        # The override chain below is ORDERED (documented §2):
+        #   validate_design → validate_ddg → colabfold → proline → mpnn_esmfold →
+        #   glycan_positions → netnglyc → glycan → salt_bridge → cavity →
+        #   double_mutant → mutation_scan (fallback, last).
+        # Each FULL-REPLACE override used to guard only on its OWN tool's absence,
+        # so a LOWER-precedence override could clobber a HIGHER one when a single
+        # prompt legitimately triggered both (e.g. "validate the ddG with
+        # AlphaFold" → colabfold stealing validate_ddg). `_claimed` makes the
+        # FIRST (highest-precedence) override that fires the deterministic winner:
+        # once routing is claimed, no later full-replace override may overwrite it.
+        # (The two REWRITE overrides — proline, mpnn_esmfold — also set it, since
+        # they sit high in the order; they are naturally inert once a higher
+        # full-replace has claimed, because their target tool is no longer present.)
+        _claimed = False
+
         # ── Validate-design meta-tool override ─────────────────────────────────
         # Checked FIRST: "validate design" appears in _MPNN_ESMFOLD_KEYWORDS too,
         # so this must win and replace tools_needed before that override runs.
@@ -740,6 +756,7 @@ class ToolRouter:
             vd_inputs.update(self._parse_validate_design_options(user_input))
             tools_needed = ["validate_design"]
             tool_inputs  = {"validate_design": vd_inputs}
+            _claimed = True
 
         # ── High-accuracy ddG validation tier override ─────────────────────────
         # Checked FIRST so "validate ddg" / "high-accuracy stability" route to the
@@ -747,7 +764,7 @@ class ToolRouter:
         # double-mutant pipeline. Operates on an explicit mutation list (parsed in
         # _run_validate_ddg) or the top candidates from existing scan_results.
         _vddg_intent = bool(user_input and self._detect_validate_ddg_intent(user_input))
-        if _vddg_intent and "validate_ddg" not in tools_needed:
+        if _vddg_intent and "validate_ddg" not in tools_needed and not _claimed:
             _v_chain = "A"
             for _inp in list(tool_inputs.values()):
                 if isinstance(_inp, dict) and _inp.get("chain"):
@@ -761,6 +778,7 @@ class ToolRouter:
                     "_user_input": user_input,
                 }
             }
+            _claimed = True
 
         # ── ColabFold intent override ──────────────────────────────────────────
         # Explicit high-accuracy folding path (AF2 via the WSL2 ColabFold env).
@@ -772,6 +790,7 @@ class ToolRouter:
             and self._detect_colabfold_intent(user_input)
             and "colabfold" not in tools_needed
             and "validate_design" not in tools_needed  # meta-tool already claimed it
+            and not _claimed
         )
         if _cf_intent:
             _cf_chain = "A"
@@ -787,21 +806,23 @@ class ToolRouter:
             cf_inputs.update(self._parse_colabfold_options(user_input))
             tools_needed = ["colabfold"]
             tool_inputs  = {"colabfold": cf_inputs}
+            _claimed = True
 
         # ── Proline intent override ────────────────────────────────────────────
         # Check BEFORE building step_info so the icon/description are correct.
-        if user_input and self._detect_proline_intent(user_input):
+        if user_input and self._detect_proline_intent(user_input) and not _claimed:
             if "mutation_scan" in tools_needed:
                 tools_needed, tool_inputs = self._rewrite_as_proline(
                     tools_needed, tool_inputs
                 )
+                _claimed = True
 
         # ── MPNN+ESMFold intent override ───────────────────────────────────────
         # Always rewrite if 'proteinmpnn' is in the pipeline.
         # Only rewrite 'esmfold' → 'mpnn_esmfold' when the session already holds
         # ProteinMPNN results (prevents "check fold mutation I64E" from hijacking
         # a plain ESMFold foldability request on a structure with no designs).
-        if user_input and self._detect_mpnn_esmfold_intent(user_input):
+        if user_input and self._detect_mpnn_esmfold_intent(user_input) and not _claimed:
             _session_has_mpnn = (
                 self.session.get_proteinmpnn_result(self._first_model_id()) is not None
             )
@@ -811,6 +832,7 @@ class ToolRouter:
                 tools_needed, tool_inputs = self._rewrite_as_mpnn_esmfold(
                     tools_needed, tool_inputs
                 )
+                _claimed = True
 
         # ── Glycan positions intent override ──────────────────────────────────
         # Must fire BEFORE the general glycan check so that phrases like
@@ -819,7 +841,7 @@ class ToolRouter:
         _glycan_positions_intent = bool(
             user_input and self._detect_glycan_positions_intent(user_input)
         )
-        if _glycan_positions_intent and "glycan_positions" not in tools_needed:
+        if _glycan_positions_intent and "glycan_positions" not in tools_needed and not _claimed:
             _gp_model_id = self._first_model_id()
             _gp_chain    = "A"
             for _inp in list(translator_result.get("tool_inputs", {}).values()):
@@ -835,6 +857,7 @@ class ToolRouter:
                     "_user_input": user_input,
                 }
             }
+            _claimed = True
 
         # ── NetNGlyc intent override ───────────────────────────────────────────
         # Fires for explicit OST recognition requests (e.g. "run NetNGlyc on
@@ -842,7 +865,7 @@ class ToolRouter:
         _netnglyc_intent = bool(
             user_input and self._detect_netnglyc_intent(user_input)
         )
-        if _netnglyc_intent and "netnglyc" not in tools_needed:
+        if _netnglyc_intent and "netnglyc" not in tools_needed and not _claimed:
             _ng_model_id = self._first_model_id()
             _ng_chain    = "A"
             for _inp in list(translator_result.get("tool_inputs", {}).values()):
@@ -857,6 +880,7 @@ class ToolRouter:
                     "_user_input": user_input,
                 }
             }
+            _claimed = True
 
         # ── Glycan intent override ─────────────────────────────────────────
         # Fires when glycan keywords are present and the translator did NOT
@@ -867,14 +891,16 @@ class ToolRouter:
         # stop_reason='refusal' when the short answer ("chain A") has no prior
         # context the model can work with.
         _glycan_intent = bool(user_input and self._detect_glycan_intent(user_input))
-        if _glycan_intent and "glycan" not in tools_needed and not _glycan_positions_intent and not _netnglyc_intent:
+        if (_glycan_intent and "glycan" not in tools_needed
+                and not _glycan_positions_intent and not _netnglyc_intent and not _claimed):
             tools_needed, tool_inputs = self._rewrite_as_glycan(
                 tools_needed, tool_inputs
             )
+            _claimed = True
 
         # ── Salt bridge intent override ────────────────────────────────────────
         _sb_intent = bool(user_input and any(kw in user_input.lower() for kw in self._SALT_BRIDGE_KEYWORDS))
-        if _sb_intent and "salt_bridge" not in tools_needed:
+        if _sb_intent and "salt_bridge" not in tools_needed and not _claimed:
             # Rewrite to salt_bridge tool
             tools_needed = ["salt_bridge"]
             tool_inputs = {"salt_bridge": {"model_id": self._primary_model_id(), "chain": "A"}}
@@ -883,16 +909,18 @@ class ToolRouter:
                 if isinstance(inp, dict) and inp.get("chain"):
                     tool_inputs["salt_bridge"]["chain"] = inp["chain"]
                     break
+            _claimed = True
 
         # ── Cavity intent override ──────────────────────────────────────────────
         _cav_intent = bool(user_input and self._detect_cavity_intent(user_input))
-        if _cav_intent and "cavity" not in tools_needed:
+        if _cav_intent and "cavity" not in tools_needed and not _claimed:
             tools_needed = ["cavity"]
             tool_inputs = {"cavity": {"model_id": self._primary_model_id(), "chain": "A"}}
             for inp in list(translator_result.get("tool_inputs", {}).values()):
                 if isinstance(inp, dict) and inp.get("chain"):
                     tool_inputs["cavity"]["chain"] = inp["chain"]
                     break
+            _claimed = True
 
         # ── Cavity assembly mode detection ──────────────────────────────────────
         # When assembly keywords are present, find_cavities() uses chains=None
@@ -914,6 +942,7 @@ class ToolRouter:
             user_input
             and self._detect_double_mutant_intent(user_input)
             and "double_mutant" not in tools_needed
+            and not _claimed
         )
         if _dm_intent:
             _dm_chain = "A"
@@ -929,6 +958,7 @@ class ToolRouter:
                     "_user_input": user_input,
                 }
             }
+            _claimed = True
 
         # ── Mutation scan intent fallback ──────────────────────────────────────
         # Fires when user clearly wants a mutation scan but the translator returned
@@ -941,14 +971,21 @@ class ToolRouter:
         _lower_ui_ms = user_input.lower() if user_input else ""
         _ms_intent = bool(
             user_input
+            and not _claimed                       # a higher-precedence override already won
             and self._detect_mutation_scan_intent(user_input)
             and "mutation_scan" not in tools_needed
+            # DISTRACTOR non-capture: only UPGRADE a generic/cavity mis-route to a
+            # mutation scan. NEVER clobber a specialized tool the translator
+            # deliberately chose — e.g. "CamSol *solubility scan*" legitimately
+            # routes camsol, and a *proteinmpnn* redesign that mentions "improve
+            # solubility"/"reduce aggregation" must stay proteinmpnn (the
+            # collisions the new eval corpus forbids). `cavity` stays an allowed
+            # upgrade target because it is itself a frequent mis-route for a
+            # "suggest mutation to improve solubility" request.
+            and all(t in ("chimerax", "cavity") for t in tools_needed)
             and not self._detect_proline_intent(user_input)
             and not self._detect_glycan_intent(user_input)
             and not self._detect_double_mutant_intent(user_input)
-            and not any(t in tools_needed for t in (
-                "proline", "glycan", "glycan_positions", "double_mutant", "disulfide",
-            ))
             # Only skip if the user's words genuinely match cavity / salt-bridge tools.
             and not self._detect_cavity_intent(user_input)
             and not any(kw in _lower_ui_ms for kw in self._SALT_BRIDGE_KEYWORDS)
