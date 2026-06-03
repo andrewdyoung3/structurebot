@@ -86,6 +86,11 @@ class CaseRun:
     num_predict: Optional[int] = None
     near_ceiling: bool = False
     length_truncated: bool = False
+    # output-capture honesty: an error string if the call failed (after retries), and
+    # whether the (parsed) translation was effectively empty (no tool/command/clarify/
+    # refuse) — a swallowed failure that previously looked like a silent 0-score row.
+    error: Optional[str] = None
+    output_empty: bool = False
 
 
 def _truncation(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,16 +132,52 @@ def run_corpus(callers: Dict[str, Caller], cases: List[eh.EvalCase],
             run_rows: List[CaseRun] = []
             for case in cases:
                 translation, meta = caller(case)
+                meta = meta or {}
                 sc = score_translation(case, translation, weights, probe)
                 tn = [t for t in (translation.get("tools_needed") or []) if isinstance(t, str)] \
                     if isinstance(translation, dict) else []
-                tr = _truncation(meta or {})
+                tr = _truncation(meta)
                 run_rows.append(CaseRun(
                     backend=backend, run_idx=r, case_id=case.id, category=case.category,
                     tier=case.tier, challenge=case.challenge_type, score=sc,
-                    tools_needed=tn, routed_tool=(tn[0] if tn else ""), **tr))
+                    tools_needed=tn, routed_tool=(tn[0] if tn else ""),
+                    error=meta.get("error"), output_empty=_is_empty_output(translation), **tr))
             out[backend].append(run_rows)
     return out
+
+
+def _is_empty_output(tr: Dict[str, Any]) -> bool:
+    """A translation that does NOTHING — no tool, no command, no clarification, no
+    refusal. The signature of a swallowed failure (vs a legitimate clarify/refuse)."""
+    if not isinstance(tr, dict):
+        return True
+    cmds = [c for c in (tr.get("commands") or []) if isinstance(c, str) and c.strip()]
+    return not (tr.get("tools_needed") or cmds or tr.get("clarification_needed") or tr.get("refused"))
+
+
+def assert_capture_rate(all_runs: Dict[str, List[List[CaseRun]]],
+                        threshold: float = 0.10) -> Dict[str, float]:
+    """ABORT (raise) if any backend produced no usable output for more than
+    *threshold* of its rows (errored OR empty). Same honesty principle as the
+    truncation guard: a backend returning empty must FAIL the run, not yield a
+    fictitious low-score 'result'. Returns the per-backend miss-rate."""
+    rates: Dict[str, float] = {}
+    problems: List[str] = []
+    for backend, run_list in all_runs.items():
+        rows = [r for run in run_list for r in run]
+        n = len(rows) or 1
+        missed = [r for r in rows if r.error or r.output_empty]
+        rates[backend] = len(missed) / n
+        if rates[backend] > threshold:
+            kinds = sorted({(r.error or "empty-output").split(":")[0] for r in missed})
+            problems.append(f"{backend}: {len(missed)}/{n} ({rates[backend]*100:.0f}%) rows "
+                            f"empty/errored, over the {threshold*100:.0f}% threshold — kinds: {kinds}")
+    if problems:
+        raise RuntimeError(
+            "HOLLOW RUN — a backend failed to produce output for too many cases; the "
+            "scored result would be fiction. Inspect results.csv (error column).\n  "
+            + "\n  ".join(problems))
+    return rates
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -256,6 +297,9 @@ def write_csv(all_runs: Dict[str, List[List[CaseRun]]], path) -> Path:
                     "accuracy", "functionality", "usability", "aggregate",
                     "fully_correct", "tools_needed", "routed_tool",
                     "prompt_eval_count", "done_reason", "near_ceiling", "length_truncated",
+                    # output-capture honesty: the captured call error (if any) and
+                    # whether the parsed output was empty (a swallowed failure).
+                    "error", "output_empty",
                     # the ACTUAL effect sets, persisted so graded overlap can be
                     # computed post-hoc WITHOUT re-running: chain-qualified residue
                     # lists for selection_resnums ("A:25;B:25;…"), or got/want RGB for
@@ -275,6 +319,7 @@ def write_csv(all_runs: Dict[str, List[List[CaseRun]]], path) -> Path:
                         ";".join(row.tools_needed), row.routed_tool,
                         row.prompt_eval_count if row.prompt_eval_count is not None else "",
                         row.done_reason or "", int(row.near_ceiling), int(row.length_truncated),
+                        row.error or "", int(row.output_empty),
                         got, want,
                     ])
     return path
@@ -299,21 +344,48 @@ def _effect_sets(fun: eh.DimResult) -> Tuple[str, str]:
 # ════════════════════════════════════════════════════════════════════════════════
 #  Production backend callers (forced + direct, no fallback)
 # ════════════════════════════════════════════════════════════════════════════════
+# Transient API conditions worth a retry+backoff (rate-limit / overload / network).
+# Over a 900-call run these WILL occur; without a retry+capture they get swallowed
+# into empty rows and a hollow "0.08" result (the bug this fixes).
+_TRANSIENT_MARKERS = ("rate", "ratelimit", "overload", "timeout", "timed out",
+                      "connection", "temporarily", "529", "503", "502", "429", "500")
+
+def _empty_translation(reason: str) -> Dict[str, Any]:
+    return {"commands": [], "explanations": [], "warnings": [reason],
+            "clarification_needed": None, "confidence": "low",
+            "tools_needed": [], "tool_inputs": {}, "refused": False}
+
+def _translate_capturing(backend, translator, case, retries: int = 4,
+                         base_delay: float = 2.0):
+    """Run backend.translate EXACTLY as the smoke does (reset → forced backend →
+    translate), but retry transient API failures with exponential backoff and, on
+    final failure, CAPTURE the error (return it) instead of silently emptying."""
+    import time
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            translator.reset_conversation()
+            translator._backend = backend
+            sess = EvalSession(case.session)
+            return backend.translate(translator, case.prompt, sess), None
+        except Exception as exc:                       # noqa: BLE001 — captured, not hidden
+            last = exc
+            msg = f"{type(exc).__name__}: {exc}".lower()
+            if any(m in msg for m in _TRANSIENT_MARKERS) and attempt < retries - 1:
+                time.sleep(min(base_delay * (2 ** attempt), 30.0))
+                continue
+            break
+    err = f"{type(last).__name__}: {last}" if last is not None else "empty"
+    return _empty_translation(err), err
+
+
 def make_claude_caller(translator) -> Caller:
     from translator import make_backend
     backend = make_backend("claude")
 
     def call(case):
-        translator.reset_conversation()
-        translator._backend = backend
-        sess = EvalSession(case.session)
-        try:
-            tr = backend.translate(translator, case.prompt, sess)
-        except Exception as exc:
-            tr = {"commands": [], "explanations": [], "warnings": [str(exc)],
-                  "clarification_needed": None, "confidence": "low",
-                  "tools_needed": [], "tool_inputs": {}}
-        return tr, {}
+        tr, err = _translate_capturing(backend, translator, case)
+        return tr, ({"error": err} if err else {})
     return call
 
 
@@ -322,16 +394,11 @@ def make_ollama_caller(translator) -> Caller:
     backend = make_backend("ollama")
 
     def call(case):
-        translator.reset_conversation()
-        translator._backend = backend
-        sess = EvalSession(case.session)
-        try:
-            tr = backend.translate(translator, case.prompt, sess)
-        except Exception as exc:
-            tr = {"commands": [], "explanations": [], "warnings": [str(exc)],
-                  "clarification_needed": None, "confidence": "low",
-                  "tools_needed": [], "tool_inputs": {}}
-        return tr, OllamaBackend.last_meta()
+        tr, err = _translate_capturing(backend, translator, case)
+        meta = OllamaBackend.last_meta()
+        if err:
+            meta = dict(meta); meta["error"] = err
+        return tr, meta
     return call
 
 
@@ -444,9 +511,19 @@ def main(argv=None) -> Dict[str, Path]:
 
     all_runs = run_corpus(callers, cases, runs=args.runs, probe=probe)
     prov = provenance(args.manifest, runs=args.runs, weights=eh.WEIGHTS)
-    paths = write_artifacts(all_runs, cases, args.out, prov)
-    print(f"scored {prov['runs']-1} of {prov['runs']} runs · wrote {paths['report']} + {paths['csv']}")
-    return paths
+
+    # Always write the CSV first (errors are inspectable), THEN gate: a hollow run
+    # (a backend that produced empty/errored output for >10% of cases) ABORTS before
+    # a clean report.md is written — it must fail loudly, not present a 0.08 result.
+    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    csv_path = write_csv(all_runs, out / "results.csv")
+    print(f"wrote {csv_path}")
+    rates = assert_capture_rate(all_runs, threshold=0.10)     # raises on a hollow run
+    md_path = out / "report.md"
+    md_path.write_text(build_report_md(all_runs, cases, prov), encoding="utf-8")
+    print(f"scored {prov['runs']-1} of {prov['runs']} runs · capture rates "
+          f"{ {b: f'{(1-r)*100:.0f}%' for b, r in rates.items()} } · wrote {md_path}")
+    return {"report": md_path, "csv": csv_path}
 
 
 if __name__ == "__main__":

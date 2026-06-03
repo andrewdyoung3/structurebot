@@ -233,6 +233,45 @@ def test_write_artifacts_and_report_md(tmp_path):
     assert "effect_got" in paths["csv"].read_text(encoding="utf-8").splitlines()[0]
 
 
+def test_capture_rate_guard_aborts_hollow_run():
+    cases = _corpus()
+    probe = MockProbe(sel_output="residue id #1/A:20 name ALA index 19")
+
+    # a backend that errors/empties on every case must ABORT the run (not yield a result)
+    def hollow(case):
+        return er._empty_translation("RateLimitError: 429 rate limit"), {"error": "RateLimitError: 429"}
+    all_runs = er.run_corpus({"claude": hollow}, cases, runs=1, probe=probe)
+    with pytest.raises(RuntimeError):
+        er.assert_capture_rate(all_runs, threshold=0.10)
+
+    # a healthy run passes the guard with a 0 miss-rate
+    healthy = er.run_corpus({"claude": _perfect_caller()}, cases, runs=1, probe=probe)
+    rates = er.assert_capture_rate(healthy, threshold=0.10)
+    assert rates["claude"] == 0.0
+
+
+def test_error_and_empty_captured_in_csv(tmp_path):
+    cases = _corpus()
+    probe = MockProbe(sel_output="residue id #1/A:20 name ALA index 19")
+
+    def hollow(case):
+        return er._empty_translation("BoomError: kaboom"), {"error": "BoomError: kaboom"}
+    all_runs = er.run_corpus({"claude": hollow}, cases, runs=1, probe=probe)
+    path = er.write_csv(all_runs, tmp_path / "e.csv")
+    import csv as _csv
+    rows = list(_csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+    assert "error" in rows[0] and "output_empty" in rows[0]
+    assert all("BoomError" in r["error"] for r in rows)
+    assert all(r["output_empty"] == "1" for r in rows)
+
+
+def test_is_empty_output_distinguishes_clarify_refuse_from_failure():
+    assert er._is_empty_output({"tools_needed": [], "commands": []})          # true failure
+    assert not er._is_empty_output({"tools_needed": [], "commands": [], "clarification_needed": "?"})
+    assert not er._is_empty_output({"tools_needed": [], "commands": [], "refused": True})
+    assert not er._is_empty_output({"tools_needed": ["camsol"], "commands": []})
+
+
 def test_run_corpus_refuses_unfrozen_gold():
     pend = eh.EvalCase("p", "zone", 1, "direct", "x",
                        gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
