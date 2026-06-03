@@ -229,6 +229,10 @@ def build_markdown(comparison: Dict[str, Any], model_label: str = "") -> str:
     n_runs = S[backends[0]]["n_runs"] if backends else 0
     n_cases = S[backends[0]]["n_cases"] if backends else 0
     L: List[str] = [f"# Translator backend benchmark — {_dt.date.today().isoformat()}"]
+    L.append("\n> **SUPERSEDED** by the model-independent 3-dimension harness "
+             "(`eval_harness.py`: accuracy / functionality / usability, gold human-defined, "
+             "Claude scored as a contestant). This routing+syntax \"% of Claude\" artifact is "
+             "kept for history only — do not read it as end-to-end correctness.")
     L.append(f"\n_Ollama model: **{model_label or config.OLLAMA_MODEL}**_  ·  "
              f"eval corpus: {n_cases} cases × {len(corpus.categories())} categories  ·  "
              f"**N = {n_runs} runs** (mean [min–max]). FULL = post-guard (`translate()`); "
@@ -270,12 +274,18 @@ def write_artifacts(comparison: Dict[str, Any], model_label: str = "",
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["backend", "run", "id", "category", "raw_pass", "full_pass",
-                    "schema_valid", "routing_ok", "latency_s", "error"])
+                    "schema_valid", "routing_ok", "latency_s", "error",
+                    "tools_needed", "routed_tool"])
         for b, data in comparison.items():
             for ri, rows in enumerate(data["runs"]):
                 for r in rows:
+                    tn = r.get("tools_needed") or []
+                    tn = tn if isinstance(tn, list) else [tn]
+                    tools_needed = ";".join(str(t) for t in tn)
+                    routed_tool = str(tn[0]) if tn else ""   # primary routed tool
                     w.writerow([b, ri, r["id"], r["category"], r["raw_pass"], r["full_pass"],
-                                r["schema_valid"], r["routing_ok"], r["latency_s"], r["error"] or ""])
+                                r["schema_valid"], r["routing_ok"], r["latency_s"], r["error"] or "",
+                                tools_needed, routed_tool])
     return {"md": md_path, "csv": csv_path}
 
 
