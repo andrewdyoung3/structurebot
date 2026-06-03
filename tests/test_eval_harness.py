@@ -385,6 +385,10 @@ def test_residue_color_solid_rgb_tolerance():
     tr = _tr(tools=["chimerax"], commands=["color #1/A red"])
     assert eh.score_functionality(case, tr, probe=lambda c: "rgb(252,3,1)").passed      # within tol of red
     assert not eh.score_functionality(case, tr, probe=lambda c: "rgb(0,0,255)").passed  # blue != red
+    # the LIVE format is per-atom HEX from `info atomcolor`; parse the dominant colour
+    # (ignore the model/resnum digits in the spec)
+    assert eh._parse_rgb("#1/A:1@N color #ff0000\n#1/A:1@CA color #ff0000") == (255, 0, 0)
+    assert eh.score_functionality(case, tr, probe=lambda c: "#1/A:1@N color #ff0000").passed
 
 
 def test_residue_color_scheme_is_accuracy_only():

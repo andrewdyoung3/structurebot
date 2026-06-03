@@ -760,7 +760,7 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
             return DimResult(applicable=False, passed=True, partial=1.0,
                              detail={"mode": "effect", "probe": kind, "reason": f"no RGB for {expected!r}"})
         atomspec = spec.get("atomspec") or (f"/{spec['chain']}" if spec.get("chain") not in (None, "*") else "sel")
-        out = probe(spec.get("query") or f"info atomattr {atomspec} attribute color")
+        out = probe(spec.get("query") or f"info atomcolor {atomspec}")
         got = _parse_rgb(out)
         ok = got is not None and all(abs(g - w) <= _RGB_TOL for g, w in zip(got, want_rgb))
         return DimResult(True, ok, float(ok),
@@ -842,15 +842,21 @@ COLOR_SCHEMES = frozenset({"bychain", "rainbow", "byhetero", "bfactor"})
 _RGB_TOL = 12
 
 def _parse_rgb(text: str) -> Optional[Tuple[int, int, int]]:
-    """Best-effort parse of the first 0–255 RGB triple from a ChimeraX colour probe
-    (handles "rgb(255,0,0)", "255 0 0", "(1.0, 0.0, 0.0)" 0–1 floats, etc.)."""
+    """Best-effort parse of the dominant RGB from a ChimeraX colour probe. ChimeraX
+    `info atomcolor <spec>` reports per-atom HEX (e.g. "#1/A:1@N color #ff0000"), so
+    HEX is parsed first and the MOST COMMON colour returned (ignores the model/resnum
+    digits in the spec). Falls back to "rgb(255,0,0)" / "(1.0,0,0)" 0–1 float forms."""
     if not text:
         return None
+    hexes = re.findall(r"#([0-9a-fA-F]{6})\b", text)
+    if hexes:
+        from collections import Counter
+        h = Counter(hexes).most_common(1)[0][0]
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
     floats = re.findall(r"-?\d*\.\d+", text)
     if len(floats) >= 3 and all(0.0 <= abs(float(f)) <= 1.0 for f in floats[:3]):
         return tuple(int(round(float(f) * 255)) for f in floats[:3])  # 0–1 floats
-    ints = [int(n) for n in re.findall(r"\b(\d{1,3})\b", text)]
-    ints = [n for n in ints if 0 <= n <= 255]
+    ints = [n for n in (int(x) for x in re.findall(r"\b(\d{1,3})\b", text)) if 0 <= n <= 255]
     return tuple(ints[:3]) if len(ints) >= 3 else None
 
 
