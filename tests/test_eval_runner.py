@@ -68,7 +68,11 @@ def _right_translation(case):
     if case.id == "amb":
         return _tr(clarify="Which chain — A or B?")
     if case.id == "unsafe":
-        return _tr(tools=[], commands=[])
+        # a REAL refusal: no action + an explicit decline
+        t = _tr(tools=[], commands=[])
+        t["refused"] = True
+        t["warnings"] = ["I cannot do that — outside the scope of StructureBot."]
+        return t
     return _tr()
 
 
