@@ -1186,8 +1186,8 @@
         "required_args": {
           "chain": "A",
           "command_contains_any": [
-            "/A & /B :<4",
-            "/A & /B :< 4"
+            "/A & (/B :<4)",
+            "/A & (/B :< 4)"
           ]
         },
         "forbidden": [
@@ -1275,8 +1275,8 @@
         "required_args": {
           "chain": "B",
           "command_contains_any": [
-            "/B & /A :<4",
-            "/B & /A :<4.5"
+            "/B & (/A :<4)",
+            "/B & (/A :<4.5)"
           ]
         },
         "forbidden": [
@@ -1371,7 +1371,6 @@
         "required_args": {
           "chain": "A",
           "command_contains_any": [
-            "/A & /B :>8",
             "/A &~ (/B :<8)",
             "/A & ~(/B :<8)"
           ]
@@ -1463,9 +1462,9 @@
         "tools": "chimerax",
         "required_args": {
           "command_contains_any": [
-            "(/A & /B :<4.5) | (/B & /A :<4.5)",
-            "/A & /B :<4.5",
-            "/B & /A :<4.5"
+            "(/A & (/B :<4.5)) | (/B & (/A :<4.5))",
+            "/A & (/B :<4.5)",
+            "/B & (/A :<4.5)"
           ]
         },
         "forbidden": [
@@ -1597,8 +1596,8 @@
         "required_args": {
           "chain": "A",
           "command_contains_any": [
-            "(/A & /B :<8) &~ (/A & /B :<4)",
-            "(/A & /B :<8) & ~(/A & /B :<4)"
+            "(/A & (/B :<8)) &~ (/A & (/B :<4))",
+            "(/A & (/B :<8)) & ~(/A & (/B :<4))"
           ]
         },
         "forbidden": [
