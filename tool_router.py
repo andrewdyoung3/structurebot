@@ -2213,8 +2213,17 @@ class ToolRouter:
 
         bias_aas = [str(a).upper() for a in (inputs.get("bias_amino_acids") or [])
                     if str(a).strip()]
-        bias_toward = str(inputs.get("bias_toward") or "").lower()
-        if not bias_aas and "hydrophil" in bias_toward:
+        # A "more soluble" / "hydrophilic" / "reduce aggregation" objective maps to a
+        # SOFT positive bias toward the polar/charged set. The model signals it either
+        # structurally (bias_amino_acids, handled above) or in free text via
+        # bias_toward/design_scope — accept the solubility synonyms here so the
+        # objective is actually HONOURED (not silently dropped). Only "hydrophil"
+        # was matched before, so bias_toward:"soluble" — the corpus's own wording —
+        # fell through.
+        _bias_hint = (str(inputs.get("bias_toward") or "") + " "
+                      + str(inputs.get("design_scope") or "")).lower()
+        if not bias_aas and any(tok in _bias_hint for tok in
+                                ("hydrophil", "solub", "soluble", "polar", "aggregation")):
             bias_aas = list(_HYDROPHILIC_AAS)   # D E N Q H K R S T
 
         # design_scope is the canonical key (see translator prompt); design_mode

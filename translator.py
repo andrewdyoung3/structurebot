@@ -198,6 +198,7 @@ tool_inputs: dict of tool-specific parameters, e.g.:
     {{"proteinmpnn": {{
         "model_id": "1", "chain": "A",
         "design_scope": "selected" | "interface" | "chain",
+        "design_positions": [20, 21, 22, ..., 30],
         "partner_chain": "B",
         "exclude_amino_acids": ["C"],
         "bias_amino_acids": ["D","E","N","Q","H","K","R","S","T"]
@@ -206,9 +207,16 @@ tool_inputs: dict of tool-specific parameters, e.g.:
       in ChimeraX; "interface" = redesign only the chain/partner_chain interface;
       "chain" = the whole chain. Use "selected" whenever the request says "the
       selected residues"; use "interface" for interface/dimer-interface requests.
-    • exclude_amino_acids = HARD exclusions ("no cysteines" → ["C"]).
-    • bias_amino_acids = SOFT preference ("hydrophilic" → the polar/charged set
-      D E N Q H K R S T). Omit keys that don't apply.
+    • design_positions = EXPLICIT residue numbers when the user names a range or
+      list (e.g. "residues 20-30 of chain A" → [20,21,...,30], "residues 5, 9, 14"
+      → [5,9,14]). Always emit the EXPANDED integer list (never the string
+      "20-30"). Set design_scope "selected" alongside it. A named explicit range is
+      NOT a whole-chain redesign.
+    • exclude_amino_acids = HARD exclusions ("no cysteines" → ["C"], "no prolines"
+      → ["P"]).
+    • bias_amino_acids = SOFT preference ("hydrophilic" / "more soluble" / "reduce
+      aggregation" → the polar/charged set D E N Q H K R S T). Omit keys that don't
+      apply.
 
 If the request cannot be safely translated without more information:
 {{
