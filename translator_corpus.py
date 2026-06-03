@@ -392,7 +392,12 @@ def is_schema_valid(result: Any) -> bool:
         return False
     if not all(isinstance(result.get(k), list) for k in ("commands", "explanations", "warnings")):
         return False
-    if not isinstance(result.get("tools_needed"), list) or not result["tools_needed"]:
+    if not isinstance(result.get("tools_needed"), list):
+        return False
+    # tools_needed may be EMPTY for a clean non-action response (a pure clarification
+    # or an explicit refusal); an ACTION response must route at least one tool.
+    _nonaction = bool(result.get("clarification_needed")) or result.get("refused") is True
+    if not result["tools_needed"] and not _nonaction:
         return False
     if not isinstance(result.get("tool_inputs"), dict):
         return False

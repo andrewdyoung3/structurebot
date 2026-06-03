@@ -156,6 +156,11 @@ epitopes/binding sites — are STANDARD computational structural biology. Transl
 them to ChimeraX commands (and tool routing) normally; do NOT decline or return
 an empty response for such requests. They are benign visualisation/analysis work
 on coordinate files, not anything hazardous.
+Conversely, a request that is genuinely OUTSIDE this scope — not about a deposited
+protein structure at all (file-system/shell/network/OS actions, or other non-
+structural tasks) — must be DECLINED via the refusal shape below (refused:true), NOT
+forced into invented ChimeraX commands. Decline the out-of-scope, execute the
+in-scope; never invent an action you cannot actually perform.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT  (strict JSON, no markdown, no prose)
@@ -218,15 +223,32 @@ tool_inputs: dict of tool-specific parameters, e.g.:
       aggregation" → the polar/charged set D E N Q H K R S T). Omit keys that don't
       apply.
 
-If the request cannot be safely translated without more information:
+If the request cannot be safely translated without more information, ASK — emit a
+pure question with NO tool and NO command (do not guess a chain or default to
+acting). But do NOT over-clarify: a clear, answerable request must still execute.
 {{
   "commands":            [],
   "explanations":        [],
   "warnings":            [],
   "clarification_needed": "A single concise question for the user",
   "confidence":          "low",
-  "tools_needed":        ["chimerax"],
+  "tools_needed":        [],
   "tool_inputs":         {{}}
+}}
+
+If the request is OUTSIDE StructureBot's scope or is UNSAFE — anything that is not
+visualisation/analysis of a protein structure (e.g. file-system, shell, network, or
+operating-system actions) — DECLINE. Do NOT invent ChimeraX commands; emit a clean
+non-action shape with the structured refusal flag and a one-line reason:
+{{
+  "commands":            [],
+  "explanations":        [],
+  "warnings":            ["One sentence: why this is outside StructureBot's scope."],
+  "clarification_needed": null,
+  "confidence":          "low",
+  "tools_needed":        [],
+  "tool_inputs":         {{}},
+  "refused":             true
 }}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -737,6 +759,10 @@ TRANSLATION_JSON_SCHEMA: Dict[str, Any] = {
                                  "items": {"type": "string",
                                            "enum": list(config.TRANSLATOR_TOOL_NAMES)}},
         "tool_inputs":          {"type": "object"},
+        # Structured decline signal for out-of-scope / unsafe requests (a clean
+        # non-action shape: tools_needed:[], commands:[], refused:true). Optional —
+        # absent/false on every normal response.
+        "refused":              {"type": "boolean"},
     },
     "required": ["commands", "explanations", "warnings", "clarification_needed",
                  "confidence", "tools_needed", "tool_inputs"],
@@ -1173,15 +1199,24 @@ class CommandTranslator:
         result.setdefault("warnings",            [])
         result.setdefault("clarification_needed", None)
         result.setdefault("confidence",          "medium")
-        result.setdefault("tools_needed",        ["chimerax"])
+        result.setdefault("tools_needed",        [])
         result.setdefault("tool_inputs",         {})
+        result["refused"] = bool(result.get("refused", False))
 
         # Coerce confidence to one of three values
         if result["confidence"] not in ("high", "medium", "low"):
             result["confidence"] = "medium"
 
-        # Ensure tools_needed is always a non-empty list
-        if not isinstance(result["tools_needed"], list) or not result["tools_needed"]:
+        # tools_needed must be a list. Default to ["chimerax"] ONLY for an ACTION
+        # response — a pure clarification (clarification_needed set) or an explicit
+        # refusal (refused:true) legitimately carries NO tool (a clean non-action
+        # shape), so do NOT inject boilerplate ["chimerax"] there. (That boilerplate
+        # previously poisoned eval scoring: it counted as "acting" and tripped the
+        # refuse cases' forbidden ["chimerax"].)
+        if not isinstance(result["tools_needed"], list):
+            result["tools_needed"] = []
+        _is_nonaction = bool(result.get("clarification_needed")) or result["refused"]
+        if not result["tools_needed"] and not _is_nonaction:
             result["tools_needed"] = ["chimerax"]
 
         # Ensure tool_inputs is a dict
