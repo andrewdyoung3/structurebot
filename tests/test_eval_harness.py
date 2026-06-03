@@ -333,6 +333,40 @@ def test_discover_skips_non_manifest_json(tmp_path):
     assert eh.discover_manifest_id_prompts(tmp_path) == {}
 
 
+def test_solvent_excluded_from_selection_reader():
+    # Identical exclusion on gold and model side — incidental waters never count.
+    txt = ("residue id #1/A:5 name LEU index 4\n"
+           "residue id #1/A:50 name ALA index 49\n"
+           "residue id #1/B:902 name HOH index 0\n"
+           "residue id #1/W:7 name WAT index 1")
+    assert eh._parse_info_residues(txt) == {5, 50}          # HOH + WAT dropped
+    assert "HOH" in eh.SOLVENT_RESNAMES and "WAT" in eh.SOLVENT_RESNAMES
+
+
+def test_selection_spec_shapes_and_strict_raise():
+    assert eh.selection_spec(None) is None
+    assert eh.selection_spec("#1/A:40-42") == "#1/A:40-42"
+    assert eh.selection_spec({"spec": "/A:10"}) == "/A:10"
+    assert eh.selection_spec({"chain": "A", "resnums": [40, 41, 42]}) == "/A:40,41,42"
+    for bad in ({"chain": "A"}, {"resnums": [1]}, {"foo": "bar"}, 42):
+        with pytest.raises(ValueError):
+            eh.selection_spec(bad)
+    # the loader RAISES on an unrecognised selection — never silently null
+    with pytest.raises(ValueError):
+        eh.validate_manifest([eh.EvalCase(
+            "s", "zone", 1, "direct", "p",
+            gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
+            gold_usability=eh.GoldUsability("execute"),
+            session={"models": [{"id": "#1", "pdb": "2LZM", "chains": ["A"]}],
+                     "selection": {"weird": True}})])
+
+
+def test_session_open_commands_applies_structured_selection():
+    sess = {"models": [{"id": "#1", "pdb": "2LZM", "chains": ["A"]}],
+            "selection": {"chain": "A", "resnums": [40, 41, 42]}}
+    assert eh.session_open_commands(sess) == ["open 2LZM", "select /A:40,41,42"]
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 #  v1.1 EXTENSIONS — clarify_about / session / nested-AND tools / command_contains_any
 # ════════════════════════════════════════════════════════════════════════════════

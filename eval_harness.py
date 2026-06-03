@@ -282,6 +282,12 @@ def validate_manifest(cases: List[EvalCase]) -> List[EvalCase]:
             for m in models:
                 if not (isinstance(m, dict) and "id" in m and "pdb" in m and "chains" in m):
                     raise ValueError(f"{c.id}: each session.models entry needs id/pdb/chains")
+            # selection must be a RECOGNISED shape — never silently dropped (a
+            # silent-null on a `sel`-relative case would resolve to the empty set).
+            try:
+                selection_spec(c.session.get("selection"))
+            except ValueError as exc:
+                raise ValueError(f"{c.id}: {exc}")
         if c.gold_accuracy is not None:
             for tok in c.gold_accuracy.forbidden:
                 # a forbidden token must be a known tool literal OR a known behaviour
@@ -445,10 +451,36 @@ def hallucinated_tools(tr: Dict[str, Any]) -> List[str]:
     return [t for t in model_tools(tr) if t not in TOOL_REGISTRY]
 
 
+def selection_spec(sel: Any) -> Optional[str]:
+    """Resolve a session.selection into a ChimeraX selection spec, or None when no
+    selection. RECOGNISED SHAPES:
+      • `null`                              → no selection
+      • a non-empty STRING                  → a raw ChimeraX spec, e.g. "#1/A:40-42"
+      • {"spec": "<spec>"}                  → that raw spec
+      • {"chain": "A", "resnums": [40,41,42]} → built as "/A:40,41,42"
+    Any OTHER shape is a gold hazard (a silently-dropped selection makes a
+    `sel`-relative case resolve to the empty set), so this RAISES rather than
+    nulling it."""
+    if sel is None:
+        return None
+    if isinstance(sel, str):
+        return sel.strip() or None
+    if isinstance(sel, dict):
+        if isinstance(sel.get("spec"), str) and sel["spec"].strip():
+            return sel["spec"].strip()
+        chain, resnums = sel.get("chain"), sel.get("resnums")
+        if chain and isinstance(resnums, (list, tuple)) and resnums:
+            nums = ",".join(str(int(r)) for r in resnums)
+            return f"/{chain}:{nums}"
+    raise ValueError(f"unrecognised session.selection shape: {sel!r} (expected null, a "
+                     f"string spec, {{'spec': '<spec>'}}, or {{'chain','resnums'}})")
+
+
 def session_open_commands(session: Optional[Dict[str, Any]]) -> List[str]:
     """ChimeraX commands that reconstruct a case's loaded-state precondition:
     open each declared model's pdb, then apply the selection (if any). Used by the
-    effect scorer (and the benchmark runner) to set the scene before asserting."""
+    effect scorer (and the benchmark runner) to set the scene before asserting.
+    Raises on an unrecognised selection shape (never silently drops it)."""
     cmds: List[str] = []
     if not session:
         return cmds
@@ -456,11 +488,9 @@ def session_open_commands(session: Optional[Dict[str, Any]]) -> List[str]:
         pdb = (m or {}).get("pdb")
         if pdb:
             cmds.append(f"open {pdb}")
-    sel = session.get("selection")
-    if isinstance(sel, str) and sel.strip():
-        cmds.append(f"select {sel.strip()}")
-    elif isinstance(sel, dict) and sel.get("spec"):
-        cmds.append(f"select {sel['spec']}")
+    spec = selection_spec(session.get("selection"))
+    if spec:
+        cmds.append(f"select {spec}")
     return cmds
 
 
@@ -724,11 +754,20 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
 # the model id `#1` or the trailing `index N` (a naive \d+ scan double-counts those).
 _SEL_RE = re.compile(r"residue id\s+(?:#(\d+))?/([^:\s]+):(-?\d+)\s+name\s+(\S+)")
 
+# Solvent / crystal-water residue names — EXCLUDED from every parsed selection so
+# that incidental waters picked up by a non-chain-restricted distance zone never
+# count. This is applied IDENTICALLY to the frozen gold and to the model's measured
+# selection (one shared reader), so neither side is penalised for waters.
+SOLVENT_RESNAMES = frozenset({"HOH", "WAT", "DOD", "H2O", "SOL", "TIP", "TIP3", "TIP4"})
+
 def _parse_info_residues(text: str, chain: Optional[str] = None) -> set:
-    """Parse ChimeraX `info residues sel` output → set of resnums (optionally one chain)."""
+    """Parse ChimeraX `info residues sel` output → set of resnums (optionally one
+    chain). Solvent residues are excluded (see SOLVENT_RESNAMES)."""
     nums: set = set()
     for m in _SEL_RE.finditer(text or ""):
-        ch, resnum = m.group(2), int(m.group(3))
+        ch, resnum, resname = m.group(2), int(m.group(3)), m.group(4)
+        if resname.upper() in SOLVENT_RESNAMES:
+            continue
         if chain is None or ch == chain:
             nums.add(resnum)
     return nums
