@@ -255,13 +255,19 @@ def write_csv(all_runs: Dict[str, List[List[CaseRun]]], path) -> Path:
         w.writerow(["backend", "run", "id", "category", "tier", "challenge",
                     "accuracy", "functionality", "usability", "aggregate",
                     "fully_correct", "tools_needed", "routed_tool",
-                    "prompt_eval_count", "done_reason", "near_ceiling", "length_truncated"])
+                    "prompt_eval_count", "done_reason", "near_ceiling", "length_truncated",
+                    # the ACTUAL effect sets, persisted so graded overlap can be
+                    # computed post-hoc WITHOUT re-running: chain-qualified residue
+                    # lists for selection_resnums ("A:25;B:25;…"), or got/want RGB for
+                    # residue_color. Empty for dispatch / usability-only cases.
+                    "effect_got", "effect_want"])
         for backend, run_list in all_runs.items():
             for r, run in enumerate(run_list):
                 for row in run:
                     s = row.score
                     def cell(d):
                         return "" if not d.applicable else ("1" if d.passed else "0")
+                    got, want = _effect_sets(s.functionality)
                     w.writerow([
                         backend, r, row.case_id, row.category, row.tier, row.challenge,
                         cell(s.accuracy), cell(s.functionality), cell(s.usability),
@@ -269,8 +275,25 @@ def write_csv(all_runs: Dict[str, List[List[CaseRun]]], path) -> Path:
                         ";".join(row.tools_needed), row.routed_tool,
                         row.prompt_eval_count if row.prompt_eval_count is not None else "",
                         row.done_reason or "", int(row.near_ceiling), int(row.length_truncated),
+                        got, want,
                     ])
     return path
+
+
+def _effect_sets(fun: eh.DimResult) -> Tuple[str, str]:
+    """Extract the model's resulting set (got) and the gold (want) from an effect
+    DimResult, as `;`-joined strings — the FULL chain-qualified lists for
+    selection_resnums (e.g. 'A:25;B:25'), or the RGB triples for residue_color."""
+    d = fun.detail or {}
+    got = d.get("got", d.get("got_rgb"))
+    want = d.get("want", d.get("want_rgb"))
+    def _j(v):
+        if v is None:
+            return ""
+        if isinstance(v, (list, tuple)):
+            return ";".join(str(x) for x in v)
+        return str(v)
+    return _j(got), _j(want)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -323,3 +346,108 @@ def make_chimerax_probe(base_url: str = "http://localhost:60001"):
         with urllib.request.urlopen(url, timeout=20) as r:
             return r.read().decode("utf-8", "replace")
     return probe
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Report markdown + artifacts + CLI
+# ════════════════════════════════════════════════════════════════════════════════
+def _pct(x) -> str:
+    return "n/a" if x is None or x != x else f"{x*100:.0f}%"   # NaN-safe
+
+
+def build_report_md(all_runs: Dict[str, List[List["CaseRun"]]],
+                    cases: List[eh.EvalCase], prov: Dict[str, Any]) -> str:
+    rep = aggregate(all_runs, cases)
+    backends = list(all_runs)
+    L = [header_text(prov).rstrip(), ""]
+    # overall (per-dimension + aggregate + fully-correct), both backends
+    L.append("## Overall (mean over scored runs; cold run discarded)\n")
+    L.append("| Metric | " + " | ".join(backends) + " |")
+    L.append("|--------|" + "|".join(["---"] * len(backends)) + "|")
+    for label, key in [("Accuracy", "accuracy"), ("Functionality", "functionality"),
+                       ("Usability", "usability")]:
+        L.append(f"| {label} | " + " | ".join(_pct(rep[b]["overall"][key]) for b in backends) + " |")
+    L.append("| **Aggregate** (A.50/F.35/U.15) | " +
+             " | ".join(f"**{rep[b]['overall']['aggregate']*100:.0f}%**" for b in backends) + " |")
+    L.append("| **Fully-correct** | " +
+             " | ".join(f"**{_pct(rep[b]['overall']['fully_correct'])}**" for b in backends) + " |")
+    L.append("| scored runs (of total) | " +
+             " | ".join(f"{rep[b]['n_runs_scored']}/{rep[b]['n_runs_total']}" for b in backends) + " |")
+
+    for axis, title in [("by_category", "Per-category"), ("by_tier", "Per-tier"),
+                        ("by_challenge", "Per-challenge")]:
+        L.append(f"\n## {title} — Accuracy · Functionality · Usability · agg · fully-correct\n")
+        L.append("| Group (n) | " + " | ".join(backends) + " |")
+        L.append("|-----------|" + "|".join(["---"] * len(backends)) + "|")
+        keys = sorted(set().union(*[set(rep[b][axis]) for b in backends]))
+        for k in keys:
+            cells = []
+            n = 0
+            for b in backends:
+                g = rep[b][axis].get(k)
+                if not g:
+                    cells.append("—"); continue
+                n = g["n"]
+                cells.append(f"{_pct(g['accuracy'])} · {_pct(g['functionality'])} · "
+                             f"{_pct(g['usability'])} · {g['aggregate']*100:.0f}% · {_pct(g['fully_correct'])}")
+            L.append(f"| {k} ({n}) | " + " | ".join(cells) + " |")
+
+    L.append("\n## Truncation (Ollama honesty guard)\n")
+    for b in backends:
+        t = rep[b]["truncation"]
+        L.append(f"- **{b}**: instrumented={t['instrumented']} · "
+                 f"max_prompt_eval_count={t['max_prompt_eval_count']} · "
+                 f"near_ceiling={t['near_ceiling_cases']} · length_truncated={t['length_truncated_cases']}")
+    L.append("\n_Per-case rows (incl. the full chain-qualified effect_got/effect_want "
+             "sets) are in `results.csv`._\n")
+    return "\n".join(L) + "\n"
+
+
+def write_artifacts(all_runs: Dict[str, List[List["CaseRun"]]], cases: List[eh.EvalCase],
+                    out_dir, prov: Dict[str, Any]) -> Dict[str, Path]:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / "results.csv"
+    md_path = out / "report.md"
+    write_csv(all_runs, csv_path)
+    md_path.write_text(build_report_md(all_runs, cases, prov), encoding="utf-8")
+    return {"report": md_path, "csv": csv_path}
+
+
+def main(argv=None) -> Dict[str, Path]:
+    import argparse
+    import os
+    ap = argparse.ArgumentParser(description="Run the model-independent 3-dimension translator benchmark.")
+    ap.add_argument("--manifest", default="scripts/eval_corpus_manifest.json",
+                    help="frozen corpus JSON")
+    ap.add_argument("--backends", default="claude,ollama", help="comma list (claude,ollama)")
+    ap.add_argument("--runs", type=int, default=6,
+                    help="TOTAL runs per backend; the cold run is discarded, so scored = runs-1 "
+                         "(use 6 for 5 scored runs)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="recorded in provenance; the Ollama backend itself is fixed at seed 0")
+    ap.add_argument("--out", default="scripts/eval_3dim_results",
+                    help="output DIRECTORY for report.md + results.csv")
+    ap.add_argument("--chimerax-url", default="http://localhost:60001")
+    args = ap.parse_args(argv)
+
+    import config
+    config.load_env_file()
+    from translator import CommandTranslator
+
+    cases = eh.load_manifest(args.manifest)
+    eh.assert_no_pending_gold(cases)                 # never run on unfrozen gold
+    t = CommandTranslator(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    factory = {"claude": make_claude_caller, "ollama": make_ollama_caller}
+    callers = {n: factory[n](t) for n in (x.strip() for x in args.backends.split(",")) if n in factory}
+    probe = make_chimerax_probe(args.chimerax_url)
+
+    all_runs = run_corpus(callers, cases, runs=args.runs, probe=probe)
+    prov = provenance(args.manifest, runs=args.runs, weights=eh.WEIGHTS)
+    paths = write_artifacts(all_runs, cases, args.out, prov)
+    print(f"scored {prov['runs']-1} of {prov['runs']} runs · wrote {paths['report']} + {paths['csv']}")
+    return paths
+
+
+if __name__ == "__main__":
+    main()

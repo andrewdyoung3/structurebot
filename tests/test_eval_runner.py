@@ -198,6 +198,41 @@ def test_csv_includes_tools_and_truncation(tmp_path):
     assert "camsol" in text                            # routed tool recorded
 
 
+def test_csv_persists_chain_qualified_effect_sets(tmp_path):
+    # the FULL chain-qualified got/want sets must be persisted per effect case (so
+    # graded overlap can be computed post-hoc without re-running).
+    case = eh.EvalCase("q", "zone", 2, "compound", "x",
+                       gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
+                       gold_functionality=eh.GoldFunctionality(
+                           "effect", {"probe": "selection_resnums", "chain": None,
+                                      "expected": ["A:25", "B:25"]}),
+                       gold_usability=eh.GoldUsability("execute"))
+
+    def caller(c):
+        return (_tr(tools=["chimerax"], commands=["select x", "info residues sel"]), {})
+    probe = MockProbe(sel_output="residue id #1/A:25 name LEU index 1\nresidue id #1/B:25 name LEU index 2")
+    all_runs = er.run_corpus({"m": caller}, [case], runs=1, probe=probe)
+    path = er.write_csv(all_runs, tmp_path / "q.csv")
+    import csv as _csv
+    rows = list(_csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+    assert "effect_got" in rows[0] and "effect_want" in rows[0]
+    assert rows[0]["effect_got"] == "A:25;B:25"            # full chain-qualified set, not a count
+    assert rows[0]["effect_want"] == "A:25;B:25"
+
+
+def test_write_artifacts_and_report_md(tmp_path):
+    cases = _corpus()
+    probe = MockProbe(sel_output="residue id #1/A:20 name ALA index 19")
+    all_runs = er.run_corpus({"claude": _perfect_caller(), "ollama": _perfect_caller()},
+                             cases, runs=2, probe=probe)
+    prov = er.provenance("scripts/eval_corpus_manifest.json", runs=2, weights=eh.WEIGHTS)
+    paths = er.write_artifacts(all_runs, cases, tmp_path / "out", prov)
+    assert paths["report"].exists() and paths["csv"].exists()
+    md = paths["report"].read_text(encoding="utf-8")
+    assert "Aggregate" in md and "Per-category" in md and prov["corpus_sha"] in md
+    assert "effect_got" in paths["csv"].read_text(encoding="utf-8").splitlines()[0]
+
+
 def test_run_corpus_refuses_unfrozen_gold():
     pend = eh.EvalCase("p", "zone", 1, "direct", "x",
                        gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
