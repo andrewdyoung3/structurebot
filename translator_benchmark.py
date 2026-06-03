@@ -233,6 +233,10 @@ def build_markdown(comparison: Dict[str, Any], model_label: str = "") -> str:
              f"eval corpus: {n_cases} cases × {len(corpus.categories())} categories  ·  "
              f"**N = {n_runs} runs** (mean [min–max]). FULL = post-guard (`translate()`); "
              f"RAW = pre-guard (`backend.translate()`). Bar = mean over N≥5.")
+    L.append("\n> **Scope of this score: ROUTING + COMMAND SYNTAX only.** A case passes on "
+             "correct tool routing and well-formed ChimeraX commands; **`tool_inputs` "
+             "(arguments / scope) are NOT checked**, so this is *not* an end-to-end "
+             "correctness number. The argument/scope-checking upgrade is a separate item.")
     L.append("\n## Overall (mean [min–max] over N runs)\n")
     L.append("| Metric | " + " | ".join(backends) + " |")
     L.append("|--------|" + "|".join(["---"] * len(backends)) + "|")
