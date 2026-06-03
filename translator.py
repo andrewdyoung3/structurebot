@@ -764,6 +764,15 @@ class OllamaBackend(TranslatorBackend):
     """
     name = "ollama"
 
+    # Last `/api/chat` response metadata (prompt_eval_count / done_reason / …),
+    # stashed by _chat for the benchmark runner's TRUNCATION instrumentation. Purely
+    # additive — never read on the production path, never changes behaviour.
+    _LAST_META: Dict[str, Any] = {}
+
+    @classmethod
+    def last_meta(cls) -> Dict[str, Any]:
+        return dict(cls._LAST_META)
+
     def translate(self, translator: "CommandTranslator",
                   user_input: str, session) -> Dict[str, Any]:
         # Same pre-screen short-circuit as Claude (backend-agnostic routing).
@@ -834,7 +843,18 @@ class OllamaBackend(TranslatorBackend):
         )
         _OLLAMA_MAY_BE_LOADED = True   # a request was issued — model may be resident
         resp.raise_for_status()
-        return (resp.json().get("message", {}) or {}).get("content", "") or ""
+        data = resp.json() or {}
+        # Stash response metadata for the benchmark runner's truncation honesty guard
+        # (a silently truncated prompt scored as a model failure was the original
+        # num_ctx bug). Additive — the returned content is unchanged.
+        OllamaBackend._LAST_META = {
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "eval_count":        data.get("eval_count"),
+            "done_reason":       data.get("done_reason"),
+            "num_ctx":           int(config.OLLAMA_NUM_CTX),
+            "num_predict":       int(config.OLLAMA_NUM_PREDICT),
+        }
+        return (data.get("message", {}) or {}).get("content", "") or ""
 
 
 def ensure_translator_unloaded() -> None:
