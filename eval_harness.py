@@ -110,12 +110,26 @@ def _mentions(inp: Dict[str, Any], blob: str, *tokens: str) -> bool:
     hay = (blob + " " + " ".join(str(v) for v in inp.values())).lower()
     return any(tok in hay for tok in tokens)
 
+# The polar/charged set the translator prompt prescribes for "more soluble" /
+# "hydrophilic". A model that emits this as `bias_amino_acids` HAS expressed a
+# solubility/hydrophilic objective even without the literal word, so the constraint
+# checks must recognise it (else a correct structured output is a false negative).
+_POLAR_AAS = frozenset("DENQHKRST")
+_HYDROPHOBIC_AAS = frozenset("FILMVWY")
+
+def _has_polar_bias(inp: Dict[str, Any]) -> bool:
+    bias = inp.get("bias_amino_acids") or inp.get("bias_aas") or []
+    if isinstance(bias, str):
+        bias = list(bias)
+    bset = {str(x).upper() for x in bias}
+    return len(bset & _POLAR_AAS) >= 2 and not (bset & _HYDROPHOBIC_AAS)
+
 CONSTRAINT_REGISTRY: Dict[str, Callable[[Dict[str, Any], str], bool]] = {
     "exclude_cys":  lambda inp, blob: _has_excluded_aa(inp, "C"),
     "exclude_pro":  lambda inp, blob: _has_excluded_aa(inp, "P"),
-    "solubility":   lambda inp, blob: _mentions(inp, blob, "solub", "soluble", "hydrophil"),
-    "hydrophilic":  lambda inp, blob: _mentions(inp, blob, "hydrophil", "polar", "solub"),
-    "charged":      lambda inp, blob: _mentions(inp, blob, "charg", "polar"),
+    "solubility":   lambda inp, blob: _mentions(inp, blob, "solub", "soluble", "hydrophil") or _has_polar_bias(inp),
+    "hydrophilic":  lambda inp, blob: _mentions(inp, blob, "hydrophil", "polar", "solub") or _has_polar_bias(inp),
+    "charged":      lambda inp, blob: _mentions(inp, blob, "charg", "polar") or _has_polar_bias(inp),
 }
 
 # Forbidden BEHAVIOUR tokens (not tools): predicate returns True when the behaviour
@@ -704,8 +718,27 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
             kk = str(k).lower()
             if kk == "scope":
                 checks.append(("scope", bool(_parse_scope(exp)) and _parse_scope(exp) <= _parse_scope(got.get("design_positions") or got.get("fixed_positions"))))
-            elif kk == "chain":
-                checks.append(("chain", any(str(got.get(f, "")).upper() == str(exp).upper() for f in ("chain", "chain_id", "chain_a"))))
+            elif kk in ("chain", "chain_id", "chain_a"):
+                # chain aliases — the model is inconsistent about chain vs chain_id
+                checks.append((kk, any(str(got.get(f, "")).upper() == str(exp).upper()
+                                       for f in ("chain", "chain_id", "chain_a"))))
+            elif kk in ("exclude_amino_acids", "omit_amino_acids", "exclude_aas"):
+                # MEMBERSHIP, not exact: the gold letter(s) ("C" or ["C"]) must be
+                # excluded by the model's list/string (which may be ["C"] or "C").
+                got_ex = got.get("exclude_amino_acids") or got.get("omit_amino_acids") or got.get("exclude_aas") or []
+                got_seq = got_ex if isinstance(got_ex, (list, tuple)) else [got_ex]
+                got_letters = {c for s in got_seq for c in str(s).upper() if c.isalpha()}
+                gold_seq = exp if isinstance(exp, (list, tuple)) else [exp]
+                gold_letters = {c for s in gold_seq for c in str(s).upper() if c.isalpha()}
+                checks.append((kk, bool(gold_letters) and gold_letters <= got_letters))
+            elif kk == "bias_toward":
+                # the model may express a solubility/hydrophilic bias either as the
+                # word (bias_toward) OR structurally (bias_amino_acids = polar set)
+                want = str(exp).lower()
+                ok = want in str(got.get("bias_toward", "")).lower()
+                if not ok and any(t in want for t in ("solub", "hydrophil", "polar", "charg")):
+                    ok = _has_polar_bias(got)
+                checks.append((kk, ok))
             else:
                 checks.append((kk, str(got.get(kk)).lower() == str(exp).lower()))
         passed = all(ok for _, ok in checks) if checks else (want_tool in tools)
@@ -722,8 +755,15 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
         return DimResult(True, False, 0.0, {"mode": "effect", "reason": "no ChimeraX probe (skipped/CI)"})
     # Loaded-state precondition: open the declared structure(s) + apply the
     # selection so the effect assertion has the right scene (live ChimeraX in prod,
-    # mock probe in CI).
-    for cmd in session_open_commands(case.session):
+    # mock probe in CI). RESET the scene first (matching freeze_zone_gold.py) so the
+    # declared structure is model #1 in a CLEAN scene — otherwise a prior effect
+    # case's models stay open, `open`/`#1` resolve to the wrong structure, and the
+    # assertion reads stale/cross-contaminated state (gold and measurement must use
+    # the SAME scene setup).
+    open_cmds = session_open_commands(case.session)
+    if open_cmds:
+        probe("close session")
+    for cmd in open_cmds:
         probe(cmd)
     # run the model's commands
     for c in (tr.get("commands") or []):

@@ -391,6 +391,32 @@ def test_residue_color_solid_rgb_tolerance():
     assert eh.score_functionality(case, tr, probe=lambda c: "#1/A:1@N color #ff0000").passed
 
 
+def test_dispatch_and_accuracy_recognise_structured_solubility():
+    # the prompt-prescribed expression of "more soluble, no cysteines": chain A,
+    # exclude_amino_acids ["C"], bias_amino_acids = the polar/charged set. This must
+    # satisfy a gold that names chain_id / exclude_amino_acids:"C" / bias_toward:"soluble"
+    # (false-negativing a correct output is a measurement bug, not model quality).
+    good = _tr(tools=["proteinmpnn"], tool_inputs={"proteinmpnn": {
+        "chain": "A", "exclude_amino_acids": ["C"],
+        "bias_amino_acids": ["D", "E", "N", "Q", "H", "K", "R", "S", "T"]}})
+    disp = eh.EvalCase("d", "mpnn", 3, "collision", "x",
+                       gold_accuracy=eh.GoldAccuracy(tools="proteinmpnn",
+                                                     required_args={"chain": "A", "constraints": ["exclude_cys", "solubility"]},
+                                                     forbidden=["camsol"]),
+                       gold_functionality=eh.GoldFunctionality("dispatch",
+                                                               {"tool": "proteinmpnn",
+                                                                "inputs": {"chain_id": "A", "exclude_amino_acids": "C", "bias_toward": "soluble"}}),
+                       gold_usability=eh.GoldUsability("execute"))
+    assert eh.score_accuracy(disp, good).passed         # chain + exclude_cys + solubility(polar bias) + no camsol
+    assert eh.score_functionality(disp, good).passed    # chain_id alias + exclude membership + bias polar
+    # a genuine mis-route (mutation_scan) must still FAIL dispatch (not calibrate-to-pass)
+    bad = _tr(tools=["mutation_scan"], tool_inputs={"mutation_scan": {"chain": "A"}})
+    assert not eh.score_functionality(disp, bad).passed
+    # a proteinmpnn that omits the cysteine exclusion still fails the membership check
+    nocys = _tr(tools=["proteinmpnn"], tool_inputs={"proteinmpnn": {"chain": "A"}})
+    assert not eh.score_functionality(disp, nocys).passed
+
+
 def test_residue_color_scheme_is_accuracy_only():
     case = eh.EvalCase("sch", "viz", 2, "inferential", "Colour by chain.",
                        gold_accuracy=eh.GoldAccuracy(tools="chimerax",
