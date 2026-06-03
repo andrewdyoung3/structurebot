@@ -267,9 +267,10 @@ def _normalize_prompt(s: str) -> str:
 
 
 def discover_eval_manifests(scripts_dir: Union[str, Path, None] = None) -> Dict[str, List[EvalCase]]:
-    """Find every eval-harness manifest JSON under *scripts_dir* (default ./scripts).
-    A file counts as a manifest only if it loads+validates as one (so benchmark
-    result JSON etc. are skipped). Returns {filename: cases}."""
+    """Find every eval-harness manifest JSON under *scripts_dir* (default ./scripts)
+    that loads+validates against the FULL scorer schema (so it can be scored).
+    Returns {filename: cases}. (For the LEAKAGE guard, prefer
+    `discover_manifest_id_prompts`, which is tolerant of richer/extended schemas.)"""
     scripts_dir = Path(scripts_dir or (Path(__file__).parent / "scripts"))
     out: Dict[str, List[EvalCase]] = {}
     if not scripts_dir.is_dir():
@@ -278,7 +279,43 @@ def discover_eval_manifests(scripts_dir: Union[str, Path, None] = None) -> Dict[
         try:
             out[p.name] = load_manifest(p)
         except Exception:
-            continue                       # not an eval manifest — skip
+            continue                       # not a (strictly-valid) eval manifest — skip
+    return out
+
+
+def _raw_cases(path: Union[str, Path]) -> Optional[List[Dict[str, Any]]]:
+    """Return the case-list of a JSON file IFF it looks like an eval manifest
+    (a list of objects, or {"cases":[...]}, each with id + prompt). Else None.
+    Tolerant of ANY extra gold fields — used only for the leakage guard, which
+    needs nothing beyond id + prompt, so a richer/extended corpus schema still
+    arms it."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("cases")
+    if not isinstance(raw, list) or not raw:
+        return None
+    if not all(isinstance(c, dict) and "id" in c and "prompt" in c for c in raw):
+        return None
+    return raw
+
+
+def discover_manifest_id_prompts(scripts_dir: Union[str, Path, None] = None
+                                 ) -> Dict[str, List[Tuple[str, str]]]:
+    """{filename: [(id, prompt), …]} for every eval-manifest-shaped JSON under
+    *scripts_dir* — SCHEMA-TOLERANT (only needs id + prompt), so the frozen
+    `eval_corpus_manifest.json` arms the leakage guard even if it extends the
+    documented gold schema (session/clarify_about/command_contains_any/…)."""
+    scripts_dir = Path(scripts_dir or (Path(__file__).parent / "scripts"))
+    out: Dict[str, List[Tuple[str, str]]] = {}
+    if not scripts_dir.is_dir():
+        return out
+    for p in sorted(scripts_dir.glob("*.json")):
+        cases = _raw_cases(p)
+        if cases is not None:
+            out[p.name] = [(str(c["id"]), str(c["prompt"])) for c in cases]
     return out
 
 
@@ -291,18 +328,23 @@ def assert_example_pool_disjoint(example_pool: List[Any] = None,
     import translator_corpus as tc
     pool = example_pool if example_pool is not None else tc.EXAMPLE_POOL
 
-    # Build the forbidden (held-out) id/prompt sets, tagged by source.
-    sources: Dict[str, List[Any]] = {"EVAL_CORPUS": list(tc.EVAL_CORPUS)}
-    sources.update(discover_eval_manifests(scripts_dir))
+    # Build the forbidden (held-out) id/prompt sets, tagged by source. EVAL_CORPUS
+    # comes from translator_corpus; every eval manifest under scripts/ is read
+    # SCHEMA-TOLERANTLY (id + prompt only) so the frozen corpus arms the guard even
+    # if it extends the documented gold schema.
+    sources: Dict[str, List[Tuple[str, str]]] = {
+        "EVAL_CORPUS": [(c.id, c.prompt) for c in tc.EVAL_CORPUS],
+    }
+    sources.update(discover_manifest_id_prompts(scripts_dir))
 
     counts: Dict[str, int] = {}
     clashes: List[str] = []
     pool_ids = [c.id for c in pool]
     pool_norm = {c.id: _normalize_prompt(c.prompt) for c in pool}
-    for src, cases in sources.items():
-        counts[src] = len(cases)
-        held_ids = {c.id for c in cases}
-        held_norm = {_normalize_prompt(c.prompt) for c in cases}
+    for src, id_prompts in sources.items():
+        counts[src] = len(id_prompts)
+        held_ids = {i for i, _ in id_prompts}
+        held_norm = {_normalize_prompt(p) for _, p in id_prompts}
         for c in pool:
             if c.id in held_ids:
                 clashes.append(f"id {c.id!r} also in {src}")

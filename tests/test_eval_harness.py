@@ -330,3 +330,26 @@ def test_discover_skips_non_manifest_json(tmp_path):
     (tmp_path / "benchmark_results.json").write_text(
         json.dumps({"some": "results", "rows": [1, 2, 3]}), encoding="utf-8")
     assert eh.discover_eval_manifests(tmp_path) == {}
+    assert eh.discover_manifest_id_prompts(tmp_path) == {}
+
+
+def test_guard_arms_on_EXTENDED_schema_manifest(tmp_path):
+    # The frozen corpus extends the documented gold schema (session / clarify_about
+    # / command_contains_any / tools-as-string). The leakage guard must still arm on
+    # it (it only needs id + prompt) — a richer schema must NOT silently bypass it.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    ext_case = {
+        "id": tc.EXAMPLE_POOL[0].id,                 # an EXAMPLE_POOL id collision
+        "category": "viz", "tier": 1, "challenge_type": "direct",
+        "prompt": "a unique prompt that won't clash",
+        "session": {"models": [{"id": "#1", "pdb": "2LZM"}], "selection": None},
+        "gold_accuracy": {"tools": "chimerax",
+                          "required_args": {"command_contains_any": ["color #1/A red"]}},
+        "gold_usability": {"expected": "clarify", "clarify_about": "which chain"},
+    }
+    (tmp_path / "eval_corpus_manifest.json").write_text(
+        json.dumps({"schema_version": 2, "cases": [ext_case]}), encoding="utf-8")
+    # tolerant discovery still reads it (id + prompt), even though strict load fails
+    assert "eval_corpus_manifest.json" in eh.discover_manifest_id_prompts(tmp_path)
+    with pytest.raises(ValueError):
+        eh.assert_example_pool_disjoint(scripts_dir=tmp_path)
