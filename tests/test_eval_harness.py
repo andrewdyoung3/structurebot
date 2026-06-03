@@ -264,3 +264,69 @@ def test_tool_registry_is_the_21_literals():
     assert len(eh.TOOL_REGISTRY) == 21
     # every documented tool-input field key is a real registry tool (or chimerax)
     assert set(eh.TOOL_INPUT_FIELDS) <= (eh.TOOL_REGISTRY | {"chimerax"})
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  TRIPLE-DISJOINTNESS guard (auto-arming) — EXAMPLE_POOL vs every held-out set
+# ════════════════════════════════════════════════════════════════════════════════
+def test_normalize_prompt_is_near_dup_proof():
+    assert eh._normalize_prompt("Colour chain A red.") == eh._normalize_prompt("colour  chain a RED!!!")
+    assert eh._normalize_prompt("Select within 5 Å of B") == eh._normalize_prompt("select within 5  of  b")
+
+
+def test_example_pool_triple_disjoint_live():
+    # EXAMPLE_POOL must be clean vs EVAL_CORPUS + every manifest currently present.
+    counts = eh.assert_example_pool_disjoint()
+    assert counts["EVAL_CORPUS"] == len(tc.EVAL_CORPUS)
+    # the sample manifest is discovered and enforced
+    assert "eval_manifest_sample.json" in counts
+
+
+def _write_manifest(dir_path: Path, cases: list) -> None:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    payload = {"_schema": "eval_harness manifest v1", "cases": cases}
+    (dir_path / "eval_corpus_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_guard_auto_arms_on_new_manifest_id_collision(tmp_path):
+    # A frozen-corpus file that reuses an EXAMPLE_POOL *id* must be caught the
+    # moment it appears in scripts/ — no code change needed (auto-arming).
+    leak_id = tc.EXAMPLE_POOL[0].id
+    _write_manifest(tmp_path, [{
+        "id": leak_id, "category": "c", "tier": 1, "challenge_type": "direct",
+        "prompt": "a totally different prompt", "gold_usability": {"expected": "clarify"},
+    }])
+    with pytest.raises(ValueError):
+        eh.assert_example_pool_disjoint(scripts_dir=tmp_path)
+
+
+def test_guard_catches_near_duplicate_prompt(tmp_path):
+    # A near-duplicate PROMPT (punctuation/case variant) of an EXAMPLE_POOL entry
+    # must be caught even though the id differs.
+    ex = tc.EXAMPLE_POOL[0]
+    near_dup = ex.prompt.upper().replace(".", " !!! ")
+    _write_manifest(tmp_path, [{
+        "id": "frozen_new_id", "category": "c", "tier": 1, "challenge_type": "direct",
+        "prompt": near_dup, "gold_usability": {"expected": "clarify"},
+    }])
+    with pytest.raises(ValueError):
+        eh.assert_example_pool_disjoint(scripts_dir=tmp_path)
+
+
+def test_guard_passes_when_manifest_is_disjoint(tmp_path):
+    _write_manifest(tmp_path, [{
+        "id": "frozen_unique_1", "category": "viz", "tier": 1, "challenge_type": "direct",
+        "prompt": "Render the helices as flat ribbons in teal.",
+        "gold_usability": {"expected": "execute"},
+        "gold_accuracy": {"tools": ["chimerax"]},
+    }])
+    counts = eh.assert_example_pool_disjoint(scripts_dir=tmp_path)
+    assert counts["eval_corpus_manifest.json"] == 1
+
+
+def test_discover_skips_non_manifest_json(tmp_path):
+    # a non-manifest JSON in the dir must be ignored, not crash discovery
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "benchmark_results.json").write_text(
+        json.dumps({"some": "results", "rows": [1, 2, 3]}), encoding="utf-8")
+    assert eh.discover_eval_manifests(tmp_path) == {}

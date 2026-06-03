@@ -243,11 +243,77 @@ def assert_disjoint_from_examples(cases: List[EvalCase]) -> None:
     fiction). Raises ValueError on any overlap."""
     import translator_corpus as tc
     ex_ids = {c.id for c in tc.EXAMPLE_POOL}
-    ex_prompts = {c.prompt.strip().lower() for c in tc.EXAMPLE_POOL}
+    ex_prompts = {_normalize_prompt(c.prompt) for c in tc.EXAMPLE_POOL}
     bad_ids = [c.id for c in cases if c.id in ex_ids]
-    bad_prompts = [c.id for c in cases if c.prompt.strip().lower() in ex_prompts]
+    bad_prompts = [c.id for c in cases if _normalize_prompt(c.prompt) in ex_prompts]
     if bad_ids or bad_prompts:
         raise ValueError(f"manifest overlaps EXAMPLE_POOL — ids={bad_ids} prompts={bad_prompts}")
+
+
+# ── Triple-disjointness guard (auto-arming) ──────────────────────────────────────
+# The few-shot EXAMPLE_POOL must be disjoint — by id AND by NORMALISED prompt
+# (near-duplicate-proof) — from EVERY held-out eval set: the old
+# `translator_corpus.EVAL_CORPUS` AND every eval manifest JSON in scripts/. The
+# frozen corpus `scripts/eval_corpus_manifest.json` is NOT in the repo yet; this
+# guard AUTO-ARMS — it discovers whatever eval manifests are present, so the moment
+# the frozen corpus is committed it is enforced with no code change.
+_PUNCT_RE = re.compile(r"[^a-z0-9 ]+")
+_WS_RE = re.compile(r"\s+")
+
+def _normalize_prompt(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — so a near-duplicate
+    prompt ('Colour chain A red.' vs 'colour chain a red') is caught as a clash."""
+    return _WS_RE.sub(" ", _PUNCT_RE.sub(" ", (s or "").lower())).strip()
+
+
+def discover_eval_manifests(scripts_dir: Union[str, Path, None] = None) -> Dict[str, List[EvalCase]]:
+    """Find every eval-harness manifest JSON under *scripts_dir* (default ./scripts).
+    A file counts as a manifest only if it loads+validates as one (so benchmark
+    result JSON etc. are skipped). Returns {filename: cases}."""
+    scripts_dir = Path(scripts_dir or (Path(__file__).parent / "scripts"))
+    out: Dict[str, List[EvalCase]] = {}
+    if not scripts_dir.is_dir():
+        return out
+    for p in sorted(scripts_dir.glob("*.json")):
+        try:
+            out[p.name] = load_manifest(p)
+        except Exception:
+            continue                       # not an eval manifest — skip
+    return out
+
+
+def assert_example_pool_disjoint(example_pool: List[Any] = None,
+                                 scripts_dir: Union[str, Path, None] = None) -> Dict[str, int]:
+    """Assert the few-shot EXAMPLE_POOL is disjoint (by id AND normalised prompt)
+    from EVAL_CORPUS and from EVERY discovered eval manifest. Raises ValueError on
+    any clash, listing it. Returns {source: n_cases_checked_against} for visibility.
+    Auto-arms: the frozen `eval_corpus_manifest.json` is enforced as soon as present."""
+    import translator_corpus as tc
+    pool = example_pool if example_pool is not None else tc.EXAMPLE_POOL
+
+    # Build the forbidden (held-out) id/prompt sets, tagged by source.
+    sources: Dict[str, List[Any]] = {"EVAL_CORPUS": list(tc.EVAL_CORPUS)}
+    sources.update(discover_eval_manifests(scripts_dir))
+
+    counts: Dict[str, int] = {}
+    clashes: List[str] = []
+    pool_ids = [c.id for c in pool]
+    pool_norm = {c.id: _normalize_prompt(c.prompt) for c in pool}
+    for src, cases in sources.items():
+        counts[src] = len(cases)
+        held_ids = {c.id for c in cases}
+        held_norm = {_normalize_prompt(c.prompt) for c in cases}
+        for c in pool:
+            if c.id in held_ids:
+                clashes.append(f"id {c.id!r} also in {src}")
+            if pool_norm[c.id] in held_norm:
+                clashes.append(f"prompt of {c.id!r} (~{pool_norm[c.id]!r}) also in {src}")
+    # also guard against accidental dupes WITHIN the pool
+    if len(pool_ids) != len(set(pool_ids)):
+        clashes.append("duplicate ids within EXAMPLE_POOL")
+    if clashes:
+        raise ValueError("EXAMPLE_POOL leakage:\n  " + "\n  ".join(sorted(set(clashes))))
+    return counts
 
 
 # ════════════════════════════════════════════════════════════════════════════════
