@@ -190,6 +190,53 @@ def _rate(scores, get) -> Optional[float]:
     return (sum(1 for s in applic if get(s).passed) / len(applic)) if applic else None
 
 
+def _jaccard_pairs(got, want) -> float:
+    """Jaccard overlap of two (chain,resnum) selection sets given as ';'-style lists
+    of 'A:25' tokens. Two empty sets are a perfect 1.0; otherwise |∩|/|∪|."""
+    def to_set(seq):
+        s = set()
+        for x in (seq or []):
+            x = str(x).strip()
+            if ":" in x:
+                c, _, n = x.partition(":")
+                s.add((c, n))
+            elif x:
+                s.add(x)
+        return s
+    g, w = to_set(got), to_set(want)
+    if not g and not w:
+        return 1.0
+    return len(g & w) / len(g | w) if (g | w) else 1.0
+
+
+def _graded_functionality(s: eh.CaseScore) -> Optional[float]:
+    """GRADED functionality (companion to strict): for a selection_resnums effect
+    case, the Jaccard overlap of the actual vs gold (chain,resnum) sets; for every
+    OTHER applicable case it equals the strict 0/1 (so graded == strict everywhere
+    except selection-effect — isolating exactly what grading changes). None when
+    functionality is not applicable."""
+    f = s.functionality
+    if not f.applicable:
+        return None
+    d = f.detail or {}
+    if d.get("probe") == "selection_resnums":
+        return _jaccard_pairs(d.get("got"), d.get("want"))
+    return 1.0 if f.passed else 0.0
+
+
+def _case_graded_aggregate(s: eh.CaseScore, weights=eh.WEIGHTS) -> float:
+    """The companion weighted aggregate, using GRADED functionality (strict A and U)."""
+    fg = _graded_functionality(s)
+    num = den = 0.0
+    if s.accuracy.applicable:
+        num += weights["accuracy"] * (1.0 if s.accuracy.passed else 0.0); den += weights["accuracy"]
+    if s.functionality.applicable:
+        num += weights["functionality"] * (fg if fg is not None else 0.0); den += weights["functionality"]
+    if s.usability.applicable:
+        num += weights["usability"] * (1.0 if s.usability.passed else 0.0); den += weights["usability"]
+    return num / den if den else 0.0
+
+
 def _dim_breakdown(pairs: List[Tuple[eh.EvalCase, eh.CaseScore]],
                    keyfn) -> Dict[str, Dict[str, Any]]:
     groups: Dict[str, List[eh.CaseScore]] = {}
@@ -197,12 +244,15 @@ def _dim_breakdown(pairs: List[Tuple[eh.EvalCase, eh.CaseScore]],
         groups.setdefault(str(keyfn(case)), []).append(sc)
     out: Dict[str, Dict[str, Any]] = {}
     for k, scs in sorted(groups.items()):
+        fg = [_graded_functionality(s) for s in scs if s.functionality.applicable]
         out[k] = {
             "n": len(scs),
             "accuracy":      _rate(scs, lambda s: s.accuracy),
             "functionality": _rate(scs, lambda s: s.functionality),
+            "functionality_graded": (statistics.mean(fg) if fg else None),   # companion
             "usability":     _rate(scs, lambda s: s.usability),
-            "aggregate":     statistics.mean(s.aggregate for s in scs),
+            "aggregate":     statistics.mean(s.aggregate for s in scs),       # STRICT (primary)
+            "aggregate_graded": statistics.mean(_case_graded_aggregate(s) for s in scs),
             "fully_correct": sum(1 for s in scs if s.fully_correct) / len(scs),
         }
     return out
@@ -296,7 +346,7 @@ def write_csv(all_runs: Dict[str, List[List[CaseRun]]], path) -> Path:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["backend", "run", "id", "category", "tier", "challenge",
-                    "accuracy", "functionality", "usability", "aggregate",
+                    "accuracy", "functionality", "functionality_graded", "usability", "aggregate",
                     "fully_correct", "tools_needed", "routed_tool",
                     "prompt_eval_count", "done_reason", "near_ceiling", "length_truncated",
                     # output-capture honesty: the captured call error (if any) and
@@ -314,9 +364,11 @@ def write_csv(all_runs: Dict[str, List[List[CaseRun]]], path) -> Path:
                     def cell(d):
                         return "" if not d.applicable else ("1" if d.passed else "0")
                     got, want = _effect_sets(s.functionality)
+                    fg = _graded_functionality(s)
                     w.writerow([
                         backend, r, row.case_id, row.category, row.tier, row.challenge,
-                        cell(s.accuracy), cell(s.functionality), cell(s.usability),
+                        cell(s.accuracy), cell(s.functionality),
+                        ("" if fg is None else f"{fg:.3f}"), cell(s.usability),
                         f"{s.aggregate:.3f}", int(s.fully_correct),
                         ";".join(row.tools_needed), row.routed_tool,
                         row.prompt_eval_count if row.prompt_eval_count is not None else "",
@@ -433,19 +485,27 @@ def build_report_md(all_runs: Dict[str, List[List["CaseRun"]]],
     L.append("## Overall (mean over scored runs; cold run discarded)\n")
     L.append("| Metric | " + " | ".join(backends) + " |")
     L.append("|--------|" + "|".join(["---"] * len(backends)) + "|")
-    for label, key in [("Accuracy", "accuracy"), ("Functionality", "functionality"),
-                       ("Usability", "usability")]:
+    for label, key in [("Accuracy", "accuracy"), ("Functionality (strict)", "functionality")]:
         L.append(f"| {label} | " + " | ".join(_pct(rep[b]["overall"][key]) for b in backends) + " |")
-    L.append("| **Aggregate** (A.50/F.35/U.15) | " +
+    L.append("| _Functionality (graded, companion)_ | " +
+             " | ".join(f"_{_pct(rep[b]['overall']['functionality_graded'])}_" for b in backends) + " |")
+    L.append("| Usability | " + " | ".join(_pct(rep[b]["overall"]["usability"]) for b in backends) + " |")
+    L.append("| **Aggregate (strict, PRIMARY)** (A.50/F.35/U.15) | " +
              " | ".join(f"**{rep[b]['overall']['aggregate']*100:.0f}%**" for b in backends) + " |")
-    L.append("| **Fully-correct** | " +
+    L.append("| _Graded aggregate (companion)_ | " +
+             " | ".join(f"_{rep[b]['overall']['aggregate_graded']*100:.0f}%_" for b in backends) + " |")
+    L.append("| **Fully-correct (strict)** | " +
              " | ".join(f"**{_pct(rep[b]['overall']['fully_correct'])}**" for b in backends) + " |")
     L.append("| scored runs (of total) | " +
              " | ".join(f"{rep[b]['n_runs_scored']}/{rep[b]['n_runs_total']}" for b in backends) + " |")
+    L.append("\n_Strict exact-set functionality is the PRIMARY scored value (feeds the "
+             "aggregate + fully-correct, unchanged). **Graded** is an additive companion: "
+             "selection_resnums effect cases use the Jaccard overlap of the actual vs gold "
+             "(chain,resnum) sets; every other case's graded == its strict value._\n")
 
     for axis, title in [("by_category", "Per-category"), ("by_tier", "Per-tier"),
                         ("by_challenge", "Per-challenge")]:
-        L.append(f"\n## {title} — Accuracy · Functionality · Usability · agg · fully-correct\n")
+        L.append(f"\n## {title} — A · F(strict)[F graded] · U · agg(strict)[agg graded] · fully\n")
         L.append("| Group (n) | " + " | ".join(backends) + " |")
         L.append("|-----------|" + "|".join(["---"] * len(backends)) + "|")
         keys = sorted(set().union(*[set(rep[b][axis]) for b in backends]))
@@ -457,8 +517,10 @@ def build_report_md(all_runs: Dict[str, List[List["CaseRun"]]],
                 if not g:
                     cells.append("—"); continue
                 n = g["n"]
-                cells.append(f"{_pct(g['accuracy'])} · {_pct(g['functionality'])} · "
-                             f"{_pct(g['usability'])} · {g['aggregate']*100:.0f}% · {_pct(g['fully_correct'])}")
+                cells.append(f"{_pct(g['accuracy'])} · {_pct(g['functionality'])}"
+                             f"[{_pct(g['functionality_graded'])}] · {_pct(g['usability'])} · "
+                             f"{g['aggregate']*100:.0f}%[{g['aggregate_graded']*100:.0f}%] · "
+                             f"{_pct(g['fully_correct'])}")
             L.append(f"| {k} ({n}) | " + " | ".join(cells) + " |")
 
     L.append("\n## Truncation (Ollama honesty guard)\n")
@@ -470,6 +532,67 @@ def build_report_md(all_runs: Dict[str, List[List["CaseRun"]]],
     L.append("\n_Per-case rows (incl. the full chain-qualified effect_got/effect_want "
              "sets) are in `results.csv`._\n")
     return "\n".join(L) + "\n"
+
+
+def _runs_from_csv(csv_path, by_id: Dict[str, eh.EvalCase]) -> Dict[str, List[List["CaseRun"]]]:
+    """Reconstruct an `all_runs` structure from a saved results.csv so the report
+    (strict + graded) can be RESTATED post-hoc WITHOUT re-running. Graded is
+    recomputed from the persisted effect_got/effect_want + each case's probe type."""
+    import csv as _csv
+    from collections import defaultdict
+    rows = list(_csv.DictReader(Path(csv_path).read_text(encoding="utf-8").splitlines()))
+    grouped: Dict[str, Dict[int, List[CaseRun]]] = defaultdict(lambda: defaultdict(list))
+
+    def _dim(cell: str, detail=None) -> eh.DimResult:
+        return eh.DimResult(applicable=(cell != ""), passed=(cell == "1"),
+                            partial=(1.0 if cell == "1" else 0.0), detail=(detail or {}))
+
+    for r in rows:
+        case = by_id.get(r["id"])
+        probe = (case.gold_functionality.assertion or {}).get("probe") \
+            if (case and case.gold_functionality) else None
+        got = [x for x in (r.get("effect_got") or "").split(";") if x]
+        want = [x for x in (r.get("effect_want") or "").split(";") if x]
+        sc = eh.CaseScore(
+            id=r["id"], accuracy=_dim(r["accuracy"]),
+            functionality=_dim(r["functionality"], {"probe": probe, "got": got, "want": want}),
+            usability=_dim(r["usability"]),
+            aggregate=(float(r["aggregate"]) if r.get("aggregate") else 0.0),
+            fully_correct=(r.get("fully_correct") == "1"))
+        cr = CaseRun(
+            backend=r["backend"], run_idx=int(r["run"]), case_id=r["id"], category=r["category"],
+            tier=int(r["tier"]), challenge=r["challenge"], score=sc,
+            tools_needed=[t for t in (r.get("tools_needed") or "").split(";") if t],
+            routed_tool=(r.get("routed_tool") or ""),
+            prompt_eval_count=(int(r["prompt_eval_count"]) if r.get("prompt_eval_count") else None),
+            done_reason=(r.get("done_reason") or None),
+            near_ceiling=(r.get("near_ceiling") == "1"),
+            length_truncated=(r.get("length_truncated") == "1"),
+            error=(r.get("error") or None),
+            output_empty=(r.get("output_empty") == "1"))
+        grouped[r["backend"]][int(r["run"])].append(cr)
+    return {b: [runs[i] for i in sorted(runs)] for b, runs in grouped.items()}
+
+
+def report_from_csv(csv_path, manifest_path: str = "scripts/eval_corpus_manifest.json",
+                    out_dir=None) -> Dict[str, Any]:
+    """Restate a saved benchmark in BOTH rulers (strict + graded) WITHOUT re-running.
+    Writes `<csv_dir>/report_restated.md`; returns the per-backend capture rate so a
+    hollow backend can be flagged (not silently presented as a baseline)."""
+    cases = eh.load_manifest(manifest_path)
+    by_id = {c.id: c for c in cases}
+    all_runs = _runs_from_csv(csv_path, by_id)
+    out = Path(out_dir or Path(csv_path).parent)
+    out.mkdir(parents=True, exist_ok=True)
+    runs_total = max((len(rl) for rl in all_runs.values()), default=0)
+    prov = provenance(manifest_path, runs=runs_total, weights=eh.WEIGHTS)
+    md = out / "report_restated.md"
+    md.write_text(build_report_md(all_runs, cases, prov), encoding="utf-8")
+    rates = {}
+    for b, rl in all_runs.items():
+        rows = [r for run in rl for r in run]
+        rates[b] = (sum(1 for r in rows if r.error or r.output_empty) / len(rows)) if rows else 0.0
+    return {"report": md, "rates": rates, "all_runs": all_runs, "cases": cases}
 
 
 def write_artifacts(all_runs: Dict[str, List[List["CaseRun"]]], cases: List[eh.EvalCase],
@@ -498,7 +621,15 @@ def main(argv=None) -> Dict[str, Path]:
     ap.add_argument("--out", default="scripts/eval_3dim_results",
                     help="output DIRECTORY for report.md + results.csv")
     ap.add_argument("--chimerax-url", default="http://localhost:60001")
+    ap.add_argument("--from-csv", default=None,
+                    help="RESTATE a saved results.csv in strict+graded (no run, no live deps)")
     args = ap.parse_args(argv)
+
+    if args.from_csv:                                   # post-hoc restatement, no run
+        res = report_from_csv(args.from_csv, args.manifest, args.out)
+        print(f"restated {args.from_csv} → {res['report']} · capture rates "
+              f"{ {b: f'{(1-r)*100:.0f}%' for b, r in res['rates'].items()} }")
+        return {"report": res["report"]}
 
     import config
     config.load_env_file()

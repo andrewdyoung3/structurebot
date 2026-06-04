@@ -272,6 +272,42 @@ def test_is_empty_output_distinguishes_clarify_refuse_from_failure():
     assert not er._is_empty_output({"tools_needed": ["camsol"], "commands": []})
 
 
+def test_jaccard_and_graded_functionality():
+    assert er._jaccard_pairs(["A:1", "A:2"], ["A:1", "A:2"]) == 1.0
+    assert er._jaccard_pairs(["A:1", "A:2", "A:3"], ["A:1", "A:2"]) == pytest.approx(2 / 3)
+    assert er._jaccard_pairs([], []) == 1.0
+    assert er._jaccard_pairs(["A:1"], ["B:1"]) == 0.0      # A:1 ≠ B:1 (chain-qualified)
+    # selection_resnums effect → graded = Jaccard (companion ≠ strict 0/1)
+    sel = eh.DimResult(True, False, 0.0, {"probe": "selection_resnums",
+                                          "got": ["A:1", "A:2"], "want": ["A:1", "A:2", "A:3"]})
+    sc = eh.CaseScore("z", eh.DimResult(True, True, 1.0), sel, eh.DimResult(True, True, 1.0), 0.5, False)
+    assert er._graded_functionality(sc) == pytest.approx(2 / 3)   # graded shows partial overlap
+    # NON-selection (dispatch) → graded == strict 0/1, NOT a Jaccard
+    disp = eh.DimResult(True, False, 0.0, {"mode": "dispatch"})
+    sc2 = eh.CaseScore("d", eh.DimResult(True, True, 1.0), disp, eh.DimResult(True, True, 1.0), 0.5, False)
+    assert er._graded_functionality(sc2) == 0.0
+    # n/a functionality → None
+    sc3 = eh.CaseScore("r", eh.DimResult(False, True, 1.0), eh.DimResult(False, True, 1.0),
+                       eh.DimResult(True, True, 1.0), 1.0, True)
+    assert er._graded_functionality(sc3) is None
+
+
+def test_csv_has_graded_column_and_report_from_csv_round_trips(tmp_path):
+    cases = _corpus()
+    probe = MockProbe(sel_output="residue id #1/A:20 name ALA index 19")
+    all_runs = er.run_corpus({"m": _perfect_caller()}, cases, runs=2, probe=probe)
+    csv = er.write_csv(all_runs, tmp_path / "r.csv")
+    assert "functionality_graded" in csv.read_text(encoding="utf-8").splitlines()[0]
+    # restate from the CSV (strict + graded), reusing these cases as the manifest
+    by_id = {c.id: c for c in cases}
+    rebuilt = er._runs_from_csv(csv, by_id)
+    rep = er.aggregate(rebuilt, cases)
+    o = rep["m"]["overall"]
+    assert "functionality_graded" in o and "aggregate_graded" in o
+    # strict aggregate is preserved (primary) and graded is present alongside
+    assert o["aggregate"] == pytest.approx(rep["m"]["overall"]["aggregate"])
+
+
 def test_run_corpus_refuses_unfrozen_gold():
     pend = eh.EvalCase("p", "zone", 1, "direct", "x",
                        gold_accuracy=eh.GoldAccuracy(tools="chimerax"),
