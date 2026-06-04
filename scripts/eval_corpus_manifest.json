@@ -4633,7 +4633,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         },
@@ -4645,7 +4651,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }
@@ -4675,7 +4685,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "B"
         }
@@ -4683,7 +4699,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "B"
           }
@@ -4712,7 +4732,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         }
@@ -4720,7 +4746,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }
@@ -4749,7 +4779,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         }
@@ -4757,7 +4793,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }
@@ -4786,7 +4826,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         }
@@ -4794,7 +4840,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A",
             "top_n": 5
@@ -4824,7 +4874,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         }
@@ -4832,7 +4888,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }
@@ -4861,7 +4921,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         },
@@ -4872,7 +4938,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }
@@ -4901,7 +4971,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         }
@@ -4909,7 +4985,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }
@@ -4939,7 +5019,13 @@
         "selection": null
       },
       "gold_accuracy": {
-        "tools": "proline",
+        "tools": [
+          [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ]
+        ],
         "required_args": {
           "chain": "A"
         }
@@ -4947,7 +5033,11 @@
       "gold_functionality": {
         "mode": "dispatch",
         "assertion": {
-          "tool": "proline",
+          "tool": [
+            "mutation_scan",
+            "proline",
+            "rosetta"
+          ],
           "inputs": {
             "chain": "A"
           }

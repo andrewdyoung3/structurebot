@@ -748,12 +748,20 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
 
     if g.mode == "dispatch":
         spec = g.assertion or {}
-        want_tool = str(spec.get("tool", "")).lower()
+        # `tool` may be a single literal OR an any-of list (e.g. a router-rewrite
+        # category like proline → ["mutation_scan","proline","rosetta"]), mirroring
+        # the accuracy any-of. The inputs are checked against whichever was routed.
+        _want = spec.get("tool")
+        want_tools = [str(t).lower() for t in (_want if isinstance(_want, (list, tuple))
+                                               else ([_want] if _want else []))]
         tools = model_tools(tr)
-        if want_tool and want_tool not in tools:
-            return DimResult(True, False, 0.0, {"reason": f"tool {want_tool} not dispatched", "tools": tools})
+        matched = next((t for t in want_tools if t in tools), None)
+        if want_tools and matched is None:
+            return DimResult(True, False, 0.0,
+                             {"reason": f"none of {want_tools} dispatched", "tools": tools})
+        use_tool = matched or (want_tools[0] if want_tools else "")
         ti = tr.get("tool_inputs") or {}
-        got = {str(k).lower(): v for k, v in (ti.get(want_tool) or {}).items()}
+        got = {str(k).lower(): v for k, v in (ti.get(use_tool) or {}).items()}
         checks: List[Tuple[str, bool]] = []
         for k, exp in (spec.get("inputs") or {}).items():
             kk = str(k).lower()
@@ -782,7 +790,7 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
                 checks.append((kk, ok))
             else:
                 checks.append((kk, str(got.get(kk)).lower() == str(exp).lower()))
-        passed = all(ok for _, ok in checks) if checks else (want_tool in tools)
+        passed = all(ok for _, ok in checks) if checks else (matched is not None)
         return DimResult(True, passed, sum(ok for _, ok in checks) / (len(checks) or 1),
                          {"mode": "dispatch", "checks": checks, "captured_inputs": got})
 

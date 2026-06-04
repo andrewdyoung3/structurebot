@@ -473,6 +473,33 @@ def test_dispatch_and_accuracy_recognise_structured_solubility():
     assert not eh.score_functionality(disp, nocys).passed
 
 
+def test_dispatch_any_of_tool_for_router_rewrite_category():
+    # proline is realized via the router's mutation_scan->proline rewrite (the prompt
+    # never emits a `proline` tool), so the gold accepts the any-of engineering path.
+    case = eh.EvalCase("p", "proline", 1, "direct", "Add prolines to rigidify chain A.",
+                       gold_accuracy=eh.GoldAccuracy(tools=[["mutation_scan", "proline", "rosetta"]],
+                                                     required_args={"chain": "A"}),
+                       gold_functionality=eh.GoldFunctionality("dispatch",
+                                                               {"tool": ["mutation_scan", "proline", "rosetta"],
+                                                                "inputs": {"chain": "A"}}),
+                       gold_usability=eh.GoldUsability("execute"))
+    for t in ("mutation_scan", "proline", "rosetta"):           # any of the three passes
+        tr = _tr(tools=[t], tool_inputs={t: {"chain": "A"}})
+        assert eh.score_functionality(case, tr).passed, t
+        assert eh.score_accuracy(case, tr).passed, t
+    # a genuinely wrong route (esm / proteinmpnn) still FAILS — not calibrate-to-pass
+    for t in ("esm", "proteinmpnn"):
+        tr = _tr(tools=[t], tool_inputs={t: {"chain": "A"}})
+        assert not eh.score_functionality(case, tr).passed, t
+        assert not eh.score_accuracy(case, tr).passed, t
+    # back-compat: a single-string dispatch tool still works
+    legacy = eh.EvalCase("c", "camsol", 1, "direct", "x",
+                         gold_accuracy=eh.GoldAccuracy(tools="camsol"),
+                         gold_functionality=eh.GoldFunctionality("dispatch", {"tool": "camsol", "inputs": {"chain": "A"}}),
+                         gold_usability=eh.GoldUsability("execute"))
+    assert eh.score_functionality(legacy, _tr(tools=["camsol"], tool_inputs={"camsol": {"chain": "A"}})).passed
+
+
 def test_residue_color_scheme_is_accuracy_only():
     case = eh.EvalCase("sch", "viz", 2, "inferential", "Colour by chain.",
                        gold_accuracy=eh.GoldAccuracy(tools="chimerax",
