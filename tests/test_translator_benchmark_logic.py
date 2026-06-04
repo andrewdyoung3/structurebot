@@ -129,6 +129,38 @@ def test_check_kinds() -> None:
     _assert(corpus.Check("cmd_re", r":<").evaluate(r), "cmd_re matches")
     _assert(corpus.Check("no_cmd_re", r"\bzone\b").evaluate(r), "no_cmd_re passes when absent")
     _assert(not corpus.Check("no_cmd_re", r"info").evaluate(r), "no_cmd_re fails when present")
+    # behaviour check kinds (clarify / refuse exemplars)
+    clar = _result(tools=[], clarification_needed="Which chain — A or B?")
+    _assert(corpus.Check("clar_set").evaluate(clar), "clar_set true when a question is asked")
+    _assert(corpus.Check("no_action").evaluate(clar), "no_action true with no tool & no command")
+    _assert(not corpus.Check("clar_set").evaluate(_result()), "clar_set false on a normal action")
+    ref = _result(tools=[], refused=True)
+    _assert(corpus.Check("refused").evaluate(ref), "refused true when declined")
+    _assert(not corpus.Check("refused").evaluate(_result()), "refused false on a normal action")
+
+
+def test_few_shot_pool_v1_is_mostly_execute_with_one_clarify_and_refuse() -> None:
+    """FEW_SHOT_POOL_V1 is a FIXED, named intervention: mostly execute, with at
+    least one CLARIFY and one REFUSE exemplar so the execute-heavy pool doesn't bias
+    the model away from clarifying (T4) or erode refuse behaviour. Reproducible."""
+    pairs = corpus.few_shot_pairs()
+    ex = cl = rf = 0
+    for _prompt, out in pairs:
+        if out.get("refused"):
+            rf += 1
+        elif out.get("clarification_needed"):
+            cl += 1
+        else:
+            ex += 1
+    _assert(cl >= 1, "pool has a CLARIFY exemplar", f"clarify={cl}")
+    _assert(rf >= 1, "pool has a REFUSE exemplar", f"refuse={rf}")
+    _assert(ex > (cl + rf), "pool is MOSTLY execute (not a thumb on the scale)",
+            f"execute={ex} vs clarify+refuse={cl + rf}")
+    # the targeted weak-spot categories are actually wired in
+    cats = {c.category for c in corpus.EXAMPLE_POOL
+            if c.id in corpus.FEW_SHOT_OUTPUTS}
+    for need in ("selection_scope", "zone", "mutation_scan", "clarify", "safety"):
+        _assert(need in cats, f"weak-spot category {need!r} is in the few-shot pool")
 
 
 # -- C. FULL vs RAW (guard split) ----------------------------------------------

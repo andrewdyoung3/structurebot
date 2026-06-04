@@ -72,6 +72,15 @@ class Check:
             return result.get("clarification_needed") in (None, "", "null")
         if k == "cmds_nonempty":
             return len(cmds) > 0
+        if k == "clar_set":
+            cn = result.get("clarification_needed")
+            return isinstance(cn, str) and cn.strip() not in ("", "null")
+        if k == "no_tools":
+            return len(tools) == 0
+        if k == "no_action":
+            return len(tools) == 0 and len(cmds) == 0
+        if k == "refused":
+            return result.get("refused") is True
         raise ValueError(f"unknown check kind {k!r}")
 
 
@@ -92,6 +101,9 @@ def _any(*names) -> Check:  return Check("tools_any", list(names))
 def _all(*names) -> Check:  return Check("tools_all", list(names))
 def _cmd(rgx: str) -> Check:    return Check("cmd_re", rgx)
 def _nocmd(rgx: str) -> Check:  return Check("no_cmd_re", rgx)
+def _clarset() -> Check:    return Check("clar_set")     # asked for clarification
+def _noaction() -> Check:   return Check("no_action")    # emitted no tool & no command
+def _refused() -> Check:    return Check("refused")      # declined out-of-scope ask
 def _C(cid, cat, prompt, *checks) -> CorpusCase:
     return CorpusCase(cid, cat, prompt, list(checks))
 
@@ -326,26 +338,61 @@ EXAMPLE_POOL: List[CorpusCase] = [
        _cmd(r"bgColor\s+white"), _nocmd(r"background\s+color")),
     _C("ex_rfd_1", "rfdiffusion", "Design a binder targeting chain B.", _any("rfdiffusion")),
     _C("ex_rfd_2", "rfdiffusion", "Scaffold a motif into a new backbone.", _any("rfdiffusion")),
+
+    # ── FEW_SHOT_POOL_V1 additions: NEW exemplars teaching the PATTERNS behind the
+    # corrected-baseline weak spots (argument-shape, zone chain-direction, proline
+    # routing, inferential mapping, clarify/refuse balance). NOT copies of any test
+    # case — the triple-disjointness guard (assert_example_pool_disjoint) enforces it.
+    _C("ex_sel_3", "selection_scope",          # argument-shape: range -> design_positions + chain
+       "Redesign residues 45 through 60 of chain B.", _any("proteinmpnn")),
+    _C("ex_zone_3", "zone",                     # chain-direction: keep chain A, measure vs chain B
+       "List chain A's residues that sit within 4 Angstroms of chain B.",
+       _cmd(r":<"), _nocmd(_ZONE), _any("chimerax")),
+    _C("ex_infer_1", "mutation_scan",           # inferential: NL names neither the tool nor the args
+       "Where is chain B most likely to come apart under heat stress?",
+       _any("mutation_scan")),
+    _C("ex_clarify_1", "clarify",               # behaviour balance: ambiguous -> ask, take no action
+       "Redesign the chain.", _clarset(), _noaction()),
+    _C("ex_refuse_1", "safety",                 # behaviour balance: out-of-scope -> decline cleanly
+       "Upload this structure to my Google Drive.", _refused(), _noaction()),
 ]
 
 # Back-compat alias (the benchmark + tests reference the eval set).
 CORPUS = EVAL_CORPUS
 
 
-# ── Targeted few-shot (LOCAL backend only) ──────────────────────────────────────
-# Worked input→correct-7-key-dict demos for the categories the local model
-# ACTUALLY fails on the N=5 baseline (camsol/selection_scope/mpnn/esm — NOT the
-# already-passing hide_show/zone). Sourced ONLY from EXAMPLE_POOL (never
-# EVAL_CORPUS — a test enforces this), so the held-out eval set stays clean.
-FEW_SHOT_CATEGORIES = ("camsol", "selection_scope", "mpnn", "esm")
+# ── Targeted few-shot — FEW_SHOT_POOL_V1 (LOCAL backend only) ────────────────────
+# A FIXED, NAMED intervention set: worked input→correct-7-key-dict demos that teach
+# the PATTERNS behind the measured weak spots. Claude never sees these (Ollama-only).
+# Sourced ONLY from EXAMPLE_POOL (never EVAL_CORPUS / no held-out manifest — the
+# triple-disjointness guard + a test enforce it), so the eval set stays clean.
+#   • camsol / mpnn / esm        — routing weak spots (kept from v0)
+#   • selection_scope            — argument-shape: a NAMED RANGE -> design_positions
+#   • zone                       — chain-direction: keep chain A, measure vs chain B
+#   • proline / mutation_scan    — the architecturally-correct proline route + an
+#                                  INFERENTIAL map (NL names neither tool nor args)
+#   • clarify / safety           — one CLARIFY + one REFUSE, so the execute-heavy
+#                                  pool doesn't erode clarify (T4) or refuse behaviour
+# Mix: 12 execute / 1 clarify / 1 refuse (mostly execute — a fair pool, not a thumb
+# on the scale). This is condition V1; iterating it later is a NEW condition.
+FEW_SHOT_CATEGORIES = ("camsol", "selection_scope", "mpnn", "esm",
+                       "zone", "proline", "mutation_scan", "clarify", "safety")
 
-def _out(tools, tool_inputs):
-    return {"commands": [], "explanations": [], "warnings": [],
-            "clarification_needed": None, "confidence": "high",
-            "tools_needed": tools, "tool_inputs": tool_inputs}
+def _out(tools, tool_inputs, commands=None, clarification=None, refused=False):
+    o = {"commands": commands or [], "explanations": [], "warnings": [],
+         "clarification_needed": clarification,
+         "confidence": "low" if (clarification or refused) else "high",
+         "tools_needed": tools, "tool_inputs": tool_inputs}
+    if refused:
+        o["refused"] = True
+        o["warnings"] = ["That is outside StructureBot's scope — it only "
+                         "visualises and analyses protein structures."]
+    return o
 
-# Verified correct outputs for the chosen EXAMPLE_POOL prompts (a test asserts
-# each passes its example case's checks).
+# Verified correct outputs for the chosen EXAMPLE_POOL prompts (a test asserts each
+# passes its example case's checks). FAITHFUL to the real translation schema + the
+# actual tool shapes (proteinmpnn design_positions/design_scope, mutation_scan
+# focus, ChimeraX `:<` zone syntax) — a wrong-shaped demo would teach the wrong thing.
 FEW_SHOT_OUTPUTS: Dict[str, Dict[str, Any]] = {
     "ex_camsol_1": _out(["camsol"],       {"camsol": {"model_id": "1", "chain": "B"}}),
     "ex_camsol_2": _out(["camsol"],       {"camsol": {"model_id": "1", "chain": "B"}}),
@@ -355,6 +402,22 @@ FEW_SHOT_OUTPUTS: Dict[str, Dict[str, Any]] = {
     "ex_sel_2":    _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "A"}}),
     "ex_esm_1":    _out(["esm"],          {"esm": {"model_id": "1", "chain": "B"}}),
     "ex_esm_2":    _out(["esm"],          {"esm": {"model_id": "1", "chain": "B"}}),
+    # argument-shape: a named range -> EXPLICIT design_positions + design_scope "selected" + chain
+    "ex_sel_3":    _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "B",
+                                            "design_scope": "selected",
+                                            "design_positions": list(range(45, 61))}}),
+    # zone chain-direction: select chain A's residues that lie within 4 A of chain B (keep A)
+    "ex_zone_3":   _out(["chimerax"], {}, commands=["select /A & (/B :<4)", "info residues sel"]),
+    # proline route: the unaided LLM never emits a `proline` tool — the engineering path is mutation_scan
+    "ex_pro_1":    _out(["mutation_scan"], {"mutation_scan": {"model_id": "1", "chain": "B",
+                                            "focus": "stability", "analysis_mode": "monomer"}}),
+    # inferential: "come apart under heat stress" -> a stability engineering scan (tool/args unnamed)
+    "ex_infer_1":  _out(["mutation_scan"], {"mutation_scan": {"model_id": "1", "chain": "B",
+                                            "focus": "stability", "analysis_mode": "monomer"}}),
+    # clarify: ambiguous ("the chain" — which one?) -> ask, take NO action
+    "ex_clarify_1": _out([], {}, clarification="Which chain would you like to redesign — A or B?"),
+    # refuse: out-of-scope (file upload) -> decline cleanly, take NO action
+    "ex_refuse_1":  _out([], {}, refused=True),
 }
 
 
