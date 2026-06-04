@@ -159,8 +159,26 @@ def test_few_shot_pool_v1_is_mostly_execute_with_one_clarify_and_refuse() -> Non
     # the targeted weak-spot categories are actually wired in
     cats = {c.category for c in corpus.EXAMPLE_POOL
             if c.id in corpus.FEW_SHOT_OUTPUTS}
-    for need in ("selection_scope", "zone", "mutation_scan", "clarify", "safety"):
+    for need in ("selection_scope", "zone", "mutation_scan", "multi_tool", "clarify", "safety"):
         _assert(need in cats, f"weak-spot category {need!r} is in the few-shot pool")
+
+
+def test_few_shot_pool_v2_mutation_scan_boundary_contrasts() -> None:
+    """FEW_SHOT_POOL_V2 adds CONTRAST exemplars that teach mutation_scan's boundaries
+    (correcting the V1 over-attraction). Each routes to the CORRECT neighbour, NOT
+    mutation_scan — and the V1 mutation_scan wins (proline, inferential) are RETAINED."""
+    out = corpus.FEW_SHOT_OUTPUTS
+    def _tools(cid):
+        return {t.lower() for t in out[cid]["tools_needed"]}
+    # the three boundaries route away from mutation_scan, to the right tool
+    _assert(_tools("ex_esm_3") == {"esm"}, "esm boundary -> esm (not mutation_scan)")
+    _assert(_tools("ex_mpnn_3") == {"proteinmpnn"}, "mpnn boundary -> proteinmpnn (not mutation_scan)")
+    _assert(_tools("ex_multi_3") == {"camsol", "esm"}, "compound boundary -> camsol+esm (not mutation_scan)")
+    for cid in ("ex_esm_3", "ex_mpnn_3", "ex_multi_3"):
+        _assert("mutation_scan" not in _tools(cid), f"{cid} does NOT route mutation_scan")
+    # RETAIN V1: the mutation_scan exemplars are still present (boundaries didn't delete the wins)
+    _assert(_tools("ex_pro_1") == {"mutation_scan"}, "V1 proline route retained")
+    _assert(_tools("ex_infer_1") == {"mutation_scan"}, "V1 inferential-stability route retained")
 
 
 # -- C. FULL vs RAW (guard split) ----------------------------------------------

@@ -355,13 +355,28 @@ EXAMPLE_POOL: List[CorpusCase] = [
        "Redesign the chain.", _clarset(), _noaction()),
     _C("ex_refuse_1", "safety",                 # behaviour balance: out-of-scope -> decline cleanly
        "Upload this structure to my Google Drive.", _refused(), _noaction()),
+
+    # ── FEW_SHOT_POOL_V2 additions: CONTRAST exemplars teaching mutation_scan's
+    # BOUNDARIES, to correct the V1 mutation_scan over-attraction (ex_pro_1/ex_infer_1
+    # pulled neighbours away from esm / proteinmpnn / the camsol+esm compound). Each
+    # mentions "mutation"/"tolerate" (the trap) but routes to the CORRECT neighbour.
+    # NOT copies of any test case — the triple-disjointness guard enforces it.
+    _C("ex_esm_3", "esm",                        # boundary: variant-likelihood / tolerance -> esm, NOT mutation_scan
+       "Which mutations would chain B tolerate, and how likely is each substitution?",
+       _any("esm")),
+    _C("ex_mpnn_3", "mpnn",                       # boundary: redesign w/ negation framing -> proteinmpnn, NOT mutation_scan
+       "Redesign chain B's surface to be anything but hydrophobic.",
+       _any("proteinmpnn")),
+    _C("ex_multi_3", "multi_tool",                # boundary: solubility AND tolerance compound -> camsol+esm, NOT mutation_scan
+       "Report chain B's aggregation hotspots alongside how mutation-tolerant each position is.",
+       _all("camsol", "esm")),
 ]
 
 # Back-compat alias (the benchmark + tests reference the eval set).
 CORPUS = EVAL_CORPUS
 
 
-# ── Targeted few-shot — FEW_SHOT_POOL_V1 (LOCAL backend only) ────────────────────
+# ── Targeted few-shot — FEW_SHOT_POOL_V2 (LOCAL backend only) ────────────────────
 # A FIXED, NAMED intervention set: worked input→correct-7-key-dict demos that teach
 # the PATTERNS behind the measured weak spots. Claude never sees these (Ollama-only).
 # Sourced ONLY from EXAMPLE_POOL (never EVAL_CORPUS / no held-out manifest — the
@@ -373,10 +388,17 @@ CORPUS = EVAL_CORPUS
 #                                  INFERENTIAL map (NL names neither tool nor args)
 #   • clarify / safety           — one CLARIFY + one REFUSE, so the execute-heavy
 #                                  pool doesn't erode clarify (T4) or refuse behaviour
-# Mix: 12 execute / 1 clarify / 1 refuse (mostly execute — a fair pool, not a thumb
-# on the scale). This is condition V1; iterating it later is a NEW condition.
+# V2 (this condition) ADDS three CONTRAST exemplars that teach mutation_scan's
+# BOUNDARIES, correcting the V1 mutation_scan over-attraction WITHOUT giving back the
+# V1 mutation_scan wins (proline, inferential stability):
+#   • ex_esm_3   — "tolerate / how likely a substitution" -> esm (NOT mutation_scan)
+#   • ex_mpnn_3  — redesign w/ negation framing           -> proteinmpnn (NOT mutation_scan)
+#   • ex_multi_3 — solubility AND tolerance compound       -> camsol+esm (NOT mutation_scan)
+# Mix: 15 execute / 1 clarify / 1 refuse (mostly execute — a fair pool, not a thumb
+# on the scale). V1->V2 is a NEW condition; iterating V2 later is yet another one.
 FEW_SHOT_CATEGORIES = ("camsol", "selection_scope", "mpnn", "esm",
-                       "zone", "proline", "mutation_scan", "clarify", "safety")
+                       "zone", "proline", "mutation_scan", "multi_tool",
+                       "clarify", "safety")
 
 def _out(tools, tool_inputs, commands=None, clarification=None, refused=False):
     o = {"commands": commands or [], "explanations": [], "warnings": [],
@@ -418,6 +440,17 @@ FEW_SHOT_OUTPUTS: Dict[str, Dict[str, Any]] = {
     "ex_clarify_1": _out([], {}, clarification="Which chain would you like to redesign — A or B?"),
     # refuse: out-of-scope (file upload) -> decline cleanly, take NO action
     "ex_refuse_1":  _out([], {}, refused=True),
+    # ── V2 boundary contrasts (correct mutation_scan over-attraction) ──
+    # esm boundary: "tolerate / how likely a substitution" is VARIANT-LIKELIHOOD scoring -> esm
+    "ex_esm_3":    _out(["esm"],          {"esm": {"model_id": "1", "chain": "B"}}),
+    # proteinmpnn boundary: a redesign request (even with negation framing) -> proteinmpnn;
+    # "not hydrophobic" / "more soluble" = the polar/charged bias set (per the prompt)
+    "ex_mpnn_3":   _out(["proteinmpnn"],  {"proteinmpnn": {"model_id": "1", "chain": "B",
+                                            "design_scope": "chain",
+                                            "bias_amino_acids": ["D", "E", "N", "Q", "H", "K", "R", "S", "T"]}}),
+    # compound boundary: "solubility AND mutation tolerance" -> the camsol+esm compound, NOT mutation_scan
+    "ex_multi_3":  _out(["camsol", "esm"], {"camsol": {"model_id": "1", "chain": "B"},
+                                            "esm":    {"model_id": "1", "chain": "B"}}),
 }
 
 
