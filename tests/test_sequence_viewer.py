@@ -24,6 +24,7 @@ from sequence_viewer import (
     build_scf_file,
     build_scf_runscript,
     ensure_sequence_viewer_commands,
+    dock_sequences_bottom_command,
     left_click_select_command,
     lean_layout_commands,
     default_presentation_commands,
@@ -158,6 +159,18 @@ def test_ensure_viewer_commands() -> None:
             "no chains -> whole-model sequence chain")
 
 
+def test_dock_sequences_bottom_command(tmp_path) -> None:
+    out = tmp_path / "dock.py"
+    cmd = dock_sequences_bottom_command(out)
+    _assert(cmd == f'runscript "{out.as_posix()}"', "returns runscript command")
+    _assert(out.exists(), "loader written")
+    body = out.read_text(encoding="utf-8")
+    _assert("BottomDockWidgetArea" in body, "loader docks to the BOTTOM area")
+    _assert("splitDockWidget" in body and "Vertical" in body,
+            "loader stacks viewers vertically")
+    _assert("SequenceViewer" in body, "loader targets Sequence Viewers")
+
+
 def test_left_click_toggle() -> None:
     _assert(left_click_select_command(True) == "mousemode left select",
             "enable -> mousemode left select")
@@ -287,6 +300,47 @@ def test_bridge_presentation_per_open(monkeypatch) -> None:
             f"got {calls.count('cartoon')}")
 
 
+def _seq_bridge(monkeypatch, chains_value):
+    """A bridge whose run_command records calls and answers `info chains` with
+    *chains_value* and opens with a #1 model."""
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+
+    def fake(c, timeout=30):
+        calls.append(c)
+        if c.startswith("info chains"):
+            return {"value": chains_value, "error": None}
+        return {"value": "Opened #1", "error": None}
+
+    monkeypatch.setattr(b, "run_command", fake)
+    return b, calls
+
+
+def test_model_chains_parses_info_chains(monkeypatch) -> None:
+    b, _ = _seq_bridge(monkeypatch, "chain id /A chain_id A\nchain id /B chain_id B")
+    _assert(b._model_chains("1") == ["A", "B"], "parses chain ids from info chains")
+
+
+def test_bridge_per_chain_sequence_and_dock_on_open(monkeypatch) -> None:
+    b, calls = _seq_bridge(monkeypatch, "chain id /A chain_id A\nchain id /B chain_id B")
+    b.run_commands(["open 1hsg"])
+    _assert("sequence chain #1/A" in calls and "sequence chain #1/B" in calls,
+            "opens a viewer PER CHAIN", f"got {calls}")
+    _assert("sequence chain #1" not in calls, "no grouped whole-model viewer")
+    _assert(any(c.startswith("runscript ") for c in calls),
+            "re-docks to the bottom via runscript")
+
+
+def test_bridge_per_chain_cap_falls_back_to_grouped(monkeypatch) -> None:
+    # 10 chains > default cap (8) → single grouped viewer, not 10 panels.
+    many = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCDEFGHIJ")
+    b, calls = _seq_bridge(monkeypatch, many)
+    b.run_commands(["open big"])
+    _assert("sequence chain #1" in calls, "above the cap -> grouped viewer")
+    _assert("sequence chain #1/A" not in calls, "no per-chain panels above the cap")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -300,6 +354,7 @@ def main() -> int:
     test_scf_empty_when_no_colors()
     test_scf_runscript_writes_loader_and_command()
     test_ensure_viewer_commands()
+    test_dock_sequences_bottom_command(Path(tempfile.mkdtemp()))
     test_left_click_toggle()
     test_layout_and_presentation_command_lists()
     test_apply_runs_all_in_order()

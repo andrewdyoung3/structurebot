@@ -29,6 +29,32 @@ CHIMERAX_SHOW_SEQUENCE_ON_OPEN: bool = (
     not in ("0", "false", "no", "off")
 )
 
+# PER-CHAIN sequences: open one Sequence Viewer PER CHAIN (`sequence chain #N/A`,
+# `#N/B`, …) instead of a single grouped viewer. ChimeraX otherwise collapses
+# identical chains (e.g. a homodimer) into one "chains A,B" row, so a column
+# selection hits BOTH chains; per-chain viewers let the user select residues in a
+# SPECIFIC chain. Set CHIMERAX_SEQUENCE_PER_CHAIN=false to restore the grouped
+# viewer. CHIMERAX_SEQUENCE_PER_CHAIN_MAX caps it: structures with MORE chains
+# than this (e.g. a viral capsid) fall back to the single grouped viewer so we
+# never open dozens of panels.
+CHIMERAX_SEQUENCE_PER_CHAIN: bool = (
+    os.environ.get("CHIMERAX_SEQUENCE_PER_CHAIN", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+CHIMERAX_SEQUENCE_PER_CHAIN_MAX: int = int(
+    os.environ.get("CHIMERAX_SEQUENCE_PER_CHAIN_MAX", "8")
+)
+
+# DOCK the Sequence Viewer(s) along the BOTTOM edge, stacked vertically (so each
+# chain's sequence is visible at once). ChimeraX docks the viewer at the TOP by
+# default and exposes no REST command to move it, so StructureBot drives the Qt
+# dock widget directly (verified on 1.11.1). Set CHIMERAX_SEQUENCE_DOCK_BOTTOM=
+# false to leave the viewer where ChimeraX puts it.
+CHIMERAX_SEQUENCE_DOCK_BOTTOM: bool = (
+    os.environ.get("CHIMERAX_SEQUENCE_DOCK_BOTTOM", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 # ── Deterministic ChimeraX layout + presentation ──────────────────────────────
 # Config-driven command lists applied by StructureBot (NOT LLM-generated, NOT the
 # built-in `preset`). All tokens verified against ChimeraX 1.11.1.
@@ -36,9 +62,10 @@ CHIMERAX_SHOW_SEQUENCE_ON_OPEN: bool = (
 # LEAN LAYOUT — applied ONCE per ChimeraX session (first open). Hides the Log,
 # Command Line Interface and Toolbar panels for a clean window; KEEPS the menubar
 # and title bar. The Sequence Viewer (opened via sequence_viewer.ensure_sequence_
-# viewer_commands) docks at the top by default. REST command/runscript coloring +
-# selection keep working with the CLI hidden (verified). Disable with
-# CHIMERAX_LEAN_LAYOUT=false.
+# viewer_commands) is re-docked to the bottom by StructureBot. REST command/
+# runscript coloring + selection keep working with the CLI hidden (verified). Disable with
+# CHIMERAX_LEAN_LAYOUT=false. (The Sequence Viewer is re-docked to the BOTTOM,
+# stacked per chain — see CHIMERAX_SEQUENCE_DOCK_BOTTOM above.)
 CHIMERAX_LEAN_LAYOUT: bool = (
     os.environ.get("CHIMERAX_LEAN_LAYOUT", "true").strip().lower()
     not in ("0", "false", "no", "off")

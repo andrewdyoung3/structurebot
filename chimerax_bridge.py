@@ -434,16 +434,48 @@ class ChimeraXBridge:
         m = re.search(r"#(\d+)", value)
         return m.group(1) if m else None
 
+    def _model_chains(self, model_id: str) -> List[str]:
+        """The chain ids of model #*model_id* (e.g. ``['A', 'B']``) via
+        ``info chains``. Returns [] on any failure so callers fall back to the
+        whole-model (grouped) viewer."""
+        try:
+            r = self.run_command(f"info chains #{model_id}")
+            value = r.get("value") if isinstance(r, dict) else None
+            if not isinstance(value, str):
+                return []
+            chains: List[str] = []
+            for c in re.findall(r"chain_id\s+(\S+)", value):
+                if c not in chains:
+                    chains.append(c)
+            return chains
+        except Exception:
+            return []
+
     def _maybe_show_sequence_on_open(self, model_id: str) -> None:
         """Open + associate the Sequence Viewer for the new model (config-gated by
-        CHIMERAX_SHOW_SEQUENCE_ON_OPEN). Best-effort; never disrupts the batch."""
+        CHIMERAX_SHOW_SEQUENCE_ON_OPEN). For multimers, opens one viewer PER CHAIN
+        (so residues can be selected in a specific chain) and re-docks them along
+        the bottom, stacked. Best-effort; never disrupts the batch."""
         try:
             import config as _cfg
             if not getattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", True):
                 return
-            from sequence_viewer import ensure_sequence_viewer_commands
-            for c in ensure_sequence_viewer_commands(model_id):
+            from sequence_viewer import (
+                ensure_sequence_viewer_commands,
+                dock_sequences_bottom_command,
+            )
+            chains: Optional[List[str]] = None
+            if getattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN", True):
+                found = self._model_chains(model_id)
+                cap = int(getattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8))
+                # Above the cap (e.g. a viral capsid) fall back to the single
+                # grouped viewer rather than open dozens of panels.
+                if found and len(found) <= cap:
+                    chains = found
+            for c in ensure_sequence_viewer_commands(model_id, chains):
                 self.run_command(c)
+            if getattr(_cfg, "CHIMERAX_SEQUENCE_DOCK_BOTTOM", True):
+                self.run_command(dock_sequences_bottom_command())
         except Exception:
             pass  # sequence viewer is non-essential; never disrupt the batch
 
