@@ -170,8 +170,10 @@ def assert_capture_rate(all_runs: Dict[str, List[List[CaseRun]]],
         rates[backend] = len(missed) / n
         if rates[backend] > threshold:
             kinds = sorted({(r.error or "empty-output").split(":")[0] for r in missed})
+            sample = next((r.error for r in missed if r.error), "empty-output")
             problems.append(f"{backend}: {len(missed)}/{n} ({rates[backend]*100:.0f}%) rows "
-                            f"empty/errored, over the {threshold*100:.0f}% threshold — kinds: {kinds}")
+                            f"empty/errored, over the {threshold*100:.0f}% threshold — kinds: "
+                            f"{kinds}; e.g.: {sample[:240]}")
     if problems:
         raise RuntimeError(
             "HOLLOW RUN — a backend failed to produce output for too many cases; the "
