@@ -129,12 +129,14 @@ def test_check_kinds() -> None:
     _assert(corpus.Check("cmd_re", r":<").evaluate(r), "cmd_re matches")
     _assert(corpus.Check("no_cmd_re", r"\bzone\b").evaluate(r), "no_cmd_re passes when absent")
     _assert(not corpus.Check("no_cmd_re", r"info").evaluate(r), "no_cmd_re fails when present")
-    # behaviour check kinds (clarify / refuse exemplars)
-    clar = _result(tools=[], clarification_needed="Which chain — A or B?")
+    # behaviour check kinds (clarify / refuse exemplars). NB: `tools_needed=[]` must
+    # go through the **over override — `_result(tools=[])` hits the `or ["chimerax"]`
+    # default and would NOT be empty.
+    clar = _result(clarification_needed="Which chain — A or B?", tools_needed=[])
     _assert(corpus.Check("clar_set").evaluate(clar), "clar_set true when a question is asked")
     _assert(corpus.Check("no_action").evaluate(clar), "no_action true with no tool & no command")
     _assert(not corpus.Check("clar_set").evaluate(_result()), "clar_set false on a normal action")
-    ref = _result(tools=[], refused=True)
+    ref = _result(refused=True, tools_needed=[])
     _assert(corpus.Check("refused").evaluate(ref), "refused true when declined")
     _assert(not corpus.Check("refused").evaluate(_result()), "refused false on a normal action")
 
@@ -190,6 +192,22 @@ def test_full_vs_raw_guard_split() -> None:
     _assert(not corpus.score_case(case, raw)[0], "RAW fails — Chimera-1 `zone`, no `:<`")
     full = bm._apply_guard(raw)
     _assert(corpus.score_case(case, full)[0], "FULL passes — guard rewrote zone→:< (guard-rescue)")
+
+
+def test_apply_guard_stays_in_lockstep_with_translate() -> None:
+    """_apply_guard (the eval's FULL output) must apply EVERY backend-agnostic guard
+    CommandTranslator.translate() applies — else the benchmark measures un-guarded
+    output. The chain-scope guard slipped exactly because nothing tested this."""
+    SCOPE = "~ligand & ~solvent & ~ions"
+    full = bm._apply_guard(_result(commands=["color #1/B blue"]))
+    _assert(full["commands"] == [f"color (#1/B & {SCOPE}) blue"],
+            "FULL scopes a bare chain ref to the macromolecule", f"got {full['commands']}")
+    # both guards compose, in order (zone → chain-scope)
+    full2 = bm._apply_guard(_result(commands=["select #1/A & (zone #1/B 4.5)"]))
+    _assert(full2["commands"] == [f"select (#1/A & {SCOPE}) & ((#1/B & {SCOPE}) :<4.5)"],
+            "FULL composes zone + chain-scope guards", f"got {full2['commands']}")
+    _assert(bm._apply_guard(_result(commands=["color ligand white"]))["commands"]
+            == ["color ligand white"], "FULL leaves the ligand keyword untouched")
 
 
 # -- D. schema validity --------------------------------------------------------
@@ -288,7 +306,8 @@ def main() -> int:
     test_scorer_case_insensitive_matches_router(); test_router_and_scorer_case_consistent()
     test_few_shot_example_pool_only(); test_few_shot_message_assembly()
     test_check_kinds()
-    test_full_vs_raw_guard_split(); test_schema_validity()
+    test_full_vs_raw_guard_split(); test_apply_guard_stays_in_lockstep_with_translate()
+    test_schema_validity()
     test_single_pass_bucketing(); test_nrun_aggregation_math()
     test_markdown_report_builds()
     print("\n(forced-backend tests need pytest monkeypatch)")

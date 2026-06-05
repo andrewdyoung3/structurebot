@@ -444,6 +444,19 @@ def model_tools(tr: Dict[str, Any]) -> List[str]:
 def commands_blob(tr: Dict[str, Any]) -> str:
     return " \n ".join(c for c in (tr.get("commands") or []) if isinstance(c, str))
 
+
+# Reverse the translator's chain-scope decoration `(<chain> & ~ligand & ~solvent &
+# ~ions)` → `<chain>` so a gold `command_contains_any` pattern (written in the bare
+# `color #1/B blue` form) still matches the deterministically-scoped command. The
+# scoping is an always-on guard, not model output — matching its bare intent keeps
+# the gold stable and credits the model correctly. Kept in lockstep with
+# translator._MACRO_SCOPE.
+_SCOPE_DECOR_RE = re.compile(r"\(((?:#\d+)?/[A-Za-z0-9]+) & ~ligand & ~solvent & ~ions\)")
+
+def _descope(blob: str) -> str:
+    """Strip the macromolecule-scope decoration so bare-form patterns match."""
+    return _SCOPE_DECOR_RE.sub(r"\1", blob)
+
 def merged_inputs(tr: Dict[str, Any], tools: List[str]) -> Dict[str, Any]:
     """Union of tool_inputs[tool] for the routed tools, keys lowercased."""
     ti = tr.get("tool_inputs") or {}
@@ -647,13 +660,20 @@ def score_accuracy(case: EvalCase, tr: Dict[str, Any]) -> DimResult:
         elif key == "command_contains_any":
             # ChimeraX accuracy: ANY of these substrings must appear in the emitted
             # commands (the model produced a runnable command of the right shape).
+            # Match against the DE-SCOPED blob so a bare-form gold pattern still
+            # matches a command the always-on chain-scope guard wrapped.
             subs = expected or []
-            ok = any(str(s).lower() in blob.lower() for s in subs)
+            hay = _descope(blob).lower()
+            ok = any(str(s).lower() in hay for s in subs)
             components.append(("command_contains_any", ok))
         elif key == "chain":
             want = str(expected).upper()
             in_inputs = any(str(inp.get(f, "")).upper() == want for f in CHAIN_FIELDS)
-            in_cmds = bool(re.search(rf"[/:#]\s*{re.escape(want)}\b", blob))
+            if want.lower() in _CLASS_KEYWORDS:
+                # a class keyword (ligand/solvent/…) is written bare, not `/X`
+                in_cmds = bool(re.search(rf"\b{re.escape(want.lower())}\b", blob, re.I))
+            else:
+                in_cmds = bool(re.search(rf"[/:#]\s*{re.escape(want)}\b", blob))
             components.append((f"chain({expected})", in_inputs or in_cmds))
         elif key == "scope":
             want = _parse_scope(expected)
@@ -848,12 +868,22 @@ def score_functionality(case: EvalCase, tr: Dict[str, Any],
         if want_rgb is None:                       # unknown colour → don't assert a bogus RGB
             return DimResult(applicable=False, passed=True, partial=1.0,
                              detail={"mode": "effect", "probe": kind, "reason": f"no RGB for {expected!r}"})
-        atomspec = spec.get("atomspec") or (f"/{spec['chain']}" if spec.get("chain") not in (None, "*") else "sel")
+        atomspec = spec.get("atomspec") or _macromolecule_atomspec(spec.get("chain"))
         out = probe(spec.get("query") or f"info atomcolor {atomspec}")
         got = _parse_rgb(out)
         ok = got is not None and all(abs(g - w) <= _RGB_TOL for g, w in zip(got, want_rgb))
+        # DISJOINTNESS: an optional spec that must NOT carry the expected colour — e.g.
+        # "colour chain B red" must leave the MK1 ligand (`/B & ligand`) un-reddened.
+        # The chain colour bleeding into the ligand is a FAIL even if the chain is right.
+        excl = spec.get("excluded_atomspec")
+        excl_rgb = None
+        if ok and excl:
+            excl_rgb = _parse_rgb(probe(f"info atomcolor {excl}"))
+            if excl_rgb is not None and all(abs(g - w) <= _RGB_TOL for g, w in zip(excl_rgb, want_rgb)):
+                ok = False  # the expected colour bled into the excluded spec (e.g. the ligand)
         return DimResult(True, ok, float(ok),
-                         {"mode": "effect", "probe": kind, "want_rgb": list(want_rgb), "got_rgb": got})
+                         {"mode": "effect", "probe": kind, "want_rgb": list(want_rgb),
+                          "got_rgb": got, "excluded_atomspec": excl, "excluded_rgb": excl_rgb})
     if kind == "representation":
         out = probe(spec.get("query", "info"))
         token = str(spec.get("expected", ""))
@@ -924,11 +954,29 @@ NAMED_RGB: Dict[str, Tuple[int, int, int]] = {
     "red": (255, 0, 0), "blue": (0, 0, 255), "green": (0, 128, 0),
     "gray": (128, 128, 128), "grey": (128, 128, 128),
     "yellow": (255, 255, 0), "teal": (0, 128, 128),
+    "white": (255, 255, 255), "black": (0, 0, 0),
 }
 # Scheme/gradient colourings — a single RGB is meaningless, so functionality is
 # accuracy-only for these (the F-dim is normalised out of the aggregate).
 COLOR_SCHEMES = frozenset({"bychain", "rainbow", "byhetero", "bfactor"})
 _RGB_TOL = 12
+
+# Built-in ChimeraX classification keywords that are a class, not a chain id.
+_CLASS_KEYWORDS = frozenset({"ligand", "solvent", "ions", "protein", "nucleic"})
+
+
+def _macromolecule_atomspec(chain: Optional[str]) -> str:
+    """Resolve a gold `chain` field to a ChimeraX atomspec that mirrors the
+    translator's macromolecule-scoping principle: a real chain id → that chain's
+    macromolecule ONLY (`/X & ~ligand & ~solvent & ~ions`, so the probe reads the
+    protein/nucleic — not a ligand/ion sharing the chain id, the 1HSG MK1=B:902
+    bleed); a class keyword (`ligand`/`solvent`/…) passes through as-is; None/`*`
+    → the current selection."""
+    if chain in (None, "*"):
+        return "sel"
+    if str(chain).lower() in _CLASS_KEYWORDS:
+        return str(chain).lower()
+    return f"/{chain} & ~ligand & ~solvent & ~ions"
 
 def _parse_rgb(text: str) -> Optional[Tuple[int, int, int]]:
     """Best-effort parse of the dominant RGB from a ChimeraX colour probe. ChimeraX

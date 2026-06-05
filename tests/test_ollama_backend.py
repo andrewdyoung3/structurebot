@@ -38,6 +38,10 @@ _VALID = {
     "explanations": ["a", "b", "c"], "warnings": [], "clarification_needed": None,
     "confidence": "high", "tools_needed": ["chimerax"], "tool_inputs": {},
 }
+# translate() scopes a bare "chain A" ref to the macromolecule, so the parsed
+# commands come back with `color #1/A` → `color (#1/A & ~ligand & ~solvent & ~ions)`
+# (`cartoon #1` is a whole-MODEL ref, not a chain ref → untouched).
+_VALID_SCOPED = ["cartoon #1", "color (#1/A & ~ligand & ~solvent & ~ions) red", "view"]
 
 
 def _translator() -> CommandTranslator:
@@ -89,7 +93,7 @@ def test_ollama_builds_constrained_request_and_parses() -> None:
     for k in ("commands", "explanations", "warnings", "clarification_needed",
               "confidence", "tools_needed", "tool_inputs"):
         _assert(k in result, f"normalized result has '{k}'")
-    _assert(result["commands"] == _VALID["commands"], "parsed commands match")
+    _assert(result["commands"] == _VALID_SCOPED, "parsed commands match (chain-scoped)")
 
 
 # -- B. guards apply to Ollama output (backend-agnostic) -----------------------
@@ -101,8 +105,9 @@ def test_guard_applies_to_ollama_output() -> None:
                explanations=["x", "y"])
     with patch("requests.post", return_value=_ollama_resp(bad)):
         result = t.translate("interface residues within 4.5 of B", _session())
-    _assert(result["commands"][0] == "select #1/A & (#1/B :<4.5)",
-            "_sanitize_zone_syntax rewrote the Ollama output (same guard path)",
+    _assert(result["commands"][0] == "select (#1/A & ~ligand & ~solvent & ~ions) & "
+            "((#1/B & ~ligand & ~solvent & ~ions) :<4.5)",
+            "_sanitize_zone_syntax rewrote the Ollama output, then chain-scoped (same guard path)",
             f"got {result['commands'][0]!r}")
     _assert(any("Rewrote" in w for w in result["warnings"]), "rewrite surfaced as warning")
 
@@ -118,7 +123,7 @@ def test_claude_error_falls_back_to_ollama() -> None:
         mc.messages.create.side_effect = conn
         result = t.translate("color chain A red", _session())
     _assert(mpost.called, "Claude connectivity error + fallback on → Ollama called")
-    _assert(result["commands"] == _VALID["commands"], "result came from Ollama")
+    _assert(result["commands"] == _VALID_SCOPED, "result came from Ollama (chain-scoped)")
 
 
 def test_claude_success_does_not_call_ollama() -> None:

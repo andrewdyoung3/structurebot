@@ -140,6 +140,65 @@ def _sanitize_zone_syntax(
     return new_cmds, new_exps, notes
 
 
+# ── Chain-reference macromolecule-scoping guard ─────────────────────────────────
+# PRINCIPLE: a direct reference to "chain A–Z" must affect ONLY the macromolecule of
+# that chain — never a ligand/solvent/ion that happens to share the chain id; and a
+# reference to "ligand" affects ONLY the ligand. They are DISJOINT, every time,
+# across ALL operations (color, hide, show, select, zone refs, …).
+#
+# Why: in 1HSG the MK1 ligand is assigned chain B (B:902), so a bare `/B` selector
+# also hits the ligand — literally correct for `/B`, but NOT what "chain B" means
+# ("colour chain B red" coloured chain B AND the ligand). This deterministic guard
+# scopes every BARE chain selector to the macromolecule by appending
+# `& ~ligand & ~solvent & ~ions` (verified live on 1HSG: `/B` = 885 atoms →
+# `/B & ~ligand & ~solvent & ~ions` = 757 = protein only; the exclusion form keeps
+# ANY polymer, so it also covers nucleic-acid chains). The `ligand` keyword is a
+# separate built-in classification and is left untouched (so disjointness holds both
+# ways). Backend-agnostic: both backends inherit it via CommandTranslator.translate.
+#
+# NOT touched: a sub-chain ref (`/B:902`, `/B@CA` — an explicit residue/atom spec),
+# an already-scoped ref (`/B & protein` / `/B & ~ligand …`), a negation (`~/B`), and
+# a `/` inside a file path (the boundary lookbehind excludes `cache/foo`, `C:/…`).
+# The zone OPERATOR forms `/B :<4.5` / `/B:<4.5` ARE scoped (the reference chain is a
+# macromolecule too) — runs AFTER _sanitize_zone_syntax so zone syntax is normalised.
+_MACRO_SCOPE = "~ligand & ~solvent & ~ions"
+_CHAIN_REF_RE = re.compile(
+    r"(?:(?<=[\s(|,&])|^)"                  # spec boundary (NOT '~' → leave negations)
+    r"(?P<tok>(?:#\d+)?/[A-Za-z0-9]+)"      # optional model + a bare chain id
+)
+
+
+def _scope_chain_refs_to_macromolecule(commands: list) -> tuple:
+    """Scope every BARE chain selector in *commands* to the macromolecule
+    (`& ~ligand & ~solvent & ~ions`). Returns (new_commands, notes). 1:1 with the
+    input (no command is dropped); a command with no bare chain ref is unchanged."""
+    new_cmds: list = []
+    notes: list = []
+    for cmd in commands:
+        def _repl(m: "re.Match") -> str:
+            tok = m.group("tok")
+            end = m.end()
+            after = cmd[end:end + 2]
+            # explicit residue/atom sub-ref (`:902`, `@CA`) — but NOT the zone
+            # operators `:<`/`:>`/`@<`/`@>` — is intentional: leave it.
+            if after[:1] in (":", "@") and after[1:2] not in ("<", ">"):
+                return m.group(0)
+            # the model already scoped it (protein / macromolecule): leave it.
+            rest = cmd[end:].lstrip()
+            if rest.startswith(("& ~ligand", "&~ligand", "& protein", "&protein")):
+                return m.group(0)
+            return f"({tok} & {_MACRO_SCOPE})"
+        rewritten = _CHAIN_REF_RE.sub(_repl, cmd)
+        if rewritten != cmd:
+            notes.append(
+                f"Scoped chain reference(s) to the macromolecule "
+                f"(excluded ligand/solvent/ions): {cmd!r} → {rewritten!r}"
+            )
+            print(f"  [chain-scope] {cmd!r} → {rewritten!r}", flush=True)
+        new_cmds.append(rewritten)
+    return new_cmds, notes
+
+
 # ── Static system block (cached) ───────────────────────────────────────────────
 
 _STATIC_SYSTEM = """\
@@ -998,10 +1057,17 @@ class CommandTranslator:
         new_cmds, new_exps, zone_notes = _sanitize_zone_syntax(
             result.get("commands") or [], result.get("explanations") or []
         )
-        if zone_notes:
-            result["commands"]     = new_cmds
+        # Deterministic guard: a "chain X" reference targets ONLY that chain's
+        # macromolecule, never a ligand/solvent/ion sharing the chain id (the 1HSG
+        # MK1=B:902 bleed). Runs AFTER the zone guard so zone syntax is normalised.
+        scoped_cmds, scope_notes = _scope_chain_refs_to_macromolecule(new_cmds)
+        if zone_notes or scope_notes:
+            result["commands"]     = scoped_cmds
             result["explanations"] = new_exps
-            result["warnings"]     = (result.get("warnings") or []) + zone_notes
+            # Zone notes are surfaced (invalid-syntax rewrites/drops the user should
+            # see); chain-scoping is a silent correctness fix (logged, not warned).
+            if zone_notes:
+                result["warnings"] = (result.get("warnings") or []) + zone_notes
 
         return result
 

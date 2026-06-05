@@ -22,6 +22,7 @@ from translator import (
     CommandTranslator as Translator,
     RefusalError,
     _sanitize_zone_syntax,
+    _scope_chain_refs_to_macromolecule,
 )
 
 # -- Helpers -------------------------------------------------------------------
@@ -222,7 +223,8 @@ def test_benign_design_request_not_flagged() -> None:
         mock_client.messages.create.side_effect = [empty, good]   # 1st empty, retry OK
         result = t.translate(_BENIGN, session)
 
-    assert result.get("commands") == ["select #1/A"], (
+    # the chain-scope guard scopes the bare `select #1/A` to the macromolecule
+    assert result.get("commands") == ["select (#1/A & ~ligand & ~solvent & ~ions)"], (
         f"benign request should translate after retry, got {result!r}")
     assert mock_client.messages.create.call_count == 2, "should retry exactly once"
     _ok("benign design request not flagged (retry rescued it)")
@@ -301,6 +303,39 @@ def test_zone_guard_drops_unrewritable() -> None:
     _assert(any("Dropped" in n for n in notes), "drop logged", f"got {notes}")
 
 
+def test_chain_scope_guard_scopes_bare_chain_refs() -> None:
+    print("\n=== D2. chain-reference macromolecule-scoping guard ===")
+    SCOPE = "~ligand & ~solvent & ~ions"
+    # a bare chain ref is scoped to the macromolecule (the 1HSG MK1=B:902 bleed)
+    out, notes = _scope_chain_refs_to_macromolecule(["color /B red"])
+    _assert(out == [f"color (/B & {SCOPE}) red"], "bare /B scoped", f"got {out}")
+    _assert(bool(notes), "scope logged in notes")
+    out, _ = _scope_chain_refs_to_macromolecule(["hide #1/B cartoon", "show /A cartoon"])
+    _assert(out == [f"hide (#1/B & {SCOPE}) cartoon", f"show (/A & {SCOPE}) cartoon"],
+            "scoping applies to hide/show too (every operation)", f"got {out}")
+    # zone reference chains are scoped on BOTH sides
+    out, _ = _scope_chain_refs_to_macromolecule(["select /A & (/B :<4.5)"])
+    _assert(out == [f"select (/A & {SCOPE}) & ((/B & {SCOPE}) :<4.5)"],
+            "zone refs scoped both sides", f"got {out}")
+
+
+def test_chain_scope_guard_leaves_ligand_and_subrefs() -> None:
+    # DISJOINTNESS the other way: the `ligand` keyword is untouched
+    out, notes = _scope_chain_refs_to_macromolecule(["color ligand white"])
+    _assert(out == ["color ligand white"] and notes == [],
+            "ligand keyword left untouched (disjoint)", f"got {out}")
+    # explicit residue/atom sub-refs and negations are intentional → untouched
+    untouched = ["color /B:902 red", "color /B@CA red", "color ~/A gray",
+                 'runscript "cache/seqview/x.py"', "open 1hsg"]
+    out, notes = _scope_chain_refs_to_macromolecule(untouched)
+    _assert(out == untouched and notes == [],
+            "residue/atom sub-refs, negation, paths left untouched", f"got {out}")
+    # idempotent: an already-scoped ref is not double-wrapped
+    pre = ["color (/B & ~ligand & ~solvent & ~ions) red"]
+    out, notes = _scope_chain_refs_to_macromolecule(pre)
+    _assert(out == pre and notes == [], "already-scoped ref not double-wrapped", f"got {out}")
+
+
 def test_translate_rewrites_zone_end_to_end() -> None:
     """A model emitting the parenthesised Chimera-1 zone is corrected before
     return: interface request → `:<` + `& #1/A`, `info residues sel` survives."""
@@ -313,8 +348,9 @@ def test_translate_rewrites_zone_end_to_end() -> None:
         result = t.translate(
             "select the residues at the dimer interface on chain A", session)
     cmds = result.get("commands", [])
-    _assert(cmds[0] == "select #1/A & (#1/B :<4.5)",
-            "interface select uses :< not zone", f"got {cmds}")
+    _assert(cmds[0] == "select (#1/A & ~ligand & ~solvent & ~ions) & "
+            "((#1/B & ~ligand & ~solvent & ~ions) :<4.5)",
+            "interface select uses :< not zone (chain-scoped)", f"got {cmds}")
     _assert(all("zone" not in c for c in cmds), "no `zone` survives")
     _assert("info residues sel" in cmds, "`info residues sel` preserved")
     _assert(any("Rewrote" in w for w in result.get("warnings", [])),
@@ -349,7 +385,8 @@ def test_hide_chain_targets_representation() -> None:
         result = t.translate("hide chain B", session)
     cmds = result.get("commands", [])
     joined = " ".join(cmds).lower()
-    _assert(cmds == ["hide #1/B cartoon"], "hide targets cartoon", f"got {cmds}")
+    _assert(cmds == ["hide (#1/B & ~ligand & ~solvent & ~ions) cartoon"],
+            "hide targets cartoon (chain-scoped)", f"got {cmds}")
     _assert("cartoon" in joined or "target a" in joined,
             "representation named (cartoon / target ac), not bare hide")
     _assert(cmds != ["hide #1/B"], "not a bare atoms-only hide")
@@ -381,8 +418,8 @@ def test_backend_translate_returns_normalized_shape() -> None:
     for key in ("commands", "explanations", "warnings", "clarification_needed",
                 "confidence", "tools_needed", "tool_inputs"):
         _assert(key in result, f"normalized result has '{key}'")
-    _assert(result["commands"] == ["select #1/A"],
-            "backend produced the parsed commands", f"got {result.get('commands')}")
+    _assert(result["commands"] == ["select (#1/A & ~ligand & ~solvent & ~ions)"],
+            "backend produced the parsed commands (chain-scoped)", f"got {result.get('commands')}")
     _assert(mock_client.messages.create.called,
             "default backend used the Claude client")
 
@@ -414,6 +451,8 @@ def main() -> int:
     # D. zone-syntax guard + hide/show representation
     test_zone_guard_rewrites_bare_and_parenthesised()
     test_zone_guard_leaves_valid_and_volume_zone()
+    test_chain_scope_guard_scopes_bare_chain_refs()
+    test_chain_scope_guard_leaves_ligand_and_subrefs()
     test_zone_guard_drops_unrewritable()
     test_translate_rewrites_zone_end_to_end()
     test_system_prompt_documents_zone_and_hide()

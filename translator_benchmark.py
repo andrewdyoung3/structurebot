@@ -35,7 +35,10 @@ from typing import Any, Dict, List, Optional
 
 import config
 import translator_corpus as corpus
-from translator import CommandTranslator, make_backend, _sanitize_zone_syntax
+from translator import (
+    CommandTranslator, make_backend,
+    _sanitize_zone_syntax, _scope_chain_refs_to_macromolecule,
+)
 
 # Fixed deterministic session context (1HSG — the §7 reference structure) so the
 # corpus prompts resolve to a known model + chains without any network/ChimeraX.
@@ -55,15 +58,20 @@ class _FixedSession:
 
 def _apply_guard(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Replicate CommandTranslator.translate()'s post-step: the backend-agnostic
-    guard. FULL == _apply_guard(backend.translate(...)) by construction (translate
-    does exactly backend.translate + this guard; no fallback for a forced backend)."""
+    guards, IN THE SAME ORDER. FULL == _apply_guard(backend.translate(...)) by
+    construction (translate does exactly backend.translate + these guards; no
+    fallback for a forced backend): (1) _sanitize_zone_syntax, then (2)
+    _scope_chain_refs_to_macromolecule (a chain ref targets only the macromolecule —
+    keep this in lockstep with translate() or the eval measures un-guarded output)."""
     full = copy.deepcopy(raw)
     nc, ne, notes = _sanitize_zone_syntax(
         full.get("commands") or [], full.get("explanations") or [])
-    if notes:
-        full["commands"]     = nc
+    scoped, scope_notes = _scope_chain_refs_to_macromolecule(nc)
+    if notes or scope_notes:
+        full["commands"]     = scoped
         full["explanations"] = ne
-        full["warnings"]     = (full.get("warnings") or []) + notes
+        if notes:                       # zone notes surfaced; chain-scoping is silent
+            full["warnings"] = (full.get("warnings") or []) + notes
     return full
 
 

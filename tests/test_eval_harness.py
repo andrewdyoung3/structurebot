@@ -447,6 +447,61 @@ def test_residue_color_solid_rgb_tolerance():
     assert eh.score_functionality(case, tr, probe=lambda c: "#1/A:1@N color #ff0000").passed
 
 
+def test_command_contains_any_matches_chain_scoped_command():
+    # the always-on chain-scope guard wraps `color #1/B blue` →
+    # `color (#1/B & ~ligand & ~solvent & ~ions) blue`; a bare-form gold pattern must
+    # still match (de-scoped) — else every chain-ref viz/hide_show case false-fails.
+    SCOPE = "~ligand & ~solvent & ~ions"
+    assert eh._descope(f"color (#1/B & {SCOPE}) blue") == "color #1/B blue"
+    case = eh.EvalCase("cca", "viz", 1, "direct", "Make chain B blue.",
+                       gold_accuracy=eh.GoldAccuracy(tools="chimerax",
+                           required_args={"chain": "B", "color": "blue",
+                                          "command_contains_any": ["color #1/B blue"]}),
+                       gold_functionality=eh.GoldFunctionality(
+                           "effect", {"probe": "residue_color", "expected": "blue", "chain": "B"}),
+                       gold_usability=eh.GoldUsability("execute"))
+    scoped = _tr(tools=["chimerax"], commands=[f"color (#1/B & {SCOPE}) blue"])
+    assert eh.score_accuracy(case, scoped).passed, "scoped command still matches bare gold pattern"
+    bare = _tr(tools=["chimerax"], commands=["color #1/B blue"])
+    assert eh.score_accuracy(case, bare).passed, "bare command still matches (back-compat)"
+
+
+def test_macromolecule_atomspec_scoping():
+    # a real chain id is scoped to the macromolecule (excludes a ligand/ion sharing
+    # the chain id — the 1HSG MK1=B:902 bleed); class keywords pass through.
+    assert eh._macromolecule_atomspec("B") == "/B & ~ligand & ~solvent & ~ions"
+    assert eh._macromolecule_atomspec("ligand") == "ligand"
+    assert eh._macromolecule_atomspec("solvent") == "solvent"
+    assert eh._macromolecule_atomspec(None) == "sel"
+
+
+def test_residue_color_disjointness_excluded_atomspec():
+    # "colour chain B red" must leave the MK1 ligand un-reddened. The probe reads the
+    # macromolecule (`/B & ~ligand …` → red) AND the excluded ligand spec; a bleed FAILS.
+    case = eh.EvalCase("disj", "viz", 1, "direct", "Colour chain B red.",
+                       gold_accuracy=eh.GoldAccuracy(tools="chimerax",
+                                                     required_args={"chain": "B", "color": "red"}),
+                       gold_functionality=eh.GoldFunctionality(
+                           "effect", {"probe": "residue_color", "expected": "red", "chain": "B",
+                                      "excluded_atomspec": "/B & ligand"}),
+                       gold_usability=eh.GoldUsability("execute"))
+    tr = _tr(tools=["chimerax"], commands=["color #1/B red"])
+
+    def probe_scoped(cmd):           # protein B red, ligand NOT red (the fix)
+        c = cmd.lower()
+        if "atomcolor" not in c:
+            return ""
+        if "~ligand" in c:           # macromolecule spec (/B & ~ligand & …) → red
+            return "#1/B:1@N color #ff0000\n#1/B:1@CA color #ff0000"
+        return "#1/B:902@N1 color #3050f8\n#1/B:902@C1 color #d2b48c"       # /B & ligand → byhetero
+
+    def probe_bleed(cmd):            # bare /B coloured the ligand red too (the bug)
+        return "#1/B:1@N color #ff0000" if "atomcolor" in cmd.lower() else ""
+
+    assert eh.score_functionality(case, tr, probe=probe_scoped).passed, "scoped: ligand not red → pass"
+    assert not eh.score_functionality(case, tr, probe=probe_bleed).passed, "bleed: ligand red → FAIL"
+
+
 def test_dispatch_and_accuracy_recognise_structured_solubility():
     # the prompt-prescribed expression of "more soluble, no cysteines": chain A,
     # exclude_amino_acids ["C"], bias_amino_acids = the polar/charged set. This must
