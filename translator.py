@@ -978,6 +978,33 @@ _CLAUDE_FALLBACK_ERRORS = (
 )
 
 
+def is_usage_cap_error(exc: BaseException) -> bool:
+    """True for a Claude API USAGE/SPEND-CAP rejection: a ``BadRequestError``
+    (HTTP 400, ``invalid_request_error``) whose message reports a usage limit
+    ("You have reached your specified API usage limits …").
+
+    NARROW on purpose. A usage-cap is a 400, not a 429 (`RateLimitError`) or 401
+    (`AuthenticationError`), so it matched none of `_CLAUDE_FALLBACK_ERRORS`. But a
+    genuinely malformed request is ALSO a 400 `BadRequestError` — it must NOT match
+    here (it has to surface, never silently reroute to Ollama). The discriminator is
+    the "usage limit" phrase in the message, narrowed by the `invalid_request_error`
+    error type when the SDK exposes the parsed body.
+    """
+    if not isinstance(exc, anthropic.BadRequestError):
+        return False
+    msg = (getattr(exc, "message", None) or str(exc) or "").lower()
+    if "usage limit" not in msg:
+        return False
+    etype = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            etype = str(err.get("type", "")).lower()
+    # accept the cap when the type confirms it OR the SDK didn't expose a parsed body
+    return etype in ("", "invalid_request_error")
+
+
 _BACKENDS = {"claude": ClaudeBackend, "ollama": OllamaBackend}
 
 
@@ -1080,23 +1107,41 @@ class CommandTranslator:
           fall back to the local Ollama backend. Any other error (e.g. a
           RefusalError from an empty/declined-but-successful response) propagates
           unchanged — never a fallback trigger.
+        - a Claude USAGE/SPEND-CAP rejection (a 400 BadRequestError, NOT a 429/401)
+          is also treated as a fallback trigger when active == claude; a genuinely
+          malformed 400 must SURFACE, never reroute (see is_usage_cap_error).
         - active backend == "ollama" (forced/benchmark): NEVER falls back to
           Claude; its error surfaces (benchmark honesty).
         """
         try:
             return self._backend.translate(self, user_input, session)
         except _CLAUDE_FALLBACK_ERRORS as exc:
-            if not (self._backend.name == "claude"
-                    and getattr(config, "TRANSLATOR_FALLBACK", True)):
+            if not self._may_fall_back():
                 raise
-            # ClaudeBackend appended the user turn before failing; drop that
-            # dangling turn so the fallback doesn't double-append it.
-            if self._history and self._history[-1].get("role") == "user":
-                self._history.pop()
-            sys.stderr.write(
-                f"[translator] Claude API failure ({type(exc).__name__}); "
-                "falling back to the local Ollama backend.\n")
-            return make_backend("ollama").translate(self, user_input, session)
+            return self._fall_back_to_ollama(user_input, session, type(exc).__name__)
+        except anthropic.BadRequestError as exc:
+            # A usage/spend-cap rejection is a 400 (invalid_request_error), so it
+            # never matched _CLAUDE_FALLBACK_ERRORS. Fall back ONLY for the cap; any
+            # other 400 (a real malformed request) re-raises and surfaces.
+            if not (is_usage_cap_error(exc) and self._may_fall_back()):
+                raise
+            return self._fall_back_to_ollama(user_input, session, "usage-limit cap")
+
+    def _may_fall_back(self) -> bool:
+        """The one-directional fallback is allowed only when the ACTIVE backend is
+        claude and TRANSLATOR_FALLBACK is on — a forced 'ollama' NEVER falls back."""
+        return (self._backend.name == "claude"
+                and getattr(config, "TRANSLATOR_FALLBACK", True))
+
+    def _fall_back_to_ollama(self, user_input: str, session, reason: str) -> Dict[str, Any]:
+        """Drop the dangling user turn ClaudeBackend appended before failing (so the
+        fallback doesn't double-append it) and re-run on the local Ollama backend."""
+        if self._history and self._history[-1].get("role") == "user":
+            self._history.pop()
+        sys.stderr.write(
+            f"[translator] Claude API failure ({reason}); "
+            "falling back to the local Ollama backend.\n")
+        return make_backend("ollama").translate(self, user_input, session)
 
     def _build_system_blocks(self, session: SessionState) -> list:
         """

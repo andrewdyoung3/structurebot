@@ -54,7 +54,7 @@ except ImportError:
     sys.exit(1)
 
 from chimerax_bridge import ChimeraXBridge
-from translator import CommandTranslator, RefusalError
+from translator import CommandTranslator, RefusalError, is_usage_cap_error
 from session_state import SessionState
 from tool_router import ToolRouter
 
@@ -630,6 +630,29 @@ class StructureBot:
             "(The request is fine for a structural-biology tool.)[/dim]"
         )
 
+    def _report_translation_error(self, exc: Exception) -> None:
+        """Surface an UNEXPECTED translation failure as a clean one-line message and
+        return to the prompt — the REPL must never crash on a backend error. The full
+        error goes to stderr for diagnosis (§5 error-first). A Claude usage/spend-cap
+        is special-cased with actionable guidance (the cap message carries the reset
+        date)."""
+        sys.stderr.write(f"[main] translation error: {type(exc).__name__}: {exc}\n")
+        if is_usage_cap_error(exc):
+            console.print(
+                f"[warn]⚠ Claude API usage limit reached: {escape(str(exc))}[/warn]"
+            )
+            console.print(
+                "[dim]Set TRANSLATOR_BACKEND=ollama to use the local model, or wait "
+                "for the limit to reset (see the date above).[/dim]"
+            )
+        else:
+            console.print(
+                f"[warn]⚠ Couldn't translate that request: {escape(str(exc))}[/warn]"
+            )
+            console.print(
+                "[dim]Returning to the prompt — try again, or rephrase it.[/dim]"
+            )
+
     def _handle_request(self, user_input: str, is_retry: bool = False) -> None:
         # 1. Translate
         try:
@@ -645,6 +668,13 @@ class StructureBot:
                 self._report_translation_decline(exc)
                 return
             raise
+        except Exception as exc:
+            # Backstop for the NON-refusal escape path: any other unexpected
+            # translation failure (e.g. a Claude usage-cap BadRequestError that the
+            # one-way fallback couldn't reroute when fallback is off) must surface
+            # cleanly and return to the prompt — the REPL never crashes on it.
+            self._report_translation_error(exc)
+            return
 
         # 2. Route (augment with tool pipeline info; no execution yet)
         result = self.router.route(result, user_input=user_input)

@@ -180,6 +180,77 @@ def test_refusal_is_not_a_fallback_trigger() -> None:
     _assert(not mpost.called, "RefusalError does NOT fall back to Ollama")
 
 
+# -- C2. usage-cap (400) fallback ----------------------------------------------
+
+def _usage_cap_error() -> anthropic.BadRequestError:
+    """A Claude USAGE/SPEND-CAP rejection: HTTP 400 invalid_request_error whose
+    message reports a usage limit (NOT a 429 RateLimitError / 401 AuthError)."""
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://x"))
+    msg = ("You have reached your specified API usage limits. "
+           "You will regain access on 2026-07-01 at 00:00 UTC.")
+    body = {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
+    return anthropic.BadRequestError(msg, response=resp, body=body)
+
+
+def _malformed_400() -> anthropic.BadRequestError:
+    """A genuinely malformed request — also a 400, must NOT be treated as a cap."""
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://x"))
+    msg = "messages: at least one message is required"
+    body = {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
+    return anthropic.BadRequestError(msg, response=resp, body=body)
+
+
+def test_is_usage_cap_error_classification() -> None:
+    print("\n=== C2. usage-cap fallback ===")
+    _assert(T.is_usage_cap_error(_usage_cap_error()), "usage-cap 400 classified as a cap")
+    _assert(not T.is_usage_cap_error(_malformed_400()), "malformed 400 is NOT a cap")
+    _assert(not T.is_usage_cap_error(
+        anthropic.RateLimitError(
+            "rate", response=httpx.Response(429, request=httpx.Request("POST", "http://x")),
+            body=None)), "429 RateLimitError is NOT a cap")
+    _assert(not T.is_usage_cap_error(ValueError("nope")), "non-API error is NOT a cap")
+    # forced 'ollama' never falls back, so a cap can't reroute it
+    _assert(not _ollama_translator()._may_fall_back(), "forced ollama → _may_fall_back is False")
+    _assert(_translator()._may_fall_back(), "active claude + fallback on → _may_fall_back is True")
+
+
+def test_usage_cap_falls_back_to_ollama() -> None:
+    t = _translator()   # active = claude
+    with patch.object(t, "client") as mc, \
+         patch("requests.post", return_value=_ollama_resp(_VALID)) as mpost:
+        mc.messages.create.side_effect = _usage_cap_error()
+        result = t.translate("color chain A red", _session())
+    _assert(mpost.called, "usage-cap + fallback on → Ollama called")
+    _assert(result["commands"] == _VALID_SCOPED, "result came from Ollama (normal translation)")
+
+
+def test_usage_cap_fallback_disabled_reraises() -> None:
+    t = _translator()
+    with patch.object(config, "TRANSLATOR_FALLBACK", False), \
+         patch.object(t, "client") as mc, patch("requests.post") as mpost:
+        mc.messages.create.side_effect = _usage_cap_error()
+        raised = False
+        try:
+            t.translate("color chain A red", _session())
+        except anthropic.BadRequestError:
+            raised = True
+    _assert(raised, "usage-cap + fallback OFF → surfaces (no silent swallow)")
+    _assert(not mpost.called, "fallback OFF → Ollama NOT called")
+
+
+def test_non_usage_cap_400_does_not_fall_back() -> None:
+    t = _translator()
+    with patch.object(t, "client") as mc, patch("requests.post") as mpost:
+        mc.messages.create.side_effect = _malformed_400()
+        raised = False
+        try:
+            t.translate("color chain A red", _session())
+        except anthropic.BadRequestError:
+            raised = True
+    _assert(raised, "malformed 400 → surfaces as an error (not a cap)")
+    _assert(not mpost.called, "malformed 400 → does NOT reroute to Ollama")
+
+
 # -- D. VRAM unload invariant --------------------------------------------------
 
 def test_ensure_unloaded_noop_when_nothing_loaded(monkeypatch) -> None:
@@ -283,6 +354,10 @@ def main() -> int:
     test_fallback_disabled_reraises()
     test_forced_ollama_error_surfaces_claude_never_called()
     test_refusal_is_not_a_fallback_trigger()
+    test_is_usage_cap_error_classification()
+    test_usage_cap_falls_back_to_ollama()
+    test_usage_cap_fallback_disabled_reraises()
+    test_non_usage_cap_400_does_not_fall_back()
     print("\n(ensure-unloaded tests need pytest's monkeypatch)")
     test_gpu_dispatch_fires_unload()
     test_non_gpu_dispatch_does_not_unload()
