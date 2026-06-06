@@ -156,10 +156,13 @@ class ToolRouter:
         "per-residue displacement",
         "residue shift",
         "anchored overlay",
+        "overlay anchored on",
         "anchor on residues",
         "anchor the overlay",
+        "anchoring the conserved",
         "hinge motion",
         "domain motion",
+        "rigid core and show",
         "morph analysis",
         "open vs closed",
         "open and closed",
@@ -3416,6 +3419,88 @@ class ToolRouter:
                 pass
 
     @staticmethod
+    def _ca_coords_live_multichain(
+        bridge: "ChimeraXBridge",
+        model_id: str,
+    ) -> "Dict[Tuple[str,int], Any]":
+        """
+        ``{(chain_id, resno): np.array([x, y, z])}`` for ALL protein chains in
+        *model_id*.  Used for multimer quaternary comparison so the Kabsch fit
+        operates on the JOINT multi-chain Cα set rather than a single chain.
+        Returns ``{}`` on error.
+        """
+        import json
+        import numpy as _np
+        import tempfile
+        import os as _os
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", delete=False, encoding="utf-8", mode="w"
+            ) as jf:
+                out_path = jf.name
+
+            out_posix = out_path.replace("\\", "/")
+
+            script = (
+                "import json as _json\n"
+                "from chimerax.atomic import AtomicStructure\n"
+                f"_mid = {model_id!r}\n"
+                f"_out = {out_posix!r}\n"
+                "_models = {m.id_string: m for m in session.models "
+                "if isinstance(m, AtomicStructure)}\n"
+                "_m = _models.get(_mid)\n"
+                "_c = {}\n"
+                "if _m:\n"
+                "    for _ch in _m.chains:\n"
+                "        _cid = _ch.chain_id\n"
+                "        for _r in _ch.residues:\n"
+                "            _ca = _r.find_atom('CA')\n"
+                "            if _ca is not None:\n"
+                "                _c[_cid + ':' + str(_r.number)] = "
+                "[round(float(_x), 4) for _x in _ca.coord]\n"
+                "with open(_out, 'w') as _fh:\n"
+                "    _json.dump(_c, _fh)\n"
+                "print('OK:' + str(len(_c)))\n"
+            )
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8"
+            ) as sf:
+                sf.write(script)
+                script_path = sf.name
+
+            try:
+                result = bridge.run_command(f'runscript "{script_path}"')
+            finally:
+                try:
+                    _os.unlink(script_path)
+                except Exception:
+                    pass
+
+            val = (result.get("value") or "").strip()
+            if not val.startswith("OK:") or not _os.path.isfile(out_path):
+                return {}
+            with open(out_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            # Keys are "CHAIN:RESNO" strings — convert to (chain, resno) tuples
+            out = {}
+            for k, v in raw.items():
+                try:
+                    ch, rn = k.split(":", 1)
+                    out[(ch, int(rn))] = _np.array(v, dtype=float)
+                except (ValueError, TypeError):
+                    pass
+            return out
+        except Exception:
+            return {}
+        finally:
+            try:
+                _os.unlink(out_path)
+            except Exception:
+                pass
+
+    @staticmethod
     def _anchor_kabsch(
         coords_a:       Dict[int, "Any"],
         coords_b:       Dict[int, "Any"],
@@ -3579,6 +3664,112 @@ class ToolRouter:
 
         return cmds, exps
 
+    @classmethod
+    def _conformer_shift_color_cmds_mc(
+        cls,
+        per_shift:  "Dict[Tuple[str,int], float]",
+        model_spec: str,
+    ) -> "Tuple[List[str], List[str]]":
+        """
+        Multi-chain version of ``_conformer_shift_color_cmds``.
+        *per_shift* is keyed by ``(chain_id, resno)`` tuples (multichain mode).
+        Percentile buckets are computed globally across ALL chains so the colour
+        scale is uniform and directly comparable between chains.
+        """
+        if not per_shift:
+            return [], []
+        import numpy as _np
+
+        vals = sorted(per_shift.values())
+        p25, p50, p70, p85 = (
+            float(_np.percentile(vals, 25)),
+            float(_np.percentile(vals, 50)),
+            float(_np.percentile(vals, 70)),
+            float(_np.percentile(vals, 85)),
+        )
+        thresholds = [
+            (p25, "blue"),
+            (p50, "cornflower blue"),
+            (p70, "white"),
+            (p85, "orange"),
+            (float("inf"), "red"),
+        ]
+
+        def _bucket(v: float) -> str:
+            for hi, col in thresholds:
+                if v <= hi:
+                    return col
+            return "red"
+
+        cmds = [f"color {model_spec} white"]
+        exps = ["Reset to white before per-residue shift colouring"]
+
+        # Group by chain → runs of consecutive residues with same colour
+        chain_map: Dict[str, List[int]] = {}
+        for (ch, rn) in sorted(per_shift):
+            chain_map.setdefault(ch, []).append(rn)
+
+        for chain in sorted(chain_map):
+            resnos = sorted(chain_map[chain])
+            runs: List[tuple] = []
+            for rn in resnos:
+                col = _bucket(per_shift[(chain, rn)])
+                if runs and runs[-1][0] == col:
+                    runs[-1][1].append(rn)
+                else:
+                    runs.append((col, [rn]))
+
+            for col, res_list in runs:
+                if col == "white":
+                    continue
+                if len(res_list) > 1 and res_list == list(range(res_list[0], res_list[-1] + 1)):
+                    spec = f"/{chain}:{res_list[0]}-{res_list[-1]}"
+                else:
+                    spec = f"/{chain}:" + ",".join(str(r) for r in res_list)
+                cmds.append(f"color {model_spec}{spec} {col}")
+                exps.append(f"Colour chain {chain}{spec} {col} (shift percentile bucket)")
+
+        return cmds, exps
+
+    @classmethod
+    def _mc_anchor_to_align_specs(
+        cls,
+        anchor_keys: "List[Any]",
+        model_id_a:  str,
+        model_id_b:  str,
+    ) -> "Tuple[str, str]":
+        """
+        Build ChimeraX ``align`` atom specs for a multi-chain anchor.
+
+        *anchor_keys* is a list of ``(chain_id, resno)`` tuples.
+
+        - If all chains share the same residue numbers: ``#mid/A,B,C:range@CA``
+        - Otherwise (asymmetric anchor): ``#mid/A,B,C@CA`` using all Cα of
+          the anchor chains (approximate but always valid ChimeraX syntax).
+
+        Returns ``(spec_for_b, spec_for_a)``.
+        """
+        chain_resnums: Dict[str, List[int]] = {}
+        for (ch, rn) in anchor_keys:
+            chain_resnums.setdefault(ch, []).append(rn)
+
+        chains = sorted(chain_resnums.keys())
+        chain_str = ",".join(chains)
+
+        # Check whether all chains share the same sorted residue list
+        sorted_sets = [tuple(sorted(chain_resnums[c])) for c in chains]
+        if len(set(sorted_sets)) == 1:
+            # Same range for all chains → compact /CHAINS:range spec
+            range_str = cls._resnums_to_chimerax_range(list(sorted_sets[0]))
+            spec_b = f"#{model_id_b}/{chain_str}:{range_str}@CA"
+            spec_a = f"#{model_id_a}/{chain_str}:{range_str}@CA"
+        else:
+            # Asymmetric ranges → align on all Cα of anchor chains (approximate)
+            spec_b = f"#{model_id_b}/{chain_str}@CA"
+            spec_a = f"#{model_id_a}/{chain_str}@CA"
+
+        return spec_b, spec_a
+
     def _run_conformer_comparison(
         self,
         inputs:     Dict[str, Any],
@@ -3588,11 +3779,15 @@ class ToolRouter:
         Thin orchestrator: anchor-restricted conformer comparison.
 
         (1) Reads live Cα coordinates for both conformers via runscript.
-        (2) Determines anchor residues (user-specified or auto from global
-            Kabsch rigid core — bottom-40% of displacement).
+            Multichain mode (chain="ALL") reads all chains as (chain,resno) keys.
+        (2) Determines anchor residues via iterative prune (repeatedly removes
+            the top-displaced residues until convergence).  Reliably converges on
+            ONE rigid domain even for multimers (quaternary motion detection).
         (3) Anchor-restricted Kabsch: fits R+t on anchor, applies to all
             matched residues → per-residue Cα shift map.
         (4) Issues ``align #B/<anchor>@CA to #A/<anchor>@CA`` for visual overlay.
+            Model A rendered fully opaque (reference frame); model B at
+            CONFORMER_B_TRANSPARENCY% (default 50%) so both are visible.
         (5) Colours model B by per-residue shift (adaptive blue→red).
         (6) Writes CSV artifact, persists to session.
 
@@ -3614,6 +3809,8 @@ class ToolRouter:
         chain_a    = str(inputs.get("chain_a") or "A").upper()
         chain_b    = str(inputs.get("chain_b") or "A").upper()
         anchor_str = str(inputs.get("anchor") or "auto").strip()
+        # Multichain mode: chain_a=="ALL" → read all chains; keys become (chain,resno) tuples.
+        multichain = (chain_a == "ALL")
 
         if model_id_a == model_id_b:
             return ToolStepResult(
@@ -3627,20 +3824,28 @@ class ToolRouter:
             )
 
         # ── 1. Read live Cα coordinates ───────────────────────────────────────
-        coords_a = self._ca_coords_live(self.bridge, model_id_a, chain_a)
-        coords_b = self._ca_coords_live(self.bridge, model_id_b, chain_b)
+        if multichain:
+            coords_a = self._ca_coords_live_multichain(self.bridge, model_id_a)
+            coords_b = self._ca_coords_live_multichain(self.bridge, model_id_b)
+            chain_display = "all chains"
+        else:
+            coords_a = self._ca_coords_live(self.bridge, model_id_a, chain_a)
+            coords_b = self._ca_coords_live(self.bridge, model_id_b, chain_b)
+            chain_display = f"{chain_a}/{chain_b}"
 
         if not coords_a:
             return ToolStepResult(
                 tool="conformer_comparison", success=False,
                 error=(f"Could not read Cα coordinates for model #{model_id_a} "
-                       f"chain {chain_a}.  Check the model is open and the chain ID is correct."),
+                       + (f"(all chains)" if multichain else f"chain {chain_a}.")
+                       + "  Check the model is open."),
             )
         if not coords_b:
             return ToolStepResult(
                 tool="conformer_comparison", success=False,
                 error=(f"Could not read Cα coordinates for model #{model_id_b} "
-                       f"chain {chain_b}.  Check the model is open and the chain ID is correct."),
+                       + (f"(all chains)" if multichain else f"chain {chain_b}.")
+                       + "  Check the model is open."),
             )
 
         common = sorted(set(coords_a) & set(coords_b))
@@ -3648,7 +3853,7 @@ class ToolRouter:
             return ToolStepResult(
                 tool="conformer_comparison", success=False,
                 error=(f"Too few common Cα residues ({len(common)}) between "
-                       f"#{model_id_a}/{chain_a} and #{model_id_b}/{chain_b}.  "
+                       f"#{model_id_a} and #{model_id_b} ({chain_display}).  "
                        "Check that both conformers are the same protein and chain IDs match."),
             )
 
@@ -3657,17 +3862,28 @@ class ToolRouter:
         common_set = set(common)
 
         if anchor_str.lower() == "auto":
-            # Global fit → rigid core = bottom-40th-percentile displacement
-            shifts_g, _, _ = self._anchor_kabsch(coords_a, coords_b, common)
-            if shifts_g is None:
-                return ToolStepResult(
-                    tool="conformer_comparison", success=False,
-                    error="Global Kabsch fit failed (too few common residues).",
-                )
-            cutoff = float(_np.percentile(sorted(shifts_g.values()), 40))
-            anchor_resnums = [r for r in common if shifts_g[r] <= cutoff]
-            anchor_source  = (
-                f"auto (bottom-40% global rigid core: {len(anchor_resnums)} residues)"
+            # Iterative prune: repeatedly remove the top-displaced residues until
+            # convergence.  This reliably converges on ONE rigid domain even for
+            # multimers where each chain is individually conserved but their
+            # relative arrangement (quaternary) changes — e.g. haemoglobin T↔R.
+            anchor_resnums = list(common)
+            n_iters = 0
+            min_anchor = max(10, int(len(common) * 0.05))
+            for _iter in range(12):
+                shifts_g, _, _ = self._anchor_kabsch(coords_a, coords_b, anchor_resnums)
+                if shifts_g is None:
+                    return ToolStepResult(
+                        tool="conformer_comparison", success=False,
+                        error="Auto-anchor Kabsch fit failed (too few common residues).",
+                    )
+                cutoff = float(_np.percentile(sorted(shifts_g.values()), 40))
+                new_anchor = [r for r in anchor_resnums if shifts_g[r] <= cutoff]
+                n_iters += 1
+                if len(new_anchor) < min_anchor or set(new_anchor) == set(anchor_resnums):
+                    break
+                anchor_resnums = new_anchor
+            anchor_source = (
+                f"auto-iterative ({n_iters} prune steps → {len(anchor_resnums)} residues)"
             )
         else:
             anchor_resnums = self._parse_anchor_spec(anchor_str, common_set)
@@ -3700,9 +3916,14 @@ class ToolRouter:
         viz_cmds: List[str] = []
         viz_exps: List[str] = []
 
-        anc_range  = self._resnums_to_chimerax_range(anchor_resnums)
-        align_spec_b = f"#{model_id_b}/{chain_b}:{anc_range}@CA"
-        align_spec_a = f"#{model_id_a}/{chain_a}:{anc_range}@CA"
+        if multichain:
+            align_spec_b, align_spec_a = self._mc_anchor_to_align_specs(
+                anchor_resnums, model_id_a, model_id_b
+            )
+        else:
+            anc_range    = self._resnums_to_chimerax_range(anchor_resnums)
+            align_spec_b = f"#{model_id_b}/{chain_b}:{anc_range}@CA"
+            align_spec_a = f"#{model_id_a}/{chain_a}:{anc_range}@CA"
         align_cmd = f"align {align_spec_b} to {align_spec_a}"
 
         align_res = self.bridge.run_command(align_cmd)
@@ -3710,8 +3931,8 @@ class ToolRouter:
         align_err = (align_res.get("error") or "").strip()
 
         # Fallback: if range notation fails (rare — unequal counts edge case),
-        # try an explicit comma-separated residue list
-        if align_err and "Unequal" in align_err:
+        # try an explicit comma-separated residue list (single-chain only)
+        if align_err and "Unequal" in align_err and not multichain:
             anc_list = ",".join(str(r) for r in anchor_resnums)
             align_cmd = (f"align #{model_id_b}/{chain_b}:{anc_list}@CA "
                          f"to #{model_id_a}/{chain_a}:{anc_list}@CA")
@@ -3731,13 +3952,31 @@ class ToolRouter:
         if m_a:
             align_rmsd = round(float(m_a.group(1)), 3)
 
+        # DEFAULT PRESENTATION: model A opaque (fixed reference frame);
+        # model B semi-transparent so the superposition reads clearly.
+        # Verified: "target c" required — bare "transparency #N 50" silently
+        # has no effect on cartoons in ChimeraX 1.11.1 (§5 silent-success gap).
+        import config as _cfg
+        _transp = getattr(_cfg, "CONFORMER_B_TRANSPARENCY", 50)
+        viz_cmds.append(f"transparency #{model_id_a} 0 target c")
+        viz_exps.append(f"#{model_id_a} fully opaque (reference — fixed frame)")
+        viz_cmds.append(f"transparency #{model_id_b} {_transp} target c")
+        viz_exps.append(
+            f"#{model_id_b} {_transp}% transparent (mobile — coloured by shift)"
+        )
+
         viz_cmds.append("view")
         viz_exps.append("Fit aligned models in view")
 
         # ── 5. Colour model B by per-residue shift ────────────────────────────
-        color_cmds, color_exps = self._conformer_shift_color_cmds(
-            per_shift, f"#{model_id_b}", chain_b
-        )
+        if multichain:
+            color_cmds, color_exps = self._conformer_shift_color_cmds_mc(
+                per_shift, f"#{model_id_b}"
+            )
+        else:
+            color_cmds, color_exps = self._conformer_shift_color_cmds(
+                per_shift, f"#{model_id_b}", chain_b
+            )
         viz_cmds.extend(color_cmds)
         viz_exps.extend(color_exps)
 
@@ -3749,9 +3988,13 @@ class ToolRouter:
         max_shift    = max(all_vals) if all_vals else 0.0
         mean_nonanc  = (round(sum(non_anc_vals) / len(non_anc_vals), 3)
                         if non_anc_vals else 0.0)
-        top_k        = sorted(per_shift.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        top_shifted  = [{"chain": chain_b, "resno": rn, "shift_A": sh}
-                        for rn, sh in top_k]
+        top_k = sorted(per_shift.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        if multichain:
+            top_shifted = [{"chain": rn[0], "resno": rn[1], "shift_A": sh}
+                           for rn, sh in top_k]
+        else:
+            top_shifted = [{"chain": chain_b, "resno": rn, "shift_A": sh}
+                           for rn, sh in top_k]
 
         # ── 7. Write CSV artifact ─────────────────────────────────────────────
         cache_dir = Path("cache")
@@ -3763,9 +4006,15 @@ class ToolRouter:
             with open(csv_path, "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
                 w.writerow(["chain", "resno", "shift_A", "region"])
-                for rn in sorted(per_shift):
-                    w.writerow([chain_b, rn, per_shift[rn],
-                                 "anchor" if rn in anchor_set else "mobile"])
+                if multichain:
+                    for key_mc in sorted(per_shift):
+                        ch_mc, rn_mc = key_mc
+                        w.writerow([ch_mc, rn_mc, per_shift[key_mc],
+                                    "anchor" if key_mc in anchor_set else "mobile"])
+                else:
+                    for rn in sorted(per_shift):
+                        w.writerow([chain_b, rn, per_shift[rn],
+                                    "anchor" if rn in anchor_set else "mobile"])
             csv_written = str(csv_path)
         except Exception:
             pass
@@ -3773,7 +4022,7 @@ class ToolRouter:
         # ── 8. Build report ───────────────────────────────────────────────────
         lines = [
             f"Conformer comparison: #{model_id_a} (reference) ↔ #{model_id_b} (mobile), "
-            f"chain {chain_a}/{chain_b}",
+            f"{chain_display}",
             f"Anchor: {anchor_source}",
             f"  Anchor residual RMSD : {anchor_rmsd:.3f} Å  (quality: {anchor_quality})",
             f"  All-residue RMSD     : {all_rmsd:.3f} Å  (after anchor fit)",
@@ -3796,9 +4045,10 @@ class ToolRouter:
             "CAVEATS:",
             "  • Geometric only — Cα displacement, NOT energetics.",
             "  • Anchor quality (residual RMSD ≈ 0) is the validity check.",
-            "  • For two-domain motion: run twice, anchoring on each domain.",
+            "  • For two-domain / quaternary motion: run twice anchoring on each domain.",
             "",
-            f"Model #{model_id_b} coloured blue (rigid) → red (mobile).",
+            f"Model #{model_id_a} opaque (reference); #{model_id_b} semi-transparent, "
+            "coloured blue (rigid) → red (mobile).",
         ]
         if csv_written:
             lines.append(f"CSV: {csv_written}")
@@ -3806,13 +4056,19 @@ class ToolRouter:
 
         # ── 9. Persist to session ─────────────────────────────────────────────
         elapsed_ms = round((_time.perf_counter() - t0) * 1000)
+        # Anchor head: convert tuple keys to [chain,resno] pairs for JSON compat
+        if multichain:
+            anchor_head = [[k[0], k[1]] for k in anchor_resnums[:30]]
+        else:
+            anchor_head = anchor_resnums[:30]
         result_data: Dict[str, Any] = {
             "model_id_a":          model_id_a,
             "model_id_b":          model_id_b,
             "chain_a":             chain_a,
             "chain_b":             chain_b,
+            "multichain":          multichain,
             "anchor":              anchor_source,
-            "anchor_resnums_head": anchor_resnums[:30],  # first 30 for session
+            "anchor_resnums_head": anchor_head,
             "anchor_rmsd":         anchor_rmsd,
             "anchor_quality":      anchor_quality,
             "all_rmsd":            all_rmsd,
@@ -3824,14 +4080,15 @@ class ToolRouter:
             "csv_path":            csv_written,
             "elapsed_ms":          elapsed_ms,
         }
-        key = f"{model_id_a}v{model_id_b}"
-        self.session.set_conformer_comparison_results(key, result_data)
+        sess_key = f"{model_id_a}v{model_id_b}"
+        self.session.set_conformer_comparison_results(sess_key, result_data)
 
+        top_label = top_shifted[0] if top_shifted else {}
         summary_line = (
-            f"#{model_id_a}↔#{model_id_b} chain {chain_a}/{chain_b}: "
+            f"#{model_id_a}↔#{model_id_b} {chain_display}: "
             f"anchor residual {anchor_rmsd:.2f} Å ({anchor_quality}), "
             f"max shift {max_shift:.1f} Å "
-            f"(res {top_shifted[0]['resno'] if top_shifted else '?'})"
+            f"(chain {top_label.get('chain','?')} res {top_label.get('resno','?')})"
         )
         return ToolStepResult(
             tool="conformer_comparison",
@@ -3882,6 +4139,15 @@ class ToolRouter:
         # Compound: "compar" + ("conformer" | "conformation" | "state")
         if "compar" in low and any(w in low for w in ("conformer", "conformation", " state")):
             return True
+        # Compound: "overlay" + ("anchor" | "conserved" | "rigid core")
+        # Catches: "open and overlay A and B, anchoring the conserved domains/core"
+        #          "overlay anchored on the conserved region"
+        if "overlay" in low and any(w in low for w in ("anchor", "conserved", "rigid core")):
+            return True
+        # Compound: "align" + "rigid core"
+        # Catches: "align A and B on the rigid core and show the shift"
+        if "align" in low and "rigid core" in low:
+            return True
         return False
 
     def _parse_conformer_comparison_options(
@@ -3906,15 +4172,19 @@ class ToolRouter:
             opts["model_id_a"] = self._first_model_id()
             opts["model_id_b"] = self._second_model_id()
 
-        # Chain IDs: "chain X" or "chain pair X/Y"
-        ch_pair = re.search(r"chain\s+([A-Za-z])/([A-Za-z])", user_input or "", re.I)
-        ch_single = re.search(r"\bchain\s+([A-Za-z])\b", user_input or "", re.I)
-        if ch_pair:
-            opts["chain_a"] = ch_pair.group(1).upper()
-            opts["chain_b"] = ch_pair.group(2).upper()
-        elif ch_single:
-            opts["chain_a"] = ch_single.group(1).upper()
-            opts["chain_b"] = ch_single.group(1).upper()
+        # Chain IDs: "all chains" | "chain X" | "chain pair X/Y"
+        if re.search(r"\ball\s+chains?\b", user_input or "", re.I):
+            opts["chain_a"] = "ALL"
+            opts["chain_b"] = "ALL"
+        else:
+            ch_pair = re.search(r"chain\s+([A-Za-z])/([A-Za-z])", user_input or "", re.I)
+            ch_single = re.search(r"\bchain\s+([A-Za-z])\b", user_input or "", re.I)
+            if ch_pair:
+                opts["chain_a"] = ch_pair.group(1).upper()
+                opts["chain_b"] = ch_pair.group(2).upper()
+            elif ch_single:
+                opts["chain_a"] = ch_single.group(1).upper()
+                opts["chain_b"] = ch_single.group(1).upper()
 
         # Anchor spec: "anchor on <range>", "anchor residues <range>",
         #              "core domain <range>", "anchored on <range>"

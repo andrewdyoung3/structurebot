@@ -112,6 +112,13 @@ CHIMERAX_DEFAULT_PRESENTATION_COMMANDS: list = [
     "view",
 ]
 
+# Opacity of the mobile conformer (model B) in a conformer comparison overlay.
+# 0 = fully opaque; 100 = fully transparent.  Verified: ChimeraX 1.11.1 requires
+# explicit "target c" — bare "transparency #N 50" silently has no effect on cartoons.
+CONFORMER_B_TRANSPARENCY: int = int(
+    os.environ.get("CONFORMER_B_TRANSPARENCY", "50")
+)
+
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
 # claude-sonnet-4-6 is the current recommended model.

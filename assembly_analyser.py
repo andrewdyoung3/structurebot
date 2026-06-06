@@ -172,7 +172,9 @@ def fetch_assembly_info(pdb_id: str) -> Dict[str, Any]:
         if not sym_stoich:
             stoich_list = sym_entry.get("stoichiometry") or []
             if stoich_list:
-                sym_stoich = stoich_list[0]  # e.g. "A2"
+                # Combine all components (e.g. ["A2","B2"] → "A2B2" for α2β2).
+                # Sorting ensures canonical order regardless of RCSB entry ordering.
+                sym_stoich = "".join(sorted(stoich_list))
         if not sym_oligo_state:
             sym_oligo_state = sym_entry.get("oligomeric_state") or ""
         for cluster in (sym_entry.get("clusters") or []):

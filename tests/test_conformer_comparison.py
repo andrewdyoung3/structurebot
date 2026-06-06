@@ -671,3 +671,273 @@ class TestErrorFirst:
         )
         assert not result.success
         assert "bridge" in result.error.lower()
+
+
+# ── H. Routing — new anchor-overlay phrases ─────────────────────────────────
+
+class TestNewAnchorOverlayRouting:
+    """New compound phrases for 'overlay anchored on conserved core' intent."""
+
+    NEW_POSITIVE_CASES = [
+        "open and overlay A and B, anchoring the conserved domains",
+        "overlay anchored on the conserved region",
+        "overlay anchoring the conserved core",
+        "align A and B on the rigid core and show the shift",
+        "align these two structures on the rigid core",
+        "overlay the two conformers anchored on the rigid core",
+        "overlay anchored on residues 1-50",
+    ]
+
+    def test_new_phrases_detected(self):
+        router = _make_router()
+        for text in self.NEW_POSITIVE_CASES:
+            assert router._detect_conformer_comparison_intent(text), (
+                f"should detect conformer comparison in: {text!r}"
+            )
+
+    def test_new_phrases_route_to_conformer_comparison(self):
+        router = _make_router()
+        for text in self.NEW_POSITIVE_CASES:
+            tr = {
+                "commands": [], "explanations": [], "warnings": [],
+                "clarification_needed": None, "confidence": "high",
+                "tools_needed": ["chimerax"], "tool_inputs": {},
+            }
+            routed = router.route(tr, user_input=text)
+            assert "conformer_comparison" in routed["tools_needed"], (
+                f"overlay+anchor phrase did not route to conformer_comparison: {text!r}"
+            )
+
+    def test_all_chains_parsed(self):
+        router = _make_router()
+        opts = router._parse_conformer_comparison_options(
+            "compare conformers #1 and #2 all chains"
+        )
+        assert opts.get("chain_a") == "ALL"
+        assert opts.get("chain_b") == "ALL"
+
+    def test_all_chains_not_triggered_by_specific_chain(self):
+        router = _make_router()
+        opts = router._parse_conformer_comparison_options(
+            "compare conformers #1 and #2 chain A"
+        )
+        assert opts.get("chain_a", "A") == "A"
+
+
+# ── I. Transparency default presentation ─────────────────────────────────────
+
+class TestTransparencyPresentation:
+    """Conformer comparison overlay must set ref opaque + mobile semi-transparent."""
+
+    def test_transparency_commands_in_viz(self, tmp_path, monkeypatch):
+        coords_a, coords_b = _make_coords_pair(n_rigid=20, n_mobile=10, mobile_delta=8.0)
+        router = _make_router()
+        router.bridge.run_command.return_value = {
+            "value": "RMSD between 20 atom pairs is 0.1 angstroms", "error": None,
+        }
+        monkeypatch.setattr(
+            ToolRouter, "_ca_coords_live",
+            staticmethod(lambda b, mid, ch: coords_a if mid == "4" else coords_b),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = router._run_conformer_comparison(
+            {"model_id_a": "4", "model_id_b": "1", "chain_a": "A", "chain_b": "A",
+             "anchor": "1-20"},
+        )
+        assert result.success, result.error
+        # Both transparency commands must appear in viz_commands
+        cmds_str = " ".join(result.viz_commands)
+        assert "transparency #4 0 target c" in cmds_str, (
+            "reference model A must be fully opaque"
+        )
+        assert "transparency #1" in cmds_str and "target c" in cmds_str, (
+            "mobile model B must have transparency target c"
+        )
+
+    def test_opaque_before_transparent(self, tmp_path, monkeypatch):
+        """Model A transparency-0 command appears before model B semi-transparent."""
+        coords_a, coords_b = _make_coords_pair(n_rigid=20, n_mobile=5, mobile_delta=5.0)
+        router = _make_router()
+        router.bridge.run_command.return_value = {"value": "", "error": None}
+        monkeypatch.setattr(
+            ToolRouter, "_ca_coords_live",
+            staticmethod(lambda b, mid, ch: coords_a if mid == "4" else coords_b),
+        )
+        monkeypatch.chdir(tmp_path)
+        result = router._run_conformer_comparison(
+            {"model_id_a": "4", "model_id_b": "1", "anchor": "1-20"},
+        )
+        assert result.success, result.error
+        cmds = result.viz_commands
+        idx_a = next((i for i, c in enumerate(cmds) if "transparency #4 0" in c), None)
+        idx_b = next((i for i, c in enumerate(cmds) if "transparency #1" in c and "target c" in c), None)
+        assert idx_a is not None, "transparency #4 0 not found"
+        assert idx_b is not None, "transparency #1 target c not found"
+        assert idx_a < idx_b, "opaque ref must come before semi-transparent mobile"
+
+
+# ── J. Multichain / quaternary ────────────────────────────────────────────────
+
+class TestMultichainQuaternary:
+    """Multichain mode uses (chain,resno) tuple keys and runs iterative prune."""
+
+    def _make_hb_like_coords(self):
+        """
+        Synthetic haemoglobin-like dataset: 4 chains (A,B,C,D) each 50 residues.
+        T→R transition: C and D chains shifted +15 Å relative to A and B.
+        """
+        rng = np.random.default_rng(7)
+        coords = {}
+        for chain in ("A", "B", "C", "D"):
+            for rn in range(1, 51):
+                coords[(chain, rn)] = rng.standard_normal(3) * 5
+        return coords
+
+    def _apply_quaternary_shift(self, coords, shift_chains=("C", "D"), delta=15.0):
+        out = dict(coords)
+        for key, val in coords.items():
+            if key[0] in shift_chains:
+                out[key] = val + np.array([delta, 0.0, 0.0])
+        return out
+
+    def test_multichain_kabsch_detects_quaternary(self):
+        """
+        With A,B as the user-specified anchor, C,D chains show large shifts.
+        This verifies that tuple-keyed Kabsch correctly propagates quaternary motion.
+
+        Note: auto-anchor (iterative prune) cannot reliably select one dimer over the
+        other from symmetric synthetic data — both have equal displacement from the
+        global-fit midpoint.  In practice the user specifies the anchor dimer, or real
+        protein data has intra-chain fold differences that break the symmetry.
+        """
+        coords_a = self._make_hb_like_coords()
+        angle = np.deg2rad(10)
+        R = np.array([[np.cos(angle), -np.sin(angle), 0],
+                      [np.sin(angle),  np.cos(angle), 0],
+                      [0, 0, 1]])
+        coords_b_base = {k: R @ v + np.array([2.0, 1.0, 0.0]) for k, v in coords_a.items()}
+        coords_b = self._apply_quaternary_shift(coords_b_base, shift_chains=("C", "D"), delta=12.0)
+
+        common = sorted(set(coords_a) & set(coords_b))
+
+        # User-specified anchor: A,B chains only
+        anchor = [(ch, rn) for (ch, rn) in common if ch in ("A", "B")]
+        per_shift, anc_rmsd, all_rmsd = ToolRouter._anchor_kabsch(coords_a, coords_b, anchor)
+
+        assert per_shift is not None
+        assert anc_rmsd < 1.0, f"A,B anchor should be rigid, got {anc_rmsd:.2f} Å"
+
+        # C,D must show large shifts (~12 Å)
+        cd_shifts = [per_shift[(ch, rn)] for (ch, rn) in common if ch in ("C", "D")]
+        ab_shifts = [per_shift[(ch, rn)] for (ch, rn) in common if ch in ("A", "B")]
+        assert np.mean(cd_shifts) > 8.0, (
+            f"Mean C,D shift {np.mean(cd_shifts):.1f} Å expected > 8 Å"
+        )
+        assert np.mean(ab_shifts) < 2.0, (
+            f"Mean A,B shift {np.mean(ab_shifts):.1f} Å expected < 2 Å (anchor residuals)"
+        )
+
+    def test_iterative_prune_reduces_anchor(self):
+        """Iterative prune always produces a strictly smaller anchor."""
+        coords_a = self._make_hb_like_coords()
+        angle = np.deg2rad(15)
+        R = np.array([[np.cos(angle), -np.sin(angle), 0],
+                      [np.sin(angle),  np.cos(angle), 0],
+                      [0, 0, 1]])
+        coords_b = {k: R @ v + np.array([1.0, 0.5, 0.0]) for k, v in coords_a.items()}
+        # Add large displacement to C chains
+        for (ch, rn), v in list(coords_b.items()):
+            if ch == "C":
+                coords_b[(ch, rn)] = v + np.array([20.0, 0.0, 0.0])
+
+        common = sorted(set(coords_a) & set(coords_b))
+        min_anchor = max(10, int(len(common) * 0.05))
+        anchor = list(common)
+        for _ in range(12):
+            shifts_g, _, _ = ToolRouter._anchor_kabsch(coords_a, coords_b, anchor)
+            cutoff = float(np.percentile(sorted(shifts_g.values()), 40))
+            new_anchor = [r for r in anchor if shifts_g[r] <= cutoff]
+            if len(new_anchor) < min_anchor or set(new_anchor) == set(anchor):
+                break
+            anchor = new_anchor
+        assert len(anchor) < len(common), (
+            f"Iterative prune should reduce anchor ({len(anchor)} vs {len(common)})"
+        )
+
+    def test_mc_anchor_to_align_specs_same_range(self):
+        """All chains same anchor range → compact /CHAINS:range spec."""
+        anchor = [(ch, rn) for ch in ("A", "B") for rn in range(1, 21)]
+        spec_b, spec_a = ToolRouter._mc_anchor_to_align_specs(anchor, "1", "2")
+        assert "/A,B:1-20@CA" in spec_b
+        assert "/A,B:1-20@CA" in spec_a
+
+    def test_mc_anchor_to_align_specs_different_ranges(self):
+        """Different anchor ranges per chain → all-chain Cα spec."""
+        anchor = ([(("A", rn)) for rn in range(1, 21)] +
+                  [(("B", rn)) for rn in range(5, 30)])
+        spec_b, spec_a = ToolRouter._mc_anchor_to_align_specs(anchor, "1", "2")
+        # Different ranges → must use full-chain spec
+        assert "/A,B@CA" in spec_b
+
+    def test_multichain_orchestrator_runs(self, tmp_path, monkeypatch):
+        """_run_conformer_comparison with chain='ALL' reads multichain coords."""
+        coords_a = {("A", rn): np.zeros(3) + rn for rn in range(1, 31)}
+        coords_b = {("A", rn): np.zeros(3) + rn + 0.1 for rn in range(1, 31)}
+        coords_b.update({("A", rn): np.zeros(3) + rn + 10.0 for rn in range(21, 31)})
+
+        router = _make_router()
+        router.bridge.run_command.return_value = {
+            "value": "RMSD between 20 atom pairs is 0.1 angstroms", "error": None
+        }
+        monkeypatch.setattr(
+            ToolRouter, "_ca_coords_live_multichain",
+            staticmethod(lambda b, mid: coords_a if mid == "4" else coords_b),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = router._run_conformer_comparison(
+            {"model_id_a": "4", "model_id_b": "1", "chain_a": "ALL", "chain_b": "ALL",
+             "anchor": "auto"},
+        )
+        assert result.success, result.error
+        # per_shift should have tuple keys
+        per_shift = result.data["per_shift"]
+        assert all(isinstance(k, tuple) for k in per_shift), (
+            "multichain per_shift keys must be (chain, resno) tuples"
+        )
+        # Top displaced residues must have chain field from tuple key
+        top = result.data["top_shifted"]
+        assert top[0]["chain"] == "A"
+
+
+# ── K. Assembly metadata — 2HHB/1BBB ────────────────────────────────────────
+
+class TestAssemblyMetadata2HHB:
+    """Assembly analyser stoichiometry fix: 2HHB must not be labelled 'homodimer'."""
+
+    def test_hhb_stoich_combines_multiple_entries(self):
+        """
+        RCSB returns stoich ["A2","B2"] for haemoglobin.  Combined → "A2B2"
+        → "heterotetrameric (α2β2)", not "homodimer".
+        """
+        from assembly_analyser import _stoichiometry_label
+        # Simulate the combined stoich (after fix: "".join(sorted(["A2","B2"])))
+        combined = "".join(sorted(["A2", "B2"]))  # "A2B2"
+        label = _stoichiometry_label(combined, 4)
+        assert label == "heterotetrameric (α2β2)", (
+            f"Expected heterotetrameric (α2β2), got: {label!r}"
+        )
+
+    def test_homodimer_unchanged_for_a2(self):
+        """A genuine A2 homodimer (n=2) must still return 'homodimer'."""
+        from assembly_analyser import _stoichiometry_label
+        label = _stoichiometry_label("A2", 2)
+        assert label == "homodimer", f"Expected homodimer, got: {label!r}"
+
+    def test_single_stoich_not_combined(self):
+        """["A4"] → "A4" → 'homotetramer' (no change)."""
+        from assembly_analyser import _stoichiometry_label
+        single = "".join(sorted(["A4"]))  # "A4"
+        label = _stoichiometry_label(single, 4)
+        assert label == "homotetramer", f"Expected homotetramer, got: {label!r}"
