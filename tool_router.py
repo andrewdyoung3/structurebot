@@ -3020,18 +3020,28 @@ class ToolRouter:
         quick      = bool(inputs.get("quick", False))
 
         # ── Resolve sequence ──────────────────────────────────────────────────────
-        sequence = inputs.get("sequence") or self._fetch_sequence(
-            model_id, inputs.get("chain")
-        )
+        # Priority: explicit/pasted sequence → MPNN top design (auto-pull, when the
+        # request refers to "the redesign"/"the top design"; RETRIEVED, never re-runs
+        # MPNN) → the loaded structure's chain.
+        sequence = inputs.get("sequence")
+        mpnn_src = None
+        if not sequence and self._refers_to_mpnn_design(user_input):
+            sequence, mpnn_src = self._mpnn_top_sequence(model_id)
+        if not sequence:
+            sequence = self._fetch_sequence(model_id, inputs.get("chain"))
         if not sequence:
             return ToolStepResult(
                 tool="colabfold", success=False,
                 error=(
                     "ColabFold needs an amino-acid sequence. Provide one explicitly "
-                    "(e.g. 'fold MKT... as a dimer with colabfold'), or load a "
-                    "structure first so its chain sequence can be used."
+                    "(e.g. 'fold MKT... as a dimer with colabfold'), redesign a chain "
+                    "with ProteinMPNN first then 'fold the top design', or load a "
+                    "structure so its chain sequence can be used."
                 ),
             )
+        if mpnn_src:
+            print(f"  ColabFold: folding the top ProteinMPNN design ({mpnn_src}, no re-run).",
+                  flush=True)
 
         # ── Resolve optional template (PDB id → local file) ────────────────────────
         template_path: Optional[str] = None
@@ -3364,15 +3374,17 @@ class ToolRouter:
         lengths = sorted(per_chain.values())
         return (len(lengths), tuple(lengths))
 
-    def _acquire_design_fold(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def _acquire_design_fold(self, inputs: Dict[str, Any], user_input: str = "") -> Dict[str, Any]:
         """
         Get the design's ColabFold fold, REUSING an existing result instead of
         re-folding when possible (guardrail). Priority:
           1. an explicit ``colabfold_result`` dict (chaining / tests);
           2. an in-session fold for this model (no re-fold) — enriched from the
              on-disk full result.json when present;
-          3. fold the given sequence via the bridge (whose hash-cache itself
-             reuses a prior fold → only folds if there genuinely isn't one).
+          3. the MPNN top design (auto-pull, when the request refers to "the design"
+             and no fold exists yet) → folded via the bridge (whose hash-cache reuses
+             a prior fold); RETRIEVED, never re-runs MPNN;
+          4. fold the given sequence via the bridge (hash-cache reused).
         """
         if isinstance(inputs.get("colabfold_result"), dict):
             r = dict(inputs["colabfold_result"])
@@ -3382,6 +3394,7 @@ class ToolRouter:
 
         model_id = inputs.get("model_id") or self._first_model_id()
         sequence = inputs.get("sequence")
+        user_input = user_input or inputs.get("_user_input", "")
 
         if not sequence:
             sess = self.session.get_colabfold_results(model_id) if self.session else None
@@ -3391,14 +3404,20 @@ class ToolRouter:
                 r["fold_source"] = "reused (session)"
                 self._enrich_fold_from_disk(r)
                 return r
-            return {
-                "success": False,
-                "error": (
-                    "No sequence provided and no in-session ColabFold result for this "
-                    "model. Fold a sequence first (e.g. 'fold <seq> with colabfold'), or "
-                    "give a sequence to validate."
-                ),
-            }
+            # No in-session fold → pull the MPNN top design (validate the redesign
+            # WITHOUT a prior explicit fold), letting the bridge hash-cache reuse it.
+            if self._refers_to_mpnn_design(user_input):
+                sequence, _src = self._mpnn_top_sequence(model_id)
+            if not sequence:
+                return {
+                    "success": False,
+                    "error": (
+                        "No sequence provided and no in-session ColabFold result for this "
+                        "model. Fold a sequence first (e.g. 'fold <seq> with colabfold'), "
+                        "redesign a chain with ProteinMPNN then 'validate the top design', "
+                        "or give a sequence to validate."
+                    ),
+                }
 
         bridge = self._get_colabfold_bridge()
         r = dict(bridge.predict(
@@ -3791,7 +3810,7 @@ class ToolRouter:
         t0 = _time.perf_counter()
 
         # ── 1. Fold confidence (reuse-or-fold) ────────────────────────────────────
-        fold = self._acquire_design_fold(inputs)
+        fold = self._acquire_design_fold(inputs, user_input=user_input)
         if not fold.get("success"):
             return ToolStepResult(
                 tool="validate_design", success=False,
@@ -4606,6 +4625,32 @@ class ToolRouter:
         except Exception:
             pass
         return None, "none"
+
+    # Phrases that mean "the ProteinMPNN design" (so a fold/validate request pulls
+    # the redesigned sequence instead of the loaded WT chain). Distinct from
+    # rfdiffusion "design a binder" — these only matter once colabfold/validate_design
+    # has already been dispatched.
+    _MPNN_DESIGN_REFS = (
+        "redesign", "redesigned", "top design", "best design", "the design",
+        "designed sequence", "designed seq", "mpnn design", "mpnn sequence",
+        "mpnn result", "the redesign",
+    )
+
+    def _refers_to_mpnn_design(self, text: str) -> bool:
+        low = (text or "").lower()
+        return any(p in low for p in self._MPNN_DESIGN_REFS)
+
+    def _mpnn_top_sequence(self, model_id: Optional[str] = None):
+        """The TOP ProteinMPNN designed sequence for *model_id*, RETRIEVED never
+        re-run (session → persisted cache FASTA, via `_resolve_mpnn_data`). Returns
+        (sequence | None, source). "Top" = lowest ProteinMPNN score (best); falls
+        back to the first design when scores are absent/equal."""
+        data, src = self._resolve_mpnn_data(model_id)
+        seqs = [s for s in ((data or {}).get("sequences") or []) if s.get("sequence")]
+        if not seqs:
+            return None, src
+        best = min(seqs, key=lambda s: s["score"] if isinstance(s.get("score"), (int, float)) else 0.0)
+        return best.get("sequence"), src
 
     def _show_designed_sequences(self, mpnn_data=None, model_id=None) -> str:
         """

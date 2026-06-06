@@ -539,3 +539,100 @@ def test_live_validate_design_reuses_cached_fold():
     score = RosettaBridge().relax_and_score(fold["ranked_pdb"])
     assert score["success"], score.get("error")
     assert score["total_reu"] is not None and score["n_residues"] > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MPNN-result sequence auto-pull (the MPNN→ColabFold handoff) — never re-runs MPNN
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _CapturingColabFold(_FakeColabFold):
+    def __init__(self):
+        super().__init__()
+        self.sequences = []
+
+    def predict(self, **kw):
+        self.sequences.append(kw.get("sequence"))
+        return super().predict(**kw)
+
+
+# WT chain (8 W's) vs the MPNN designs; the TOP design = the lowest score (-1.2).
+_WT = "WWWWWWWW"
+_MPNN = {"sequences": [{"sequence": "AAAACCCC", "score": -0.5},
+                       {"sequence": "CDEFGHIK", "score": -1.2}],   # ← top (best)
+         "wildtype_sequence": _WT, "backend": "proteinmpnn"}
+
+
+def _router_with_mpnn(colabfold):
+    r = _router(_FakeRosetta(), chimerax=_FakeChimerax(), colabfold=colabfold)
+    r.session.structures = {"1": {"name": "1il8", "path": "x.pdb"}}
+    r.session.add_proteinmpnn_result("1", _MPNN)
+    r._fetch_sequence = lambda *a, **k: _WT                # WT chain fallback
+    r._build_colabfold_viz = lambda *a, **k: ([], [])     # type: ignore
+    r._open_pngs = lambda *a, **k: None                    # type: ignore
+    return r
+
+
+def test_mpnn_top_sequence_is_best_score_from_session():
+    r = _router_with_mpnn(_CapturingColabFold())
+    seq, src = r._mpnn_top_sequence("1")
+    assert seq == "CDEFGHIK" and src == "session"        # lowest score = best
+
+
+def test_colabfold_auto_pulls_mpnn_top_design():
+    cf = _CapturingColabFold()
+    r = _router_with_mpnn(cf)
+    r._run_colabfold({"model_id": "1"}, user_input="fold the top design with colabfold")
+    assert cf.sequences == ["CDEFGHIK"], cf.sequences        # the MPNN top design, not the WT chain
+
+
+def test_colabfold_does_not_auto_pull_for_a_plain_chain_fold():
+    cf = _CapturingColabFold()
+    r = _router_with_mpnn(cf)
+    r._run_colabfold({"model_id": "1", "chain": "A"}, user_input="fold chain A with colabfold")
+    assert cf.sequences == [_WT], cf.sequences               # WT chain — NOT the design
+
+
+def test_validate_design_auto_pulls_mpnn_top_design():
+    cf = _CapturingColabFold()
+    r = _router_with_mpnn(cf)
+    res = r._run_validate_design({"model_id": "1"}, user_input="validate the top design with colabfold")
+    assert res.success
+    assert cf.sequences == ["CDEFGHIK"], cf.sequences        # auto-pull fed validate-design
+
+
+def test_auto_pull_reads_cache_fasta_when_no_session(tmp_path, monkeypatch):
+    # No in-session MPNN result → fall back to the persisted cache FASTA (survives an
+    # unsaved session); still NEVER re-runs MPNN.
+    import config
+    from proteinmpnn_bridge import write_designs_fasta
+    monkeypatch.setattr(config, "PROTEINMPNN_CACHE_DIR", tmp_path)
+    write_designs_fasta("1", _WT, _MPNN["sequences"])
+    cf = _CapturingColabFold()
+    r = _router(_FakeRosetta(), chimerax=_FakeChimerax(), colabfold=cf)
+    r.session.structures = {"1": {"name": "1il8", "path": "x.pdb"}}   # NO add_proteinmpnn_result
+    r._fetch_sequence = lambda *a, **k: _WT
+    r._build_colabfold_viz = lambda *a, **k: ([], [])
+    r._open_pngs = lambda *a, **k: None
+    r._run_colabfold({"model_id": "1"}, user_input="fold the redesign with colabfold")
+    assert cf.sequences == ["CDEFGHIK"], cf.sequences        # top design read from the cache FASTA
+
+
+def test_validate_design_reuses_fold_after_restore(tmp_path):
+    # The linchpin's persistence: a colabfold fold pointer round-trips save/load and
+    # validate-design reuses it post-restart WITHOUT re-folding.
+    ranked = _write_pdb(tmp_path / "ranked.pdb", {"A": 36})
+    s = SessionState()
+    s.set_colabfold_results("1", {"ranked_pdb": ranked, "mean_plddt": 90.0,
+                                  "ptm": 0.7, "length": 36, "copies": 1})
+    s.save(str(tmp_path / "session.json"))
+    restored, err = SessionState.try_load(str(tmp_path / "session.json"))
+    assert err is None and restored is not None
+    assert restored.get_colabfold_results("1")["ranked_pdb"] == ranked   # pointer round-trips
+
+    cf = _FakeColabFold()
+    r = _router(_FakeRosetta(), chimerax=_FakeChimerax(), colabfold=cf)
+    r.session = restored
+    res = r._run_validate_design({"model_id": "1"}, user_input="validate this design")
+    assert res.success
+    assert res.data["design"]["fold_source"] == "reused (session)"
+    assert cf.predict_calls == 0                              # post-restart: NO re-fold
