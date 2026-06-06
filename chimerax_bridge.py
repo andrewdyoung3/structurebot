@@ -451,6 +451,23 @@ class ChimeraXBridge:
         except Exception:
             return []
 
+    def _model_chain_resnums(self, model_id: str, chain: str) -> List[int]:
+        """The MACROMOLECULE residue numbers of chain *chain*, in sequence order,
+        via ``info residues`` scoped to ``~solvent & ~ligand & ~ions`` (so waters /
+        the MK1-style ligand sharing the chain id are excluded). Sorted ascending
+        (the chain's residue order); [] on any failure. Insertion codes collapse to
+        their base number (a rare edge; the common non-1-start / gap cases are kept)."""
+        try:
+            r = self.run_command(
+                f"info residues #{model_id}/{chain} & ~solvent & ~ligand & ~ions")
+            value = r.get("value") if isinstance(r, dict) else None
+            if not isinstance(value, str):
+                return []
+            nums = {int(m) for m in re.findall(rf"/{re.escape(chain)}:(-?\d+)", value)}
+            return sorted(nums)
+        except Exception:
+            return []
+
     def _maybe_show_sequence_on_open(self, model_id: str) -> None:
         """Open + associate the Sequence Viewer for the new model (config-gated by
         CHIMERAX_SHOW_SEQUENCE_ON_OPEN). For multimers, opens one viewer PER CHAIN
@@ -463,6 +480,8 @@ class ChimeraXBridge:
             from sequence_viewer import (
                 ensure_sequence_viewer_commands,
                 dock_sequences_bottom_command,
+                numbering_header_command,
+                _run_error_first,
             )
             chains: Optional[List[str]] = None
             if getattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN", True):
@@ -474,6 +493,18 @@ class ChimeraXBridge:
                     chains = found
             for c in ensure_sequence_viewer_commands(model_id, chains):
                 self.run_command(c)
+            # Per-chain residue-number ruler (actual PDB resnums). Run error-first so a
+            # failure on one chain is RECORDED and the remaining chains + the dock hook
+            # still run — numbering never disrupts the open (fire-and-forget).
+            if chains and getattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", True):
+                interval = int(getattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL", 10))
+                num_cmds: List[str] = []
+                for ch in chains:
+                    cmd = numbering_header_command(
+                        model_id, ch, self._model_chain_resnums(model_id, ch), interval)
+                    if cmd:
+                        num_cmds.append(cmd)
+                _run_error_first(self.run_command, num_cmds)
             if getattr(_cfg, "CHIMERAX_SEQUENCE_DOCK_BOTTOM", True):
                 self.run_command(dock_sequences_bottom_command())
         except Exception:

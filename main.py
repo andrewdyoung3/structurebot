@@ -890,11 +890,32 @@ class StructureBot:
 
         # 10. Auto-fix on first failure (once only, ChimeraX commands only)
         if not success and not is_retry and failed_cmd and error_msg:
-            console.print("\n[warn]Asking Claude for a corrected command…[/warn]")
+            console.print("\n[warn]Asking for a corrected command…[/warn]")
+            # Bug 6a: the actual error text is fed into translate_error_fix so the
+            # model cannot re-propose the same command blind (already handled by
+            # translate_error_fix, which builds the prompt from failed_command +
+            # error_message verbatim — no silent re-prompt).
             fix = self.translator.translate_error_fix(failed_cmd, error_msg, self.session)
             fix_cmds = fix.get("commands", [])
             fix_exps = fix.get("explanations", [])
-            if fix_cmds:
+
+            # Bug 6b: no-progress detection — halt cleanly instead of looping.
+            # No progress = the correction is empty (guards blocked it or model
+            # refused) OR the model re-proposed the identical failing command.
+            _same_cmd = bool(
+                fix_cmds
+                and fix_cmds[0].strip().lower() == failed_cmd.strip().lower()
+            )
+            if not fix_cmds or _same_cmd:
+                console.print(
+                    f"[warn]Couldn't auto-correct — "
+                    f"error: {escape(error_msg[:200])}[/warn]"
+                )
+                console.print(
+                    "[dim]Correction re-proposed the same command or was blocked "
+                    "by a validation guard.  Try rephrasing your request.[/dim]"
+                )
+            else:
                 console.print("\n[warn]Suggested correction:[/warn]")
                 self._show_preview(fix_cmds, fix_exps, fix.get("confidence", "medium"))
                 choice = Prompt.ask(

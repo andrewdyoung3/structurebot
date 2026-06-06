@@ -256,6 +256,9 @@ class SessionState:
         # Validate-design meta-tool results: model_id → evidence-rich report dict
         # Populated by ToolRouter._run_validate_design() (fold + RMSD + energy).
         self.validate_design_results: Dict[str, Any] = {}
+        # Conformer-comparison results: "{model_id_a}v{model_id_b}" → shift report dict
+        # Populated by ToolRouter._run_conformer_comparison() (anchor-restricted Kabsch).
+        self.conformer_comparison_results: Dict[str, Any] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -702,6 +705,16 @@ class SessionState:
         """Return stored validate-design report for a model, or None."""
         return self.validate_design_results.get(str(model_id))
 
+    # ── Conformer-comparison result tracking ──────────────────────────────────
+
+    def set_conformer_comparison_results(self, key: str, result: Dict[str, Any]) -> None:
+        """Store conformer-comparison shift report keyed by '{model_id_a}v{model_id_b}'."""
+        self.conformer_comparison_results[str(key)] = result
+
+    def get_conformer_comparison_results(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return stored conformer-comparison report for *key*, or None."""
+        return self.conformer_comparison_results.get(str(key))
+
     # ── Rosetta relax cache tracking ──────────────────────────────────────────
 
     def set_relax_cache(self, pdb_hash: str, relaxed_path: str) -> None:
@@ -918,7 +931,8 @@ class SessionState:
             "double_mutant_results":  self.double_mutant_results,
             "netnglyc_results":       self.netnglyc_results,
             "colabfold_results":      self.colabfold_results,
-            "validate_design_results": self.validate_design_results,
+            "validate_design_results":      self.validate_design_results,
+            "conformer_comparison_results": self.conformer_comparison_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -951,7 +965,8 @@ class SessionState:
         state.double_mutant_results  = data.get("double_mutant_results", {})
         state.netnglyc_results       = data.get("netnglyc_results", {})
         state.colabfold_results      = data.get("colabfold_results", {})
-        state.validate_design_results = data.get("validate_design_results", {})
+        state.validate_design_results      = data.get("validate_design_results", {})
+        state.conformer_comparison_results = data.get("conformer_comparison_results", {})
         return state
 
     @classmethod
@@ -1070,7 +1085,8 @@ class SessionState:
             "double_mutant_results":  self.double_mutant_results,
             "netnglyc_results":       self.netnglyc_results,
             "colabfold_results":      self.colabfold_results,
-            "validate_design_results": self.validate_design_results,
+            "validate_design_results":      self.validate_design_results,
+            "conformer_comparison_results": self.conformer_comparison_results,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -1099,4 +1115,5 @@ class SessionState:
         self.double_mutant_results  = copy.deepcopy(snap.get("double_mutant_results", {}))
         self.netnglyc_results       = copy.deepcopy(snap.get("netnglyc_results", {}))
         self.colabfold_results      = copy.deepcopy(snap.get("colabfold_results", {}))
-        self.validate_design_results = copy.deepcopy(snap.get("validate_design_results", {}))
+        self.validate_design_results      = copy.deepcopy(snap.get("validate_design_results", {}))
+        self.conformer_comparison_results = copy.deepcopy(snap.get("conformer_comparison_results", {}))

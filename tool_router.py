@@ -139,10 +139,34 @@ class ToolRouter:
         "salt_bridge":       "⚡",
         "cavity":            "🕳",
         "double_mutant":     "⚗️🔗",
-        "validate_ddg":      "⚗️✅",
-        "colabfold":         "🧬🔮",
-        "validate_design":   "🧬✅",
+        "validate_ddg":          "⚗️✅",
+        "colabfold":             "🧬🔮",
+        "validate_design":       "🧬✅",
+        "conformer_comparison":  "🔄",
     }
+
+    # Conformer-comparison intent keywords.  Specific enough to avoid false
+    # positives with existing tools; compound check covers "compare.*conformer".
+    _CONFORMER_COMPARISON_KEYWORDS: tuple = (
+        "compare conformer",
+        "conformer comparison",
+        "conformational change",
+        "conformational comparison",
+        "per-residue shift",
+        "per-residue displacement",
+        "residue shift",
+        "anchored overlay",
+        "anchor on residues",
+        "anchor the overlay",
+        "hinge motion",
+        "domain motion",
+        "morph analysis",
+        "open vs closed",
+        "open and closed",
+        "two conformers",
+        "two conformations",
+        "conformation comparison",
+    )
 
     # Validate-design meta-tool: the HEAVY ColabFold+Rosetta orchestrator. It
     # fires ONLY on explicit high-accuracy phrasing — BARE "validate design" /
@@ -257,6 +281,15 @@ class ToolRouter:
         "another design", "new design", "design again", "redesign the dimer",
         "redesign the interface", "redesign selected", "make it hydrophilic",
         "make it hydrophobic",
+    )
+    # Primary visualization verbs: a request that OPENS with one of these is a
+    # structural viz op — NOT an MPNN sequence-display request — regardless of
+    # whether "redesigned"/"redesign" appears later.  This prevents "remove chain B
+    # … show the overlay … redesigned chain A" from dumping the MPNN design list.
+    # (Acceptance case R1 / Bug 5 fix.)
+    _PRIMARY_VIZ_VERBS: tuple = (
+        "remove", "hide", "close", "overlay", "color", "colour",
+        "cartoon", "style", "align", "matchmaker",
     )
     _MPNN_DISPLAY_VERBS: tuple = (
         "show", "output", "print", "display", "list", "what", "see", "view",
@@ -808,6 +841,21 @@ class ToolRouter:
             tool_inputs  = {"colabfold": cf_inputs}
             _claimed = True
 
+        # ── Conformer-comparison intent override ──────────────────────────────
+        # Fires on explicit phrasing only ("compare conformers", "anchored overlay",
+        # "per-residue shift", "morph analysis", etc.) — never on generic phrases.
+        _cc_intent = bool(
+            user_input
+            and self._detect_conformer_comparison_intent(user_input)
+            and "conformer_comparison" not in tools_needed
+            and not _claimed
+        )
+        if _cc_intent:
+            cc_inputs = self._parse_conformer_comparison_options(user_input, translator_result)
+            tools_needed = ["conformer_comparison"]
+            tool_inputs  = {"conformer_comparison": cc_inputs}
+            _claimed = True
+
         # ── Proline intent override ────────────────────────────────────────────
         # Check BEFORE building step_info so the icon/description are correct.
         if user_input and self._detect_proline_intent(user_input) and not _claimed:
@@ -1017,6 +1065,31 @@ class ToolRouter:
         if _glycan_intent or _glycan_positions_intent or _netnglyc_intent:
             result["clarification_needed"] = None
 
+        # ── Bug 4c: suppress translator commands that duplicate a fold/design tool ──
+        # When colabfold / validate_design / esmfold / mpnn_esmfold is dispatched,
+        # the tool opens, folds, and visualises the result itself.  Any `open` or
+        # `matchmaker` commands the translator emitted in parallel are spurious —
+        # they desync model IDs (the #2-vs-#3 bug from the live fold-overlay session).
+        _FOLD_TOOLS = frozenset({"colabfold", "validate_design", "esmfold", "mpnn_esmfold"})
+        if any(t in _FOLD_TOOLS for t in tools_needed):
+            _raw_cmds = result.get("commands") or []
+            _raw_exps = result.get("explanations") or []
+            _suppress_re = re.compile(r"^\s*(open|matchmaker)\s", re.IGNORECASE)
+            _kept = [
+                (_raw_cmds[i], _raw_exps[i] if i < len(_raw_exps) else "")
+                for i in range(len(_raw_cmds))
+                if not _suppress_re.match(_raw_cmds[i])
+            ]
+            _suppressed = [c for c in _raw_cmds if _suppress_re.match(c)]
+            if _suppressed:
+                result["commands"]     = [p[0] for p in _kept]
+                result["explanations"] = [p[1] for p in _kept]
+                print(
+                    f"  [fold-guard] suppressed {len(_suppressed)} open/matchmaker "
+                    f"command(s) alongside tool dispatch: {_suppressed}",
+                    flush=True,
+                )
+
         step_info: List[Dict[str, Any]] = []
         for tool in tools_needed:
             icon = self._TOOL_ICONS.get(tool, "⚙️")
@@ -1061,6 +1134,15 @@ class ToolRouter:
         if tool == "validate_design":
             return ("Validate design — ColabFold confidence + matchmaker RMSD + "
                     "Rosetta folding-energy sanity (evidence-rich report)")
+        if tool == "conformer_comparison":
+            inp = tool_inputs.get("conformer_comparison", {})
+            a   = inp.get("model_id_a", "?")
+            b   = inp.get("model_id_b", "?")
+            anc = inp.get("anchor", "auto")
+            return (
+                f"Conformer comparison #{a}↔#{b} — anchor-restricted Kabsch "
+                f"(anchor: {anc}) + per-residue Cα shift map (blue=rigid, red=mobile)"
+            )
         if tool == "proteinmpnn":
             return "ProteinMPNN fixed-backbone sequence redesign"
         if tool == "mpnn_esmfold":
@@ -1355,6 +1437,8 @@ class ToolRouter:
                 return self._run_colabfold(inputs, user_input=user_input)
             if tool == "validate_design":
                 return self._run_validate_design(inputs, user_input=user_input)
+            if tool == "conformer_comparison":
+                return self._run_conformer_comparison(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -3231,6 +3315,534 @@ class ToolRouter:
                 pass
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Conformer-comparison (thin orchestrator — NOT a new bridge)
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    # Reuses:  validate-design's _per_residue_ca_deviation Kabsch pattern
+    #          (generalised to anchor-restricted fit via _anchor_kabsch)
+    #          + _build_deviation_color_cmds grouped-color idiom
+    #          + proteinmpnn_bridge.chain_resnum_to_seqpos for residue mapping
+    #
+    # STEP 0 probe findings (ChimeraX 1.11.1):
+    #   • align #N/chain:range@CA to #M/chain:range@CA  CONFIRMED WORKS — moves
+    #     model N; output "RMSD between K atom pairs is X.XXX angstroms"; requires
+    #     equal atom counts (same residue numbers in both specs).
+    #   • Cα extraction via runscript: r.find_atom('CA') returns None for residues
+    #     without CA — requires if-guard.  JSON output via print(json.dumps(coords))
+    #     works cleanly.  4AKE/1AKE: 214 residues each, all 1–214, no gaps.
+    #   • The numpy Kabsch path is AUTHORITATIVE for numbers; `align` is for the
+    #     visible overlay only.
+
+    @staticmethod
+    def _ca_coords_live(
+        bridge: "ChimeraXBridge",
+        model_id: str,
+        chain: str,
+    ) -> Dict[int, "Any"]:
+        """
+        ``{resno: np.array([x, y, z])}`` for Cα atoms of *chain* in the live
+        ChimeraX model *model_id* (e.g. ``"4"``).  Reads from the CURRENT model
+        state (post any prior operations).  Returns ``{}`` on error.
+
+        Implementation note: writes Cα coordinates to a temp JSON file (the
+        same write-then-read pattern as the ESMFold/PyRosetta workers), because
+        large ``print()`` output from a ChimeraX runscript can be truncated by
+        the REST API's response buffer.
+        """
+        import json
+        import numpy as _np
+        import tempfile
+        import os as _os
+
+        try:
+            # Out-file receives the JSON — ChimeraX reads/writes, Python reads
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", delete=False, encoding="utf-8", mode="w"
+            ) as jf:
+                out_path = jf.name
+
+            # Use forward-slash path inside the script (safe on Windows)
+            out_posix = out_path.replace("\\", "/")
+
+            script = (
+                "import json as _json\n"
+                "from chimerax.atomic import AtomicStructure\n"
+                f"_mid = {model_id!r}\n"
+                f"_out = {out_posix!r}\n"
+                "_models = {m.id_string: m for m in session.models "
+                "if isinstance(m, AtomicStructure)}\n"
+                "_m = _models.get(_mid)\n"
+                "_c = {}\n"
+                "if _m:\n"
+                f"    for _ch in _m.chains:\n"
+                f"        if _ch.chain_id != {chain!r}: continue\n"
+                "        for _r in _ch.residues:\n"
+                "            _ca = _r.find_atom('CA')\n"
+                "            if _ca is not None:\n"
+                "                _c[str(_r.number)] = "
+                "[round(float(_x), 4) for _x in _ca.coord]\n"
+                "with open(_out, 'w') as _fh:\n"
+                "    _json.dump(_c, _fh)\n"
+                "print('OK:' + str(len(_c)))\n"
+            )
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8"
+            ) as sf:
+                sf.write(script)
+                script_path = sf.name
+
+            try:
+                result = bridge.run_command(f'runscript "{script_path}"')
+            finally:
+                try:
+                    _os.unlink(script_path)
+                except Exception:
+                    pass
+
+            val = (result.get("value") or "").strip()
+            # Validate that the script ran and wrote the file
+            if not val.startswith("OK:") or not _os.path.isfile(out_path):
+                return {}
+            with open(out_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            return {int(k): _np.array(v, dtype=float) for k, v in raw.items()}
+        except Exception:
+            return {}
+        finally:
+            try:
+                _os.unlink(out_path)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _anchor_kabsch(
+        coords_a:       Dict[int, "Any"],
+        coords_b:       Dict[int, "Any"],
+        anchor_resnums: List[int],
+    ) -> "Tuple[Optional[Dict[int,float]], Optional[float], Optional[float]]":
+        """
+        Anchor-restricted Kabsch superposition (generalised from
+        ``_per_residue_ca_deviation``).
+
+        1. Fits rotation R and translation t to align the *anchor* subset of B
+           onto A (minimises anchor RMSD).
+        2. Applies R, t to ALL common residues of B.
+        3. Returns ``(per_resno_shift_Å, anchor_residual_rmsd, all_pairs_rmsd)``.
+
+        ``anchor_residual_rmsd ≈ 0`` confirms the anchor is internally rigid
+        and the shift map is trustworthy.  Returns ``(None, None, None)`` when
+        the anchor or common-residue sets are too small (< 3).
+        """
+        import numpy as _np
+
+        anc_set  = set(anchor_resnums)
+        a_set    = set(coords_a)
+        b_set    = set(coords_b)
+        anc_com  = sorted(anc_set & a_set & b_set)
+        all_com  = sorted(a_set & b_set)
+
+        if len(anc_com) < 3 or len(all_com) < 3:
+            return None, None, None
+
+        P_anc = _np.array([coords_b[r] for r in anc_com])  # B anchor
+        Q_anc = _np.array([coords_a[r] for r in anc_com])  # A anchor
+
+        p_c = P_anc.mean(0)
+        q_c = Q_anc.mean(0)
+        Pc  = P_anc - p_c
+        Qc  = Q_anc - q_c
+        H   = Pc.T @ Qc
+        U, _S, Vt = _np.linalg.svd(H)
+        d   = _np.sign(_np.linalg.det(Vt.T @ U.T))
+        R   = Vt.T @ _np.diag([1.0, 1.0, d]) @ U.T
+        t   = q_c - R @ p_c
+
+        per_shift: Dict[int, float] = {}
+        all_diffs = []
+        for rn in all_com:
+            b_tr = R @ coords_b[rn] + t
+            diff = coords_a[rn] - b_tr
+            per_shift[rn] = round(float(_np.sqrt((diff ** 2).sum())), 3)
+            all_diffs.append(diff)
+
+        anc_diffs  = _np.array([coords_a[r] - (R @ coords_b[r] + t) for r in anc_com])
+        anchor_rms = round(float(_np.sqrt((anc_diffs ** 2).sum(1).mean())), 3)
+        all_arr    = _np.array(all_diffs)
+        all_rms    = round(float(_np.sqrt((all_arr ** 2).sum(1).mean())), 3)
+
+        return per_shift, anchor_rms, all_rms
+
+    @staticmethod
+    def _parse_anchor_spec(anchor_str: str, common_resnums: "set") -> List[int]:
+        """
+        Parse ``"1-29,124-214"`` or ``"1,2,3"`` into a sorted list of residue
+        numbers that are also in *common_resnums*.  Returns ``[]`` on failure.
+        """
+        result: set = set()
+        for part in anchor_str.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    lo_s, hi_s = part.split("-", 1)
+                    result.update(range(int(lo_s.strip()), int(hi_s.strip()) + 1))
+                except ValueError:
+                    pass
+            else:
+                try:
+                    result.add(int(part))
+                except ValueError:
+                    pass
+        return sorted(result & common_resnums)
+
+    @staticmethod
+    def _resnums_to_chimerax_range(resnums: List[int]) -> str:
+        """
+        Compress a sorted list of residue numbers to ChimeraX range notation.
+        ``[1,2,3,5,6,10]`` → ``"1-3,5-6,10"``.
+        """
+        if not resnums:
+            return ""
+        runs: List[tuple] = []
+        start = prev = resnums[0]
+        for r in resnums[1:]:
+            if r == prev + 1:
+                prev = r
+            else:
+                runs.append((start, prev))
+                start = prev = r
+        runs.append((start, prev))
+        return ",".join(str(s) if s == e else f"{s}-{e}" for s, e in runs)
+
+    @classmethod
+    def _conformer_shift_color_cmds(
+        cls,
+        per_shift:  Dict[int, float],
+        model_spec: str,
+        chain:      str,
+    ) -> "Tuple[List[str], List[str]]":
+        """
+        Colour *model_spec* by per-residue Cα displacement using adaptive
+        percentile-based buckets (blue=rigid → red=mobile).
+
+        Uses the same grouped-run idiom as ``_build_deviation_color_cmds``
+        but scales to the actual shift magnitude via percentiles, so the
+        colour gradient is informative for any conformational change magnitude
+        (small ≈1 Å or large ≈15+ Å like adenylate kinase).
+        """
+        if not per_shift:
+            return [], []
+        import numpy as _np
+
+        vals = sorted(per_shift.values())
+        p25, p50, p70, p85 = (
+            float(_np.percentile(vals, 25)),
+            float(_np.percentile(vals, 50)),
+            float(_np.percentile(vals, 70)),
+            float(_np.percentile(vals, 85)),
+        )
+        thresholds = [
+            (p25, "blue"),
+            (p50, "cornflower blue"),
+            (p70, "white"),
+            (p85, "orange"),
+            (float("inf"), "red"),
+        ]
+
+        def _bucket(v: float) -> str:
+            for hi, col in thresholds:
+                if v <= hi:
+                    return col
+            return "red"
+
+        base = f"{model_spec}/{chain}" if chain else model_spec
+        cmds = [f"color {base} white"]
+        exps = ["Reset to white before per-residue shift colouring"]
+
+        runs: List[tuple] = []
+        for rn in sorted(per_shift):
+            col = _bucket(per_shift[rn])
+            if runs and runs[-1][0] == col:
+                runs[-1][1].append(rn)
+            else:
+                runs.append((col, [rn]))
+
+        for col, resnos in runs:
+            if col == "white":
+                continue
+            if len(resnos) > 1 and resnos == list(range(resnos[0], resnos[-1] + 1)):
+                spec = f":{resnos[0]}-{resnos[-1]}"
+            else:
+                spec = ":" + ",".join(str(r) for r in resnos)
+            cmds.append(f"color {model_spec}{spec} {col}")
+            exps.append(f"Colour {spec} {col} (shift percentile bucket)")
+
+        return cmds, exps
+
+    def _run_conformer_comparison(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> "ToolStepResult":
+        """
+        Thin orchestrator: anchor-restricted conformer comparison.
+
+        (1) Reads live Cα coordinates for both conformers via runscript.
+        (2) Determines anchor residues (user-specified or auto from global
+            Kabsch rigid core — bottom-40% of displacement).
+        (3) Anchor-restricted Kabsch: fits R+t on anchor, applies to all
+            matched residues → per-residue Cα shift map.
+        (4) Issues ``align #B/<anchor>@CA to #A/<anchor>@CA`` for visual overlay.
+        (5) Colours model B by per-residue shift (adaptive blue→red).
+        (6) Writes CSV artifact, persists to session.
+
+        Caveats baked into the output (project honesty ethos):
+          • Geometric only — Cα displacement, NOT energetics.
+          • Anchor quality = anchor residual RMSD (should be ≈ 0).
+          • For two-domain motion, run twice anchoring on each domain.
+        """
+        import csv
+        import time as _time
+        from datetime import datetime
+        from pathlib import Path
+
+        t0 = _time.perf_counter()
+        user_input = user_input or inputs.get("_user_input", "")
+
+        model_id_a = str(inputs.get("model_id_a") or self._first_model_id())
+        model_id_b = str(inputs.get("model_id_b") or self._second_model_id())
+        chain_a    = str(inputs.get("chain_a") or "A").upper()
+        chain_b    = str(inputs.get("chain_b") or "A").upper()
+        anchor_str = str(inputs.get("anchor") or "auto").strip()
+
+        if model_id_a == model_id_b:
+            return ToolStepResult(
+                tool="conformer_comparison", success=False,
+                error="model_id_a and model_id_b must be different models.",
+            )
+        if self.bridge is None:
+            return ToolStepResult(
+                tool="conformer_comparison", success=False,
+                error="ChimeraX bridge unavailable — cannot read Cα coordinates.",
+            )
+
+        # ── 1. Read live Cα coordinates ───────────────────────────────────────
+        coords_a = self._ca_coords_live(self.bridge, model_id_a, chain_a)
+        coords_b = self._ca_coords_live(self.bridge, model_id_b, chain_b)
+
+        if not coords_a:
+            return ToolStepResult(
+                tool="conformer_comparison", success=False,
+                error=(f"Could not read Cα coordinates for model #{model_id_a} "
+                       f"chain {chain_a}.  Check the model is open and the chain ID is correct."),
+            )
+        if not coords_b:
+            return ToolStepResult(
+                tool="conformer_comparison", success=False,
+                error=(f"Could not read Cα coordinates for model #{model_id_b} "
+                       f"chain {chain_b}.  Check the model is open and the chain ID is correct."),
+            )
+
+        common = sorted(set(coords_a) & set(coords_b))
+        if len(common) < 10:
+            return ToolStepResult(
+                tool="conformer_comparison", success=False,
+                error=(f"Too few common Cα residues ({len(common)}) between "
+                       f"#{model_id_a}/{chain_a} and #{model_id_b}/{chain_b}.  "
+                       "Check that both conformers are the same protein and chain IDs match."),
+            )
+
+        # ── 2. Determine anchor residues ──────────────────────────────────────
+        import numpy as _np
+        common_set = set(common)
+
+        if anchor_str.lower() == "auto":
+            # Global fit → rigid core = bottom-40th-percentile displacement
+            shifts_g, _, _ = self._anchor_kabsch(coords_a, coords_b, common)
+            if shifts_g is None:
+                return ToolStepResult(
+                    tool="conformer_comparison", success=False,
+                    error="Global Kabsch fit failed (too few common residues).",
+                )
+            cutoff = float(_np.percentile(sorted(shifts_g.values()), 40))
+            anchor_resnums = [r for r in common if shifts_g[r] <= cutoff]
+            anchor_source  = (
+                f"auto (bottom-40% global rigid core: {len(anchor_resnums)} residues)"
+            )
+        else:
+            anchor_resnums = self._parse_anchor_spec(anchor_str, common_set)
+            if len(anchor_resnums) < 3:
+                return ToolStepResult(
+                    tool="conformer_comparison", success=False,
+                    error=(f"Anchor spec {anchor_str!r} resolved to only "
+                           f"{len(anchor_resnums)} common Cα residues (need ≥ 3).  "
+                           "Use a wider range or 'auto'."),
+                )
+            anchor_source = f"user-specified ({anchor_str}; {len(anchor_resnums)} residues)"
+
+        # ── 3. Anchor-restricted Kabsch ───────────────────────────────────────
+        per_shift, anchor_rmsd, all_rmsd = self._anchor_kabsch(
+            coords_a, coords_b, anchor_resnums
+        )
+        if per_shift is None:
+            return ToolStepResult(
+                tool="conformer_comparison", success=False,
+                error="Anchor-restricted Kabsch fit failed.",
+            )
+
+        anchor_quality = (
+            "GOOD" if anchor_rmsd is not None and anchor_rmsd < 0.5
+            else "FAIR" if anchor_rmsd is not None and anchor_rmsd < 2.0
+            else "POOR"
+        )
+
+        # ── 4. Visual overlay: ChimeraX align on anchor ───────────────────────
+        viz_cmds: List[str] = []
+        viz_exps: List[str] = []
+
+        anc_range  = self._resnums_to_chimerax_range(anchor_resnums)
+        align_spec_b = f"#{model_id_b}/{chain_b}:{anc_range}@CA"
+        align_spec_a = f"#{model_id_a}/{chain_a}:{anc_range}@CA"
+        align_cmd = f"align {align_spec_b} to {align_spec_a}"
+
+        align_res = self.bridge.run_command(align_cmd)
+        align_val = (align_res.get("value") or "").strip()
+        align_err = (align_res.get("error") or "").strip()
+
+        # Fallback: if range notation fails (rare — unequal counts edge case),
+        # try an explicit comma-separated residue list
+        if align_err and "Unequal" in align_err:
+            anc_list = ",".join(str(r) for r in anchor_resnums)
+            align_cmd = (f"align #{model_id_b}/{chain_b}:{anc_list}@CA "
+                         f"to #{model_id_a}/{chain_a}:{anc_list}@CA")
+            align_res = self.bridge.run_command(align_cmd)
+            align_val = (align_res.get("value") or "").strip()
+            align_err = (align_res.get("error") or "").strip()
+
+        viz_cmds.append(align_cmd)
+        viz_exps.append(
+            f"Anchor-restricted overlay: #{model_id_b} onto #{model_id_a} "
+            f"(anchor: {anchor_source})"
+        )
+
+        # Parse ChimeraX-reported RMSD from the align command (independent check)
+        align_rmsd: Optional[float] = None
+        m_a = re.search(r"RMSD between\s+\d+\s+atom pairs is\s+([\d.]+)", align_val)
+        if m_a:
+            align_rmsd = round(float(m_a.group(1)), 3)
+
+        viz_cmds.append("view")
+        viz_exps.append("Fit aligned models in view")
+
+        # ── 5. Colour model B by per-residue shift ────────────────────────────
+        color_cmds, color_exps = self._conformer_shift_color_cmds(
+            per_shift, f"#{model_id_b}", chain_b
+        )
+        viz_cmds.extend(color_cmds)
+        viz_exps.extend(color_exps)
+
+        # ── 6. Compute summary statistics ─────────────────────────────────────
+        anchor_set   = set(anchor_resnums)
+        non_anchor   = {r: v for r, v in per_shift.items() if r not in anchor_set}
+        all_vals     = list(per_shift.values())
+        non_anc_vals = list(non_anchor.values()) if non_anchor else all_vals
+        max_shift    = max(all_vals) if all_vals else 0.0
+        mean_nonanc  = (round(sum(non_anc_vals) / len(non_anc_vals), 3)
+                        if non_anc_vals else 0.0)
+        top_k        = sorted(per_shift.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        top_shifted  = [{"chain": chain_b, "resno": rn, "shift_A": sh}
+                        for rn, sh in top_k]
+
+        # ── 7. Write CSV artifact ─────────────────────────────────────────────
+        cache_dir = Path("cache")
+        cache_dir.mkdir(exist_ok=True)
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = cache_dir / f"conformer_cmp_{model_id_a}v{model_id_b}_{ts}.csv"
+        csv_written: Optional[str] = None
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["chain", "resno", "shift_A", "region"])
+                for rn in sorted(per_shift):
+                    w.writerow([chain_b, rn, per_shift[rn],
+                                 "anchor" if rn in anchor_set else "mobile"])
+            csv_written = str(csv_path)
+        except Exception:
+            pass
+
+        # ── 8. Build report ───────────────────────────────────────────────────
+        lines = [
+            f"Conformer comparison: #{model_id_a} (reference) ↔ #{model_id_b} (mobile), "
+            f"chain {chain_a}/{chain_b}",
+            f"Anchor: {anchor_source}",
+            f"  Anchor residual RMSD : {anchor_rmsd:.3f} Å  (quality: {anchor_quality})",
+            f"  All-residue RMSD     : {all_rmsd:.3f} Å  (after anchor fit)",
+            f"  Max shift            : {max_shift:.1f} Å",
+            f"  Mean (non-anchor)    : {mean_nonanc:.1f} Å",
+        ]
+        if align_rmsd is not None:
+            lines.append(f"  ChimeraX align check : {align_rmsd:.3f} Å (anchor subset)")
+        lines += ["", "Top displaced residues (chain, resno, shift Å):"]
+        for e in top_shifted:
+            lines.append(f"  {e['chain']} {e['resno']:>4d}  {e['shift_A']:.1f} Å")
+        if anchor_quality == "POOR":
+            lines += [
+                "",
+                f"⚠ Anchor residual RMSD {anchor_rmsd:.2f} Å > 2 Å — the anchor may contain "
+                "mobile residues.  Consider specifying a tighter anchor range.",
+            ]
+        lines += [
+            "",
+            "CAVEATS:",
+            "  • Geometric only — Cα displacement, NOT energetics.",
+            "  • Anchor quality (residual RMSD ≈ 0) is the validity check.",
+            "  • For two-domain motion: run twice, anchoring on each domain.",
+            "",
+            f"Model #{model_id_b} coloured blue (rigid) → red (mobile).",
+        ]
+        if csv_written:
+            lines.append(f"CSV: {csv_written}")
+        summary_text = "\n".join(lines)
+
+        # ── 9. Persist to session ─────────────────────────────────────────────
+        elapsed_ms = round((_time.perf_counter() - t0) * 1000)
+        result_data: Dict[str, Any] = {
+            "model_id_a":          model_id_a,
+            "model_id_b":          model_id_b,
+            "chain_a":             chain_a,
+            "chain_b":             chain_b,
+            "anchor":              anchor_source,
+            "anchor_resnums_head": anchor_resnums[:30],  # first 30 for session
+            "anchor_rmsd":         anchor_rmsd,
+            "anchor_quality":      anchor_quality,
+            "all_rmsd":            all_rmsd,
+            "align_rmsd":          align_rmsd,
+            "max_shift":           round(max_shift, 3),
+            "mean_non_anchor":     mean_nonanc,
+            "top_shifted":         top_shifted,
+            "per_shift":           per_shift,    # full map persisted
+            "csv_path":            csv_written,
+            "elapsed_ms":          elapsed_ms,
+        }
+        key = f"{model_id_a}v{model_id_b}"
+        self.session.set_conformer_comparison_results(key, result_data)
+
+        summary_line = (
+            f"#{model_id_a}↔#{model_id_b} chain {chain_a}/{chain_b}: "
+            f"anchor residual {anchor_rmsd:.2f} Å ({anchor_quality}), "
+            f"max shift {max_shift:.1f} Å "
+            f"(res {top_shifted[0]['resno'] if top_shifted else '?'})"
+        )
+        return ToolStepResult(
+            tool="conformer_comparison",
+            success=True,
+            data=result_data,
+            viz_commands=viz_cmds,
+            viz_explanations=viz_exps,
+            summary=summary_line + "\n" + summary_text,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -3252,6 +3864,73 @@ class ToolRouter:
         if "validat" in low and ("colabfold" in low or "alphafold" in low):
             return True
         return False
+
+    # ── Conformer-comparison intent helpers ───────────────────────────────────
+
+    @classmethod
+    def _detect_conformer_comparison_intent(cls, text: str) -> bool:
+        """
+        True if *text* requests a conformational-change / conformer-comparison
+        analysis (anchor-restricted Kabsch + per-residue Cα shift map).
+        Fires only on explicit phrasing — NOT on generic "compare" requests.
+        """
+        if not text:
+            return False
+        low = text.lower()
+        if any(kw in low for kw in cls._CONFORMER_COMPARISON_KEYWORDS):
+            return True
+        # Compound: "compar" + ("conformer" | "conformation" | "state")
+        if "compar" in low and any(w in low for w in ("conformer", "conformation", " state")):
+            return True
+        return False
+
+    def _parse_conformer_comparison_options(
+        self,
+        user_input: str,
+        translator_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Parse conformer-comparison inputs from *user_input*.
+
+        Extracts model IDs (from ``#N`` patterns or session order),
+        chain letters, and anchor residue spec (``"1-29,124-214"`` or ``"auto"``).
+        """
+        opts: Dict[str, Any] = {"_user_input": user_input}
+
+        # Model IDs: first two ``#N`` refs, else first two session structures
+        model_refs = re.findall(r"#(\d+)", user_input or "")
+        if len(model_refs) >= 2:
+            opts["model_id_a"] = model_refs[0]
+            opts["model_id_b"] = model_refs[1]
+        else:
+            opts["model_id_a"] = self._first_model_id()
+            opts["model_id_b"] = self._second_model_id()
+
+        # Chain IDs: "chain X" or "chain pair X/Y"
+        ch_pair = re.search(r"chain\s+([A-Za-z])/([A-Za-z])", user_input or "", re.I)
+        ch_single = re.search(r"\bchain\s+([A-Za-z])\b", user_input or "", re.I)
+        if ch_pair:
+            opts["chain_a"] = ch_pair.group(1).upper()
+            opts["chain_b"] = ch_pair.group(2).upper()
+        elif ch_single:
+            opts["chain_a"] = ch_single.group(1).upper()
+            opts["chain_b"] = ch_single.group(1).upper()
+
+        # Anchor spec: "anchor on <range>", "anchor residues <range>",
+        #              "core domain <range>", "anchored on <range>"
+        anc_m = re.search(
+            r"(?:anchor(?:ed)?(?:\s+on|\s+residues?)?|core\s+domain)\s+([\d\-,\s]+)",
+            user_input or "", re.I,
+        )
+        if anc_m:
+            raw = anc_m.group(1).strip().rstrip(",")
+            # Keep only digits, hyphens, commas
+            clean = re.sub(r"[^\d\-,]", "", raw)
+            opts["anchor"] = clean if clean else "auto"
+        else:
+            opts["anchor"] = "auto"
+
+        return opts
 
     def _parse_validate_design_options(self, text: str) -> Dict[str, Any]:
         """
@@ -4589,10 +5268,23 @@ class ToolRouter:
         Classify a redesign-DISPLAY request (never a run): 'alignment', 'sequence',
         or None. Run/re-run phrasings ('redesign chain A with MPNN') return None so
         they fall through to the normal pipeline.
+
+        Bug 5 fix: a request whose FIRST verb is a primary visualization op
+        (remove/hide/overlay/color/cartoon/…) is NEVER MPNN display retrieval,
+        even if "redesigned"/"redesign" appears later in the text.
         """
         if not text:
             return None
         low = text.lower()
+
+        # Bug 5: if the request opens with a pure viz verb, it's structural viz —
+        # not a sequence-list request — regardless of "redesigned" appearing later.
+        # (e.g. "remove chain B … redesigned chain A" → hide/overlay viz, not MPNN)
+        low_stripped = low.lstrip()
+        for vv in self._PRIMARY_VIZ_VERBS:
+            if low_stripped.startswith(vv + " ") or low_stripped == vv:
+                return None
+
         if any(t in low for t in self._MPNN_RUN_TRIGGERS):
             return None
         if any(k in low for k in self._MPNN_ALIGNMENT_KEYWORDS):
@@ -4874,6 +5566,13 @@ class ToolRouter:
         if self.session.structures:
             return next(iter(self.session.structures))
         return "1"
+
+    def _second_model_id(self) -> str:
+        """Return the second loaded structure's model ID, or '2'."""
+        ids = list(self.session.structures)
+        if len(ids) >= 2:
+            return ids[1]
+        return "2"
 
     def _primary_model_id(self) -> str:
         """

@@ -216,6 +216,50 @@
    }
   },
   {
+   "id": "viz_t1_stick_view_a",
+   "category": "viz",
+   "tier": 1,
+   "challenge_type": "direct",
+   "prompt": "Show chain A as sticks.",
+   "session": {
+    "models": [
+     {
+      "id": "#1",
+      "pdb": "1HSG",
+      "chains": [
+       "A",
+       "B"
+      ]
+     }
+    ],
+    "selection": null
+   },
+   "gold_accuracy": {
+    "tools": "chimerax",
+    "required_args": {
+     "chain": "A",
+     "representation": "stick",
+     "command_contains_any": [
+      "style #1/A stick",
+      "show #1/A atoms"
+     ]
+    }
+   },
+   "gold_functionality": {
+    "mode": "effect",
+    "assertion": {
+     "probe": "representation",
+     "query": "info atoms #1/A & ~solvent & ~ligand & ~ions attribute draw_mode",
+     "expected": "draw_mode 2",
+     "chain": "A",
+     "criterion": "chain A atoms in STICK draw mode (2) \u2014 the cartoon ribbon replaced; ChimeraX 1.11.1"
+    }
+   },
+   "gold_usability": {
+    "expected": "execute"
+   }
+  },
+  {
    "id": "viz_t2_color_bychain",
    "category": "viz",
    "tier": 2,

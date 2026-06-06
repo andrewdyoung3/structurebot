@@ -199,6 +199,202 @@ def _scope_chain_refs_to_macromolecule(commands: list) -> tuple:
     return new_cmds, notes
 
 
+# ── Open-target validation guard (Bug 4a) ─────────────────────────────────────
+# `open <target>` must only reach ChimeraX when the target resolves — an
+# existing local file, a valid 4-char PDB-ID, or a .cxs session extension.
+# Hallucinated targets ("sequence", "design1.pdb" when the file doesn't exist)
+# are DROPPED pre-execution with a clean message instead of silently failing
+# inside ChimeraX ("No such file/path").
+_OPEN_TARGET_RE = re.compile(
+    r'^\s*open\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))',
+    re.IGNORECASE,
+)
+# PDB IDs are exactly 4 alphanumeric characters (digits or letters, any case).
+# Examples: 1HSG, 4UNL, 2LZM, A0A1.  The first character may be a digit.
+_PDB_ID_RE = re.compile(r'^[A-Za-z0-9]{4}$')
+
+
+def _is_valid_open_target(target: str) -> bool:
+    """True if *target* is resolvable: 4-char PDB-ID, existing file, or .cxs session."""
+    t = (target or "").strip().strip('"\'')
+    if not t:
+        return False
+    if _PDB_ID_RE.match(t):          # valid PDB-ID (4 alphanumeric chars)
+        return True
+    if Path(t).is_file():            # existing local file
+        return True
+    if t.lower().endswith(".cxs"):   # session file (may be in sessions/ dir)
+        return True
+    return False
+
+
+def _validate_open_targets(commands: list, explanations: list) -> tuple:
+    """
+    Guard (Bug 4a): drop any ``open <target>`` whose target is not resolvable.
+    Returns (new_commands, new_explanations, blocked_messages).
+
+    Non-resolvable targets produce a user-visible warning and the command is
+    removed so it never reaches ChimeraX.  The canonical bad cases:
+    ``open sequence``, ``open design1.pdb`` (file does not exist).
+    """
+    new_cmds: list = []
+    new_exps: list = []
+    blocked:  list = []
+    for i, cmd in enumerate(commands):
+        exp = explanations[i] if i < len(explanations) else ""
+        m = _OPEN_TARGET_RE.match(cmd)
+        if m:
+            raw = m.group(1) or m.group(2) or m.group(3) or ""
+            # Strip any "from <source>" qualifier (e.g. "1HSG from alphafold" → "1HSG")
+            target = raw.split()[0] if raw else ""
+            if target and not _is_valid_open_target(target):
+                blocked.append(
+                    f"Blocked 'open {raw}': '{target}' is not a valid PDB-ID or "
+                    "existing file path.  Use a 4-letter PDB code (e.g. open 1HSG) "
+                    "or provide an existing file path."
+                )
+                print(f"  [open-guard] blocked {cmd!r}: '{target}' not resolvable", flush=True)
+                continue
+        new_cmds.append(cmd)
+        new_exps.append(exp)
+    return new_cmds, new_exps, blocked
+
+
+# ── Invalid-verb rejection guard (Bug 4b) ─────────────────────────────────────
+# ChimeraX has a finite set of registered command verbs.  A command whose
+# leading word is not in this set is either hallucinated (find/search) or a
+# Chimera-1 legacy verb — neither will succeed.  The guard rejects such commands
+# BEFORE they reach ChimeraX so the user sees a clean actionable message instead
+# of the raw "Unknown command: find" REST response.
+#
+# Two-tier strategy:
+#   1. If a live registry is available (_chimerax_verb_registry, populated by
+#      probe_chimerax_verbs()), block any verb NOT in the registry.
+#   2. Without a registry, block only verbs in _HALLUCINATED_VERB_DENYLIST —
+#      this avoids accidentally blocking valid-but-unlisted commands.
+
+# Observed hallucinated verbs — always blocked regardless of registry availability.
+_HALLUCINATED_VERB_DENYLIST: frozenset = frozenset({
+    "find", "search", "locate", "lookup", "retrieve",
+    "fetch_sequence", "query", "get_sequence", "list_structures",
+    "display_structure",
+})
+
+# Module-level registry cache populated by probe_chimerax_verbs().
+# None = not yet probed.
+_chimerax_verb_registry: Optional[frozenset] = None
+
+
+def probe_chimerax_verbs(run_command_fn) -> Optional[frozenset]:
+    """
+    Probe the live ChimeraX command registry via a REST runscript and cache the
+    result in ``_chimerax_verb_registry``.  Idempotent — returns the cached set
+    on subsequent calls without re-issuing a REST request.  Returns ``None`` if
+    the probe fails; the guard then falls back to the denylist.
+
+    ChimeraX 1.11.1 registry surface (verified live):
+      ``chimerax.core.commands.cli._command_info.commands.subcommands``
+      → OrderedDict of top-level verb → _WordInfo; 193 entries.
+      ``list_commands`` does NOT exist in 1.11.1 (import fails).
+
+    *run_command_fn* must accept a ChimeraX command string and return a dict
+    with at least a ``"value"`` key (same signature as
+    ``ChimeraXBridge.run_command()``).
+    """
+    global _chimerax_verb_registry
+    if _chimerax_verb_registry is not None:
+        return _chimerax_verb_registry
+    import tempfile
+    import os as _os
+    # ChimeraX 1.11.1 stores registered top-level commands in
+    # `cli._command_info.commands.subcommands` (an OrderedDict of verb→_WordInfo).
+    # Verified live: 193 entries incl. open/color/matchmaker/view; find/search absent.
+    script = (
+        "try:\n"
+        "    from chimerax.core.commands import cli\n"
+        "    names = sorted(cli._command_info.commands.subcommands.keys())\n"
+        "    print(','.join(names))\n"
+        "except Exception as _probe_err:\n"
+        "    print('ERROR:' + str(_probe_err))\n"
+    )
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as _f:
+            _f.write(script)
+            _tmp = _f.name
+        try:
+            result = run_command_fn(f'runscript "{_tmp}"')
+        finally:
+            try:
+                _os.unlink(_tmp)
+            except Exception:
+                pass
+        val = (result.get("value") or "").strip()
+        if val and not val.startswith("ERROR:") and "," in val:
+            verbs = frozenset(v.strip().lower() for v in val.split(",") if v.strip())
+            if len(verbs) > 10:      # sanity: real ChimeraX has hundreds of commands
+                _chimerax_verb_registry = verbs
+                return verbs
+    except Exception:
+        pass
+    return None
+
+
+def _validate_command_verbs(
+    commands:    list,
+    explanations: list,
+    known_verbs: Optional[frozenset] = None,
+) -> tuple:
+    """
+    Guard (Bug 4b): reject commands whose leading verb is not a registered
+    ChimeraX command.  Returns (new_commands, new_explanations, blocked_messages).
+
+    *known_verbs* overrides the module-level registry (useful for testing).
+    If neither is set, only the hardcoded denylist is applied so valid
+    commands that happen not to be listed are never accidentally dropped.
+    """
+    active = known_verbs if known_verbs is not None else _chimerax_verb_registry
+    new_cmds: list = []
+    new_exps: list = []
+    blocked:  list = []
+
+    for i, cmd in enumerate(commands):
+        exp = explanations[i] if i < len(explanations) else ""
+        stripped = cmd.strip()
+        if not stripped or stripped.startswith("#"):
+            new_cmds.append(cmd)
+            new_exps.append(exp)
+            continue
+
+        verb = stripped.split()[0].lower()
+
+        # Tier 1: always block the observed-hallucination denylist
+        if verb in _HALLUCINATED_VERB_DENYLIST:
+            blocked.append(
+                f"Rejected '{verb}' in {cmd!r}: "
+                f"'{verb}' is not a ChimeraX command (hallucinated verb).  "
+                "No action taken."
+            )
+            print(f"  [verb-guard] rejected hallucinated verb {verb!r}: {cmd!r}", flush=True)
+            continue
+
+        # Tier 2: if a live registry is available, block verbs absent from it
+        if active is not None and verb not in active:
+            blocked.append(
+                f"Rejected '{verb}' in {cmd!r}: "
+                f"'{verb}' is not in the ChimeraX command registry.  "
+                "No action taken."
+            )
+            print(f"  [verb-guard] rejected unknown verb {verb!r}: {cmd!r}", flush=True)
+            continue
+
+        new_cmds.append(cmd)
+        new_exps.append(exp)
+
+    return new_cmds, new_exps, blocked
+
+
 # ── Static system block (cached) ───────────────────────────────────────────────
 
 _STATIC_SYSTEM = """\
@@ -321,8 +517,12 @@ TRANSLATION RULES
 5.  Use PDB ID for open (e.g. open 1HSG), not local paths, unless the user
     explicitly says "my file" or gives a filename.
 6.  Prefer `matchmaker` over `align` when structures may differ in sequence.
-7.  LIGAND RESIDUE NAMES: always use the exact 3-letter code from session state.
-    If session state shows "Ligands: MK1", use ":MK1", never ":LIG" or "ligand".
+7.  THE LIGAND: for "the ligand" / "the bound ligand" generically, use the built-in
+    `ligand` keyword selector (e.g. `color ligand white`, `style ligand stick`) — it
+    selects the bound ligand(s) WITHOUT needing the residue name, and is disjoint from
+    the protein chains. For a SPECIFICALLY named ligand you may instead use its exact
+    3-letter code from session state (e.g. ":MK1"). NEVER invent a name: do NOT emit
+    `:LIG` or `/LIG` — there is no chain or residue called "LIG".
 8.  WINDOWS PATHS: save commands must use forward slashes:
       save "C:/Users/andre/Desktop/file.png"
     Construct the full Desktop path as "C:/Users/USERNAME/Desktop/filename.ext"
@@ -335,6 +535,10 @@ TRANSLATION RULES
       color bychain #1        ← WRONG — triggers "Expected a collection" error
       color byelement #1      ← WRONG — same error
     Applies to every by* keyword: bychain, byelement, bypolymer, byhetero, bymodel.
+    An EXPLICITLY named colour (white / red / blue / …) is applied LITERALLY —
+    `color <spec> <name>` (e.g. `color ligand white`, `color #1/B red`). Do NOT
+    substitute `byelement`/`byhetero` unless the user explicitly asks to colour BY
+    element / heteroatom.
 10. "show as ribbon/cartoon" → `cartoon #N`
 11. Publication-quality requests must include in order:
       preset publication
@@ -377,6 +581,18 @@ TRANSLATION RULES
       • show chain B's cartoon again:       show #1/B cartoon
     Use the same rule for `show`. When unsure which representation is on, prefer
     `target ac` so both atoms and cartoon are affected.
+18. SWITCH a chain/selection to a STICK / SPHERE / BALL representation — a chain
+    shown as cartoon has its ATOMS HIDDEN, so a bare `style <spec> stick` styles
+    nothing visible (no effect). Emit, IN ORDER:
+      show <spec> atoms      ← reveal the atoms (`style` alone NEVER reveals them)
+      style <spec> stick     ← stick | sphere | ball+stick, as requested
+      hide <spec> cartoon    ← when "stick view" / "as sticks" REPLACES the ribbon
+                               (the usual intent for a whole chain)
+    Worked example — "show chain A as sticks":
+      show #1/A atoms
+      style #1/A stick
+      hide #1/A cartoon
+      view
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 AVAILABLE TOOLS
@@ -1073,29 +1289,39 @@ class CommandTranslator:
                 "clarification_needed": None | "question",
                 "confidence":          "high" | "medium" | "low",
             }
+
+        Four deterministic backend-agnostic guards run on every result:
+          1. _sanitize_zone_syntax   — rewrite Chimera-1 zone → :< operator
+          2. _scope_chain_refs_to_macromolecule — exclude ligand/solvent/ions
+          3. _validate_open_targets  — block unresolvable open targets (Bug 4a)
+          4. _validate_command_verbs — reject unregistered leading verbs (Bug 4b)
         """
-        # The selected backend produces the normalized translation; the
-        # deterministic guards below are backend-agnostic.
-        result = self._translate_via_backend(user_input, session)
+        result   = self._translate_via_backend(user_input, session)
+        cmds     = result.get("commands")     or []
+        exps     = result.get("explanations") or []
+        warnings = list(result.get("warnings") or [])
 
-        # Deterministic guard: never let Chimera-1 `zone` syntax reach ChimeraX,
-        # regardless of which backend / model emitted it (belt-and-suspenders to
-        # rule 16).
-        new_cmds, new_exps, zone_notes = _sanitize_zone_syntax(
-            result.get("commands") or [], result.get("explanations") or []
-        )
-        # Deterministic guard: a "chain X" reference targets ONLY that chain's
-        # macromolecule, never a ligand/solvent/ion sharing the chain id (the 1HSG
-        # MK1=B:902 bleed). Runs AFTER the zone guard so zone syntax is normalised.
-        scoped_cmds, scope_notes = _scope_chain_refs_to_macromolecule(new_cmds)
-        if zone_notes or scope_notes:
-            result["commands"]     = scoped_cmds
-            result["explanations"] = new_exps
-            # Zone notes are surfaced (invalid-syntax rewrites/drops the user should
-            # see); chain-scoping is a silent correctness fix (logged, not warned).
-            if zone_notes:
-                result["warnings"] = (result.get("warnings") or []) + zone_notes
+        # Guard 1: rewrite Chimera-1 `zone` syntax → ChimeraX zone operator
+        cmds, exps, zone_notes = _sanitize_zone_syntax(cmds, exps)
+        if zone_notes:
+            warnings.extend(zone_notes)
 
+        # Guard 2: scope bare chain refs to the macromolecule (silent correctness fix)
+        cmds, _scope_notes = _scope_chain_refs_to_macromolecule(cmds)
+
+        # Guard 3 (Bug 4a): block unresolvable `open <target>` before execution
+        cmds, exps, open_blocked = _validate_open_targets(cmds, exps)
+        if open_blocked:
+            warnings.extend(open_blocked)
+
+        # Guard 4 (Bug 4b): reject commands with an unregistered leading verb
+        cmds, exps, verb_blocked = _validate_command_verbs(cmds, exps)
+        if verb_blocked:
+            warnings.extend(verb_blocked)
+
+        result["commands"]     = cmds
+        result["explanations"] = exps
+        result["warnings"]     = warnings
         return result
 
     def _translate_via_backend(self, user_input: str, session) -> Dict[str, Any]:

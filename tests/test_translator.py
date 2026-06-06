@@ -18,11 +18,16 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import translator as _translator_mod
 from translator import (
     CommandTranslator as Translator,
     RefusalError,
     _sanitize_zone_syntax,
     _scope_chain_refs_to_macromolecule,
+    _validate_open_targets,
+    _is_valid_open_target,
+    _validate_command_verbs,
+    probe_chimerax_verbs,
 )
 
 # -- Helpers -------------------------------------------------------------------
@@ -368,6 +373,33 @@ def test_system_prompt_documents_zone_and_hide() -> None:
             "prompt shows hide targeting the cartoon/representation")
 
 
+def test_prompt_documents_stick_view_sequence() -> None:
+    """BUG 1: switching a chain to sticks needs `show <spec> atoms` THEN
+    `style <spec> <mode>` (+ `hide <spec> cartoon` to replace the ribbon) — a bare
+    `style` reveals nothing because a cartoon chain has its atoms hidden."""
+    low = _make_translator()._static_block.lower()
+    _assert("show #1/a atoms" in low, "prompt shows `show <spec> atoms` before styling")
+    _assert("style #1/a stick" in low, "prompt shows `style <spec> stick`")
+    _assert("hide #1/a cartoon" in low, "prompt hides the cartoon when replacing the ribbon")
+    _assert("style" in low and "alone" in low and "reveal" in low,
+            "prompt warns a bare `style` never reveals hidden atoms")
+
+
+def test_prompt_documents_ligand_keyword_and_literal_colour() -> None:
+    """BUG 2: "the ligand" → the built-in `ligand` keyword (never an invented
+    `:LIG`/`/LIG`); an explicitly named colour is applied literally (no byelement
+    substitution unless the user asks to colour by element)."""
+    prompt = _make_translator()._static_block
+    low = prompt.lower()
+    _assert("ligand` keyword" in low or "`ligand`" in low,
+            "prompt maps 'the ligand' to the `ligand` keyword")
+    _assert("color ligand white" in low, "prompt shows the literal `color ligand white` form")
+    _assert("lig" in low and ("do not emit `:lig`" in low or "/lig" in low),
+            "prompt forbids inventing `:LIG` / `/LIG`")
+    _assert("do not" in low and "byelement" in low and "byhetero" in low,
+            "prompt forbids substituting byelement/byhetero for a named colour")
+
+
 def test_hide_chain_targets_representation() -> None:
     """'hide chain B' must target the cartoon (not a bare `hide #1/B`, which
     only hides atoms and leaves the ribbon visible)."""
@@ -424,6 +456,260 @@ def test_backend_translate_returns_normalized_shape() -> None:
             "default backend used the Claude client")
 
 
+# -- F. Open-target validation guard (Bug 4a) ----------------------------------
+
+def test_open_valid_pdb_id_passes() -> None:
+    print("\n=== F. open-target validation guard (Bug 4a) ===")
+    for pdb in ("1HSG", "1hsg", "4UNL", "A0A1"):
+        cmds, _, blocked = _validate_open_targets([f"open {pdb}"], ["fetch"])
+        _assert(not blocked and len(cmds) == 1,
+                f"valid PDB-ID {pdb!r} passes open-target guard", f"blocked={blocked}")
+
+
+def test_open_nonexistent_file_blocked() -> None:
+    """open design1.pdb (file absent) is blocked before execution."""
+    cmds, _, blocked = _validate_open_targets(["open design1.pdb"], ["open design"])
+    _assert(not cmds, "open design1.pdb: command list is empty after blocking", f"got {cmds}")
+    _assert(bool(blocked), "open design1.pdb: produces a blocked message", f"got {blocked}")
+    _assert("design1.pdb" in (blocked[0] if blocked else ""),
+            "block message names the bad target", f"got {blocked}")
+
+
+def test_open_sequence_token_blocked() -> None:
+    """open sequence (hallucinated target) is blocked."""
+    cmds, _, blocked = _validate_open_targets(["open sequence"], ["open seq"])
+    _assert(not cmds, "open sequence: command blocked", f"got {cmds}")
+    _assert(bool(blocked), "open sequence: produces blocked message")
+
+
+def test_open_from_alphafold_valid_pdb_passes() -> None:
+    """open 1HSG from alphafold — target is the PDB-ID, passes."""
+    cmds, _, blocked = _validate_open_targets(["open 1HSG from alphafold"], ["from AF"])
+    _assert(not blocked and len(cmds) == 1,
+            "open 1HSG from alphafold passes (PDB-ID qualifier)", f"blocked={blocked}")
+
+
+def test_open_session_cxs_passes() -> None:
+    """open session.cxs — .cxs extension is a recognised special token."""
+    cmds, _, blocked = _validate_open_targets(["open session.cxs"], ["restore"])
+    _assert(not blocked and len(cmds) == 1,
+            "open session.cxs passes (recognised .cxs extension)", f"blocked={blocked}")
+
+
+def test_open_existing_file_passes(tmp_path) -> None:
+    """open <existing-file.pdb> is allowed (file exists on disk)."""
+    pdb = tmp_path / "real_structure.pdb"
+    pdb.write_text("ATOM …")
+    cmds, _, blocked = _validate_open_targets([f'open "{pdb}"'], ["open pdb"])
+    _assert(not blocked and len(cmds) == 1,
+            "existing file path passes open-target guard", f"blocked={blocked}")
+
+
+def test_open_guard_non_open_commands_untouched() -> None:
+    """Non-open commands are never touched by the open-target guard."""
+    raw = ["color #1 red", "cartoon #1", "view"]
+    cmds, exps, blocked = _validate_open_targets(raw, ["c", "c", "v"])
+    _assert(cmds == raw and not blocked,
+            "non-open commands pass through unchanged", f"got {cmds}")
+
+
+def test_open_guard_end_to_end_in_translate() -> None:
+    """translate() with an invalid open target blocks the command and warns."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+    bad_json = (
+        '{"commands": ["open sequence", "view"], '
+        '"explanations": ["open seq", "fit"], "warnings": [], '
+        '"clarification_needed": null, "confidence": "high", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    resp = MagicMock(content=[MagicMock(text=bad_json)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = resp
+        result = t.translate("open sequence", session)
+    cmds = result.get("commands", [])
+    _assert("open sequence" not in cmds,
+            "blocked open not in commands", f"got {cmds}")
+    _assert("view" in cmds, "non-blocked commands survive", f"got {cmds}")
+    _assert(any("open sequence" in str(w) or "sequence" in str(w).lower()
+                for w in result.get("warnings", [])),
+            "block message surfaced in warnings", f"got {result.get('warnings')}")
+
+
+# -- G. Invalid-verb rejection guard (Bug 4b) ----------------------------------
+
+def test_unknown_verb_denylist_rejected() -> None:
+    print("\n=== G. invalid-verb rejection guard (Bug 4b) ===")
+    for bad_verb in ("find", "search", "locate", "lookup"):
+        cmds, _, blocked = _validate_command_verbs([f"{bad_verb} chain A"], [f"bad verb {bad_verb}"])
+        _assert(not cmds, f"denylist verb '{bad_verb}' rejected (no cmds)", f"got {cmds}")
+        _assert(bool(blocked), f"denylist verb '{bad_verb}' produces block message")
+
+
+def test_known_verbs_with_registry_pass() -> None:
+    """open/color/matchmaker pass when an explicit registry is provided."""
+    registry = frozenset({"open", "color", "matchmaker", "view", "cartoon", "select", "hide",
+                          "show", "style", "info", "runscript"})
+    for cmd in ("open 1HSG", "color #1 red", "matchmaker #1 to #2", "view"):
+        cmds, _, blocked = _validate_command_verbs([cmd], ["ok"], known_verbs=registry)
+        _assert(not blocked and len(cmds) == 1,
+                f"known verb in {cmd!r} passes with registry", f"blocked={blocked}")
+
+
+def test_unknown_verb_with_registry_rejected() -> None:
+    """A verb absent from a registry is rejected (tier-2 check)."""
+    registry = frozenset({"open", "color", "view"})
+    cmds, _, blocked = _validate_command_verbs(["find chain A"], ["find"], known_verbs=registry)
+    _assert(not cmds, "verb not in registry rejected", f"got {cmds}")
+    _assert(bool(blocked), "rejection produces a block message", f"got {blocked}")
+    _assert("find" in (blocked[0] if blocked else ""),
+            "block message names the rejected verb", f"got {blocked}")
+
+
+def test_denylist_applies_even_with_registry() -> None:
+    """The denylist always blocks, even when the registry is provided."""
+    # Registry includes "search" (pathological case — registry wins anyway once
+    # a live registry is set, but denylist is Tier 1 and fires first regardless)
+    registry = frozenset({"open", "color", "search"})
+    cmds, _, blocked = _validate_command_verbs(["search chain A"], ["bad"], known_verbs=registry)
+    # Denylist takes priority (Tier 1): even if "search" is in the registry,
+    # the denylist check fires first and rejects it.
+    _assert(not cmds, "denylist verb rejected regardless of registry", f"got {cmds}")
+
+
+def test_verb_guard_without_registry_passes_unknown() -> None:
+    """Without a registry, an UNKNOWN (but not denylisted) verb passes through."""
+    # Module-level registry is None; no known_verbs argument → denylist-only mode.
+    old = _translator_mod._chimerax_verb_registry
+    _translator_mod._chimerax_verb_registry = None
+    try:
+        cmds, _, blocked = _validate_command_verbs(["somefuturecommand #1"], ["ok"])
+        _assert(len(cmds) == 1 and not blocked,
+                "unknown non-denylisted verb passes without registry", f"got {cmds}")
+    finally:
+        _translator_mod._chimerax_verb_registry = old
+
+
+def test_verb_guard_end_to_end_in_translate() -> None:
+    """translate() with a hallucinated verb blocks the command and warns."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+    bad_json = (
+        '{"commands": ["find chain A", "view"], '
+        '"explanations": ["bad", "fit"], "warnings": [], '
+        '"clarification_needed": null, "confidence": "high", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    resp = MagicMock(content=[MagicMock(text=bad_json)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = resp
+        result = t.translate("find chain A", session)
+    cmds = result.get("commands", [])
+    _assert("find chain A" not in cmds,
+            "hallucinated verb not in commands", f"got {cmds}")
+    _assert("view" in cmds, "non-blocked commands survive", f"got {cmds}")
+    _assert(any("find" in str(w) for w in result.get("warnings", [])),
+            "block message surfaced in warnings", f"got {result.get('warnings')}")
+
+
+def test_probe_chimerax_verbs_caches_on_success() -> None:
+    """probe_chimerax_verbs caches a successful result and is idempotent."""
+    old = _translator_mod._chimerax_verb_registry
+    _translator_mod._chimerax_verb_registry = None
+    try:
+        # Simulate a runscript that returns a comma-separated list
+        mock_run = MagicMock(return_value={"value": "open,color,matchmaker,view,select", "error": None})
+        with patch("tempfile.NamedTemporaryFile"):
+            # just test the caching logic — inject registry directly
+            _translator_mod._chimerax_verb_registry = frozenset({"open", "color", "view"})
+            result = probe_chimerax_verbs(mock_run)  # should return cached, not call run_fn
+        mock_run.assert_not_called()
+        _assert(result == frozenset({"open", "color", "view"}),
+                "probe returns cached registry", f"got {result}")
+    finally:
+        _translator_mod._chimerax_verb_registry = old
+
+
+def test_probe_chimerax_verbs_denylist_fallback() -> None:
+    """If probe fails, denylist still blocks hallucinated verbs."""
+    old = _translator_mod._chimerax_verb_registry
+    _translator_mod._chimerax_verb_registry = None
+    try:
+        cmds, _, blocked = _validate_command_verbs(["search chain A"], ["bad"])
+        _assert(not cmds, "denylist fallback blocks 'search'", f"got {cmds}")
+    finally:
+        _translator_mod._chimerax_verb_registry = old
+
+
+# -- H. Error-correction guards (Bug 6) ----------------------------------------
+
+def test_translate_error_fix_includes_error_text() -> None:
+    """translate_error_fix feeds both the failed command and the actual error text."""
+    print("\n=== H. error-correction guards (Bug 6) ===")
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+
+    captured_inputs = []
+
+    def _capture_translate(user_input, sess):
+        captured_inputs.append(user_input)
+        return {
+            "commands": ["open 1HSG"], "explanations": ["fetch"], "warnings": [],
+            "clarification_needed": None, "confidence": "high",
+            "tools_needed": ["chimerax"], "tool_inputs": {},
+        }
+
+    with patch.object(t, "translate", side_effect=_capture_translate):
+        t.translate_error_fix("open design1.pdb", "No such file: design1.pdb", session)
+
+    _assert(bool(captured_inputs), "translate was called with the fix prompt")
+    prompt = captured_inputs[0] if captured_inputs else ""
+    _assert("open design1.pdb" in prompt,
+            "failed command is in correction prompt", f"got: {prompt[:120]}")
+    _assert("No such file: design1.pdb" in prompt,
+            "actual error text is in correction prompt", f"got: {prompt[:120]}")
+
+
+def test_correction_blocked_by_guard_4a() -> None:
+    """If the corrected command is also an invalid open, guards block it (4a)."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+    same_bad_json = (
+        '{"commands": ["open design1.pdb"], "explanations": ["retry"], '
+        '"warnings": [], "clarification_needed": null, "confidence": "medium", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    resp = MagicMock(content=[MagicMock(text=same_bad_json)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = resp
+        fix = t.translate_error_fix("open design1.pdb", "No such file", session)
+    # Guard 4a should have blocked open design1.pdb → commands empty
+    _assert(not fix.get("commands"),
+            "re-proposed invalid open blocked by guard 4a in correction", f"got {fix.get('commands')}")
+
+
+def test_correction_blocked_by_guard_4b() -> None:
+    """If the corrected command uses a hallucinated verb, guard 4b blocks it."""
+    t = _make_translator()
+    session = MagicMock()
+    session.get_context_summary.return_value = "No structures loaded."
+    bad_fix_json = (
+        '{"commands": ["search design1.pdb"], "explanations": ["wrong"], '
+        '"warnings": [], "clarification_needed": null, "confidence": "low", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    resp = MagicMock(content=[MagicMock(text=bad_fix_json)], stop_reason="end_turn")
+    with patch.object(t, "client") as mock_client:
+        mock_client.messages.create.return_value = resp
+        fix = t.translate_error_fix("find design1.pdb", "Unknown command: find", session)
+    _assert(not fix.get("commands"),
+            "hallucinated verb in correction blocked by guard 4b", f"got {fix.get('commands')}")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -456,11 +742,38 @@ def main() -> int:
     test_zone_guard_drops_unrewritable()
     test_translate_rewrites_zone_end_to_end()
     test_system_prompt_documents_zone_and_hide()
+    test_prompt_documents_stick_view_sequence()
+    test_prompt_documents_ligand_keyword_and_literal_colour()
     test_hide_chain_targets_representation()
 
     # E. pluggable backend
     test_default_backend_is_claude()
     test_backend_translate_returns_normalized_shape()
+
+    # F. open-target validation guard (Bug 4a)
+    test_open_valid_pdb_id_passes()
+    test_open_nonexistent_file_blocked()
+    test_open_sequence_token_blocked()
+    test_open_from_alphafold_valid_pdb_passes()
+    test_open_session_cxs_passes()
+    # test_open_existing_file_passes requires tmp_path (pytest fixture) — runs via pytest
+    test_open_guard_non_open_commands_untouched()
+    test_open_guard_end_to_end_in_translate()
+
+    # G. invalid-verb rejection guard (Bug 4b)
+    test_unknown_verb_denylist_rejected()
+    test_known_verbs_with_registry_pass()
+    test_unknown_verb_with_registry_rejected()
+    test_denylist_applies_even_with_registry()
+    test_verb_guard_without_registry_passes_unknown()
+    test_verb_guard_end_to_end_in_translate()
+    test_probe_chimerax_verbs_caches_on_success()
+    test_probe_chimerax_verbs_denylist_fallback()
+
+    # H. error-correction guards (Bug 6)
+    test_translate_error_fix_includes_error_text()
+    test_correction_blocked_by_guard_4a()
+    test_correction_blocked_by_guard_4b()
 
     print()
     print("=" * 60)

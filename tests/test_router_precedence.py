@@ -145,3 +145,88 @@ def test_compound_primary_tools_survive(prompt, trans, expected):
     tools = _route(trans, prompt)
     for t in expected:
         assert t in tools, f"{prompt!r} → {tools}, expected {t} preserved"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  (4) BUG 5 — viz-verb primary: "redesigned" mention in a viz request must NOT
+#  trigger the MPNN sequence-display fast-path.  Tests _detect_mpnn_display_intent
+#  directly (the fast-path guard lives outside route()).
+# ════════════════════════════════════════════════════════════════════════════════
+
+VIZ_VERB_NON_MPNN_DISPLAY = [
+    # R1 acceptance case from the live transcript
+    "remove chain B from view and just show the overlay of chain A and redesigned chain A",
+    # Other primary-viz-verb forms
+    "hide chain B and show the redesigned chain A as a cartoon",
+    "overlay chain A with the redesigned chain A",
+    "color redesigned chain A blue",
+    "cartoon redesigned chain A",
+    "close the redesigned model",
+]
+
+VIZ_VERB_IS_MPNN_DISPLAY = [
+    # These DO NOT start with a primary viz verb → MPNN display path is fine
+    "show the redesigned sequence",
+    "output the redesigned sequences",
+    "what did the redesign produce",
+    "show me the designed sequences",
+]
+
+
+@pytest.mark.parametrize("prompt", VIZ_VERB_NON_MPNN_DISPLAY)
+def test_viz_verb_does_not_trigger_mpnn_display(prompt):
+    """A request that opens with a primary viz verb must NOT be classified as an
+    MPNN display request (Bug 5 — 'redesigned' distractor capture)."""
+    router = _make_router(session_has_mpnn=True)
+    intent = router._detect_mpnn_display_intent(prompt)
+    assert intent is None, (
+        f"{prompt!r} → intent={intent!r}; expected None (viz request, not MPNN display)"
+    )
+
+
+@pytest.mark.parametrize("prompt", VIZ_VERB_IS_MPNN_DISPLAY)
+def test_non_viz_verb_can_trigger_mpnn_display(prompt):
+    """Requests that do NOT start with a primary viz verb may still be classified
+    as MPNN display — the guard must not over-block."""
+    router = _make_router(session_has_mpnn=True)
+    intent = router._detect_mpnn_display_intent(prompt)
+    assert intent is not None, (
+        f"{prompt!r} → intent=None; expected 'sequence' or 'alignment' (MPNN display)"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  (5) BUG 4c — fold-tool command suppression: translator open/matchmaker
+#  commands alongside a fold tool are stripped from result["commands"].
+# ════════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("fold_tool", ["colabfold", "validate_design", "esmfold", "mpnn_esmfold"])
+def test_fold_tool_suppresses_open_matchmaker(fold_tool):
+    """When a fold/design tool is dispatched, spurious open/matchmaker commands
+    emitted by the translator are stripped (Bug 4c — #2-vs-#3 model-ID desync fix)."""
+    router = _make_router()
+    translator_result = {
+        "commands": [
+            "open sequence",
+            "open 1HSG",
+            "matchmaker #1 to #2",
+            "cartoon #1",
+            "view",
+        ],
+        "explanations": ["a", "b", "c", "d", "e"],
+        "warnings": [],
+        "clarification_needed": None,
+        "confidence": "high",
+        "tools_needed": [fold_tool],
+        "tool_inputs": {fold_tool: {"model_id": "1", "chain": "A"}},
+    }
+    routed = router.route(translator_result, user_input="fold and overlay chain A")
+    cmds = routed.get("commands", [])
+    open_or_mm = [c for c in cmds if c.strip().lower().startswith(("open ", "matchmaker "))]
+    assert not open_or_mm, (
+        f"{fold_tool}: expected open/matchmaker stripped, got {cmds}"
+    )
+    # Non-fold commands survive
+    assert any("view" in c or "cartoon" in c for c in cmds), (
+        f"{fold_tool}: viz commands should survive suppression, got {cmds}"
+    )

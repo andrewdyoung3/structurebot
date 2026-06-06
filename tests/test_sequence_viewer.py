@@ -25,6 +25,8 @@ from sequence_viewer import (
     build_scf_runscript,
     ensure_sequence_viewer_commands,
     dock_sequences_bottom_command,
+    build_numbering_header_content,
+    numbering_header_command,
     left_click_select_command,
     lean_layout_commands,
     default_presentation_commands,
@@ -169,6 +171,62 @@ def test_dock_sequences_bottom_command(tmp_path) -> None:
     _assert("splitDockWidget" in body and "Vertical" in body,
             "loader stacks viewers vertically")
     _assert("SequenceViewer" in body, "loader targets Sequence Viewers")
+
+
+def _ruler_labels(content):
+    import re
+    return [int(x) for x in re.findall(r"\d+", content)]
+
+
+def test_numbering_labels_are_actual_resnums_via_seqpos() -> None:
+    print("\n=== C2. residue-number ruler ===")
+    from proteinmpnn_bridge import chain_resnum_to_seqpos
+    # a non-1-start chain (2..50) → 2,12,22… by interval 10, NOT 1,11,21
+    resnums = list(range(2, 51))
+    content = build_numbering_header_content(resnums, 10)
+    _assert(_ruler_labels(content)[:3] == [2, 12, 22],
+            "non-1-start chain labelled with ACTUAL resnums (2,12,22 not 1,11,21)",
+            f"got {_ruler_labels(content)}")
+    _assert(len(content) == len(resnums), "one column per residue")
+    # placement is via chain_resnum_to_seqpos: each label's UNITS digit sits at its
+    # canonical column → consistent with the MPNN alignment numbering
+    pos1 = chain_resnum_to_seqpos(resnums)
+    for r in (2, 12, 22, 42):
+        col = pos1[r] - 1
+        _assert(content[col] == str(r)[-1],
+                f"resnum {r} units digit at MPNN column {col}", f"content={content!r}")
+
+
+def test_numbering_interval_and_first_last() -> None:
+    # interval 5 honored; a 1-start chain (1..25) → 1,6,11,16,21 + last (25)
+    c5 = build_numbering_header_content(list(range(1, 26)), 5)
+    _assert(_ruler_labels(c5) == [1, 6, 11, 16, 21, 25], "interval=5 respected + last",
+            f"got {_ruler_labels(c5)}")
+    # interval 10 over 1..28 → first (1) AND last (28) both labelled (no merge)
+    c10 = build_numbering_header_content(list(range(1, 29)), 10)
+    labs = _ruler_labels(c10)
+    _assert(labs[0] == 1 and labs[-1] == 28, "first and last residue both labelled", f"got {labs}")
+    # a last residue that would MERGE into the previous label is dropped (no "2123")
+    cmerge = build_numbering_header_content(list(range(1, 24)), 10)
+    _assert(2123 not in _ruler_labels(cmerge), "last label dropped when it would merge",
+            f"got {_ruler_labels(cmerge)}")
+    # gap-aware: 1..50 then 60..70 → shows 60 (the real resnum), never 51
+    cg = build_numbering_header_content(list(range(1, 51)) + list(range(60, 71)), 10)
+    _assert(60 in _ruler_labels(cg) and 51 not in _ruler_labels(cg),
+            "gap-aware (real resnum 60, not naive 51)", f"got {_ruler_labels(cg)}")
+    _assert(build_numbering_header_content([], 10) == "", "empty chain → empty ruler")
+
+
+def test_numbering_header_command_is_well_formed(tmp_path) -> None:
+    out = tmp_path / "num.py"
+    cmd = numbering_header_command("1", "A", list(range(2, 51)), 10, out_py_path=out)
+    _assert(cmd == f'runscript "{out.as_posix()}"', "returns runscript command")
+    body = out.read_text(encoding="utf-8")
+    _assert('"1/A"' in body, "loader targets the chain A viewer (ident 1/A)")
+    _assert("add_fixed_header" in body, "loader adds a fixed header (Route 2)")
+    _assert('"Numbering"' in body, "header is named 'Numbering'")
+    _assert(numbering_header_command("1", "A", [], 10, out_py_path=tmp_path / "x.py") == "",
+            "no resnums → no command")
 
 
 def test_left_click_toggle() -> None:
@@ -341,6 +399,78 @@ def test_bridge_per_chain_cap_falls_back_to_grouped(monkeypatch) -> None:
     _assert("sequence chain #1/A" not in calls, "no per-chain panels above the cap")
 
 
+# -- numbering on the per-chain open path (bridge, mocked REST) -----------------
+
+def _info_res(chain, resnums):
+    return "\n".join(f"residue id /{chain}:{n} name ALA index {i}"
+                     for i, n in enumerate(resnums))
+
+
+def _seq_bridge_numbering(monkeypatch, residues_by_chain, *,
+                          numbering=True, interval=10, fail_substr=None):
+    """A bridge whose run_command answers info chains (A,B) + info residues per chain,
+    optionally raising for a command containing *fail_substr*. Numbering config is
+    set on the config module."""
+    from chimerax_bridge import ChimeraXBridge
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", numbering)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL", interval)
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+
+    def fake(c, timeout=30):
+        calls.append(c)
+        if fail_substr and fail_substr in c:
+            raise RuntimeError("boom")
+        if c.startswith("info chains"):
+            return {"value": "chain id /A chain_id A\nchain id /B chain_id B", "error": None}
+        if c.startswith("info residues"):
+            ch = "A" if "/A" in c else ("B" if "/B" in c else "?")
+            return {"value": residues_by_chain.get(ch, ""), "error": None}
+        return {"value": "Opened #1", "error": None}
+
+    monkeypatch.setattr(b, "run_command", fake)
+    return b, calls
+
+
+def test_bridge_model_chain_resnums_sorted_excludes_solvent(monkeypatch) -> None:
+    # unordered input → sorted ascending (sequence order); solvent excluded by the
+    # `& ~solvent & ~ligand & ~ions` scoping in the issued command.
+    val = "residue id /A:5 name LEU\nresidue id /A:2 name GLN\nresidue id /A:9 name VAL"
+    b, calls = _seq_bridge_numbering(monkeypatch, {"A": val})
+    _assert(b._model_chain_resnums("1", "A") == [2, 5, 9], "resnums parsed + sorted ascending")
+    _assert(any("~solvent" in c and "~ligand" in c for c in calls),
+            "info residues scoped to the macromolecule (no solvent/ligand bleed)")
+
+
+def test_bridge_numbering_on_open(monkeypatch) -> None:
+    resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
+    b, calls = _seq_bridge_numbering(monkeypatch, resn, interval=10)
+    b.run_commands(["open 1hsg"])
+    _assert(any("numbering_1_A" in c for c in calls) and any("numbering_1_B" in c for c in calls),
+            "a per-chain numbering runscript is emitted for each chain", f"got {calls}")
+
+
+def test_bridge_numbering_toggle_off(monkeypatch) -> None:
+    resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
+    b, calls = _seq_bridge_numbering(monkeypatch, resn, numbering=False)
+    b.run_commands(["open 1hsg"])
+    _assert(not any("numbering_" in c for c in calls), "toggle OFF → zero numbering commands")
+    _assert("sequence chain #1/A" in calls, "per-chain viewers still open")
+    _assert(any("dock_sequences_bottom" in c for c in calls), "dock hook still runs")
+
+
+def test_bridge_numbering_failure_does_not_abort_open(monkeypatch) -> None:
+    # the chain-A numbering runscript raises → recorded + skipped, chain B + dock run on
+    resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
+    b, calls = _seq_bridge_numbering(monkeypatch, resn, fail_substr="numbering_1_A")
+    b.run_commands(["open 1hsg"])    # must NOT raise
+    _assert(any("numbering_1_B" in c for c in calls),
+            "chain B numbering still ran after chain A failed (error-first)")
+    _assert(any("dock_sequences_bottom" in c for c in calls),
+            "dock hook still runs after a numbering failure (open completes)")
+
+
 # -- Runner --------------------------------------------------------------------
 
 def main() -> int:
@@ -355,6 +485,9 @@ def main() -> int:
     test_scf_runscript_writes_loader_and_command()
     test_ensure_viewer_commands()
     test_dock_sequences_bottom_command(Path(tempfile.mkdtemp()))
+    test_numbering_labels_are_actual_resnums_via_seqpos()
+    test_numbering_interval_and_first_last()
+    test_numbering_header_command_is_well_formed(Path(tempfile.mkdtemp()))
     test_left_click_toggle()
     test_layout_and_presentation_command_lists()
     test_apply_runs_all_in_order()

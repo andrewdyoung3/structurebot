@@ -55,6 +55,22 @@ CHIMERAX_SEQUENCE_DOCK_BOTTOM: bool = (
     not in ("0", "false", "no", "off")
 )
 
+# NUMBERING: add a residue-number RULER to each per-chain Sequence Viewer, labelled
+# every N residues. The labels are the ACTUAL PDB residue numbers (auth seq IDs),
+# placed via proteinmpnn_bridge.chain_resnum_to_seqpos — so a chain that doesn't
+# start at 1 (1IL8 chain A is 2..72) shows 2,12,22… NOT 1,11,21, consistent with the
+# MPNN alignment numbering. ChimeraX 1.11.1's NATIVE numbering is position-based
+# (`numbering_start + count`, a linear offset that can't honor gaps), so this ships
+# a custom FIXED HEADER (`alignment.add_fixed_header`) instead. Set
+# CHIMERAX_SEQUENCE_NUMBERING=false to disable.
+CHIMERAX_SEQUENCE_NUMBERING: bool = (
+    os.environ.get("CHIMERAX_SEQUENCE_NUMBERING", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+CHIMERAX_SEQUENCE_NUMBER_INTERVAL: int = int(
+    os.environ.get("CHIMERAX_SEQUENCE_NUMBER_INTERVAL", "10")
+)
+
 # ── Deterministic ChimeraX layout + presentation ──────────────────────────────
 # Config-driven command lists applied by StructureBot (NOT LLM-generated, NOT the
 # built-in `preset`). All tokens verified against ChimeraX 1.11.1.
@@ -113,6 +129,7 @@ TRANSLATOR_BACKEND: str = os.environ.get("TRANSLATOR_BACKEND", "claude").strip()
 # router registry. Keep sorted + in sync with `_dispatch_tool`.
 TRANSLATOR_TOOL_NAMES: list = [
     "assembly_analyser", "camsol", "cavity", "chimerax", "colabfold",
+    "conformer_comparison",
     "disulfide", "double_mutant", "esm", "esmfold", "glycan",
     "glycan_positions", "mpnn_esmfold", "mutation_scan", "netnglyc",
     "proline", "proteinmpnn", "rfdiffusion", "rosetta", "salt_bridge",
