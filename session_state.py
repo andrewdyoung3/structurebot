@@ -259,6 +259,10 @@ class SessionState:
         # Conformer-comparison results: "{model_id_a}v{model_id_b}" → shift report dict
         # Populated by ToolRouter._run_conformer_comparison() (anchor-restricted Kabsch).
         self.conformer_comparison_results: Dict[str, Any] = {}
+        # Biological-assembly generation tracking: au_model_id → {assembly_model_id, assembly_id,
+        # assembly_type, n_subunits, pdb_id}.  Populated by _run_bio_assembly() so downstream
+        # tools (interface detection, sequence viewers) can address the full assembly.
+        self.generated_assemblies: Dict[str, Dict[str, Any]] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -428,6 +432,16 @@ class SessionState:
     def get_assembly_info(self, pdb_id: str) -> Optional[Dict[str, Any]]:
         """Return cached assembly info for a PDB ID, or None."""
         return self.assembly_info.get(pdb_id.upper())
+
+    def set_generated_assembly(self, au_model_id: str, info: Dict[str, Any]) -> None:
+        """Record a biological assembly generated via `sym`.
+        *au_model_id* is the asymmetric-unit model; *info* should carry
+        assembly_model_id, assembly_id, assembly_type, n_subunits, pdb_id."""
+        self.generated_assemblies[str(au_model_id)] = dict(info)
+
+    def get_generated_assembly(self, au_model_id: str) -> Optional[Dict[str, Any]]:
+        """Return the generated-assembly record for *au_model_id*, or None."""
+        return self.generated_assemblies.get(str(au_model_id))
 
     def set_analysis_mode(self, model_id: str, mode: str) -> None:
         """Set the analysis mode ('monomer' or 'multimer') for a model."""
@@ -933,6 +947,7 @@ class SessionState:
             "colabfold_results":      self.colabfold_results,
             "validate_design_results":      self.validate_design_results,
             "conformer_comparison_results": self.conformer_comparison_results,
+            "generated_assemblies":         self.generated_assemblies,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -967,6 +982,7 @@ class SessionState:
         state.colabfold_results      = data.get("colabfold_results", {})
         state.validate_design_results      = data.get("validate_design_results", {})
         state.conformer_comparison_results = data.get("conformer_comparison_results", {})
+        state.generated_assemblies         = data.get("generated_assemblies", {})
         return state
 
     @classmethod
@@ -1087,6 +1103,7 @@ class SessionState:
             "colabfold_results":      self.colabfold_results,
             "validate_design_results":      self.validate_design_results,
             "conformer_comparison_results": self.conformer_comparison_results,
+            "generated_assemblies":         self.generated_assemblies,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -1117,3 +1134,4 @@ class SessionState:
         self.colabfold_results      = copy.deepcopy(snap.get("colabfold_results", {}))
         self.validate_design_results      = copy.deepcopy(snap.get("validate_design_results", {}))
         self.conformer_comparison_results = copy.deepcopy(snap.get("conformer_comparison_results", {}))
+        self.generated_assemblies         = copy.deepcopy(snap.get("generated_assemblies", {}))

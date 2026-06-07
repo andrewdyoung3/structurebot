@@ -59,7 +59,7 @@ except ImportError:
     sys.exit(1)
 
 from chimerax_bridge import ChimeraXBridge
-from translator import CommandTranslator, RefusalError, is_usage_cap_error
+from translator import CommandTranslator, RefusalError, is_usage_cap_error, probe_chimerax_verbs
 from session_state import SessionState
 from tool_router import ToolRouter
 
@@ -659,6 +659,11 @@ class StructureBot:
             )
 
     def _handle_request(self, user_input: str, is_retry: bool = False) -> None:
+        # Populate the verb-guard registry once per bridge connection (idempotent).
+        # Must run BEFORE translate() so Tier 2 of _validate_command_verbs fires.
+        if self.bridge:
+            probe_chimerax_verbs(self.bridge.run_command)
+
         # 1. Translate
         try:
             with console.status("[cyan]Translating…[/cyan]"):
@@ -911,15 +916,34 @@ class StructureBot:
                 fix_cmds
                 and fix_cmds[0].strip().lower() == failed_cmd.strip().lower()
             )
-            if not fix_cmds or _same_cmd:
+            # Bug 6c (3b fix): halt if the correction reuses the SAME non-existent
+            # verb that was just rejected.  The verb guard in translate_error_fix
+            # blocks the command and empties fix_cmds, but when the registry is
+            # unavailable and the verb isn't in the denylist it may slip through.
+            # Extract the leading verb of the failed command; if the correction's
+            # first command starts with the same verb, it's the same hallucination.
+            _failed_verb = failed_cmd.strip().split()[0].lower() if failed_cmd.strip() else ""
+            _fix_verb    = fix_cmds[0].strip().split()[0].lower() if fix_cmds else ""
+            _same_verb   = bool(
+                _failed_verb and _fix_verb and _failed_verb == _fix_verb
+                and _failed_verb not in ("open", "close", "color", "colour",
+                                         "select", "hide", "show", "cartoon",
+                                         "surface", "style", "align", "view",
+                                         "transparency", "sym", "matchmaker")
+            )
+            if not fix_cmds or _same_cmd or _same_verb:
                 console.print(
                     f"[warn]Couldn't auto-correct — "
                     f"error: {escape(error_msg[:200])}[/warn]"
                 )
-                console.print(
-                    "[dim]Correction re-proposed the same command or was blocked "
-                    "by a validation guard.  Try rephrasing your request.[/dim]"
+                _reason = (
+                    "Correction re-proposed the same non-existent verb "
+                    f"'{_failed_verb}' — halting to prevent a loop."
+                    if _same_verb else
+                    "Correction re-proposed the same command or was blocked "
+                    "by a validation guard.  Try rephrasing your request."
                 )
+                console.print(f"[dim]{_reason}[/dim]")
             else:
                 console.print("\n[warn]Suggested correction:[/warn]")
                 self._show_preview(fix_cmds, fix_exps, fix.get("confidence", "medium"))
@@ -1146,8 +1170,10 @@ class StructureBot:
 
     def _display_assembly_type_on_open(self, name: str, model_id: str) -> None:
         """
-        After a structure is opened, query RCSB for assembly type and display it.
-        Only runs for 4-letter PDB IDs; silently skips on any error.
+        After a structure is opened, query RCSB for assembly type, display it,
+        and surface an AU-vs-biological mismatch note when the file contains only
+        the asymmetric unit (e.g. 2 chains) but the biological assembly is larger
+        (e.g. homotetramer A4 = 4 chains).
         """
         if not re.match(r"^[A-Za-z0-9]{4}$", name.strip()):
             return
@@ -1162,6 +1188,27 @@ class StructureBot:
                 analyser = AssemblyAnalyser(self.bridge, self.session)
                 display  = analyser.get_assembly_display(name, asm_info)
                 console.print(f"  [dim]✓ {name.upper()} → {escape(display)}[/dim]")
+
+                # AU-vs-biological mismatch detector (Component 2)
+                n_bio = asm_info.get("n_subunits")
+                if n_bio and int(n_bio) > 1:
+                    try:
+                        loaded_chains = self.bridge._model_chains(model_id)
+                        n_loaded = len(loaded_chains)
+                        if n_loaded > 0 and int(n_bio) > n_loaded:
+                            asm_type = asm_info.get("assembly_type") or "biological assembly"
+                            stoich   = asm_info.get("stoichiometry") or ""
+                            stoich_s = f" ({stoich})" if stoich else ""
+                            console.print(
+                                f"  [dim yellow]⚠ Loaded the asymmetric unit "
+                                f"({n_loaded} chain{'s' if n_loaded != 1 else ''}); "
+                                f"biological assembly is a {asm_type}{stoich_s} — "
+                                f"generate it with "
+                                f"\"work as {asm_type.split()[-1]}\" / "
+                                f"\"generate biological assembly\"?[/dim yellow]"
+                            )
+                    except Exception:
+                        pass  # mismatch note is non-critical
         except Exception:
             pass  # assembly info is non-critical; never interrupt the flow
 

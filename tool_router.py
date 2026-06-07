@@ -131,6 +131,7 @@ class ToolRouter:
         "rosetta":           "⚗️",
         "mutation_scan":     "🔬⚗️",
         "assembly_analyser": "🔗",
+        "bio_assembly":      "🏗️",
         "disulfide":         "🔗⚗️",
         "proline":           "🧪",
         "glycan":            "🍬",
@@ -205,6 +206,57 @@ class ToolRouter:
         "pentamer": 5, "pentameric": 5,
         "hexamer": 6, "hexameric": 6,
     }
+
+    # Keywords that signal a biological-assembly generation request.
+    # "open as X" / "work as X" / "generate biological assembly" etc.
+    # Kept tight: the key distinguisher is the "biological assembly" / oligomer
+    # + generation verb pairing, NOT bare oligomer mentions (which appear in
+    # mutation-scan requests like "redesign the interface of the dimer").
+    _BIO_ASSEMBLY_KEYWORDS: tuple = (
+        "generate biological assembly",
+        "generate the biological assembly",
+        "generate assembly",   # covers "generate assembly 2" with explicit id
+        "build biological assembly",
+        "build the biological assembly",
+        "build biological unit",
+        "build the biological unit",
+        "apply crystal symmetry",
+        "apply symmetry",
+        "generate the full assembly",
+        "make the full assembly",
+        "make the full tetramer",
+        "make the full dimer",
+        "make the full trimer",
+        "make the full hexamer",
+        "open as tetramer",
+        "open as a tetramer",
+        "open as dimer",
+        "open as a dimer",
+        "open as trimer",
+        "open as a trimer",
+        "open as hexamer",
+        "open as a hexamer",
+        "open as oligomer",
+        "work as tetramer",
+        "work as a tetramer",
+        "work as dimer",
+        "work as a dimer",
+        "work as trimer",
+        "work as a trimer",
+        "work as hexamer",
+        "work as the full",
+        "view as tetramer",
+        "view as a tetramer",
+        "show full assembly",
+        "show the full assembly",
+        "show biological assembly",
+        "show the biological assembly",
+        "full biological assembly",
+        "complete biological assembly",
+        "load biological assembly",
+        "load the biological assembly",
+        "expand to full assembly",
+    )
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
     # Checked case-insensitively; any match replaces 'proteinmpnn' (or 'esmfold'
@@ -765,7 +817,8 @@ class ToolRouter:
         # (The two REWRITE overrides — proline, mpnn_esmfold — also set it, since
         # they sit high in the order; they are naturally inert once a higher
         # full-replace has claimed, because their target tool is no longer present.)
-        _claimed = False
+        _claimed     = False
+        _ba_intent   = False  # bio-assembly generation override (set below)
 
         # ── Validate-design meta-tool override ─────────────────────────────────
         # Checked FIRST: "validate design" appears in _MPNN_ESMFOLD_KEYWORDS too,
@@ -842,6 +895,30 @@ class ToolRouter:
             cf_inputs.update(self._parse_colabfold_options(user_input))
             tools_needed = ["colabfold"]
             tool_inputs  = {"colabfold": cf_inputs}
+            _claimed = True
+
+        # ── Biological-assembly generation intent override ────────────────────
+        # Fires when user asks to "work as tetramer" / "generate biological
+        # assembly" / "build the biological unit" / "apply crystal symmetry" etc.
+        # Emits `sym #N assembly M copies true` on the EXISTING loaded model.
+        # Does NOT re-open the structure (that was the duplicate-#2 bug).
+        _ba_intent = bool(
+            user_input
+            and self._detect_bio_assembly_intent(user_input)
+            and "bio_assembly" not in tools_needed
+            and not _claimed
+        )
+        if _ba_intent:
+            _ba_model_id   = self._primary_model_id()
+            _ba_assembly_id = self._parse_bio_assembly_id(user_input)
+            tools_needed = ["bio_assembly"]
+            tool_inputs  = {
+                "bio_assembly": {
+                    "model_id":    _ba_model_id,
+                    "assembly_id": _ba_assembly_id,
+                    "_user_input": user_input,
+                }
+            }
             _claimed = True
 
         # ── Conformer-comparison intent override ──────────────────────────────
@@ -1068,6 +1145,13 @@ class ToolRouter:
         if _glycan_intent or _glycan_positions_intent or _netnglyc_intent:
             result["clarification_needed"] = None
 
+        # Bio-assembly: clear any translator-emitted commands (e.g. a re-open) —
+        # the sym command is issued from within _run_bio_assembly, not from the
+        # commands list; a spurious re-open would duplicate the AU model.
+        if _ba_intent:
+            result["commands"]     = []
+            result["explanations"] = []
+
         # ── Bug 4c: suppress translator commands that duplicate a fold/design tool ──
         # When colabfold / validate_design / esmfold / mpnn_esmfold is dispatched,
         # the tool opens, folds, and visualises the result itself.  Any `open` or
@@ -1115,6 +1199,11 @@ class ToolRouter:
         if tool == "chimerax":
             n = len(result.get("commands", []))
             return f"Execute {n} ChimeraX command(s)"
+        if tool == "bio_assembly":
+            inp   = tool_inputs.get("bio_assembly", {})
+            mid   = inp.get("model_id") or self._primary_model_id()
+            asmid = inp.get("assembly_id", 1)
+            return f"Generate biological assembly {asmid} from AU model #{mid} (sym)"
         if tool == "camsol":
             inp   = tool_inputs.get("camsol", {})
             chain = inp.get("chain", "all chains")
@@ -1442,6 +1531,8 @@ class ToolRouter:
                 return self._run_validate_design(inputs, user_input=user_input)
             if tool == "conformer_comparison":
                 return self._run_conformer_comparison(inputs, user_input=user_input)
+            if tool == "bio_assembly":
+                return self._run_bio_assembly(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -1464,7 +1555,7 @@ class ToolRouter:
                     f"Unknown tool '{tool}'. "
                     "Available: chimerax, camsol, esm, esmfold, proteinmpnn, "
                     "mpnn_esmfold, rfdiffusion, rosetta, mutation_scan, "
-                    "assembly_analyser, disulfide, proline, glycan, "
+                    "assembly_analyser, bio_assembly, disulfide, proline, glycan, "
                     "glycan_positions, netnglyc, salt_bridge, cavity, "
                     "double_mutant, validate_ddg, colabfold, validate_design."
                 ),
@@ -2604,6 +2695,155 @@ class ToolRouter:
             viz_commands     = result.viz_commands,
             viz_explanations = result.viz_explanations,
             summary          = summary,
+        )
+
+    def _run_bio_assembly(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """Thin orchestrator: generate the biological assembly via ChimeraX `sym`.
+
+        Emits ``sym #N assembly M copies true`` on the EXISTING loaded model —
+        does NOT re-open (that was the duplicate-#2 bug).  Tracks the generated
+        assembly model and the original AU model in session_state so downstream
+        tools (interface detection, sequence viewers) can address the assembly.
+
+        Error-first: if no model is loaded, or the assembly ID is invalid, a
+        clean error is returned that lists available assemblies (from ``sym #N``).
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+        user_input = user_input or inputs.get("_user_input", "")
+
+        model_id    = str(inputs.get("model_id") or self._primary_model_id())
+        assembly_id = int(inputs.get("assembly_id") or 1)
+
+        # Guard: must have a loaded model
+        if not self.session.structures:
+            return ToolStepResult(
+                tool="bio_assembly", success=False,
+                error=(
+                    "No structure is loaded.  Open a structure first, then "
+                    "ask to generate the biological assembly."
+                ),
+            )
+
+        if self.bridge is None:
+            return ToolStepResult(
+                tool="bio_assembly", success=False,
+                error="ChimeraX bridge unavailable.",
+            )
+
+        # Check what assemblies are available (sym #N with no further args)
+        def _list_assemblies() -> str:
+            try:
+                r = self.bridge.run_command(f"sym #{model_id}")
+                val = (r.get("value") or "").strip()
+                return val if val else "(could not list assemblies)"
+            except Exception:
+                return "(could not list assemblies)"
+
+        # Generate the assembly
+        sym_cmd = f"sym #{model_id} assembly {assembly_id} copies true"
+        try:
+            result = self.bridge.run_command(sym_cmd)
+        except Exception as exc:
+            return ToolStepResult(
+                tool="bio_assembly", success=False,
+                error=(
+                    f"ChimeraX error running `{sym_cmd}`: {exc}\n"
+                    f"Available assemblies: {_list_assemblies()}"
+                ),
+            )
+
+        err = result.get("error") if isinstance(result, dict) else None
+        val = (result.get("value") or "") if isinstance(result, dict) else str(result)
+
+        if err:
+            return ToolStepResult(
+                tool="bio_assembly", success=False,
+                error=(
+                    f"sym assembly generation failed: {err}\n"
+                    f"Available assemblies for model #{model_id}: {_list_assemblies()}"
+                ),
+            )
+
+        # Parse the assembly model ID from the ChimeraX response.
+        # Response format: "Made N copies for <name> assembly M"
+        # The new group model is next after the current highest model number.
+        assembly_model_id: Optional[str] = None
+        try:
+            models_r = self.bridge.run_command("info models")
+            models_val = (models_r.get("value") or "") if isinstance(models_r, dict) else ""
+            # Find model named "<name> assembly <id>"
+            struct_info = self.session.get_structure(model_id)
+            struct_name = (struct_info.get("name") or "").lower() if struct_info else ""
+            for line in models_val.splitlines():
+                if f"assembly {assembly_id}" in line.lower():
+                    m = re.search(r"model id #(\d+)\b", line)
+                    if m:
+                        assembly_model_id = m.group(1)
+                        break
+            # Fallback: highest numeric model id in session
+            if assembly_model_id is None:
+                ids = re.findall(r"model id #(\d+)\b", models_val)
+                if ids:
+                    assembly_model_id = str(max(int(i) for i in ids))
+        except Exception:
+            pass
+
+        # Fetch assembly info for the pdb_id (may already be cached)
+        pdb_id = None
+        n_subunits = None
+        asm_type = None
+        try:
+            struct_info = self.session.get_structure(model_id)
+            name = (struct_info.get("name") or "") if struct_info else ""
+            if re.match(r"^[A-Za-z0-9]{4}$", name):
+                pdb_id = name.upper()
+                cached = self.session.get_assembly_info(pdb_id)
+                asm_info = cached
+                if not asm_info:
+                    from assembly_analyser import fetch_assembly_info
+                    asm_info = fetch_assembly_info(pdb_id)
+                    if asm_info and not asm_info.get("error"):
+                        self.session.set_assembly_info(pdb_id, asm_info)
+                if asm_info and not asm_info.get("error"):
+                    n_subunits = asm_info.get("n_subunits")
+                    asm_type   = asm_info.get("assembly_type")
+        except Exception:
+            pass
+
+        # Track in session_state
+        gen_record: Dict[str, Any] = {
+            "au_model_id":       model_id,
+            "assembly_model_id": assembly_model_id,
+            "assembly_id":       assembly_id,
+            "assembly_type":     asm_type,
+            "n_subunits":        n_subunits,
+            "pdb_id":            pdb_id,
+        }
+        self.session.set_generated_assembly(model_id, gen_record)
+
+        # Build summary
+        asm_label = asm_type or f"assembly {assembly_id}"
+        copies_note = f"{n_subunits} chains" if n_subunits else "multiple chains"
+        summary = (
+            f"Generated {asm_label} from AU #{model_id} "
+            + (f"→ assembly model #{assembly_model_id}" if assembly_model_id else "")
+            + f" ({copies_note}); AU #{model_id} kept and hidden"
+        )
+
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+        return ToolStepResult(
+            tool         = "bio_assembly",
+            success      = True,
+            data         = gen_record,
+            viz_commands = ["view"],
+            viz_explanations = ["Fit the full assembly in view"],
+            summary      = summary,
+            elapsed_ms   = elapsed_ms,
         )
 
     def _run_assembly_analyser(self, inputs: Dict[str, Any]) -> ToolStepResult:
@@ -4123,6 +4363,23 @@ class ToolRouter:
         return False
 
     # ── Conformer-comparison intent helpers ───────────────────────────────────
+
+    @classmethod
+    def _detect_bio_assembly_intent(cls, text: str) -> bool:
+        """True if *text* requests biological-assembly generation via `sym`."""
+        if not text:
+            return False
+        low = text.lower()
+        return any(kw in low for kw in cls._BIO_ASSEMBLY_KEYWORDS)
+
+    @staticmethod
+    def _parse_bio_assembly_id(text: str) -> int:
+        """Extract an explicit assembly ID from user text (e.g. 'assembly 2') → 2.
+        Returns 1 (the default biological assembly) if none is found."""
+        m = re.search(r"assembly\s+(\d+)", text.lower())
+        if m:
+            return int(m.group(1))
+        return 1
 
     @classmethod
     def _detect_conformer_comparison_intent(cls, text: str) -> bool:

@@ -268,12 +268,21 @@ def _validate_open_targets(commands: list, explanations: list) -> tuple:
 # of the raw "Unknown command: find" REST response.
 #
 # Two-tier strategy:
-#   1. If a live registry is available (_chimerax_verb_registry, populated by
-#      probe_chimerax_verbs()), block any verb NOT in the registry.
-#   2. Without a registry, block only verbs in _HALLUCINATED_VERB_DENYLIST —
-#      this avoids accidentally blocking valid-but-unlisted commands.
+#   Tier 2 (allowlist/registry): if a live registry is available, block ANY verb
+#   absent from it.  This GENERALISES — assembly_analyser, bio_assembly, and any
+#   other non-ChimeraX verb are caught automatically without enumerating them.
+#   probe_chimerax_verbs() is called in main._handle_request (before translate())
+#   whenever the bridge is connected, so the registry is populated in production.
+#
+#   Tier 1 (denylist fallback): when the registry is unavailable, block only
+#   _HALLUCINATED_VERB_DENYLIST.  Unknown-but-potentially-valid verbs are passed
+#   through to avoid false positives on unlisted-but-real ChimeraX commands.
 
-# Observed hallucinated verbs — always blocked regardless of registry availability.
+# Hallucinated verbs blocked unconditionally (Tier 1) — common English words the LLM
+# generates that can never be valid ChimeraX verbs.  This list is the FALLBACK for when
+# the live registry is unavailable (bridge disconnected or probe not yet called).
+# Unknown non-ChimeraX verbs (assembly_analyser, bio_assembly, tool names, …) are the
+# registry's job (Tier 2) and must NOT be enumerated here — the registry generalises.
 _HALLUCINATED_VERB_DENYLIST: frozenset = frozenset({
     "find", "search", "locate", "lookup", "retrieve",
     "fetch_sequence", "query", "get_sequence", "list_structures",

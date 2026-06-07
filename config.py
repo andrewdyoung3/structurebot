@@ -148,7 +148,7 @@ TRANSLATOR_BACKEND: str = os.environ.get("TRANSLATOR_BACKEND", "claude").strip()
 # misspelled / hallucinated / wrong-cased tool). A test asserts this matches the
 # router registry. Keep sorted + in sync with `_dispatch_tool`.
 TRANSLATOR_TOOL_NAMES: list = [
-    "assembly_analyser", "camsol", "cavity", "chimerax", "colabfold",
+    "assembly_analyser", "bio_assembly", "camsol", "cavity", "chimerax", "colabfold",
     "conformer_comparison",
     "disulfide", "double_mutant", "esm", "esmfold", "glycan",
     "glycan_positions", "mpnn_esmfold", "mutation_scan", "netnglyc",
