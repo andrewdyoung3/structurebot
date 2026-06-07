@@ -85,6 +85,20 @@ from tool_router import ToolStepResult
 _CONTACT_DISTANCE: float = 5.0
 _COLOURS = ["orange", "magenta", "lime", "gold", "cyan"]
 
+# Distinct palette for sub-model-aware chain background coloring.
+# Ordered so that chains within the same sub-model copy contrast well, and
+# same-letter chains across copies (e.g. #2.1/A vs #2.2/A) are distinguishable.
+_CHAIN_PALETTE = [
+    "cornflowerblue",  # copy-1 chain-1
+    "salmon",          # copy-1 chain-2
+    "palegreen",       # copy-2 chain-1
+    "goldenrod",       # copy-2 chain-2
+    "mediumpurple",    # copy-3 chain-1
+    "lightsalmon",     # copy-3 chain-2
+    "aquamarine",      # copy-4 chain-1
+    "khaki",           # copy-4 chain-2
+]
+
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
@@ -299,8 +313,14 @@ class InterfaceStabilization:
                 pass
 
         # 4. Generate viz commands
+        _color_by_chain = (
+            os.environ.get("INTERFACE_COLOR_BY_CHAIN", "true").strip().lower()
+            not in ("0", "false", "no", "off")
+        )
         viz_cmds, viz_exps = self._build_viz_commands(
-            model_id, interfaces, top_n_disulfides
+            model_id, interfaces, top_n_disulfides,
+            submodels=submodels if is_assembly else None,
+            color_by_chain=_color_by_chain,
         )
 
         # 5. Build summary
@@ -722,9 +742,11 @@ class InterfaceStabilization:
 
     def _build_viz_commands(
         self,
-        model_id:        str,
-        interfaces:      List[Dict[str, Any]],
+        model_id:         str,
+        interfaces:       List[Dict[str, Any]],
         top_n_disulfides: int,
+        submodels:        Optional[List[str]] = None,
+        color_by_chain:   bool = True,
     ) -> Tuple[List[str], List[str]]:
         cmds: List[str] = []
         exps: List[str] = []
@@ -732,8 +754,35 @@ class InterfaceStabilization:
         if not interfaces:
             return cmds, exps
 
-        cmds += [f"cartoon #{model_id}", f"color #{model_id} white"]
-        exps += ["Cartoon representation", f"Reset #{model_id} to white"]
+        cmds.append(f"cartoon #{model_id}")
+        exps.append("Cartoon representation")
+
+        if color_by_chain and submodels:
+            # Sub-model-aware chain coloring: collect unique (submodel, chain)
+            # pairs across all interfaces, sort for stable palette assignment,
+            # and assign one color per pair.  Prevents the bychain collision
+            # where same-letter chains in different sub-models get identical
+            # colors (confirmed live: color bychain keys on chain-ID only).
+            seen: set = set()
+            chain_specs: List[Tuple[str, str]] = []
+            for iface in interfaces:
+                for sm_key, ch_key in [
+                    ("submodel_a", "chain_a"),
+                    ("submodel_b", "chain_b"),
+                ]:
+                    sm = iface.get(sm_key)
+                    ch = iface.get(ch_key)
+                    if sm and ch and (sm, ch) not in seen:
+                        seen.add((sm, ch))
+                        chain_specs.append((sm, ch))
+            chain_specs.sort()
+            for idx, (sm, ch) in enumerate(chain_specs):
+                col = _CHAIN_PALETTE[idx % len(_CHAIN_PALETTE)]
+                cmds.append(f"color #{sm}/{ch} {col}")
+                exps.append(f"Chain #{sm}/{ch} → {col}")
+        else:
+            cmds.append(f"color #{model_id} white")
+            exps.append(f"Reset #{model_id} to white")
 
         # Colour each interface
         for i, iface in enumerate(interfaces):

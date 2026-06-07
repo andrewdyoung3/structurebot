@@ -444,6 +444,17 @@ MPNN_ESMFOLD_INCLUDE_WT: bool = (
     not in ("0", "false", "no")
 )
 
+# ── Interface stabilization ────────────────────────────────────────────────────
+
+# Apply per-chain distinct coloring when the interface workflow runs so that
+# each (sub-model × chain) pair gets a unique color.  Prevents the bychain
+# collision where same-letter chains across sub-models render identically.
+# Set INTERFACE_COLOR_BY_CHAIN=false to preserve a user-set coloring instead.
+INTERFACE_COLOR_BY_CHAIN: bool = (
+    os.environ.get("INTERFACE_COLOR_BY_CHAIN", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 # ── NetNGlyc 1.0 (OST recognition prediction) ─────────────────────────────────
 
 # REST API endpoint for DTU Health Tech NetNGlyc 1.0.

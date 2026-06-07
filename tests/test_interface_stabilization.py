@@ -9,6 +9,7 @@ Tests for Phase 1 interface stabilization:
   - Interface type classification + symmetry-type assignment
   - Disulfide routing (intra_copy runs, inter_copy uses assembly PDB)
   - Assembly PDB export with distinct chain IDs
+  - Sub-model-aware chain coloring (distinct colors, no bychain collision)
   - Session persistence roundtrip
 
 All mocked — no live ChimeraX or PDB files required.
@@ -23,7 +24,8 @@ Test groups
 6.  Disulfide routing (intra_copy from AU PDB, inter_copy from assembly PDB)
 7.  Assembly PDB export — distinct chain IDs + mapping
 8.  Sub-model spec correctness (spec format #N.M/chain)
-9.  Session persistence roundtrip
+9.  Chain coloring — sub-model-aware distinct colors
+10. Session persistence roundtrip
 """
 from __future__ import annotations
 
@@ -696,7 +698,177 @@ def test_intra_copy_specs_reference_same_submodel():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9. Session persistence roundtrip
+# 9. Chain coloring — sub-model-aware distinct colors
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_viz_emits_four_distinct_chain_colors_for_assembly():
+    """
+    _build_viz_commands with submodels= produces four color commands for a
+    2-copy, 2-chain assembly, one per (submodel, chain) pair.
+    """
+    from interface_stabilization import InterfaceStabilization, _CHAIN_PALETTE
+
+    stab, _, _ = _make_stab()
+    # Include interfaces that collectively cover all 4 (submodel, chain) pairs
+    interfaces = [
+        {
+            "type": "intra_copy", "submodel_a": "2.1", "submodel_b": "2.1",
+            "chain_a": "A", "chain_b": "B", "spec_a": "#2.1/A", "spec_b": "#2.1/B",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+        {
+            "type": "intra_copy", "submodel_a": "2.2", "submodel_b": "2.2",
+            "chain_a": "A", "chain_b": "B", "spec_a": "#2.2/A", "spec_b": "#2.2/B",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+        {
+            "type": "inter_copy", "submodel_a": "2.1", "submodel_b": "2.2",
+            "chain_a": "A", "chain_b": "A", "spec_a": "#2.1/A", "spec_b": "#2.2/A",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+    ]
+    cmds, exps = stab._build_viz_commands(
+        "2", interfaces, top_n_disulfides=3,
+        submodels=["2.1", "2.2"], color_by_chain=True,
+    )
+
+    # Expect a color command for each of the 4 chain positions
+    color_cmds = [c for c in cmds if c.startswith("color #2.") and "@" not in c]
+    chain_specs_colored = set()
+    for cmd in color_cmds:
+        # e.g. "color #2.1/A cornflowerblue"
+        parts = cmd.split()
+        if len(parts) == 3:
+            chain_specs_colored.add(parts[1])
+
+    assert "#2.1/A" in chain_specs_colored, "Missing color cmd for #2.1/A"
+    assert "#2.1/B" in chain_specs_colored, "Missing color cmd for #2.1/B"
+    assert "#2.2/A" in chain_specs_colored, "Missing color cmd for #2.2/A"
+    assert "#2.2/B" in chain_specs_colored, "Missing color cmd for #2.2/B"
+
+
+def test_viz_same_letter_chains_across_submodels_get_distinct_colors():
+    """
+    STEP 0 finding: color bychain assigns the same color to #2.1/A and #2.2/A
+    because it keys on chain-ID only.  The explicit palette must assign different
+    colors to same-letter chains across sub-model copies.
+    """
+    from interface_stabilization import InterfaceStabilization, _CHAIN_PALETTE
+
+    stab, _, _ = _make_stab()
+    interfaces = [
+        {
+            "type": "inter_copy", "submodel_a": "2.1", "submodel_b": "2.2",
+            "chain_a": "A", "chain_b": "A", "spec_a": "#2.1/A", "spec_b": "#2.2/A",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+        {
+            "type": "intra_copy", "submodel_a": "2.1", "submodel_b": "2.1",
+            "chain_a": "A", "chain_b": "B", "spec_a": "#2.1/A", "spec_b": "#2.1/B",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+    ]
+    cmds, _ = stab._build_viz_commands(
+        "2", interfaces, top_n_disulfides=0,
+        submodels=["2.1", "2.2"], color_by_chain=True,
+    )
+
+    # Extract color assigned to #2.1/A and #2.2/A
+    def _color_for(spec: str) -> str | None:
+        for cmd in cmds:
+            parts = cmd.split()
+            if len(parts) == 3 and parts[0] == "color" and parts[1] == spec:
+                return parts[2]
+        return None
+
+    col_21a = _color_for("#2.1/A")
+    col_22a = _color_for("#2.2/A")
+
+    assert col_21a is not None, "#2.1/A not colored"
+    assert col_22a is not None, "#2.2/A not colored"
+    assert col_21a != col_22a, (
+        f"#2.1/A and #2.2/A got the same color ({col_21a}) — bychain collision not fixed"
+    )
+
+
+def test_viz_no_chain_colors_when_disabled():
+    """
+    When color_by_chain=False, the fallback 'color #{model_id} white' is emitted
+    (no per-chain color commands, no bychain collision concern).
+    """
+    from interface_stabilization import InterfaceStabilization
+
+    stab, _, _ = _make_stab()
+    interfaces = [
+        {
+            "type": "intra_copy", "submodel_a": "2.1", "submodel_b": "2.1",
+            "chain_a": "A", "chain_b": "B", "spec_a": "#2.1/A", "spec_b": "#2.1/B",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+    ]
+    cmds, _ = stab._build_viz_commands(
+        "2", interfaces, top_n_disulfides=0,
+        submodels=["2.1", "2.2"], color_by_chain=False,
+    )
+
+    # Must have the white reset
+    assert any("white" in c for c in cmds), "Expected 'color #2 white' when disabled"
+    # Must NOT have per-chain sub-model color commands
+    chain_color_cmds = [c for c in cmds if c.startswith("color #2.") and "@" not in c]
+    assert not chain_color_cmds, (
+        f"Unexpected per-chain color cmds with color_by_chain=False: {chain_color_cmds}"
+    )
+
+
+def test_viz_flat_model_uses_white_not_bychain():
+    """
+    For a flat (non-assembly) model, no submodels= are passed and the command
+    falls back to 'color #{model_id} white' regardless of color_by_chain.
+    """
+    from interface_stabilization import InterfaceStabilization
+
+    stab, _, _ = _make_stab()
+    interfaces = [
+        {
+            "type": "flat", "submodel_a": None, "submodel_b": None,
+            "chain_a": "A", "chain_b": "B", "spec_a": "#1/A", "spec_b": "#1/B",
+            "contact_residues_a": [], "disulfide_candidates": [],
+        },
+    ]
+    cmds, _ = stab._build_viz_commands(
+        "1", interfaces, top_n_disulfides=0,
+        submodels=None, color_by_chain=True,
+    )
+
+    assert any("color #1 white" == c for c in cmds)
+    chain_color_cmds = [c for c in cmds if re.search(r"color #1\.\d+/", c)]
+    assert not chain_color_cmds
+
+
+def test_chain_color_not_emitted_on_plain_chimerax_open():
+    """
+    Chain-coloring commands are NOT generated by a plain ChimeraX open action —
+    they only appear in the interface stabilization viz pipeline.
+    """
+    router = _make_router()
+    # Simulate a plain 'open' translation (no interface tool)
+    translation = _translator_chimerax()
+    translation["commands"] = ["open 2vnc"]
+    translation["explanations"] = ["Open 2VNC"]
+
+    # The viz commands from a plain chimerax result must contain no chain-color cmds
+    chimerax_viz = translation["commands"]
+    chain_color_cmds = [
+        c for c in chimerax_viz
+        if re.search(r"color #\d+\.\d+/", c)
+    ]
+    assert not chain_color_cmds, (
+        "Chain-color commands leaked into a plain ChimeraX open result"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10. Session persistence roundtrip
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_interface_stabilization_results_session_roundtrip(tmp_path):
