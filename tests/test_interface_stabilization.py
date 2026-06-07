@@ -6,7 +6,9 @@ Tests for Phase 1 interface stabilization:
   - _run_interface_stabilization error guards
   - InterfaceStabilization class (mocked bridge)
   - Sub-model addressing correctness (no flat specs)
-  - Intra-subunit disulfide scan; inter-subunit deferred
+  - Interface type classification + symmetry-type assignment
+  - Disulfide routing (intra_copy runs, inter_copy uses assembly PDB)
+  - Assembly PDB export with distinct chain IDs
   - Session persistence roundtrip
 
 All mocked — no live ChimeraX or PDB files required.
@@ -16,10 +18,12 @@ Test groups
 1.  Routing — intent detection + route override
 2.  _run_interface_stabilization — error-first guards
 3.  InterfaceStabilization — sub-model discovery, zone-select, buried area
-4.  Interface type classification (intra vs inter)
-5.  Disulfide routing (intra runs, inter deferred)
-6.  Sub-model spec correctness (spec format #N.M/chain)
-7.  Session persistence roundtrip
+4.  Interface type classification (intra_copy / inter_copy / flat)
+5.  Symmetry-type assignment
+6.  Disulfide routing (intra_copy from AU PDB, inter_copy from assembly PDB)
+7.  Assembly PDB export — distinct chain IDs + mapping
+8.  Sub-model spec correctness (spec format #N.M/chain)
+9.  Session persistence roundtrip
 """
 from __future__ import annotations
 
@@ -271,15 +275,11 @@ def test_parse_buried_area_returns_none_on_empty():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Interface type classification (intra vs inter)
+# 4. Interface type classification (intra_copy / inter_copy / flat)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_intra_subunit_type_when_same_submodel():
-    """Two chains in same sub-model → intra_subunit."""
-    # Build a stab and call _detect_submodel_interfaces with mocked zone-selects.
-    # Sub-models: 2.1 and 2.2 each with chains A, B.
-    # Pairs: (2.1/A, 2.1/B)=intra, (2.1/A, 2.2/A)=inter, (2.1/A, 2.2/B)=inter, etc.
-
+def test_intra_copy_type_when_same_submodel():
+    """Two chains in same sub-model → intra_copy."""
     ca_hit = _cx_result("atom id /A:10@CA\natom id /A:11@CA\n")
     no_hit = _cx_result("")
 
@@ -304,18 +304,17 @@ def test_intra_subunit_type_when_same_submodel():
     submodels = ["2.1", "2.2"]
     interfaces = stab._detect_submodel_interfaces("2", submodels, 5.0, lambda msg: None)
 
-    intra = [i for i in interfaces if i["type"] == "intra_subunit"]
-    inter = [i for i in interfaces if i["type"] == "inter_subunit"]
-
-    # At least the A-B intra-subunit interface should be detected (both copies)
-    # Depends on whether the mock returns hits; at minimum the type mapping is correct.
     for iface in interfaces:
         sm_a = iface["submodel_a"]
         sm_b = iface["submodel_b"]
         if sm_a == sm_b:
-            assert iface["type"] == "intra_subunit"
+            assert iface["type"] == "intra_copy", (
+                f"Expected intra_copy for same sub-model pair, got {iface['type']}"
+            )
         else:
-            assert iface["type"] == "inter_subunit"
+            assert iface["type"] == "inter_copy", (
+                f"Expected inter_copy for cross sub-model pair, got {iface['type']}"
+            )
 
 
 def test_flat_type_for_no_submodel_model():
@@ -338,12 +337,64 @@ def test_flat_type_for_no_submodel_model():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Disulfide routing — intra runs, inter deferred
+# 5. Symmetry-type assignment
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_intra_subunit_interface_gets_disulfide_scan(tmp_path):
+def test_symmetry_type_assigned_after_buried_area():
+    """_assign_symmetry_types sets symmetry_type on all interfaces."""
+    from interface_stabilization import InterfaceStabilization
+    stab = InterfaceStabilization.__new__(InterfaceStabilization)
+
+    interfaces = [
+        {"type": "intra_copy", "chain_a": "A", "chain_b": "B",
+         "buried_area_ang2": 1518.0},
+        {"type": "intra_copy", "chain_a": "A", "chain_b": "B",
+         "buried_area_ang2": 1518.0},
+        {"type": "inter_copy", "chain_a": "A", "chain_b": "A",
+         "buried_area_ang2": 1378.0},
+        {"type": "inter_copy", "chain_a": "B", "chain_b": "B",
+         "buried_area_ang2": 1209.0},
+        {"type": "inter_copy", "chain_a": "A", "chain_b": "B",
+         "buried_area_ang2": 316.0},
+        {"type": "inter_copy", "chain_a": "B", "chain_b": "A",
+         "buried_area_ang2": 316.0},
+    ]
+    stab._assign_symmetry_types(interfaces)
+
+    # All interfaces must have symmetry_type set
+    for iface in interfaces:
+        assert iface["symmetry_type"] is not None
+
+    # The two intra_copy (A-B) entries must share the same symmetry_type
+    intra = [i for i in interfaces if i["type"] == "intra_copy"]
+    assert len(set(i["symmetry_type"] for i in intra)) == 1
+
+    # Total unique symmetry types must be 3 for this C2-symmetric assembly
+    unique_types = len(set(i["symmetry_type"] for i in interfaces))
+    assert unique_types == 3, f"Expected 3 symmetry types, got {unique_types}"
+
+    # Type 1 must be the intra_copy (highest buried area)
+    assert intra[0]["symmetry_type"] == 1
+
+
+def test_symmetry_key_cross_chain_is_order_invariant():
+    """A-B and B-A inter_copy get the same key regardless of order."""
+    from interface_stabilization import InterfaceStabilization
+    iface_ab = {"type": "inter_copy", "chain_a": "A", "chain_b": "B"}
+    iface_ba = {"type": "inter_copy", "chain_a": "B", "chain_b": "A"}
+    assert (
+        InterfaceStabilization._symmetry_key(iface_ab) ==
+        InterfaceStabilization._symmetry_key(iface_ba)
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. Disulfide routing — intra_copy from AU PDB, inter_copy from assembly PDB
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_intra_copy_interface_gets_disulfide_scan(tmp_path):
     """
-    InterfaceStabilization.analyze() calls DisulfideBridge for intra_subunit interfaces.
+    InterfaceStabilization.analyze() calls DisulfideBridge for intra_copy interfaces.
     """
     pdb = tmp_path / "2VNC.pdb"
     pdb.write_text(
@@ -399,20 +450,28 @@ def test_intra_subunit_interface_gets_disulfide_scan(tmp_path):
     assert interfaces[0]["disulfide_note"] is None
 
 
-def test_inter_subunit_interface_disulfide_deferred(tmp_path):
+def test_inter_copy_interface_scan_uses_assembly_pdb(tmp_path):
     """
-    inter_subunit interfaces must receive a disulfide_note, not a scan result.
+    inter_copy interfaces use the exported assembly PDB for the disulfide scan.
+    When export succeeds, DisulfideBridge.analyze must be called with the
+    assembly PDB path (not the AU PDB).
     """
     pdb = tmp_path / "2VNC.pdb"
     pdb.write_text(
         "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+    )
+    asm_pdb = tmp_path / "assembly_merged.pdb"
+    asm_pdb.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  CA  ALA C   1       5.000   0.000   0.000  1.00  0.00           C\n"
     )
 
     stab, bridge, session = _make_stab()
     bridge.is_running.return_value = True
 
     dummy_inter = {
-        "type":               "inter_subunit",
+        "type":               "inter_copy",
+        "symmetry_type":      2,
         "spec_a":             "#2.1/A",
         "spec_b":             "#2.2/A",
         "chain_a":            "A",
@@ -422,32 +481,145 @@ def test_inter_subunit_interface_disulfide_deferred(tmp_path):
         "contact_residues_a": [15, 16],
         "contact_residues_b": [15, 16],
         "contact_count":      4,
-        "buried_area_ang2":   None,
+        "buried_area_ang2":   1378.0,
         "disulfide_candidates": None,
         "disulfide_count":    0,
         "disulfide_top":      None,
         "disulfide_note":     None,
     }
 
+    chain_mapping = {("2.1", "A"): "A", ("2.1", "B"): "B",
+                     ("2.2", "A"): "C", ("2.2", "B"): "D"}
+
+    mock_ds_result = ToolStepResult(
+        tool="disulfide", success=True,
+        data={"candidates": [], "count": 0},
+        summary="0 candidates",
+    )
+
     with patch.object(stab, "_get_submodels", return_value=["2.1", "2.2"]):
         with patch.object(stab, "_detect_submodel_interfaces", return_value=[dummy_inter]):
-            with patch.object(stab, "_measure_buried_area", return_value=800.0):
-                with patch("interface_stabilization.DisulfideBridge") as MockDS:
-                    result = stab.analyze(
-                        model_id="2", pdb_path=str(pdb), pdb_id="2VNC"
-                    )
+            with patch.object(stab, "_measure_buried_area", return_value=1378.0):
+                with patch.object(
+                    stab, "_export_assembly_pdb",
+                    return_value=(str(asm_pdb), chain_mapping),
+                ):
+                    with patch("interface_stabilization.DisulfideBridge") as MockDS:
+                        MockDS.return_value.analyze.return_value = mock_ds_result
+                        result = stab.analyze(
+                            model_id="2", pdb_path=str(pdb), pdb_id="2VNC"
+                        )
 
     assert result.success
-    # DisulfideBridge.analyze must NOT have been called for inter-subunit
-    MockDS.return_value.analyze.assert_not_called()
-
-    iface = result.data["interfaces"][0]
-    assert iface["disulfide_note"] is not None
-    assert "phase 2" in iface["disulfide_note"].lower()
+    MockDS.return_value.analyze.assert_called_once()
+    call_kwargs = MockDS.return_value.analyze.call_args
+    used_pdb = call_kwargs[1].get("pdb_path") or call_kwargs[0][0]
+    assert used_pdb == str(asm_pdb), (
+        f"Expected assembly PDB path, got {used_pdb}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. Sub-model spec correctness — no flat specs, correct #N.M/chain format
+# 7. Assembly PDB export — distinct chain IDs + mapping
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_export_assembly_pdb_distinct_chain_ids():
+    """
+    _export_assembly_pdb must produce a PDB with 4 distinct chain IDs when
+    two sub-models each have chains A, B.
+
+    The bridge mock writes real PDB content to the requested save path so that
+    the Python-side chain-rename logic can be exercised end-to-end.
+    """
+    import os as _os
+
+    sub1_content = (
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  CA  ALA B   1       5.000   0.000   0.000  1.00  0.00           C\n"
+    )
+    sub2_content = (
+        "ATOM      3  CA  ALA A   1      10.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      4  CA  ALA B   1      15.000   0.000   0.000  1.00  0.00           C\n"
+    )
+
+    def _cmd_handler(cmd: str) -> dict:
+        if "info chains #2.1" in cmd:
+            return _cx_result("chain id /A chain_id A\nchain id /B chain_id B\n")
+        if "info chains #2.2" in cmd:
+            return _cx_result("chain id /A chain_id A\nchain id /B chain_id B\n")
+        if cmd.startswith("save ") and "#2.1" in cmd:
+            path = cmd.split()[1]
+            with open(path, "w") as fh:
+                fh.write(sub1_content)
+            return {"value": "", "error": None}
+        if cmd.startswith("save ") and "#2.2" in cmd:
+            path = cmd.split()[1]
+            with open(path, "w") as fh:
+                fh.write(sub2_content)
+            return {"value": "", "error": None}
+        return {"value": "", "error": None}
+
+    stab, bridge, _ = _make_stab()
+    bridge.run_command.side_effect = _cmd_handler
+
+    pdb_path, mapping = stab._export_assembly_pdb("2", ["2.1", "2.2"])
+
+    try:
+        assert pdb_path is not None, "Expected a combined PDB path, got None"
+        assert _os.path.isfile(pdb_path), f"Combined PDB not written: {pdb_path}"
+        assert mapping, "Expected a non-empty chain mapping"
+
+        # Mapping must cover all 4 (submodel, chain) pairs
+        for sm, ch in [("2.1", "A"), ("2.1", "B"), ("2.2", "A"), ("2.2", "B")]:
+            assert (sm, ch) in mapping, f"Missing mapping for ({sm!r}, {ch!r})"
+
+        # Sub-model 2's chains must be renamed (different from sub-model 1's)
+        assert mapping[("2.1", "A")] != mapping[("2.2", "A")]
+        assert mapping[("2.1", "B")] != mapping[("2.2", "B")]
+
+        # All 4 mapped letters must be distinct
+        letters = list(mapping.values())
+        assert len(set(letters)) == 4, f"Expected 4 distinct chain IDs, got {letters}"
+
+        # Verify the combined PDB actually has 4 distinct chain IDs on ATOM records
+        with open(pdb_path) as fh:
+            chains_in_file = {
+                line[21]
+                for line in fh
+                if line.startswith("ATOM  ") and len(line) > 21
+            }
+        assert len(chains_in_file) == 4, (
+            f"Expected 4 chains in combined PDB, found {sorted(chains_in_file)}"
+        )
+    finally:
+        if pdb_path and _os.path.isfile(pdb_path):
+            _os.unlink(pdb_path)
+
+
+def test_map_candidates_to_chimerax_adds_specs():
+    """_map_candidates_to_chimerax adds chimerax_spec_a/b fields."""
+    from interface_stabilization import InterfaceStabilization
+
+    mapping = {
+        ("2.1", "A"): "A",
+        ("2.1", "B"): "B",
+        ("2.2", "A"): "C",
+        ("2.2", "B"): "D",
+    }
+    candidates = [
+        {"chain_a": "A", "chain_a_residue": 14, "chain_b": "C", "chain_b_residue": 42},
+        {"chain_a": "B", "chain_a_residue": 20, "chain_b": "D", "chain_b_residue": 55},
+    ]
+    InterfaceStabilization._map_candidates_to_chimerax(candidates, mapping)
+
+    assert candidates[0]["chimerax_spec_a"] == "#2.1/A:14"
+    assert candidates[0]["chimerax_spec_b"] == "#2.2/A:42"
+    assert candidates[1]["chimerax_spec_a"] == "#2.1/B:20"
+    assert candidates[1]["chimerax_spec_b"] == "#2.2/B:55"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. Sub-model spec correctness — no flat specs, correct #N.M/chain format
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_submodel_specs_use_submodel_id_not_flat():
@@ -493,8 +665,8 @@ def test_submodel_specs_use_submodel_id_not_flat():
 import re  # used in test above
 
 
-def test_intra_subunit_specs_reference_same_submodel():
-    """Intra-subunit spec_a and spec_b must share the same sub-model number."""
+def test_intra_copy_specs_reference_same_submodel():
+    """intra_copy spec_a and spec_b must share the same sub-model number."""
     stab, bridge, _ = _make_stab()
 
     def _cmd_handler(cmd: str) -> dict:
@@ -515,16 +687,16 @@ def test_intra_subunit_specs_reference_same_submodel():
 
     interfaces = stab._detect_submodel_interfaces("2", ["2.1"], 5.0, lambda msg: None)
     for iface in interfaces:
-        if iface["type"] == "intra_subunit":
+        if iface["type"] == "intra_copy":
             sm_a = iface["submodel_a"]
             sm_b = iface["submodel_b"]
             assert sm_a == sm_b, (
-                f"Intra-subunit interface has mismatched submodels: {sm_a} vs {sm_b}"
+                f"intra_copy interface has mismatched submodels: {sm_a} vs {sm_b}"
             )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. Session persistence roundtrip
+# 9. Session persistence roundtrip
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_interface_stabilization_results_session_roundtrip(tmp_path):

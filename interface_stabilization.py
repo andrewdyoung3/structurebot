@@ -26,18 +26,34 @@ NOT the flat spec ``#2/A``, which addresses all sub-models simultaneously.
 
 Interface types
 ---------------
-``intra_subunit``  Two chains within the SAME sub-model (e.g. A-B in #2.1).
-                   Present in the AU PDB → disulfide scan runs immediately.
-``inter_subunit``  Same or different chain ID between DIFFERENT sub-models
-                   (e.g. #2.1/A vs #2.2/A).  Requires assembly coordinates;
-                   disulfide scan is deferred to Phase 2.
-``flat``           Model has no sub-models (raw AU); plain chain-chain interface.
-                   Treated identically to intra_subunit.
+``intra_copy``    Two chains within the SAME sub-model copy (e.g. A-B in #2.1).
+                  Coordinates are present in the AU PDB → disulfide scan runs
+                  directly against the AU PDB.
+``inter_copy``    Same or different chain ID between DIFFERENT sub-model copies
+                  (e.g. #2.1/A vs #2.2/A).  Assembly PDB is exported with
+                  distinct chain IDs (A,B → C,D for copy 2); disulfide scan
+                  runs against that assembly PDB, and candidates are mapped
+                  back to ChimeraX sub-model specs.
+``flat``          Model has no sub-models (raw AU); plain chain-chain interface.
+                  Treated identically to intra_copy.
+
+Symmetry types
+--------------
+After buried-area measurement, interfaces are grouped into symmetry-unique
+types by chain-pair pattern.  For a 2-copy C2-symmetric assembly with chains
+A,B the three unique types are:
+
+  1  intra_copy  (A,B) within the same copy     — primary dimer interface
+  2  inter_copy  same-chain letter across copies — symmetric-axis contacts
+  3  inter_copy  cross-chain across copies       — weak diagonal contacts
+
+The ``symmetry_type`` integer field (1, 2, 3, …) encodes this grouping.
 
 Output schema (per interface, stored in data["interfaces"])
 -------------------------------------------------------------
 {
-    "type":               "intra_subunit" | "inter_subunit" | "flat",
+    "type":               "intra_copy" | "inter_copy" | "flat",
+    "symmetry_type":      int,
     "spec_a":             "#2.1/A",
     "spec_b":             "#2.2/B",
     "chain_a":            "A",
@@ -56,7 +72,9 @@ Output schema (per interface, stored in data["interfaces"])
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import time as _time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -185,14 +203,41 @@ class InterfaceStabilization:
                 iface["spec_a"], iface["spec_b"]
             )
 
-        # 3. Disulfide scan (intra-subunit and flat only)
+        # 2b. Assign symmetry types (uses buried area so must follow step 2)
+        self._assign_symmetry_types(interfaces)
+
+        # 3. Disulfide scan
+        #    intra_copy / flat  → AU PDB, direct chain IDs
+        #    inter_copy         → export assembly PDB with distinct chain IDs, then scan
         ds_bridge = DisulfideBridge(chimerax_bridge=self.bridge)
 
-        for iface in interfaces:
-            if iface["type"] in ("intra_subunit", "flat"):
+        # Export assembly PDB once if any inter_copy interfaces exist
+        assembly_pdb_path: Optional[str] = None
+        assembly_chain_mapping: Dict[Tuple[str, str], str] = {}
+        if is_assembly and any(i["type"] == "inter_copy" for i in interfaces):
+            _prog("🔗 [InterfaceStabilization] Exporting assembly PDB with distinct chain IDs…")
+            assembly_pdb_path, assembly_chain_mapping = self._export_assembly_pdb(
+                model_id, submodels
+            )
+            if assembly_pdb_path:
+                n_chains = len(set(assembly_chain_mapping.values()))
                 _prog(
-                    f"🔗 [InterfaceStabilization] Scanning inter-chain disulfides: "
-                    f"chain {iface['chain_a']} ↔ chain {iface['chain_b']}…"
+                    f"🔗 [InterfaceStabilization] Assembly PDB: "
+                    f"{n_chains} distinct chain(s) → {assembly_pdb_path}"
+                )
+            else:
+                _prog(
+                    "  [InterfaceStabilization] Assembly PDB export failed — "
+                    "inter_copy disulfide scans will be skipped."
+                )
+
+        for iface in interfaces:
+            itype = iface["type"]
+            if itype in ("intra_copy", "flat"):
+                _prog(
+                    f"🔗 [InterfaceStabilization] Scanning disulfides: "
+                    f"chain {iface['chain_a']} ↔ chain {iface['chain_b']} "
+                    f"(AU PDB)…"
                 )
                 cands = self._scan_disulfides(
                     ds_bridge, pdb_path,
@@ -204,14 +249,54 @@ class InterfaceStabilization:
                 iface["disulfide_count"]      = len(cands)
                 iface["disulfide_top"]        = cands[0] if cands else None
                 iface["disulfide_note"]       = None
-            else:
-                iface["disulfide_candidates"] = None
-                iface["disulfide_count"]      = 0
-                iface["disulfide_top"]        = None
-                iface["disulfide_note"] = (
-                    "Inter-subunit disulfide scan deferred — requires biological "
-                    "assembly PDB coordinates (Phase 2)."
+
+            else:  # inter_copy
+                if not assembly_pdb_path:
+                    iface["disulfide_candidates"] = None
+                    iface["disulfide_count"]      = 0
+                    iface["disulfide_top"]        = None
+                    iface["disulfide_note"]       = (
+                        "Assembly PDB export unavailable — inter_copy scan skipped."
+                    )
+                    continue
+
+                asm_ch_a = assembly_chain_mapping.get(
+                    (iface["submodel_a"], iface["chain_a"])
                 )
+                asm_ch_b = assembly_chain_mapping.get(
+                    (iface["submodel_b"], iface["chain_b"])
+                )
+                if not asm_ch_a or not asm_ch_b:
+                    iface["disulfide_candidates"] = None
+                    iface["disulfide_count"]      = 0
+                    iface["disulfide_top"]        = None
+                    iface["disulfide_note"]       = "Chain mapping error — scan skipped."
+                    continue
+
+                _prog(
+                    f"🔗 [InterfaceStabilization] Scanning disulfides: "
+                    f"asm chain {asm_ch_a} ↔ {asm_ch_b} "
+                    f"(symmetry type {iface.get('symmetry_type')})…"
+                )
+                cands = self._scan_disulfides(
+                    ds_bridge, assembly_pdb_path,
+                    asm_ch_a, asm_ch_b,
+                    iface.get("contact_residues_a", []),
+                    _prog,
+                )
+                if cands and assembly_chain_mapping:
+                    self._map_candidates_to_chimerax(cands, assembly_chain_mapping)
+                iface["disulfide_candidates"] = cands
+                iface["disulfide_count"]      = len(cands)
+                iface["disulfide_top"]        = cands[0] if cands else None
+                iface["disulfide_note"]       = None
+
+        # Cleanup temporary assembly PDB
+        if assembly_pdb_path:
+            try:
+                os.unlink(assembly_pdb_path)
+            except OSError:
+                pass
 
         # 4. Generate viz commands
         viz_cmds, viz_exps = self._build_viz_commands(
@@ -226,13 +311,19 @@ class InterfaceStabilization:
         if self.session is not None:
             try:
                 key = f"{model_id}:{pdb_id or 'unknown'}"
+                # Convert tuple keys to strings for JSON serialisability
+                mapping_str = {
+                    f"{sm}:{ch}": new_ch
+                    for (sm, ch), new_ch in assembly_chain_mapping.items()
+                }
                 self.session.set_interface_stabilization_result(
                     model_id, {
-                        "model_id":    model_id,
-                        "pdb_id":      pdb_id,
-                        "interfaces":  interfaces,
-                        "is_assembly": is_assembly,
-                        "submodels":   submodels,
+                        "model_id":             model_id,
+                        "pdb_id":               pdb_id,
+                        "interfaces":           interfaces,
+                        "is_assembly":          is_assembly,
+                        "submodels":            submodels,
+                        "assembly_chain_map":   mapping_str,
                     }
                 )
             except AttributeError:
@@ -285,6 +376,142 @@ class InterfaceStabilization:
         found = re.findall(r"chain_id\s+([A-Za-z])\b", text)
         return sorted(set(found))
 
+    # ── Symmetry-type helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _symmetry_key(iface: Dict[str, Any]) -> str:
+        """
+        Return a string key that is identical for symmetry-equivalent interfaces.
+
+        Rules (for a 2-copy C2 assembly with chains A, B):
+          intra_copy  (A-B within copy 1) == intra_copy (A-B within copy 2) → "intra_AB"
+          inter_copy  A-A (cross copy)    == inter_copy B-B (cross copy)    → "inter_same"
+          inter_copy  A-B (cross)         == inter_copy B-A (cross)         → "inter_cross_AB"
+        """
+        ch_a = iface["chain_a"]
+        ch_b = iface["chain_b"]
+        itype = iface["type"]
+        if itype in ("intra_copy", "flat"):
+            return f"intra_{min(ch_a, ch_b)}{max(ch_a, ch_b)}"
+        else:
+            if ch_a == ch_b:
+                return "inter_same"
+            return f"inter_cross_{min(ch_a, ch_b)}{max(ch_a, ch_b)}"
+
+    def _assign_symmetry_types(self, interfaces: List[Dict[str, Any]]) -> None:
+        """
+        Set ``symmetry_type`` (1, 2, 3, …) on each interface dict in-place.
+
+        Interfaces that share the same _symmetry_key get the same integer.
+        Types are numbered in descending buried-area order of first occurrence.
+        """
+        key_to_type: Dict[str, int] = {}
+        next_type = 1
+        for iface in sorted(
+            interfaces,
+            key=lambda x: x.get("buried_area_ang2") or 0.0,
+            reverse=True,
+        ):
+            k = self._symmetry_key(iface)
+            if k not in key_to_type:
+                key_to_type[k] = next_type
+                next_type += 1
+            iface["symmetry_type"] = key_to_type[k]
+
+    # ── Assembly PDB export ────────────────────────────────────────────────────
+
+    def _export_assembly_pdb(
+        self,
+        model_id: str,
+        submodels: List[str],
+    ) -> Tuple[Optional[str], Dict[Tuple[str, str], str]]:
+        """
+        Save each sub-model to a temp PDB, rename chains to avoid collision,
+        then combine into a single PDB with 4 (or more) distinct chain IDs.
+
+        For a 2-copy assembly with chains A, B:
+            sub-model 0  → chains A, B  (unchanged)
+            sub-model 1  → chains C, D  (renamed)
+
+        Returns
+        -------
+        (pdb_path, chain_mapping)
+            pdb_path      : path to the combined PDB file (caller must delete when done)
+            chain_mapping : {(submodel_id, orig_chain): new_pdb_chain}
+        """
+        chain_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+        submodel_chains: Dict[str, List[str]] = {}
+        for sm in submodels:
+            submodel_chains[sm] = sorted(self._get_chains_for_submodel(sm))
+
+        mapping: Dict[Tuple[str, str], str] = {}
+        idx = 0
+        for sm in submodels:
+            for ch in submodel_chains.get(sm, []):
+                if idx < len(chain_letters):
+                    mapping[(sm, ch)] = chain_letters[idx]
+                idx += 1
+
+        tmp_files: List[str] = []
+        combined: List[str] = []
+
+        try:
+            for sm in submodels:
+                fd, tmp_path = tempfile.mkstemp(
+                    suffix=".pdb", prefix=f"asm_{sm.replace('.', '_')}_"
+                )
+                os.close(fd)
+                tmp_files.append(tmp_path)
+
+                r = self.bridge.run_command(f"save {tmp_path} #{sm}")
+                if r.get("error") or not os.path.isfile(tmp_path):
+                    return None, {}
+
+                with open(tmp_path) as fh:
+                    for line in fh:
+                        if len(line) > 21 and line[:6] in ("ATOM  ", "HETATM", "TER   "):
+                            orig_ch = line[21]
+                            new_ch  = mapping.get((sm, orig_ch), orig_ch)
+                            line = line[:21] + new_ch + line[22:]
+                        combined.append(line)
+        finally:
+            for p in tmp_files:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+        if not combined:
+            return None, {}
+
+        out_fd, out_path = tempfile.mkstemp(suffix=".pdb", prefix="assembly_merged_")
+        os.close(out_fd)
+        with open(out_path, "w") as fh:
+            fh.writelines(combined)
+
+        return out_path, mapping
+
+    @staticmethod
+    def _map_candidates_to_chimerax(
+        candidates: List[Dict[str, Any]],
+        chain_mapping: Dict[Tuple[str, str], str],
+    ) -> None:
+        """
+        Add ``chimerax_spec_a`` / ``chimerax_spec_b`` fields to each candidate.
+
+        Uses the reverse of chain_mapping: PDB chain letter → (submodel, orig_chain).
+        """
+        reverse: Dict[str, Tuple[str, str]] = {v: k for k, v in chain_mapping.items()}
+        for cand in candidates:
+            for side in ("a", "b"):
+                pdb_ch  = cand.get(f"chain_{side}", "")
+                resno   = cand.get(f"chain_{side}_residue")
+                sm_orig = reverse.get(pdb_ch)
+                if sm_orig and resno is not None:
+                    sm, orig_ch = sm_orig
+                    cand[f"chimerax_spec_{side}"] = f"#{sm}/{orig_ch}:{resno}"
+
     # ── Interface detection ────────────────────────────────────────────────────
 
     def _detect_submodel_interfaces(
@@ -326,7 +553,7 @@ class InterfaceStabilization:
                     continue
                 seen.add(key)
 
-                iface_type = "intra_subunit" if sm1 == sm2 else "inter_subunit"
+                iface_type = "intra_copy" if sm1 == sm2 else "inter_copy"
                 spec_a = f"#{sm1}/{ch1}"
                 spec_b = f"#{sm2}/{ch2}"
 
@@ -340,6 +567,7 @@ class InterfaceStabilization:
 
                 interfaces.append({
                     "type":               iface_type,
+                    "symmetry_type":      None,
                     "spec_a":             spec_a,
                     "spec_b":             spec_b,
                     "chain_a":            ch1,
@@ -375,6 +603,7 @@ class InterfaceStabilization:
         for (c1, c2), resnos in raw.items():
             interfaces.append({
                 "type":               "flat",
+                "symmetry_type":      None,
                 "spec_a":             f"#{model_id}/{c1}",
                 "spec_b":             f"#{model_id}/{c2}",
                 "chain_a":            c1,
@@ -472,6 +701,9 @@ class InterfaceStabilization:
 
         Returns sorted candidates list; [] on any error.
         """
+        if not pdb_path:
+            prog("  [InterfaceStabilization] Skipping disulfide scan: no PDB path provided.")
+            return []
         try:
             result = ds_bridge.analyze(
                 pdb_path              = pdb_path,
@@ -527,9 +759,9 @@ class InterfaceStabilization:
                     f"Ball style interface residues",
                 ]
 
-        # Disulfide spheres for top intra-subunit interface
+        # Disulfide spheres for top intra-copy interface
         for iface in interfaces:
-            if iface["type"] not in ("intra_subunit", "flat"):
+            if iface["type"] not in ("intra_copy", "flat"):
                 continue
             cands = iface.get("disulfide_candidates") or []
             if not cands:
@@ -593,11 +825,13 @@ class InterfaceStabilization:
             buried = iface.get("buried_area_ang2")
             buried_s = f"{buried:.0f} Å²" if buried is not None else "N/A"
             n_contact = iface.get("contact_count", 0)
-            itype = iface["type"].replace("_", "-")
+            itype    = iface["type"].replace("_", "-")
+            sym_type = iface.get("symmetry_type")
+            sym_s    = f" [sym{sym_type}]" if sym_type else ""
 
             lines.append(
                 f"  [{i+1}] {iface['spec_a']} ↔ {iface['spec_b']}  "
-                f"({itype})  contacts={n_contact}  buried={buried_s}"
+                f"({itype}{sym_s})  contacts={n_contact}  buried={buried_s}"
             )
 
             # Disulfide candidates
