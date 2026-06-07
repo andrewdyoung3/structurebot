@@ -131,8 +131,9 @@ class ToolRouter:
         "rosetta":           "⚗️",
         "mutation_scan":     "🔬⚗️",
         "assembly_analyser": "🔗",
-        "bio_assembly":      "🏗️",
-        "disulfide":         "🔗⚗️",
+        "bio_assembly":             "🏗️",
+        "interface_stabilization": "🔗🛡️",
+        "disulfide":               "🔗⚗️",
         "proline":           "🧪",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
@@ -256,6 +257,49 @@ class ToolRouter:
         "load biological assembly",
         "load the biological assembly",
         "expand to full assembly",
+    )
+
+    # Keywords that signal an interface-stabilization request.
+    # Tight enough to avoid false positives with mutation-scan / disulfide.
+    # Checked BEFORE generic disulfide or mutation-scan routing.
+    _INTERFACE_STABILIZATION_KEYWORDS: tuple = (
+        "stabilize the interface",
+        "stabilise the interface",
+        "stabilize interface",
+        "stabilise interface",
+        "stabilize the dimer interface",
+        "stabilize the tetramer interface",
+        "stabilize the trimer interface",
+        "stabilize the oligomer interface",
+        "lock the interface",
+        "lock the dimer",
+        "lock the tetramer",
+        "lock with disulfide",
+        "lock with a disulfide",
+        "crosslink the interface",
+        "crosslink the dimer",
+        "crosslink the tetramer",
+        "engineer interface disulfide",
+        "interface disulfide",
+        "inter-subunit disulfide",
+        "inter-chain disulfide",
+        "interchain disulfide",
+        "interface stabilization",
+        "interface stabilisation",
+        "strengthen the interface",
+        "reinforce the interface",
+        "reinforce the assembly",
+        "detect interfaces",
+        "characterize interface",
+        "characterise interface",
+        "characterize the interface",
+        "characterise the interface",
+        "interface contacts",
+        "interface residues",
+        "map the interface",
+        "identify the interface",
+        "buried interface area",
+        "buried surface area",
     )
 
     # Keywords that signal a ProteinMPNN + ESMFold validation request.
@@ -921,6 +965,27 @@ class ToolRouter:
             }
             _claimed = True
 
+        # ── Interface-stabilization intent override ───────────────────────────
+        # Fires on "stabilize the interface", "lock with disulfide", "interface
+        # contacts", etc.  Uses the assembly model when one has been generated;
+        # falls back to the primary AU model otherwise.
+        _is_intent = bool(
+            user_input
+            and self._detect_interface_stabilization_intent(user_input)
+            and "interface_stabilization" not in tools_needed
+            and not _claimed
+        )
+        if _is_intent:
+            _is_model_id = self._primary_assembly_model_id()
+            tools_needed = ["interface_stabilization"]
+            tool_inputs  = {
+                "interface_stabilization": {
+                    "model_id":    _is_model_id,
+                    "_user_input": user_input,
+                }
+            }
+            _claimed = True
+
         # ── Conformer-comparison intent override ──────────────────────────────
         # Fires on explicit phrasing only ("compare conformers", "anchored overlay",
         # "per-residue shift", "morph analysis", etc.) — never on generic phrases.
@@ -1204,6 +1269,13 @@ class ToolRouter:
             mid   = inp.get("model_id") or self._primary_model_id()
             asmid = inp.get("assembly_id", 1)
             return f"Generate biological assembly {asmid} from AU model #{mid} (sym)"
+        if tool == "interface_stabilization":
+            inp = tool_inputs.get("interface_stabilization", {})
+            mid = inp.get("model_id") or self._primary_assembly_model_id()
+            return (
+                f"Interface stabilization — detect contacts, buried area, "
+                f"inter-chain disulfide scan on #{mid}"
+            )
         if tool == "camsol":
             inp   = tool_inputs.get("camsol", {})
             chain = inp.get("chain", "all chains")
@@ -1533,6 +1605,8 @@ class ToolRouter:
                 return self._run_conformer_comparison(inputs, user_input=user_input)
             if tool == "bio_assembly":
                 return self._run_bio_assembly(inputs, user_input=user_input)
+            if tool == "interface_stabilization":
+                return self._run_interface_stabilization(inputs, user_input=user_input)
             if tool == "assembly_analyser":
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
@@ -2845,6 +2919,78 @@ class ToolRouter:
             summary      = summary,
             elapsed_ms   = elapsed_ms,
         )
+
+    def _run_interface_stabilization(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """
+        Orchestrate inter-subunit interface detection + disulfide scan.
+
+        Automatically uses the assembly model (from generated_assemblies) if
+        one exists; falls back to the primary AU model.  Error-first: explicit
+        guard on PDB availability before any heavy computation.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+        user_input = user_input or inputs.get("_user_input", "")
+
+        if self.bridge is None:
+            return ToolStepResult(
+                tool="interface_stabilization", success=False,
+                error="ChimeraX bridge unavailable.",
+            )
+        if not self.session.structures:
+            return ToolStepResult(
+                tool="interface_stabilization", success=False,
+                error=(
+                    "No structure is loaded.  Open a structure first, then ask "
+                    "to stabilize the interface."
+                ),
+            )
+
+        model_id = str(inputs.get("model_id") or self._primary_assembly_model_id())
+
+        # Resolve PDB path from the AU model (assembly model has no local PDB)
+        au_model_id = model_id
+        for mid, rec in self.session.generated_assemblies.items():
+            asm_mid = str(rec.get("assembly_model_id") or "")
+            if asm_mid == model_id:
+                au_model_id = str(mid)
+                break
+
+        pdb_path = self._ensure_pdb_file(au_model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="interface_stabilization", success=False,
+                error=(
+                    "Interface stabilization requires a local PDB file for the "
+                    "disulfide geometry scan.\n"
+                    "  Load the structure from a local .pdb file, or ensure "
+                    "internet access so StructureBot can download it from RCSB."
+                ),
+            )
+
+        # Resolve PDB ID for informational output
+        pdb_id: Optional[str] = None
+        struct_info = self.session.get_structure(au_model_id)
+        if struct_info:
+            name = struct_info.get("name", "")
+            if re.match(r"^[A-Za-z0-9]{4}$", name):
+                pdb_id = name.upper()
+
+        from interface_stabilization import InterfaceStabilization
+        stab = InterfaceStabilization(bridge=self.bridge, session=self.session)
+
+        result = stab.analyze(
+            model_id  = model_id,
+            pdb_path  = pdb_path,
+            pdb_id    = pdb_id,
+        )
+        if result.elapsed_ms is None:
+            result.elapsed_ms = (_time.perf_counter() - t0) * 1000
+        return result
 
     def _run_assembly_analyser(self, inputs: Dict[str, Any]) -> ToolStepResult:
         """Run biological assembly analysis (MONOMER or MULTIMER mode)."""
@@ -4361,6 +4507,31 @@ class ToolRouter:
         if "validat" in low and ("colabfold" in low or "alphafold" in low):
             return True
         return False
+
+    # ── Interface-stabilization intent helpers ────────────────────────────────
+
+    @classmethod
+    def _detect_interface_stabilization_intent(cls, text: str) -> bool:
+        """True if *text* requests interface detection / stabilization."""
+        if not text:
+            return False
+        low = text.lower()
+        return any(kw in low for kw in cls._INTERFACE_STABILIZATION_KEYWORDS)
+
+    def _primary_assembly_model_id(self) -> str:
+        """
+        Return the assembly model ID if one has been generated (e.g. '2'),
+        otherwise fall back to the primary AU model ID (e.g. '1').
+
+        Iterates generated_assemblies in reverse insertion order so the most
+        recently generated assembly is preferred.
+        """
+        # Prefer the most recently generated assembly model
+        for rec in reversed(list(self.session.generated_assemblies.values())):
+            asm_mid = rec.get("assembly_model_id")
+            if asm_mid:
+                return str(asm_mid)
+        return self._primary_model_id()
 
     # ── Conformer-comparison intent helpers ───────────────────────────────────
 

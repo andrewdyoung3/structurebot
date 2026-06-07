@@ -151,8 +151,8 @@ TRANSLATOR_TOOL_NAMES: list = [
     "assembly_analyser", "bio_assembly", "camsol", "cavity", "chimerax", "colabfold",
     "conformer_comparison",
     "disulfide", "double_mutant", "esm", "esmfold", "glycan",
-    "glycan_positions", "mpnn_esmfold", "mutation_scan", "netnglyc",
-    "proline", "proteinmpnn", "rfdiffusion", "rosetta", "salt_bridge",
+    "glycan_positions", "interface_stabilization", "mpnn_esmfold", "mutation_scan",
+    "netnglyc", "proline", "proteinmpnn", "rfdiffusion", "rosetta", "salt_bridge",
     "validate_ddg", "validate_design",
 ]
 

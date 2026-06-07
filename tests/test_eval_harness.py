@@ -314,10 +314,10 @@ def test_manifest_disjoint_from_example_pool():
         eh.assert_disjoint_from_examples([leak2])
 
 
-def test_tool_registry_is_the_23_literals():
+def test_tool_registry_is_the_24_literals():
     import config
     assert eh.TOOL_REGISTRY == frozenset(t.lower() for t in config.TRANSLATOR_TOOL_NAMES)
-    assert len(eh.TOOL_REGISTRY) == 23  # +1 bio_assembly added 2026-06-07
+    assert len(eh.TOOL_REGISTRY) == 24  # +1 interface_stabilization added 2026-06-07
     # every documented tool-input field key is a real registry tool (or chimerax)
     assert set(eh.TOOL_INPUT_FIELDS) <= (eh.TOOL_REGISTRY | {"chimerax"})
 

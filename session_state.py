@@ -263,6 +263,9 @@ class SessionState:
         # assembly_type, n_subunits, pdb_id}.  Populated by _run_bio_assembly() so downstream
         # tools (interface detection, sequence viewers) can address the full assembly.
         self.generated_assemblies: Dict[str, Dict[str, Any]] = {}
+        # Interface stabilization results: model_id → {interfaces, is_assembly, submodels, …}
+        # Populated by _run_interface_stabilization() after successful analysis.
+        self.interface_stabilization_results: Dict[str, Any] = {}
 
     # ── Structure tracking ────────────────────────────────────────────────────
 
@@ -442,6 +445,18 @@ class SessionState:
     def get_generated_assembly(self, au_model_id: str) -> Optional[Dict[str, Any]]:
         """Return the generated-assembly record for *au_model_id*, or None."""
         return self.generated_assemblies.get(str(au_model_id))
+
+    def set_interface_stabilization_result(
+        self, model_id: str, result: Dict[str, Any]
+    ) -> None:
+        """Store interface stabilization result for a model."""
+        self.interface_stabilization_results[str(model_id)] = dict(result)
+
+    def get_interface_stabilization_result(
+        self, model_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return cached interface stabilization result for *model_id*, or None."""
+        return self.interface_stabilization_results.get(str(model_id))
 
     def set_analysis_mode(self, model_id: str, mode: str) -> None:
         """Set the analysis mode ('monomer' or 'multimer') for a model."""
@@ -947,7 +962,8 @@ class SessionState:
             "colabfold_results":      self.colabfold_results,
             "validate_design_results":      self.validate_design_results,
             "conformer_comparison_results": self.conformer_comparison_results,
-            "generated_assemblies":         self.generated_assemblies,
+            "generated_assemblies":              self.generated_assemblies,
+            "interface_stabilization_results":   self.interface_stabilization_results,
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -982,7 +998,8 @@ class SessionState:
         state.colabfold_results      = data.get("colabfold_results", {})
         state.validate_design_results      = data.get("validate_design_results", {})
         state.conformer_comparison_results = data.get("conformer_comparison_results", {})
-        state.generated_assemblies         = data.get("generated_assemblies", {})
+        state.generated_assemblies                = data.get("generated_assemblies", {})
+        state.interface_stabilization_results    = data.get("interface_stabilization_results", {})
         return state
 
     @classmethod
@@ -1103,7 +1120,8 @@ class SessionState:
             "colabfold_results":      self.colabfold_results,
             "validate_design_results":      self.validate_design_results,
             "conformer_comparison_results": self.conformer_comparison_results,
-            "generated_assemblies":         self.generated_assemblies,
+            "generated_assemblies":              self.generated_assemblies,
+            "interface_stabilization_results":   self.interface_stabilization_results,
         })
 
     def restore(self, snap: Dict[str, Any]) -> None:
@@ -1134,4 +1152,5 @@ class SessionState:
         self.colabfold_results      = copy.deepcopy(snap.get("colabfold_results", {}))
         self.validate_design_results      = copy.deepcopy(snap.get("validate_design_results", {}))
         self.conformer_comparison_results = copy.deepcopy(snap.get("conformer_comparison_results", {}))
-        self.generated_assemblies         = copy.deepcopy(snap.get("generated_assemblies", {}))
+        self.generated_assemblies              = copy.deepcopy(snap.get("generated_assemblies", {}))
+        self.interface_stabilization_results  = copy.deepcopy(snap.get("interface_stabilization_results", {}))
