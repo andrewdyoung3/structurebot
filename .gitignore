@@ -13,3 +13,9 @@ __pycache__/
 .env
 session.json
 diag.py
+
+# eval run-output dirs (not source, not committed)
+scripts/eval_3dim_*/
+
+# one-off probe/exploration scripts
+scripts/probe_*.py

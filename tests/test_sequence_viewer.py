@@ -214,7 +214,7 @@ def test_numbering_interval_and_first_last() -> None:
     cg = build_numbering_header_content(list(range(1, 51)) + list(range(60, 71)), 10)
     _assert(60 in _ruler_labels(cg) and 51 not in _ruler_labels(cg),
             "gap-aware (real resnum 60, not naive 51)", f"got {_ruler_labels(cg)}")
-    _assert(build_numbering_header_content([], 10) == "", "empty chain → empty ruler")
+    _assert(build_numbering_header_content([], 10) == "", "empty chain -> empty ruler")
 
 
 def test_numbering_header_command_is_well_formed(tmp_path) -> None:
@@ -226,7 +226,7 @@ def test_numbering_header_command_is_well_formed(tmp_path) -> None:
     _assert("add_fixed_header" in body, "loader adds a fixed header (Route 2)")
     _assert('"Numbering"' in body, "header is named 'Numbering'")
     _assert(numbering_header_command("1", "A", [], 10, out_py_path=tmp_path / "x.py") == "",
-            "no resnums → no command")
+            "no resnums -> no command")
 
 
 def test_left_click_toggle() -> None:
@@ -455,7 +455,7 @@ def test_bridge_numbering_toggle_off(monkeypatch) -> None:
     resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
     b, calls = _seq_bridge_numbering(monkeypatch, resn, numbering=False)
     b.run_commands(["open 1hsg"])
-    _assert(not any("numbering_" in c for c in calls), "toggle OFF → zero numbering commands")
+    _assert(not any("numbering_" in c for c in calls), "toggle OFF -> zero numbering commands")
     _assert("sequence chain #1/A" in calls, "per-chain viewers still open")
     _assert(any("dock_sequences_bottom" in c for c in calls), "dock hook still runs")
 
@@ -469,6 +469,233 @@ def test_bridge_numbering_failure_does_not_abort_open(monkeypatch) -> None:
             "chain B numbering still ran after chain A failed (error-first)")
     _assert(any("dock_sequences_bottom" in c for c in calls),
             "dock hook still runs after a numbering failure (open completes)")
+
+
+# ── F. Consolidated sequence-viewer grouping (mocked — no live ChimeraX) ───────
+
+from sequence_viewer import (
+    consolidated_viewers_command,
+    disentangle_chain_command,
+    resolve_group_edit_target,
+)
+
+
+def _consolidation_bridge(monkeypatch, chain_str, *, threshold=3, cap=8,
+                           numbering=True, interval=10):
+    """Bridge whose run_command records calls and answers info chains with chain_str."""
+    from chimerax_bridge import ChimeraXBridge
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", threshold)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", cap)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", numbering)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL", interval)
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+
+    def fake(c, timeout=30):
+        calls.append(c)
+        if c.startswith("info chains"):
+            return {"value": chain_str, "error": None}
+        return {"value": "Opened #1", "error": None}
+
+    monkeypatch.setattr(b, "run_command", fake)
+    return b, calls
+
+
+def test_threshold_1_2_chains_uses_per_chain(monkeypatch, tmp_path) -> None:
+    """1-2 chains (below default threshold=3): per-chain viewers unchanged."""
+    print("\n=== F. Consolidation ===")
+    two = "chain id /A chain_id A\nchain id /B chain_id B"
+    b, calls = _consolidation_bridge(monkeypatch, two, threshold=3)
+    b.run_commands(["open 1abc"])
+    _assert("sequence chain #1/A" in calls and "sequence chain #1/B" in calls,
+            "<=threshold: per-chain viewers for A and B", f"got {calls}")
+    _assert(not any("consolidate" in c for c in calls),
+            "<=threshold: no consolidation runscript")
+
+
+def test_threshold_4_chains_uses_consolidated(monkeypatch, tmp_path) -> None:
+    """4 chains > threshold=3: consolidated viewers command issued."""
+    four = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCD")
+    b, calls = _consolidation_bridge(monkeypatch, four, threshold=3)
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
+    b.run_commands(["open 2hhb"])
+    # A runscript command for consolidation is issued (not per-chain commands)
+    _assert(any("runscript" in c and "consolidat" in c.lower() for c in calls),
+            "4 chains: consolidated runscript issued", f"got {calls}")
+    _assert("sequence chain #1/A" not in calls,
+            "4 chains: no per-chain viewer for A (consolidated takes over)")
+
+
+def test_consolidated_command_writes_file(tmp_path) -> None:
+    """consolidated_viewers_command writes a runscript and returns runscript cmd."""
+    cmd = consolidated_viewers_command(threshold=3, cap=8, interval=10,
+                                       numbering=True,
+                                       out_py_path=tmp_path / "cv.py")
+    _assert(cmd == f'runscript "{(tmp_path / "cv.py").as_posix()}"',
+            "returns runscript command with posix path", f"got {cmd!r}")
+    body = (tmp_path / "cv.py").read_text(encoding="utf-8")
+    _assert("_THRESHOLD = 3" in body and "_CAP = 8" in body,
+            "threshold/cap substituted correctly")
+    _assert("_INTERVAL = 10" in body and "_NUMBERING = True" in body,
+            "interval/numbering substituted")
+    _assert("__THRESHOLD__" not in body, "no unfilled placeholders")
+
+
+def test_consolidation_runscript_has_grouping_logic(tmp_path) -> None:
+    """Runscript groups chains by (seq_hash, rns) — different numbering → different group."""
+    cmd = consolidated_viewers_command(threshold=3, cap=8, out_py_path=tmp_path / "cv.py")
+    body = (tmp_path / "cv.py").read_text(encoding="utf-8")
+    _assert("grp_" in body, "group ident prefix 'grp_' present")
+    _assert("new_alignment" in body, "creates ChimeraX alignment")
+    _assert("seq_hash" in body or "md5" in body.lower(), "groups by sequence hash")
+    _assert("rns" in body and "resnums" in body.lower() or "r.number" in body,
+            "groups by residue numbering too")
+    _assert("identify_as" in body, "passes ident to new_alignment")
+
+
+def test_consolidation_runscript_has_ruler_logic(tmp_path) -> None:
+    """Runscript includes the residue-number ruler algorithm (same as build_numbering_header_content)."""
+    body = consolidated_viewers_command(
+        interval=10, numbering=True,
+        out_py_path=tmp_path / "cv.py"
+    )
+    script = (tmp_path / "cv.py").read_text(encoding="utf-8")
+    _assert("add_fixed_header" in script,
+            "ruler added via add_fixed_header (same API as per-chain ruler)")
+    _assert("Numbering" in script, "ruler header named 'Numbering' (consistent with per-chain)")
+    _assert("label_idxs" in script, "interval label logic present")
+    _assert("ungapped" in script, "pads ruler to alignment length via ungapped()")
+
+
+def test_consolidation_numbering_off_omits_ruler(tmp_path) -> None:
+    """numbering=False → ruler logic not reached; add_fixed_header still appears but gated."""
+    script = consolidated_viewers_command(
+        numbering=False, out_py_path=tmp_path / "cv.py",
+    )
+    body = (tmp_path / "cv.py").read_text(encoding="utf-8")
+    _assert("_NUMBERING = False" in body, "numbering=False substituted")
+
+
+def test_addressability_invariant_disentangle_command() -> None:
+    """disentangle_chain_command returns the exact ChimeraX command that opens a
+    standalone viewer — unrelated to what group alignment exists."""
+    cmd = disentangle_chain_command("1", "A")
+    _assert(cmd == "sequence chain #1/A",
+            "disentangle -> 'sequence chain #1/A'", f"got {cmd!r}")
+    cmd2 = disentangle_chain_command("2", "C")
+    _assert(cmd2 == "sequence chain #2/C",
+            "disentangle chain C of model 2", f"got {cmd2!r}")
+
+
+def test_disentangle_via_bridge(monkeypatch, tmp_path) -> None:
+    """Explicit disentangle issues 'sequence chain #N/A' via the bridge (no new machinery
+    needed — existing sequence chain command covers it)."""
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+    monkeypatch.setattr(b, "run_command",
+                        lambda c, timeout=30: (calls.append(c),
+                                               {"value": "ok", "error": None})[1])
+    b.run_command(disentangle_chain_command("1", "A"))
+    _assert("sequence chain #1/A" in calls,
+            "bridge issues 'sequence chain #1/A' for disentangle")
+
+
+def test_dynamic_regroup_reconsolidate(monkeypatch, tmp_path) -> None:
+    """After a sequence edit, reconsolidate() re-runs consolidated_viewers_command
+    so ChimeraX rebuilds group alignments reflecting the new grouping."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", 3)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8)
+    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+    monkeypatch.setattr(b, "run_command",
+                        lambda c, timeout=30: (calls.append(c),
+                                               {"value": "ok", "error": None})[1])
+    # Simulate: sequence change happened → call reconsolidate()
+    b.reconsolidate()
+    # Must issue a consolidate runscript + dock-bottom
+    _assert(any("consolidat" in c.lower() for c in calls),
+            "reconsolidate() issues consolidated_viewers_command", f"got {calls}")
+    _assert(any("dock_sequences_bottom" in c for c in calls),
+            "reconsolidate() re-docks viewers after regroup")
+
+
+def test_edit_disambiguation_no_chain_specified() -> None:
+    """resolve_group_edit_target: multiple chains, no chain specified → disambiguation."""
+    chains, msg = resolve_group_edit_target(["A", "C"], requested_chain=None)
+    _assert(chains is None,
+            "multi-chain group + no spec: None (must ask user)", f"chains={chains}")
+    _assert(msg is not None and ("A" in msg or "C" in msg),
+            "disambiguation message mentions the chains", f"msg={msg!r}")
+
+
+def test_edit_disambiguation_chain_specified() -> None:
+    """resolve_group_edit_target: requested_chain present → returns that chain only."""
+    chains, msg = resolve_group_edit_target(["A", "C"], requested_chain="A")
+    _assert(chains == ["A"] and msg is None,
+            "chain A specified in multi-chain group: ['A'] returned, no msg",
+            f"chains={chains}, msg={msg}")
+
+
+def test_edit_disambiguation_single_chain_group() -> None:
+    """resolve_group_edit_target: single-chain group → no disambiguation needed."""
+    chains, msg = resolve_group_edit_target(["B"], requested_chain=None)
+    _assert(chains == ["B"] and msg is None,
+            "single-chain group: unambiguous, no msg", f"chains={chains}, msg={msg}")
+
+
+def test_edit_disambiguation_chain_not_in_group() -> None:
+    """resolve_group_edit_target: requested chain not in group → error, never silent."""
+    chains, msg = resolve_group_edit_target(["A", "C"], requested_chain="B")
+    _assert(chains is None and msg is not None,
+            "chain not in group: None + error message (never wrong silent target)",
+            f"chains={chains}, msg={msg!r}")
+
+
+def test_consolidation_error_first_never_disrupts(monkeypatch, tmp_path) -> None:
+    """A failing consolidated_viewers_command runscript must not abort the open."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", 3)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", True)
+    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
+    from chimerax_bridge import ChimeraXBridge
+    four = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCD")
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    calls = []
+
+    def fake(c, timeout=30):
+        calls.append(c)
+        if c.startswith("info chains"):
+            return {"value": four, "error": None}
+        if "consolidat" in c.lower():
+            raise RuntimeError("consolidation boom")
+        return {"value": "Opened #1", "error": None}
+
+    monkeypatch.setattr(b, "run_command", fake)
+    b.run_commands(["open 2hhb"])   # must NOT raise
+    _assert(any("dock_sequences_bottom" in c for c in calls),
+            "dock hook still runs even when consolidation runscript raises (error-first)")
+
+
+def test_cap_still_falls_back_to_grouped(monkeypatch, tmp_path) -> None:
+    """10 chains > cap=8 → single whole-model viewer (existing behaviour unchanged)."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", 3)
+    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8)
+    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
+    many = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCDEFGHIJ")
+    b, calls = _consolidation_bridge(monkeypatch, many, threshold=3, cap=8)
+    b.run_commands(["open big"])
+    _assert("sequence chain #1" in calls, "above cap: grouped whole-model viewer")
+    _assert("sequence chain #1/A" not in calls, "no per-chain panels above cap")
+    _assert(not any("consolidat" in c.lower() for c in calls),
+            "above cap: no consolidation (whole-model fallback)")
 
 
 # -- Runner --------------------------------------------------------------------

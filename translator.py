@@ -124,9 +124,9 @@ def _sanitize_zone_syntax(
         if rewritten != cmd:
             notes.append(
                 f"Rewrote Chimera-1 zone syntax to the ChimeraX operator: "
-                f"{cmd!r} → {rewritten!r}"
+                f"{cmd!r} -> {rewritten!r}"
             )
-            print(f"  [zone-guard] {cmd!r} → {rewritten!r}", flush=True)
+            print(f"  [zone-guard] {cmd!r} -> {rewritten!r}", flush=True)
             cmd = rewritten
         if re.search(r"\bzone\b", cmd):           # still unsafe → drop it
             notes.append(
@@ -192,9 +192,9 @@ def _scope_chain_refs_to_macromolecule(commands: list) -> tuple:
         if rewritten != cmd:
             notes.append(
                 f"Scoped chain reference(s) to the macromolecule "
-                f"(excluded ligand/solvent/ions): {cmd!r} → {rewritten!r}"
+                f"(excluded ligand/solvent/ions): {cmd!r} -> {rewritten!r}"
             )
-            print(f"  [chain-scope] {cmd!r} → {rewritten!r}", flush=True)
+            print(f"  [chain-scope] {cmd!r} -> {rewritten!r}", flush=True)
         new_cmds.append(rewritten)
     return new_cmds, notes
 

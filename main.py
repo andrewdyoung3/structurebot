@@ -26,6 +26,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# ── UTF-8 stdout on Windows (default is cp1252 in Python 3.x) ────────────────
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # ── Windows-only keyboard polling ─────────────────────────────────────────────
 if sys.platform == "win32":
     import msvcrt

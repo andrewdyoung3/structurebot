@@ -71,6 +71,19 @@ CHIMERAX_SEQUENCE_NUMBER_INTERVAL: int = int(
     os.environ.get("CHIMERAX_SEQUENCE_NUMBER_INTERVAL", "10")
 )
 
+# CONSOLIDATION: when a structure has MORE than this many chains, collapse all
+# chains with the same sequence into ONE alignment window (one row per structure ×
+# unique sequence group) instead of opening N separate per-chain panels. Keeps
+# per-chain addressability — `#N/A` targeting is unaffected. Set to 0 to always
+# consolidate; set a large number to never consolidate (uses per-chain up to
+# CHIMERAX_SEQUENCE_PER_CHAIN_MAX). Default 3: 1-3 chains → per-chain (unchanged);
+# 4-8 chains → consolidated. Verified on ChimeraX 1.11.1: new_alignment auto-
+# associates ALL chains with identical sequences → selecting a row selects all
+# copies in 3D. Set CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD=0 to always consolidate.
+CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD: int = int(
+    os.environ.get("CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", "3")
+)
+
 # ── Deterministic ChimeraX layout + presentation ──────────────────────────────
 # Config-driven command lists applied by StructureBot (NOT LLM-generated, NOT the
 # built-in `preset`). All tokens verified against ChimeraX 1.11.1.

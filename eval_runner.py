@@ -627,7 +627,7 @@ def main(argv=None) -> Dict[str, Path]:
 
     if args.from_csv:                                   # post-hoc restatement, no run
         res = report_from_csv(args.from_csv, args.manifest, args.out)
-        print(f"restated {args.from_csv} → {res['report']} · capture rates "
+        print(f"restated {args.from_csv} -> {res['report']} - capture rates "
               f"{ {b: f'{(1-r)*100:.0f}%' for b, r in res['rates'].items()} }")
         return {"report": res["report"]}
 
