@@ -251,6 +251,52 @@ def test_non_usage_cap_400_does_not_fall_back() -> None:
     _assert(not mpost.called, "malformed 400 → does NOT reroute to Ollama")
 
 
+# -- C3. Claude usage-cap LATCH (Priority 0.4) ---------------------------------
+
+def test_usage_cap_latches_and_skips_claude_next_call() -> None:
+    print("\n=== C3. Claude cap latch ===")
+    t = _translator()   # active = claude
+    _assert(t._claude_capped is False, "latch starts unset on a fresh translator")
+    with patch.object(t, "client") as mc, \
+         patch("requests.post", return_value=_ollama_resp(_VALID)) as mpost:
+        mc.messages.create.side_effect = _usage_cap_error()
+        # First call: Claude attempted once → cap → latch + Ollama fallback
+        t.translate("color chain A red", _session())
+        first = mc.messages.create.call_count
+        _assert(first == 1, "first call attempts Claude exactly once")
+        _assert(t._claude_capped is True, "cap latches _claude_capped=True")
+        # Second call: Claude must be SKIPPED (no wasted capped round-trip)
+        t.translate("show as cartoon", _session())
+        _assert(mc.messages.create.call_count == first,
+                "after latch, Claude is NOT called again")
+    _assert(mpost.call_count >= 2, "both translations served by Ollama")
+
+
+def test_cap_does_not_latch_when_fallback_disabled() -> None:
+    t = _translator()
+    with patch.object(config, "TRANSLATOR_FALLBACK", False), \
+         patch.object(t, "client") as mc, patch("requests.post"):
+        mc.messages.create.side_effect = _usage_cap_error()
+        try:
+            t.translate("color chain A red", _session())
+        except anthropic.BadRequestError:
+            pass
+    _assert(t._claude_capped is False,
+            "cap surfaces (fallback off) → latch NOT set (Claude not silently disabled)")
+
+
+def test_transient_connection_error_does_not_latch() -> None:
+    """A transient connectivity error falls back per-call but must NOT latch — a
+    blip should not disable Claude for the whole session (only a usage cap does)."""
+    t = _translator()
+    conn = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
+    with patch.object(t, "client") as mc, \
+         patch("requests.post", return_value=_ollama_resp(_VALID)):
+        mc.messages.create.side_effect = conn
+        t.translate("color chain A red", _session())
+    _assert(t._claude_capped is False, "transient connection error does NOT latch")
+
+
 # -- D. VRAM unload invariant --------------------------------------------------
 
 def test_ensure_unloaded_noop_when_nothing_loaded(monkeypatch) -> None:

@@ -1283,6 +1283,12 @@ class CommandTranslator:
             getattr(config, "TRANSLATOR_BACKEND", "claude")
         )
 
+        # Per-session Claude usage-cap latch (Priority 0.4).  Once a usage/spend
+        # cap rejection is seen, every subsequent translate routes straight to
+        # Ollama — no more wasted capped Claude round-trips for the rest of the
+        # session.  Mirrors the intent classifier's _claude_capped latch.
+        self._claude_capped: bool = False
+
     # ── Public ─────────────────────────────────────────────────────────────────
 
     def translate(self, user_input: str, session: SessionState) -> Dict[str, Any]:
@@ -1348,6 +1354,12 @@ class CommandTranslator:
         - active backend == "ollama" (forced/benchmark): NEVER falls back to
           Claude; its error surfaces (benchmark honesty).
         """
+        # Cap latch: once a usage cap was seen this session, skip Claude entirely
+        # and go straight to Ollama (no dangling user turn to pop — ClaudeBackend
+        # was never called this turn, so route directly without _fall_back_to_ollama).
+        if self._claude_capped and self._may_fall_back():
+            return make_backend("ollama").translate(self, user_input, session)
+
         try:
             return self._backend.translate(self, user_input, session)
         except _CLAUDE_FALLBACK_ERRORS as exc:
@@ -1360,6 +1372,7 @@ class CommandTranslator:
             # other 400 (a real malformed request) re-raises and surfaces.
             if not (is_usage_cap_error(exc) and self._may_fall_back()):
                 raise
+            self._claude_capped = True   # latch — skip Claude for the rest of the session
             return self._fall_back_to_ollama(user_input, session, "usage-limit cap")
 
     def _may_fall_back(self) -> bool:
