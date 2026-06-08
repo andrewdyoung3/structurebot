@@ -1,7 +1,0 @@
-open 2d31
-lose the sticks
-get rid of the balls on chain A
-show the balls on chain A
-ditch the surface
-binding surface
-the surface of the dimer

@@ -1,2 +1,0 @@
-﻿open 2d31
-show the balls on chain A

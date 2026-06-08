@@ -1,2 +1,0 @@
-open 2d31
-scan double mutants on residues 1-3 of chain A

@@ -19,3 +19,5 @@ scripts/eval_3dim_*/
 
 # one-off probe/exploration scripts
 scripts/probe_*.py
+_live_*.txt
+live_test_*.txt
