@@ -275,3 +275,63 @@ class TestTranslationErrorBackstop:
 
         bot._report_translation_decline.assert_called_once()
         bot.router.route.assert_not_called()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# _execute_commands — emission guard (FIX 1)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestExecuteCommandsEmissionGuard:
+    """
+    Verify origin-based emission guard in _execute_commands:
+      - origin="tool_viz"     → trusted; rep-shaped commands reach bridge
+      - origin="translation"  → guarded; rep-shaped commands blocked before bridge
+    """
+
+    @staticmethod
+    def _ok_result(cmd: str) -> dict:
+        return {"command": cmd, "result": {"value": "ok", "error": None}}
+
+    def test_tool_viz_origin_bypasses_guard(self):
+        """Rep-shaped commands from ColabFold / double-mutant must reach bridge."""
+        bot = _make_mock_bot()
+        cmds = ["cartoon #1", "show #1/A atoms", "style #1/A sphere"]
+        bot.bridge.run_commands.return_value = [self._ok_result(c) for c in cmds]
+
+        ok, failed, err = bot._execute_commands(cmds, origin="tool_viz")
+
+        assert ok is True
+        assert failed is None
+        bot.bridge.run_commands.assert_called_once_with(cmds)
+
+    def test_translation_origin_blocks_rep_command(self):
+        """A free-translated rep-shaped command must be blocked before bridge."""
+        bot = _make_mock_bot()
+
+        ok, failed, err = bot._execute_commands(["hide #1 spheres"], origin="translation")
+
+        assert ok is False
+        assert failed == "hide #1 spheres"
+        assert "emission guard" in err.lower() or "blocked" in err.lower()
+        bot.bridge.run_commands.assert_not_called()
+
+    def test_translation_origin_default_blocks_rep_command(self):
+        """Default origin is 'translation', so omitting origin also triggers guard."""
+        bot = _make_mock_bot()
+
+        ok, failed, err = bot._execute_commands(["style #1 sphere"])
+
+        assert ok is False
+        assert failed == "style #1 sphere"
+        bot.bridge.run_commands.assert_not_called()
+
+    def test_translation_origin_allows_non_rep_commands(self):
+        """Non-representation commands pass through guard regardless of origin."""
+        bot = _make_mock_bot()
+        cmds = ["color #1 red", "open 1hsg"]
+        bot.bridge.run_commands.return_value = [self._ok_result(c) for c in cmds]
+
+        ok, failed, err = bot._execute_commands(cmds, origin="translation")
+
+        assert ok is True
+        bot.bridge.run_commands.assert_called_once_with(cmds)

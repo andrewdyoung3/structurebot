@@ -315,6 +315,7 @@ class ChimeraXBridge:
                 "syntax error",
                 "No such",
                 "Command failed",
+                "Expected",      # "Expected a collection of…", "Expected an atoms specifier…"
             )
             if any(val.startswith(p) for p in _ERROR_PREFIXES):
                 data["error"] = val

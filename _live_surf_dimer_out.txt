@@ -1,0 +1,87 @@
+﻿┌─────────────────────────────────────────────────────────────────────────────┐
+│  StructureBot — Natural Language Interface for UCSF ChimeraX                │
+│                                                                             │
+│    Example prompts:                                                         │
+│      Open 1HSG and show it as a cartoon                                     │
+│      Color each chain a different color                                     │
+│      Show the ligand as spheres and color it by element                     │
+│      Find all residues within 4 Å of the ligand                             │
+│      Save a publication-quality image to my desktop as figure1.png          │
+│      Run CamSol solubility analysis on the loaded structure                 │
+│      Color the structure by evolutionary conservation (ESM-2)               │
+│      Calculate ddG for mutation V82A in chain A                             │
+│      Suggest mutations to improve solubility of chain A                     │
+│      Suggest mutations avoiding chain interfaces                            │
+│      Show me the interface between chains A and B                           │
+│      Suggest disulfide bonds to stabilise the dimer                         │
+│                                                                             │
+│    Type help for more examples or quit to exit.                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+ChimeraX: C:\Users\andre\documents\ChimeraX 1.11.1\bin\ChimeraX.exe
+✓ Connected to ChimeraX at http://127.0.0.1:60001/
+✓ Ping OK (23.1 ms) — UCSF ChimeraX version: 1.11.1 (2026-01-2
+✓ Rosetta: local (PyRosetta via WSL2) — publication quality
+
+Running script: _live_surf_dimer.txt (2 command(s))
+
+── ﻿open 2d31 ──
+python : [translator] Claude API failure (usage-limit cap); falling back to the local 
+Ollama backend.
+At line:17 char:28
++ ... ut = echo "n`nn`n" | python -X utf8 main.py --script $sf 2>&1 | Out-S ...
++                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([translator] Cl...Ollama backend.:String)  
+   [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  [chain-scope] 'open 2d31 /no_think' -> 'open 2d31 (/no & ~ligand & ~solvent & ~ions)_think'
+
+                      Proposed Commands  confidence: high                      
+┌─────┬────────────────────────────────────────────────┬──────────────────────┐
+│ #   │ Command                                        │ What it does         │
+├─────┼────────────────────────────────────────────────┼──────────────────────┤
+│ 1   │ open 2d31 (/no & ~ligand & ~solvent &          │ Fetch 2D31 from RCSB │
+│     │ ~ions)_think                                   │                      │
+└─────┴────────────────────────────────────────────────┴──────────────────────┘
+  Auto-executing in 2s… (press any key to pause, ESC to cancel)  Auto-executing in 1s… (press any key to pause, ESC to cancel)
+
+  ✓ open 2d31 (/no & ~ligand & ~solvent & ~ions)_think → '(/no' has no suffix
+
+  Completed 1 command(s).
+  ✓ 2D31 → hetero-3mer (A+B+C), 3.2Å resolution
+
+── the surface of the dimer ──
+[translator] Claude API failure (usage-limit cap); falling back to the local Ollama 
+backend.
+
+                       Proposed Commands  confidence: high                     
+┌─────┬──────────────────────────────────────┬─────────────────────────────────
+│ #   │ Command                              │ What it does                    
+├─────┼──────────────────────────────────────┼─────────────────────────────────
+│ 1   │ surface #1                           │ Show solvent-accessible surface 
+│     │                                      │ for the entire dimer            
+├─────┼──────────────────────────────────────┼─────────────────────────────────
+│ 2   │ style surface mesh                   │ Style the surface as a mesh     
+├─────┼──────────────────────────────────────┼─────────────────────────────────
+│ 3   │ color surface bychain                │ Color the surface by chain      
+├─────┼──────────────────────────────────────┼─────────────────────────────────
+│ 4   │ view                                 │ Fit the view to the surface     
+└─────┴──────────────────────────────────────┴─────────────────────────────────
+  Auto-executing in 2s… (press any key to pause, ESC to cancel)  Auto-executing in 1s… (press any key to pause, ESC to cancel)
+
+  ✗ Blocked (emission guard): surface #1
+      Representation command 'surface #1' blocked — use a representation phrase
+(cartoon/sticks/surface/…) so it routes via the render layer.
+
+Asking for a corrected command…
+[translator] Claude API failure (usage-limit cap); falling back to the local Ollama 
+backend.
+Couldn't auto-correct — error: Representation command 'surface #1' blocked — 
+use a representation phrase (cartoon/sticks/surface/…) so it routes via the 
+render layer.
+Correction re-proposed the same command or was blocked by a validation guard.  
+Try rephrasing your request.
+
+✓ Script complete — session saved.
+

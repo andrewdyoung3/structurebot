@@ -102,6 +102,9 @@ _GPU_BRIDGE_TOOLS = frozenset({
     "validate_design", "esmfold", "esm",
 })
 
+# Representation classifier — created once so _claude_capped latch persists across calls
+_repr_classify_fn = None
+
 
 class ToolRouter:
     """
@@ -145,6 +148,7 @@ class ToolRouter:
         "colabfold":             "🧬🔮",
         "validate_design":       "🧬✅",
         "conformer_comparison":  "🔄",
+        "representation":        "🖼️",
     }
 
     # Conformer-comparison intent keywords.  Specific enough to avoid false
@@ -602,6 +606,10 @@ class ToolRouter:
         self._double_mutant_bridge:    Optional[Any] = None
         self._colabfold_bridge:        Optional[Any] = None
 
+        # Per-target representation snapshots keyed by ChimeraX spec string (e.g. "#1")
+        # Each value is a list of restore commands captured before the last render.
+        self._repr_snapshots:          Dict[str, List[str]] = {}
+
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
     # ── Cavity intent helpers ─────────────────────────────────────────────────
@@ -863,6 +871,28 @@ class ToolRouter:
         # full-replace has claimed, because their target tool is no longer present.)
         _claimed     = False
         _ba_intent   = False  # bio-assembly generation override (set below)
+        _repr_intent = False  # viewer representation override (set below)
+        _repr_key    = None
+
+        # ── Viewer representation intent override (FIRST — highest priority) ────
+        # Fires before ALL analysis-tool overrides because representation is
+        # orthogonal: "show cartoon" cannot mean "run a mutation scan".
+        # detect_category_phrase() uses the broad viewer vocabulary; alias
+        # resolution populates intent_key up front; LLM tier runs in execute().
+        # Translator-emitted commands are cleared (rendered deterministically).
+        if user_input:
+            from intent_registry import VIEWER_REGISTRY as _vreg
+            if _vreg.detect_category_phrase(user_input):
+                _repr_key    = _vreg.resolve_alias(user_input)  # None → LLM in execute
+                tools_needed = ["representation"]
+                tool_inputs  = {
+                    "representation": {
+                        "_user_input": user_input,
+                        "intent_key":  _repr_key,
+                    }
+                }
+                _repr_intent = True
+                _claimed     = True
 
         # ── Validate-design meta-tool override ─────────────────────────────────
         # Checked FIRST: "validate design" appears in _MPNN_ESMFOLD_KEYWORDS too,
@@ -1210,6 +1240,11 @@ class ToolRouter:
         if _glycan_intent or _glycan_positions_intent or _netnglyc_intent:
             result["clarification_needed"] = None
 
+        # Representation: clear translator-emitted commands — rendered deterministically.
+        if _repr_intent:
+            result["commands"]     = []
+            result["explanations"] = []
+
         # Bio-assembly: clear any translator-emitted commands (e.g. a re-open) —
         # the sym command is issued from within _run_bio_assembly, not from the
         # commands list; a spurious re-open would duplicate the AU model.
@@ -1264,6 +1299,15 @@ class ToolRouter:
         if tool == "chimerax":
             n = len(result.get("commands", []))
             return f"Execute {n} ChimeraX command(s)"
+        if tool == "representation":
+            inp = tool_inputs.get("representation", {})
+            key = inp.get("intent_key")
+            if key:
+                from intent_registry import VIEWER_REGISTRY as _vreg
+                defn = _vreg.get_defn(key)
+                desc = defn.description if defn else key
+                return f"Viewer representation: {desc} (deterministic render)"
+            return "Viewer representation (resolving intent…)"
         if tool == "bio_assembly":
             inp   = tool_inputs.get("bio_assembly", {})
             mid   = inp.get("model_id") or self._primary_model_id()
@@ -1603,6 +1647,8 @@ class ToolRouter:
                 return self._run_validate_design(inputs, user_input=user_input)
             if tool == "conformer_comparison":
                 return self._run_conformer_comparison(inputs, user_input=user_input)
+            if tool == "representation":
+                return self._run_representation(inputs, user_input=user_input)
             if tool == "bio_assembly":
                 return self._run_bio_assembly(inputs, user_input=user_input)
             if tool == "interface_stabilization":
@@ -6415,6 +6461,198 @@ class ToolRouter:
             status["rosetta_local"] = "wsl_bridge module not found"
 
         return status
+
+    # ── Representation (Intent/Render separation — viewer instance) ────────────
+
+    def _snapshot_repr(self, spec: str, bridge: Any) -> List[str]:
+        """
+        Probe current representation state for *spec* via runscript; return restore commands.
+        Returns [] on any failure — undo simply won't be available for that step.
+        """
+        if bridge is None:
+            return []
+        model_root = spec.lstrip("#").split("/")[0].split(".")[0]
+        script = (
+            "from chimerax.atomic import all_atomic_structures\n"
+            "for m in all_atomic_structures(session):\n"
+            f"    if m.id_string.startswith('{model_root}'):\n"
+            "        atoms_shown   = bool(m.atoms.displays.any())\n"
+            "        cartoon_shown = bool(m.residues.ribbon_displays.any())\n"
+            "        modes = list(m.atoms.draw_modes)\n"
+            "        mode  = max(set(modes), key=modes.count) if modes else 1\n"
+            "        print(f'{atoms_shown},{cartoon_shown},{mode}')\n"
+            "        break\n"
+        )
+        try:
+            import tempfile as _tmp, os as _os
+            fd, path = _tmp.mkstemp(suffix=".py")
+            try:
+                with _os.fdopen(fd, "w") as f:
+                    f.write(script)
+                r = bridge.run_command(f"runscript {path}")
+            finally:
+                try:
+                    _os.unlink(path)
+                except OSError:
+                    pass
+            val = (r.get("value") or "").strip()
+            if "," not in val:
+                return []
+            parts = val.split(",", 2)
+            if len(parts) < 3:
+                return []
+            atoms_shown   = parts[0].strip().lower() == "true"
+            cartoon_shown = parts[1].strip().lower() == "true"
+            mode          = int(parts[2].strip()) if parts[2].strip().isdigit() else 1
+            _style_map    = {0: "sphere", 1: "stick", 2: "ball"}
+            cmds: List[str] = []
+            if atoms_shown:
+                cmds.append(f"show {spec} atoms")
+                cmds.append(f"style {spec} {_style_map.get(mode, 'stick')}")
+            else:
+                cmds.append(f"hide {spec} atoms")
+            if cartoon_shown:
+                cmds.append(f"show {spec} cartoons")
+            else:
+                cmds.append(f"hide {spec} cartoons")
+            return cmds
+        except Exception:
+            return []
+
+    def _run_representation(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """
+        Deterministic viewer representation handler.
+
+        Resolution pipeline (intent_registry):
+          (a) alias match   — instant; 100% for listed phrases
+          (b) LLM classifier — constrained to return a LABEL (or "none"), never syntax
+          (c) graceful miss  — lists available intents and asks user to rephrase
+
+        Commands are executed via bridge.run_command() directly and verified
+        via post-command probe.  viz_commands=[] (already run); summary carries result.
+        """
+        from intent_registry import VIEWER_REGISTRY, make_llm_classify_fn
+
+        user_input = user_input or inputs.get("_user_input", "")
+        intent_key = inputs.get("intent_key")   # pre-resolved by route() alias match
+        model_id   = str(inputs.get("model_id") or self._primary_model_id())
+        spec       = f"#{model_id}"
+        resolution = "alias"
+
+        # Tier (b): LLM constrained classifier — fires when alias match missed
+        if intent_key is None:
+            global _repr_classify_fn
+            if _repr_classify_fn is None:
+                _repr_classify_fn = make_llm_classify_fn()
+            classify = _repr_classify_fn
+            labels   = VIEWER_REGISTRY.list_intent_keys("view")
+            intent_key, resolution = VIEWER_REGISTRY.resolve(
+                user_input,
+                llm_classify_fn=lambda t, ls: classify(t, ls),
+            )
+
+        # Tier (c): graceful miss
+        if intent_key is None:
+            miss_msg = VIEWER_REGISTRY.graceful_miss_message(user_input, "view")
+            return ToolStepResult(
+                tool    = "representation",
+                success = False,
+                error   = miss_msg,
+            )
+
+        # ── Undo/revert special case ───────────────────────────────────────────
+        if intent_key == "view.undo_representation":
+            restore_cmds = self._repr_snapshots.get(spec)
+            if not restore_cmds:
+                return ToolStepResult(
+                    tool    = "representation",
+                    success = False,
+                    error   = (
+                        f"No prior representation state recorded for {spec}. "
+                        "Apply a representation change first, then use undo/revert."
+                    ),
+                )
+            if self.bridge is None:
+                return ToolStepResult(
+                    tool="representation", success=False,
+                    error="ChimeraX bridge unavailable.",
+                )
+            for cmd in restore_cmds:
+                r = self.bridge.run_command(cmd)
+                if r.get("error"):
+                    return ToolStepResult(
+                        tool    = "representation",
+                        success = False,
+                        error   = f"Undo failed: {cmd!r} → {r['error']}",
+                    )
+            del self._repr_snapshots[spec]
+            return ToolStepResult(
+                tool    = "representation",
+                success = True,
+                summary = f"Reverted representation for {spec}",
+                viz_commands     = [],
+                viz_explanations = [],
+                data = {"intent_key": "view.undo_representation", "spec": spec},
+            )
+
+        # Render layer — single source of truth for syntax
+        commands = VIEWER_REGISTRY.render(intent_key, spec)
+        defn     = VIEWER_REGISTRY.get_defn(intent_key)
+
+        if self.bridge is None:
+            return ToolStepResult(
+                tool="representation", success=False,
+                error="ChimeraX bridge unavailable.",
+            )
+
+        # Snapshot BEFORE executing render commands — enables one-level undo
+        snapshot = self._snapshot_repr(spec, self.bridge)
+        if snapshot:
+            self._repr_snapshots[spec] = snapshot
+
+        # Execute commands — bridge._ERROR_PREFIXES catches "Expected …" and others
+        executed: List[str] = []
+        for cmd in commands:
+            r = self.bridge.run_command(cmd)
+            if r.get("error"):
+                return ToolStepResult(
+                    tool    = "representation",
+                    success = False,
+                    error   = (
+                        f"Command failed ({resolution}-resolved {intent_key!r}): "
+                        f"{cmd!r} → {r['error']}"
+                    ),
+                )
+            executed.append(cmd)
+
+        # Post-command verify guard
+        verify_ok = VIEWER_REGISTRY.verify(intent_key, spec, self.bridge)
+        verify_note = ""
+        if verify_ok is False:
+            verify_note = " [⚠ verify: display state may not have changed]"
+
+        desc    = defn.description if defn else intent_key
+        cmd_str = "; ".join(executed)
+        return ToolStepResult(
+            tool    = "representation",
+            success = True,
+            summary = (
+                f"Applied {desc} ({resolution}-resolved){verify_note}\n"
+                f"Commands: {cmd_str}"
+            ),
+            viz_commands     = [],   # already executed above
+            viz_explanations = [],
+            data = {
+                "intent_key": intent_key,
+                "spec":       spec,
+                "resolution": resolution,
+                "commands":   executed,
+            },
+        )
 
     def __repr__(self) -> str:
         extra = [t for t in (self._camsol_bridge, self._esm_bridge, self._proteinmpnn_bridge)
