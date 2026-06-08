@@ -668,7 +668,9 @@ class StructureBot:
         # For covered ops, the intent registry resolves and renders deterministically;
         # the translator is not invoked at all (§0 Intent/Render separation principle).
         # Uncovered requests fall through to the normal translation path below.
-        from intent_registry import VIEWER_REGISTRY as _vreg
+        from intent_registry import (
+            VIEWER_REGISTRY as _vreg, COLOR_REGISTRY as _creg,
+        )
         if _vreg.detect_category_phrase(user_input):
             _repr_key = _vreg.resolve_alias(user_input)  # None → LLM tier in execute()
             result = {
@@ -682,6 +684,22 @@ class StructureBot:
                     "representation": {
                         "_user_input": user_input,
                         "intent_key":  _repr_key,
+                    }
+                },
+            }
+        elif _creg.detect_category_phrase(user_input, "color"):
+            _color_key = _creg.resolve_alias(user_input)  # None → LLM/solid in execute()
+            result = {
+                "commands":             [],
+                "explanations":         [],
+                "warnings":             [],
+                "clarification_needed": None,
+                "confidence":           "high",
+                "tools_needed":         ["color"],
+                "tool_inputs":          {
+                    "color": {
+                        "_user_input": user_input,
+                        "intent_key":  _color_key,
                     }
                 },
             }

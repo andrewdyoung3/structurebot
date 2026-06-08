@@ -170,6 +170,14 @@ class IntentRegistry:
             if self.resolve_alias(text) is not None:
                 return True
             return _representation_noun_floor(low)
+        if category == "color":
+            # Conservative: gate ONLY on the color floor (an explicit color verb
+            # or "rainbow").  Unlike viewer, color scheme aliases ("by chain",
+            # "bfactor", "by element") are common non-color substrings, so an
+            # alias match is NOT treated as authoritative here — it would gate
+            # "align the chains by chain order".  Once gated, resolve_alias picks
+            # the specific scheme.
+            return _color_category_floor(text.lower())
         low = text.lower()
         triggers = _CATEGORY_TRIGGERS.get(category, ())
         return any(t in low for t in triggers)
@@ -355,19 +363,61 @@ def _probe_atom_count(spec: str, bridge: Any) -> Optional[int]:
 
 # ── LLM classifier factory ────────────────────────────────────────────────────
 
-def make_llm_classify_fn(backend_name: Optional[str] = None) -> Callable:
+# Per-category task blocks for the constrained classifier prompt.  Each block
+# states the classification question, any direction rules, and the uncovered/none
+# escape hatches.  _build_prompt() appends the labelled intent list after it.
+_VIEWER_TASK_BLOCK = (
+    "Which viewer representation intent best matches?\n"
+    "Direction rules:\n"
+    "  HIDE: 'lose', 'get rid of', 'remove', 'ditch', 'hide' "
+    "→ view.hide_atoms (sticks/balls/spheres), view.hide_cartoon, or view.hide_surface.\n"
+    "  SHOW: 'show', 'display', 'reveal' + a rep noun "
+    "→ use the matching show intent (e.g. 'show the balls' → view.spacefill).\n"
+    "IMPORTANT: there is no view.hide_sticks, view.hide_balls, "
+    "view.hide_spheres, or view.hide_surface_area.\n"
+    "Reply with ONLY the exact key string, nothing else.\n"
+    "Use 'uncovered' if about representation but no intent matches.\n"
+    "Use 'none' if NOT a representation request."
+)
+
+_COLOR_TASK_BLOCK = (
+    "Which coloring intent best matches?\n"
+    "Schemes:\n"
+    "  color.by_chain      — give each chain a distinct color.\n"
+    "  color.by_element    — color all atoms by chemical element (CPK).\n"
+    "  color.by_heteroatom — color only non-carbon atoms by element.\n"
+    "  color.rainbow       — spectrum gradient from N to C terminus.\n"
+    "  color.by_attribute  — color by per-atom B-factor / temperature factor.\n"
+    "  color.solid         — apply a single named color (e.g. red, blue).\n"
+    "Reply with ONLY the exact key string, nothing else.\n"
+    "Use 'uncovered' if about coloring but no intent matches.\n"
+    "Use 'none' if NOT a coloring request."
+)
+
+
+def make_llm_classify_fn(
+    backend_name: Optional[str] = None,
+    registry:     Optional["IntentRegistry"] = None,
+    task_block:   Optional[str] = None,
+) -> Callable:
     """
     Create a constrained LLM classifier for tier (b) resolution.
 
     Returns callable: (text: str, labels: List[str]) -> Optional[str].
-    The callable returns a valid intent key, "uncovered" (representation-category
-    but no specific match), or None — NEVER syntax.
+    The callable returns a valid intent key, "uncovered" (category matched but no
+    specific match), or None — NEVER syntax.
+
+    *registry*/*task_block* default to the viewer registry + viewer direction
+    rules (backward compatible); a new op-class passes its own registry and task
+    block (e.g. COLOR_REGISTRY + _COLOR_TASK_BLOCK).
 
     Backend: tries the configured TRANSLATOR_BACKEND first; falls back to Ollama
     on any failure (e.g. API cap).  The Ollama call uses `think: false` at the
     TOP LEVEL of the request body — required for qwen3; NOT inside options{}.
     """
     import config as _cfg
+    _reg          = registry if registry is not None else VIEWER_REGISTRY
+    _task         = task_block if task_block is not None else _VIEWER_TASK_BLOCK
     _backend      = backend_name or getattr(_cfg, "TRANSLATOR_BACKEND", "claude")
     _ollama_model = os.environ.get("OLLAMA_MODEL", getattr(_cfg, "OLLAMA_MODEL", "qwen3:8b"))
     _ollama_url   = (
@@ -379,23 +429,13 @@ def make_llm_classify_fn(backend_name: Optional[str] = None) -> Callable:
     def _build_prompt(text: str, all_labels: List[str]) -> str:
         lines = []
         for lbl in all_labels:
-            defn = VIEWER_REGISTRY._intents.get(lbl)
+            defn = _reg._intents.get(lbl)
             desc = f" — {defn.description}" if defn else ""
             lines.append(f"  {lbl}{desc}")
         label_list = "\n".join(lines)
         return (
             f'User request: "{text}"\n\n'
-            "Which viewer representation intent best matches?\n"
-            "Direction rules:\n"
-            "  HIDE: 'lose', 'get rid of', 'remove', 'ditch', 'hide' "
-            "→ view.hide_atoms (sticks/balls/spheres), view.hide_cartoon, or view.hide_surface.\n"
-            "  SHOW: 'show', 'display', 'reveal' + a rep noun "
-            "→ use the matching show intent (e.g. 'show the balls' → view.spacefill).\n"
-            "IMPORTANT: there is no view.hide_sticks, view.hide_balls, "
-            "view.hide_spheres, or view.hide_surface_area.\n"
-            "Reply with ONLY the exact key string, nothing else.\n"
-            "Use 'uncovered' if about representation but no intent matches.\n"
-            "Use 'none' if NOT a representation request.\n\n"
+            f"{_task}\n\n"
             f"Valid intents:\n{label_list}"
         )
 
@@ -645,4 +685,187 @@ VIEWER_REGISTRY.register(IntentDef(
         "cancel the representation change",
     ),
     render_fn   = lambda spec: [],  # Overridden in _run_representation; never called directly
+))
+
+
+# ── Color op-class (PART: Priority 0.5 migration) ─────────────────────────────
+# Conservative category gate + named-color extraction + the probe-verified color
+# render registry.  Mirrors the viewer op-class.  Chain-scoped colors reuse the
+# translator chain-scope guard (`& ~ligand & ~solvent & ~ions`) in _run_color so
+# "color chain A red" never bleeds onto a chain's ligand/solvent/ions.
+
+# Color verbs: color/colour/recolor/recolour/coloring/coloured/… and the
+# unambiguous "rainbow" coloring command.  Conservative — require an explicit
+# color verb (or "rainbow") so analysis phrases like "by chain alignment" or
+# "the B-factor distribution" do not falsely gate.
+_COLOR_VERB_RE = re.compile(r"\b(?:re)?colou?r(?:s|ed|ing)?\b", re.IGNORECASE)
+_RAINBOW_RE    = re.compile(r"\brainbow\b", re.IGNORECASE)
+
+# Sub-chain selection qualifiers the color op-class CANNOT render (it only targets
+# a whole chain or the whole model).  When any of these is present the phrase is
+# NOT gated to the op-class — it falls through to guarded free-translation, which
+# can build the residue/region selection.  This keeps the op-class to the simple
+# cases ("color chain A red", "color by chain", "rainbow") and prevents capturing
+# compound requests like "color the proline residues" / "color the binding pocket".
+_COLOR_COMPLEX_RE = re.compile(
+    r"\bresidues?\b"
+    r"|\b\d+\s*[-–]\s*\d+\b"                       # a residue-number range (20-30)
+    r"|:\s*\d"                                      # an explicit residue spec (:25)
+    r"|\b(?:pocket|site|interface|loop|helix|helices|sheet|strand|domain|motif"
+    r"|patch|cleft|groove|terminus|termini|backbone|side\s?chain|sidechains?"
+    r"|core|active|binding)\b"                      # named regions
+    r"|\b(?:hydrophobic|hydrophilic|charged|polar|nonpolar|apolar|buried|exposed"
+    r"|conserved|aromatic|acidic|basic)\b"          # residue properties
+    r"|\b(?:ala|arg|asn|asp|cys|gln|glu|gly|his|ile|leu|lys|met|phe|pro|ser|thr"
+    r"|trp|tyr|val|alanines?|arginines?|asparagines?|aspartates?|cysteines?"
+    r"|glutamines?|glutamates?|glycines?|histidines?|isoleucines?|leucines?"
+    r"|lysines?|methionines?|phenylalanines?|prolines?|serines?|threonines?"
+    r"|tryptophans?|tyrosines?|valines?)\b",        # specific residue types
+    re.IGNORECASE,
+)
+
+
+def _color_category_floor(low: str) -> bool:
+    """
+    Conservative gate for the color op-class.  True iff the phrase contains an
+    explicit color verb (color/colour/recolor/…) or the standalone "rainbow"
+    coloring command, AND has no sub-chain selection qualifier the op-class
+    cannot render (residue type/range, named region, property).  Scheme phrases
+    alone ("by chain", "by element") do NOT gate without a color verb — they are
+    too ambiguous.  Compound/narrow requests fall through to free-translation.
+    """
+    if not (_COLOR_VERB_RE.search(low) or _RAINBOW_RE.search(low)):
+        return False
+    if _COLOR_COMPLEX_RE.search(low):
+        return False
+    return True
+
+
+# Named colors recognised for color.solid.  Multi-word names listed FIRST so the
+# longest match wins ("cornflower blue" before "blue").  All verified to be valid
+# ChimeraX color names.
+_NAMED_COLORS_MULTI: tuple = (
+    "cornflower blue", "light blue", "sky blue", "steel blue", "dark blue",
+    "navy blue", "powder blue", "royal blue", "slate blue", "dodger blue",
+    "light green", "dark green", "forest green", "sea green", "lime green",
+    "light gray", "light grey", "dark gray", "dark grey", "slate gray",
+    "slate grey", "hot pink", "deep pink", "light pink", "light yellow",
+    "dark red", "dark orange", "medium purple",
+)
+_NAMED_COLORS_SINGLE: frozenset = frozenset([
+    "red", "green", "blue", "yellow", "orange", "purple", "magenta", "cyan",
+    "pink", "white", "black", "gray", "grey", "brown", "violet", "indigo",
+    "teal", "navy", "lime", "gold", "silver", "salmon", "tan", "maroon",
+    "olive", "coral", "crimson", "khaki", "plum", "orchid", "turquoise",
+    "beige", "lavender", "ivory", "chocolate", "tomato", "wheat",
+    "goldenrod", "firebrick", "sienna",
+])
+
+
+def extract_named_color(text: str) -> Optional[str]:
+    """
+    Extract a recognised named color from *text* (for color.solid).  Multi-word
+    names take precedence over single-word.  Returns the color name (lowercase,
+    space-preserved for multi-word) or None.
+    """
+    low = text.lower()
+    for name in _NAMED_COLORS_MULTI:
+        if re.search(r"\b" + re.escape(name) + r"\b", low):
+            return name
+    for word in re.findall(r"[a-z]+", low):
+        if word in _NAMED_COLORS_SINGLE:
+            return word
+    return None
+
+
+# Probe-verified command syntax (STEP 0 — ChimeraX 1.11.1, 1HSG; spec-FIRST):
+#   color #1 bychain                                   → OK
+#   color #1 byelement                                 → OK (all atoms by element)
+#   color #1 byhetero                                  → OK (non-carbon by element)
+#   rainbow #1                                         → OK (spectrum N→C)
+#   color byattribute bfactor #1 palette blue:white:red→ OK (bfactor only)
+#   color #1/A red                                     → OK (named color)
+#   Scoped (chain) forms ALL parse and exclude ligand/solvent/ions:
+#   color (#1/A & ~ligand & ~solvent & ~ions) red      → solvent/ligand NOT colored
+#   color (#1/A & ~ligand & ~solvent & ~ions) bychain  → OK
+#   rainbow (#1/A & ~ligand & ~solvent & ~ions)        → OK
+#   color byattribute bfactor (#1/A & ~ligand & ~solvent & ~ions) palette … → OK
+# NOTE: scheme-FIRST forms ("color bychain #1") ERROR — do not use.
+#       hydrophobicity is NOT a built-in attribute → by_attribute = bfactor only.
+
+COLOR_REGISTRY = IntentRegistry()
+
+COLOR_REGISTRY.register(IntentDef(
+    name        = "color.by_chain",
+    category    = "color",
+    description = "give each chain a distinct color",
+    aliases     = (
+        "by chain", "bychain", "color by chain", "colour by chain",
+        "color the chains", "colour the chains", "color each chain",
+        "color chains", "colour chains", "color by chains",
+        "distinct chain colors", "distinct chain colours",
+        "color chains differently",
+    ),
+    render_fn   = lambda spec: [f"color {spec} bychain"],
+))
+
+COLOR_REGISTRY.register(IntentDef(
+    name        = "color.by_element",
+    category    = "color",
+    description = "color all atoms by chemical element (CPK)",
+    aliases     = (
+        "by element", "byelement", "color by element", "colour by element",
+        "element colors", "element colours", "cpk color", "cpk colour",
+        "cpk colors", "cpk colours", "color by atom type", "by atom type",
+        "color by atom", "color elements",
+    ),
+    render_fn   = lambda spec: [f"color {spec} byelement"],
+))
+
+COLOR_REGISTRY.register(IntentDef(
+    name        = "color.by_heteroatom",
+    category    = "color",
+    description = "color only non-carbon atoms by element (heteroatoms)",
+    aliases     = (
+        "by heteroatom", "byhetero", "by hetero", "color heteroatoms",
+        "colour heteroatoms", "color by heteroatom", "color hetero",
+        "heteroatom colors", "heteroatom colours",
+    ),
+    render_fn   = lambda spec: [f"color {spec} byhetero"],
+))
+
+COLOR_REGISTRY.register(IntentDef(
+    name        = "color.rainbow",
+    category    = "color",
+    description = "spectrum gradient from N to C terminus",
+    aliases     = (
+        "rainbow", "color rainbow", "colour rainbow", "rainbow colors",
+        "rainbow colours", "rainbow coloring", "rainbow colouring",
+        "spectrum coloring", "spectrum colouring", "rainbow by residue",
+        "n to c rainbow", "n-to-c rainbow",
+    ),
+    render_fn   = lambda spec: [f"rainbow {spec}"],
+))
+
+COLOR_REGISTRY.register(IntentDef(
+    name        = "color.by_attribute",
+    category    = "color",
+    description = "color by per-atom B-factor / temperature factor",
+    aliases     = (
+        "by bfactor", "by b-factor", "by b factor", "bfactor", "b-factor",
+        "color by bfactor", "colour by bfactor", "color by b-factor",
+        "by temperature factor", "by temp factor", "bfactor coloring",
+        "bfactor colouring", "by b-value", "by b value", "color by temperature",
+    ),
+    render_fn   = lambda spec: [
+        f"color byattribute bfactor {spec} palette blue:white:red"
+    ],
+))
+
+COLOR_REGISTRY.register(IntentDef(
+    name        = "color.solid",
+    category    = "color",
+    description = "apply a single named color (e.g. red, blue, cornflower blue)",
+    aliases     = (),   # resolved via extract_named_color() in _run_color, not alias
+    render_fn   = lambda spec: [],  # overridden in _run_color (needs the color value)
 ))

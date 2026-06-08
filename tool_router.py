@@ -105,6 +105,9 @@ _GPU_BRIDGE_TOOLS = frozenset({
 # Representation classifier — created once so _claude_capped latch persists across calls
 _repr_classify_fn = None
 
+# Color classifier — created once so the _claude_capped latch persists across calls
+_color_classify_fn = None
+
 
 class ToolRouter:
     """
@@ -149,6 +152,7 @@ class ToolRouter:
         "validate_design":       "🧬✅",
         "conformer_comparison":  "🔄",
         "representation":        "🖼️",
+        "color":                 "🎨",
     }
 
     # Conformer-comparison intent keywords.  Specific enough to avoid false
@@ -873,6 +877,8 @@ class ToolRouter:
         _ba_intent   = False  # bio-assembly generation override (set below)
         _repr_intent = False  # viewer representation override (set below)
         _repr_key    = None
+        _color_intent = False  # color op-class override (set below)
+        _color_key    = None
 
         # ── Viewer representation intent override (FIRST — highest priority) ────
         # Fires before ALL analysis-tool overrides because representation is
@@ -893,6 +899,26 @@ class ToolRouter:
                 }
                 _repr_intent = True
                 _claimed     = True
+
+        # ── Color op-class intent override ─────────────────────────────────────
+        # Orthogonal to analysis tools ("color chain A red" cannot mean a scan).
+        # Checked after representation (a phrase can't be both) and guarded by
+        # _claimed so it never clobbers a higher-precedence override.  Alias
+        # resolution populates intent_key up front; LLM/solid resolution runs in
+        # execute().  Translator-emitted commands are cleared (rendered here).
+        if user_input and not _claimed:
+            from intent_registry import COLOR_REGISTRY as _creg
+            if _creg.detect_category_phrase(user_input, "color"):
+                _color_key   = _creg.resolve_alias(user_input)  # None → LLM/solid in execute
+                tools_needed = ["color"]
+                tool_inputs  = {
+                    "color": {
+                        "_user_input": user_input,
+                        "intent_key":  _color_key,
+                    }
+                }
+                _color_intent = True
+                _claimed      = True
 
         # ── Validate-design meta-tool override ─────────────────────────────────
         # Checked FIRST: "validate design" appears in _MPNN_ESMFOLD_KEYWORDS too,
@@ -1245,6 +1271,12 @@ class ToolRouter:
             result["commands"]     = []
             result["explanations"] = []
 
+        # Color: clear translator-emitted commands — rendered deterministically
+        # (scoped) in _run_color so chain colors never bleed onto ligand/solvent.
+        if _color_intent:
+            result["commands"]     = []
+            result["explanations"] = []
+
         # Bio-assembly: clear any translator-emitted commands (e.g. a re-open) —
         # the sym command is issued from within _run_bio_assembly, not from the
         # commands list; a spurious re-open would duplicate the AU model.
@@ -1308,6 +1340,15 @@ class ToolRouter:
                 desc = defn.description if defn else key
                 return f"Viewer representation: {desc} (deterministic render)"
             return "Viewer representation (resolving intent…)"
+        if tool == "color":
+            inp = tool_inputs.get("color", {})
+            key = inp.get("intent_key")
+            if key:
+                from intent_registry import COLOR_REGISTRY as _creg
+                defn = _creg.get_defn(key)
+                desc = defn.description if defn else key
+                return f"Color: {desc} (deterministic render)"
+            return "Color (resolving intent…)"
         if tool == "bio_assembly":
             inp   = tool_inputs.get("bio_assembly", {})
             mid   = inp.get("model_id") or self._primary_model_id()
@@ -1649,6 +1690,8 @@ class ToolRouter:
                 return self._run_conformer_comparison(inputs, user_input=user_input)
             if tool == "representation":
                 return self._run_representation(inputs, user_input=user_input)
+            if tool == "color":
+                return self._run_color(inputs, user_input=user_input)
             if tool == "bio_assembly":
                 return self._run_bio_assembly(inputs, user_input=user_input)
             if tool == "interface_stabilization":
@@ -6649,6 +6692,150 @@ class ToolRouter:
             data = {
                 "intent_key": intent_key,
                 "spec":       spec,
+                "resolution": resolution,
+                "commands":   executed,
+            },
+        )
+
+    def _run_color(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """
+        Deterministic color handler (Intent/Render op-class — mirrors
+        _run_representation).
+
+        Resolution:
+          (a) scheme alias (by_chain/by_element/by_heteroatom/rainbow/by_attribute)
+          (b) color.solid — a recognised named color in the phrase
+          (c) LLM constrained classifier (label only, never syntax)
+          (d) graceful miss
+
+        Chain-scoped colors reuse the translator chain-scope guard
+        (`& ~ligand & ~solvent & ~ions`) so coloring a chain never bleeds onto its
+        ligand/solvent/ions (the payoff bug).  Whole-model targets are left
+        unscoped (coloring "everything" is the user's explicit intent).
+        """
+        from intent_registry import (
+            COLOR_REGISTRY, make_llm_classify_fn, extract_named_color,
+            _COLOR_TASK_BLOCK,
+        )
+        from translator import _scope_chain_refs_to_macromolecule
+
+        user_input = user_input or inputs.get("_user_input", "")
+        intent_key = inputs.get("intent_key")        # pre-resolved scheme alias, or None
+        model_id   = str(inputs.get("model_id") or self._primary_model_id())
+        resolution = "alias"
+
+        # Parse the target: an explicit chain ("chain A" / "/A") scopes to that
+        # chain; otherwise the whole model.  "each/every/all/both/per chain(s)"
+        # means the WHOLE model (and guards against the article "a" being read as
+        # chain A in "give each chain a separate shade").
+        chain = None
+        _ui = user_input or ""
+        if re.search(r"\b(?:each|every|all|both|per)\s+chains?\b", _ui, re.I):
+            chain = None
+        else:
+            m = re.search(r"\bchain\s+([A-Za-z0-9])\b", _ui, re.I)
+            if not m:
+                m = re.search(r"(?<![A-Za-z0-9])/([A-Za-z0-9])\b", _ui)
+            if m:
+                chain = m.group(1).upper()
+        spec = f"#{model_id}/{chain}" if chain else f"#{model_id}"
+
+        # color.solid carries a parsed color value (no alias tier).
+        color_name = None
+
+        # Tier (b)/(c): resolve when no scheme alias matched up front.
+        if intent_key is None:
+            color_name = extract_named_color(user_input)
+            if color_name is not None:
+                intent_key, resolution = "color.solid", "solid"
+            else:
+                global _color_classify_fn
+                if _color_classify_fn is None:
+                    _color_classify_fn = make_llm_classify_fn(
+                        registry=COLOR_REGISTRY, task_block=_COLOR_TASK_BLOCK,
+                    )
+                classify = _color_classify_fn
+                labels   = COLOR_REGISTRY.list_intent_keys("color")
+                intent_key, resolution = COLOR_REGISTRY.resolve(
+                    user_input,
+                    llm_classify_fn=lambda t, ls: classify(t, ls),
+                )
+                # LLM picked color.solid but no named color present → ask which.
+                if intent_key == "color.solid":
+                    color_name = extract_named_color(user_input)
+                    if color_name is None:
+                        return ToolStepResult(
+                            tool    = "color",
+                            success = False,
+                            error   = (
+                                "Which color? I detected a request to apply a solid "
+                                "color but no recognised color name (e.g. 'red', "
+                                "'blue', 'cornflower blue')."
+                            ),
+                        )
+
+        # Tier (d): graceful miss
+        if intent_key is None:
+            return ToolStepResult(
+                tool    = "color",
+                success = False,
+                error   = COLOR_REGISTRY.graceful_miss_message(user_input, "color"),
+            )
+
+        # Render layer — single source of truth for syntax
+        if intent_key == "color.solid":
+            commands = [f"color {spec} {color_name}"]
+        else:
+            commands = COLOR_REGISTRY.render(intent_key, spec)
+
+        # Chain-scope guard: rewrite a bare chain ref to exclude ligand/solvent/ions
+        # so chain colors never bleed.  (Whole-model `#N` specs are not rewritten.)
+        commands, _scope_notes = _scope_chain_refs_to_macromolecule(commands)
+
+        if self.bridge is None:
+            return ToolStepResult(
+                tool="color", success=False,
+                error="ChimeraX bridge unavailable.",
+            )
+
+        executed: List[str] = []
+        for cmd in commands:
+            r = self.bridge.run_command(cmd)
+            if r.get("error"):
+                return ToolStepResult(
+                    tool    = "color",
+                    success = False,
+                    error   = (
+                        f"Command failed ({resolution}-resolved {intent_key!r}): "
+                        f"{cmd!r} → {r['error']}"
+                    ),
+                )
+            executed.append(cmd)
+
+        defn    = COLOR_REGISTRY.get_defn(intent_key)
+        desc    = defn.description if defn else intent_key
+        if intent_key == "color.solid":
+            desc = f"solid color {color_name}"
+        target  = f"chain {chain}" if chain else "whole model"
+        cmd_str = "; ".join(executed)
+        return ToolStepResult(
+            tool    = "color",
+            success = True,
+            summary = (
+                f"Applied {desc} to {target} ({resolution}-resolved)\n"
+                f"Commands: {cmd_str}"
+            ),
+            viz_commands     = [],   # already executed above
+            viz_explanations = [],
+            data = {
+                "intent_key": intent_key,
+                "spec":       spec,
+                "chain":      chain,
+                "color_name": color_name,
                 "resolution": resolution,
                 "commands":   executed,
             },
