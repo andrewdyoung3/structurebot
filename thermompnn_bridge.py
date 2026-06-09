@@ -53,15 +53,41 @@ _THREE_TO_ONE: Dict[str, str] = {
     "TYR": "Y", "VAL": "V",
 }
 
-# Fraction of CSV rows whose wildtype must verify against the PDB before the
-# position→resnum map is trusted.  Below this the map is presumed wrong (e.g. a
-# parser-ordering edge) and the whole batch is dropped to not_computed.
-_MIN_MAP_VERIFY_RATE = 0.8
-
-
 def candidate_key(chain: str, resnum: int, wt: str, mut: str) -> str:
     """Chain-aware candidate key — never collides across chains in a multimer."""
     return f"{chain}:{wt}{resnum}{mut}"
+
+
+def ordered_chain_residues(pdb_path, chain):
+    """The chain's coordinate residues in AUTHOR order → [(resnum, icode, aa)].
+
+    SHARED by the scanner (seqindex→resnum spine) and the ThermoMPNN bridge
+    (WT-anchored alignment) so BOTH see the identical residue set + order — the
+    invariant that makes the alignment's resnum keys match the candidate keys.
+    Standard residues only; insertion-coded residues ARE included (author order:
+    base then insertion) so ThermoMPNN's extra insertion rows line up 1:1.
+    Empty on failure → callers use the legacy seqindex==resnum path.
+    """
+    if not pdb_path:
+        return []
+    try:
+        from Bio.PDB import PDBParser
+        structure = PDBParser(QUIET=True).get_structure("s", str(pdb_path))
+        model = next(iter(structure))
+        ch = chain or next(iter(model)).id
+        if ch not in [c.id for c in model]:
+            return []
+        out = []
+        for r in model[ch]:
+            het, resseq, icode = r.id
+            if het.strip():                    # skip HETATM / water / ligand
+                continue
+            one = _THREE_TO_ONE.get(r.resname.strip().upper())
+            if one:
+                out.append((int(resseq), (icode or "").strip(), one))
+        return out
+    except Exception:
+        return []
 
 
 class ThermoMPNNBridge:
@@ -121,11 +147,11 @@ class ThermoMPNNBridge:
             _log(f"  ThermoMPNN: {self.status()} — skipped (fast tier renormalises without it).")
             return {}, {}
 
-        # 1. PDB chain → {author_resnum: one_letter}, min author resnum.  Done
-        # FIRST (cheap): if the chain has no mappable standard residues there is
-        # nothing to attribute ddG to, so skip BEFORE spawning the GPU subprocess.
-        res_by_num, min_resnum = self._chain_residues(pdb_path, chain)
-        if not res_by_num:
+        # 1. The chain's ordered (resnum, icode, aa) list — the alignment spine
+        # (shared with the scanner).  Done FIRST (cheap): no residues → nothing to
+        # attribute → skip BEFORE the GPU subprocess.
+        ordered = ordered_chain_residues(pdb_path, chain)
+        if not ordered:
             _log("  ThermoMPNN: no mappable chain residues — skipped (no inference run).")
             return {}, {}
 
@@ -139,9 +165,9 @@ class ThermoMPNNBridge:
             _log("  ThermoMPNN produced no output — skipped.")
             return {}, {}
 
-        # 3. Parse CSV → (resnum, wt, mut) with wildtype VERIFICATION.
-        ddg_all: Dict[str, float] = {}
-        seen = verified = 0
+        # 3. Parse CSV → rows (position, wt, mut, ddg) + the per-position wildtype.
+        rows: List[Tuple[int, str, str, float]] = []
+        pos_wt: Dict[int, str] = {}
         try:
             with open(csv_path, newline="") as fh:
                 for row in csv.DictReader(fh):
@@ -153,22 +179,36 @@ class ThermoMPNNBridge:
                         ddg = float(row["ddG_pred"])
                     except (KeyError, ValueError, TypeError):
                         continue
-                    seen += 1
-                    resnum = min_resnum + pos          # author = position + min author
-                    if res_by_num.get(resnum) != wt:   # GUARD: never mis-attribute
-                        continue
-                    verified += 1
-                    ddg_all[candidate_key(chain, resnum, wt, mut)] = self._sign * ddg
+                    rows.append((pos, wt, mut, ddg))
+                    pos_wt.setdefault(pos, wt)
         except Exception as exc:
             _log(f"  ThermoMPNN: failed parsing output ({str(exc)[:120]}) — skipped.")
             return {}, {}
 
-        # 4. Map-trust guard: if too few rows verified, the map is suspect → drop all.
-        if seen and (verified / seen) < _MIN_MAP_VERIFY_RATE:
-            _log(f"  ThermoMPNN: position→resnum map unverified "
-                 f"({verified}/{seen} wildtypes matched) — dropping (not_computed) to "
-                 "avoid mis-attribution.")
+        # 4. WT-ANCHORED ALIGNMENT (exact across gaps AND insertion codes; no offset,
+        # no coincidence).  ThermoMPNN's present positions, in order, ARE the chain's
+        # residues in author order — so the k-th unique present position maps to the
+        # k-th ordered residue, REQUIRING the wildtype AA to match at each step.  Any
+        # length/AA divergence is a HARD ERROR (drop the whole batch to not_computed)
+        # — never a probabilistic pass, never a mis-attribution.
+        upos = sorted(pos_wt)
+        if len(upos) != len(ordered):
+            _log(f"  ThermoMPNN: alignment ABORTED — {len(upos)} predicted positions "
+                 f"vs {len(ordered)} structure residues (set divergence). not_computed.")
             return {}, {}
+        pos_to_resnum: Dict[int, int] = {}
+        for k, p in enumerate(upos):
+            rn, _ic, aa = ordered[k]
+            if pos_wt[p] != aa:
+                _log(f"  ThermoMPNN: alignment ABORTED — wildtype mismatch at residue "
+                     f"#{k} (predicted {pos_wt[p]} vs structure {aa}@{rn}). not_computed "
+                     "(never mis-attribute).")
+                return {}, {}
+            pos_to_resnum[p] = rn
+
+        ddg_all: Dict[str, float] = {}
+        for pos, wt, mut, ddg in rows:
+            ddg_all[candidate_key(chain, pos_to_resnum[pos], wt, mut)] = self._sign * ddg
 
         # 5. Select the requested candidates.
         ddg_out: Dict[str, float] = {}
@@ -179,7 +219,7 @@ class ThermoMPNNBridge:
                 ddg_out[k] = round(ddg_all[k], 4)
                 src_out[k] = "thermompnn"
         _log(f"  ThermoMPNN: {len(ddg_out)}/{len(candidates)} candidate ddG(s) "
-             f"(map verified {verified}/{seen}).")
+             f"(WT-anchored alignment over {len(ordered)} residues).")
         return ddg_out, src_out
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -206,26 +246,3 @@ class ThermoMPNNBridge:
         pdb_id = Path(pdb_path).stem
         out = Path(out_dir) / f"ThermoMPNN_inference_{pdb_id}.csv"
         return str(out) if out.is_file() else None
-
-    @staticmethod
-    def _chain_residues(pdb_path: str, chain: str) -> Tuple[Dict[int, str], int]:
-        """{author_resnum: one_letter} for standard residues of *chain*, + min resnum.
-        Hetero/water and insertion-coded residues are skipped (the latter are an
-        alt_parse_PDB edge the wildtype guard will catch)."""
-        res: Dict[int, str] = {}
-        try:
-            from Bio.PDB import PDBParser
-            structure = PDBParser(QUIET=True).get_structure("s", pdb_path)
-            model = next(iter(structure))
-            if chain not in [c.id for c in model]:
-                return {}, 0
-            for r in model[chain]:
-                het, resseq, icode = r.id
-                if het.strip() or (icode and icode.strip()):
-                    continue                       # skip hetero + insertion codes
-                one = _THREE_TO_ONE.get(r.resname.strip().upper())
-                if one:
-                    res[int(resseq)] = one
-        except Exception:
-            return {}, 0
-        return res, (min(res) if res else 0)

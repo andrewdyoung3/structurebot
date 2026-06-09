@@ -45,7 +45,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Chain-aware candidate key shared with the ThermoMPNN bridge (no import cycle —
 # thermompnn_bridge only imports config).
-from thermompnn_bridge import candidate_key as thermompnn_key
+from thermompnn_bridge import (
+    candidate_key as thermompnn_key, _THREE_TO_ONE, ordered_chain_residues,
+)
 
 # ── Physicochemical tables ─────────────────────────────────────────────────────
 
@@ -266,6 +268,21 @@ class MutationScanner:
 
         self._progress = progress_callback or _safe_print
 
+    # ── Identity spine ──────────────────────────────────────────────────────────
+
+    def _resnum_for(self, seqidx: int) -> int:
+        """Author residue number for a 1-based sequence index (legacy: identity)."""
+        m = getattr(self, "_seqidx_to_resnum", None)
+        return m.get(seqidx, seqidx) if m else seqidx
+
+    def _icode_for(self, seqidx: int) -> str:
+        m = getattr(self, "_seqidx_to_icode", None)
+        return m.get(seqidx, "") if m else ""
+
+    # (the ordered-residue spine is `thermompnn_bridge.ordered_chain_residues` —
+    #  shared so the scanner's seqindex→resnum map and the bridge's WT-anchored
+    #  alignment see the identical residue set + order.)
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def scan(
@@ -352,6 +369,21 @@ class MutationScanner:
         _interface_protected: set = set(protected_residues or [])
         protected = protected | _interface_protected
         self._analysis_mode = analysis_mode
+
+        # ── Identity spine (author resnum vs sequence index) ──────────────────
+        # The structure's coordinate residues are the AUTHORITY for author-resnum
+        # addressing (Rosetta/ThermoMPNN/scope/viz).  Build the ordered (resnum,
+        # icode, aa) list; use the COORDINATE sequence for the sequence tools so
+        # seqindex maps 1:1 to author resnum (`_seqidx_to_resnum`).  Without a PDB,
+        # fall back to seqindex==resnum (legacy; correct for 1-based-contiguous).
+        _ordered = ordered_chain_residues(pdb_path, chain_id)
+        if _ordered:
+            sequence = "".join(aa for _, _, aa in _ordered)
+            self._seqidx_to_resnum = {i: rn for i, (rn, _ic, _aa) in enumerate(_ordered, 1)}
+            self._seqidx_to_icode  = {i: ic for i, (rn, ic, _aa) in enumerate(_ordered, 1)}
+        else:
+            self._seqidx_to_resnum = None      # legacy: author resnum == seqindex
+            self._seqidx_to_icode  = None
 
         # ── Step 1: Fetch / compute CamSol scores ─────────────────────────────
         self._progress("Step 1/4: CamSol solubility scoring...")
@@ -450,8 +482,8 @@ class MutationScanner:
         # selection, and as the retained score when Rosetta ddG is off.  With
         # ThermoMPNN absent this is byte-identical to the pre-ThermoMPNN fast tier.
         for cand in raw_candidates:
-            _etol = round(1.0 - esm_scores.get(cand["position"], 0.5), 4)
-            _tkey = thermompnn_key(chain_id, cand["position"], cand["from_aa"], cand["to_aa"])
+            _etol = round(1.0 - esm_scores.get(cand["position"], 0.5), 4)  # SEQINDEX
+            _tkey = thermompnn_key(chain_id, cand["resnum"], cand["from_aa"], cand["to_aa"])
             cand["_esm_tol"]    = _etol
             cand["_thermo_ddg"] = thermo_ddg.get(_tkey)      # None if not computed
             cand["_thermo_src"] = thermo_src.get(_tkey, "not_computed")
@@ -509,11 +541,12 @@ class MutationScanner:
         # this is the substrate for the future export + cross-layer aggregation.
         results: List[Dict[str, Any]] = []
         for cand in raw_candidates:
-            pos     = cand["position"]
+            seqidx  = cand["position"]                      # 1-based SEQUENCE index
+            resnum  = cand["resnum"]                        # AUTHOR resnum (identity)
             to_aa   = cand["to_aa"]
             from_aa = cand["from_aa"]
-            mk      = f"{from_aa}{pos}{to_aa}"              # Rosetta match key (one chain/scan)
-            rec_key = thermompnn_key(chain_id or "A", pos, from_aa, to_aa)  # chain-aware id
+            mk      = f"{from_aa}{resnum}{to_aa}"           # Rosetta match key (author resnum)
+            rec_key = thermompnn_key(chain_id or "A", resnum, from_aa, to_aa)  # chain-aware id
             camsol_delta = cand["estimated_camsol_delta"]
             esm_tol      = cand["_esm_tol"]
 
@@ -548,7 +581,10 @@ class MutationScanner:
 
             results.append({
                 "key":               rec_key,
-                "position":          pos,
+                "position":          resnum,    # AUTHOR resnum — identity for ALL
+                "resnum":            resnum,    #   structure consumers (Rosetta/viz/
+                "icode":             cand.get("icode", ""),  # double-mutant/display)
+                "seqindex":          seqidx,    # DERIVED — sequence tools only
                 "chain":             chain_id or "A",
                 "from_aa":           from_aa,
                 "to_aa":             to_aa,
@@ -562,7 +598,7 @@ class MutationScanner:
                 "thermompnn_source": thermo_s,
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
-                "camsol_score":      round(camsol_scores.get(pos, 0.0), 3),
+                "camsol_score":      round(camsol_scores.get(seqidx, 0.0), 3),
                 "fast_score":        cand["_fast_score"],
                 "combined_score":    score,
                 "recommendation":    rec,
@@ -801,28 +837,33 @@ class MutationScanner:
         scoped = include_positions is not None
 
         for pos, from_aa in enumerate(sequence, 1):
-            if scoped and pos not in include_positions:
-                continue     # outside the assigned scope
-            if pos in protected:
+            # pos = 1-based SEQUENCE index (CamSol/ESM are keyed by this); resnum =
+            # the AUTHOR residue number (identity / scope / Rosetta / ThermoMPNN / viz).
+            resnum = self._resnum_for(pos)
+            if scoped and resnum not in include_positions:
+                continue     # outside the assigned scope (AUTHOR resnum)
+            if resnum in protected:           # interface protection = author resnum
                 continue
 
             # Threshold pre-filter applies ONLY to whole-chain scans.  An explicit
             # scope means the user named these positions → scan them all.
             if not scoped:
-                camsol_val = camsol_scores.get(pos, 0.0)
+                camsol_val = camsol_scores.get(pos, 0.0)      # SEQINDEX-keyed
                 esm_val    = esm_scores.get(pos, 0.5)
                 if camsol_val >= camsol_thr:
                     continue     # not aggregation-prone enough
                 if esm_val >= esm_thr:
                     continue     # too conserved — risky to mutate
 
-            is_proximal = pos in proximal_set
+            is_proximal = resnum in proximal_set
 
             # Generate substitution candidates for this position
             subs = self._substitution_candidates(from_aa, cands_per_pos)
             for to_aa, camsol_delta in subs:
                 candidates.append({
-                    "position":              pos,
+                    "position":              pos,        # SEQUENCE index (CamSol/ESM)
+                    "resnum":                resnum,     # AUTHOR resnum (identity)
+                    "icode":                 self._icode_for(pos),
                     "chain":                 chain_id or "A",
                     "from_aa":               from_aa,
                     "to_aa":                 to_aa,
@@ -895,11 +936,12 @@ class MutationScanner:
         from rosetta_bridge import RosettaBridge
         bridge = RosettaBridge()
 
-        # Convert candidate dicts to the format RosettaBridge expects
+        # Convert candidate dicts to the format RosettaBridge expects.  Rosetta
+        # addresses by AUTHOR resnum (pdb2pose) — use resnum, NOT the sequence index.
         mutations = [
             {
                 "chain":    c.get("chain", chain_id or "A"),
-                "position": c["position"],
+                "position": c.get("resnum", c["position"]),
                 "from_aa":  c["from_aa"],
                 "to_aa":    c["to_aa"],
             }
@@ -957,8 +999,11 @@ class MutationScanner:
             if not bridge.is_available():
                 self._progress(f"  ThermoMPNN: {bridge.status()} — fast tier without it.")
                 return {}, {}
+            # ThermoMPNN keys by AUTHOR resnum (its WT-anchored map returns resnum);
+            # pass resnum so the candidate keys match.
             cands = [
-                {"position": c["position"], "from_aa": c["from_aa"], "to_aa": c["to_aa"]}
+                {"position": c.get("resnum", c["position"]),
+                 "from_aa": c["from_aa"], "to_aa": c["to_aa"]}
                 for c in raw_candidates
             ]
             self._progress(
