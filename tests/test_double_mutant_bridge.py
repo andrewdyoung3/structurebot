@@ -531,6 +531,34 @@ def test_pyrosetta_pairs_get_additive_fallback_when_disabled(tmp_path):
     )
 
 
+def test_mm_sign_unverified_enforced_not_computed(tmp_path):
+    """ENFORCED GUARD: when the mm endpoint returns but the sign is UNVERIFIED, the
+    sign-normalised mm value must NOT be emitted — the pair falls to the additive
+    fallback (sum of the VERIFIED single-mutant ddGs).  Proves the guard is enforced,
+    not merely a flag (the mm value 2.1 must never appear)."""
+    pdb = tmp_path / "test.pdb"
+    pdb.write_text("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 0.00           C\n")
+    mutations = [_mut(10, ddg=-1.5), _mut(20, ddg=-0.5)]   # additive = -2.0
+    mm_unverified = {"ddg_double": 2.1, "ddg_additive": 1.8, "epistasis": 0.3,
+                     "avg_distance_api": 15.0, "sign_unverified": True}
+    # far apart → dynamut2 backend → mm path; mm returns a sign_unverified result.
+    with patch.object(BRIDGE, "compute_ca_distance", return_value=15.0), \
+         patch.object(BRIDGE, "_query_dynamut2_mm", return_value=mm_unverified):
+        result = BRIDGE.analyze(inputs={
+            "pdb_path": str(pdb), "mutations": mutations,
+            "mode": "stability", "run_pyrosetta": False,
+        })
+    assert result.success
+    pairs = result.data.get("pairs", [])
+    assert len(pairs) == 1
+    scored = pairs[0]
+    assert scored["backend_used"] == "additive_fallback"      # mm NOT used
+    assert scored["ddg_double"] == pytest.approx(-2.0)        # additive, NOT 2.1
+    assert scored["ddg_double"] != 2.1                        # the unverified mm value is gone
+    assert any("unverified" in w.lower() for w in scored.get("warnings", [])), \
+        "should warn that mm sign is unverified → not_computed"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Confidence classification
 # ══════════════════════════════════════════════════════════════════════════════

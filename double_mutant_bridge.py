@@ -353,7 +353,10 @@ class DoubleMutantBridge:
                     f"Mid-range CA-CA distance ({dist_str}); "
                     "DynaMut2 accuracy reduced for interacting residues."
                 )
-            pair["warnings"] = pair_warns
+            # PRESERVE earlier per-pair warnings (additive-fallback note, the mm
+            # sign-unverified guard) — appending, not overwriting, so the guard is
+            # never silenced.
+            pair["warnings"] = pair.get("warnings", []) + pair_warns
 
         scored_pairs.sort(key=lambda p: p["composite_score"], reverse=True)
         top_pairs = scored_pairs[:top_n]
@@ -679,19 +682,29 @@ class DoubleMutantBridge:
                 per_deadline = time.perf_counter() + _PER_PAIR_TIMEOUT
                 try:
                     res = self._query_dynamut2_mm(pdb_path, pair, per_deadline)
-                    pair.update(res)
-                    pair["backend_used"] = pair["backend"]
                     if res.get("sign_unverified"):
+                        # ENFORCED GUARD: the mm sign is INFERRED (prediction_mm never
+                        # live-reconfirmed — endpoint errors).  mm output is therefore
+                        # NOT_COMPUTED — the sign-normalised value is NEVER emitted.
+                        # The API worked, so this is NOT a failure (don't trip the
+                        # breaker); fall through to the additive fallback (a sum of the
+                        # VERIFIED single-mutant ddGs).  Flip the guard ON only via
+                        # DYNAMUT2_MM_SIGN_VERIFIED after a live mm sign check.
+                        with _cb_lock:
+                            _consec_fail[0] = 0
                         pair["warnings"] = pair.get("warnings", []) + [
-                            "DynaMut2 mm ddG SIGN is INFERRED (prediction_mm sign not "
-                            "empirically reconfirmed — endpoint errors) → treat the "
-                            "stabilising/destabilising DIRECTION as provisional "
-                            "(magnitude usable; set DYNAMUT2_MM_SIGN_VERIFIED after a "
-                            "live mm anti-symmetry check)."
+                            "DynaMut2 mm sign UNVERIFIED (prediction_mm not empirically "
+                            "reconfirmed) → mm ddG NOT_COMPUTED; using additive fallback "
+                            "(set DYNAMUT2_MM_SIGN_VERIFIED only after a live mm "
+                            "anti-symmetry check)."
                         ]
-                    with _cb_lock:
-                        _consec_fail[0] = 0
-                    return pair   # API succeeded — no fallback needed
+                        # do NOT pair.update(res) → fall through to additive fallback
+                    else:
+                        pair.update(res)
+                        pair["backend_used"] = pair["backend"]
+                        with _cb_lock:
+                            _consec_fail[0] = 0
+                        return pair   # API succeeded + sign VERIFIED
                 except Exception as exc:
                     with _cb_lock:
                         _consec_fail[0] += 1
