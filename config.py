@@ -306,6 +306,28 @@ ROSETTA_WORKER_FOOTPRINT_MB: int = int(
 # identical-results contract.  (Ranking/sign are seed-independent regardless.)
 ROSETTA_BASE_SEED: int = int(os.environ.get("ROSETTA_BASE_SEED", "1"))
 
+# ── Deep-tier runtime estimate + size-aware worker cap (estimate-honesty fix) ───
+# The pre-launch estimate is the entire user-facing surface of the opt-in design,
+# so it must NOT undershoot.  Per-mutation FastRelax cost scales SUPER-linearly
+# with pose size (memory-bandwidth bound on single-channel DDR5).  Calibrated to
+# two measured anchors (WT relax cached, solo): 1CRN 46 res ≈ 10 s/mutation;
+# 2HHB 574 res ≳ 733 s/mutation (one core, killed before finish → a lower bound).
+#   per_mut_sec(n) = BASE_SEC × (n / BASE_RES) ** EXPONENT
+#   @46 → 10 s ; @574 → ~940 s (biased ABOVE the >733 s lower bound) ; @141 → ~76 s
+# EXPONENT 1.8 is intentionally conservative (round up; never undershoot an anchor).
+ROSETTA_PER_MUT_BASE_SEC:  float = float(os.environ.get("ROSETTA_PER_MUT_BASE_SEC", "10"))
+ROSETTA_PER_MUT_BASE_RES:  int   = int(os.environ.get("ROSETTA_PER_MUT_BASE_RES", "46"))
+ROSETTA_PER_MUT_EXPONENT:  float = float(os.environ.get("ROSETTA_PER_MUT_EXPONENT", "1.8"))
+
+# Per-worker PyRosetta footprint now scales with the ACTUAL pose size so the
+# worker cap shrinks for large complexes and never oversubscribes WSL into swap
+# (0% disk must STAY 0%).  Calibrated to the 2HHB tetramer: 8 workers ≈ 1.75 GB
+# each (574 res) → BASE + PER_RES×n ⇒ 500 + 2.2×574 ≈ 1763 MB ⇒ cap_mem = 6 (not
+# the lucky 8).  46-res monomer ≈ 600 MB.  Replaces the flat ROSETTA_WORKER_
+# FOOTPRINT_MB, which is kept only as the fallback when pose size is unknown.
+ROSETTA_WORKER_BASE_MB:    int   = int(os.environ.get("ROSETTA_WORKER_BASE_MB", "500"))
+ROSETTA_WORKER_MB_PER_RES: float = float(os.environ.get("ROSETTA_WORKER_MB_PER_RES", "2.2"))
+
 # Median-absolute-deviation spread (kcal/mol) above which a multi-trajectory
 # ddG prediction is flagged low-confidence.
 ROSETTA_SPREAD_LOW_CONFIDENCE: float = float(

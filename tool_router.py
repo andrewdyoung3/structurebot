@@ -653,10 +653,11 @@ class ToolRouter:
         return any(kw in lower for kw in cls._MUTATION_SCAN_KEYWORDS)
 
     # ── Mutation-scan tiering: scope + opt-in Rosetta (Priority 1) ─────────────
-    # Coarse per-position Rosetta ddG cost, calibrated from prior runs at this
-    # protein size (~141-residue chain ≈ 1 h on this box → ~25 s/position).  Used
-    # ONLY to surface an APPROXIMATE pre-launch estimate; not a hard budget.
-    _ROSETTA_DDG_SEC_PER_POS = 25
+    # Deep-tier mutation grid: each scoped position expands to candidates_per_pos
+    # substitutions (mutation_scanner defaults), so the Rosetta call count is
+    # positions × subs, NOT positions.  Used by the runtime estimate.
+    _DEFAULT_CANDS_PER_POS  = 3      # mutation_scanner.scan() default
+    _DEFAULT_MAX_CANDIDATES = 20     # whole-chain scan cap
 
     # Explicit deep-tier trigger.  Word-boundary so bare "rose" does NOT match
     # ("rosette", "the value rose", "rosé") — same class as the viewer
@@ -681,34 +682,52 @@ class ToolRouter:
             return f"~{seconds / 60:.0f} min"
         return f"~{seconds / 3600:.1f} h"
 
-    def _resolve_deep_workers(self) -> int:
-        """Resolved deep-tier pool size for the runtime estimate (config-capped)."""
+    def _resolve_deep_workers(self, n_residues: Optional[int] = None) -> int:
+        """Resolved deep-tier pool size — capped to hardware AND the POSE-SIZE-
+        scaled per-worker footprint (so a large complex shrinks the pool, matching
+        what the real run will do; prevents the estimate from dividing by more
+        workers than will actually fit)."""
         import config as _cfg
         try:
-            from rosetta_bridge import resolve_rosetta_workers
+            from rosetta_bridge import resolve_rosetta_workers, worker_footprint_mb
             return resolve_rosetta_workers(
                 configured     = getattr(_cfg, "ROSETTA_MAX_WORKERS", 8),
                 physical_cores = getattr(_cfg, "ROSETTA_PHYSICAL_CORES", 8),
                 mem_budget_mb  = getattr(_cfg, "ROSETTA_WSL_MEM_BUDGET_MB", 12000),
-                per_worker_mb  = getattr(_cfg, "ROSETTA_WORKER_FOOTPRINT_MB", 1200),
+                per_worker_mb  = worker_footprint_mb(n_residues),
             )
         except Exception:
             return 1
 
+    def _pose_residue_count(self, model_id: str) -> Optional[int]:
+        """Total residues of the FULL pose Rosetta will load (ALL chains — e.g. the
+        whole 2HHB tetramer, 574, not just the scanned chain).  Uses the cached/
+        downloaded PDB (the same file the deep run uses).  None if unavailable."""
+        try:
+            from rosetta_bridge import count_pdb_residues
+            p = self._ensure_pdb_file(model_id)
+            return count_pdb_residues(p) if p else None
+        except Exception:
+            return None
+
     def _estimate_rosetta_runtime(
         self,
-        n_positions: Optional[int],
+        n_mutations: Optional[int],
+        n_residues:  Optional[int],
         workers:     int = 1,
     ) -> Optional[str]:
         """
-        Coarse n-scaled deep-tier estimate string, or None if n unknown.
+        Honest deep-tier estimate, or None if the mutation count is unknown.
 
-        Folds in parallelism: t ≈ n × per-pos-sec / workers — so the estimate
-        shrinks with BOTH scope (FIX A) and worker count (FIX D).
+        est ≈ n_mutations × per_mutation_sec(n_residues) / workers
+        — counts the ACTUAL dispatched mutations (positions × candidates_per_pos),
+        scales per-mutation cost SUPER-linearly with the FULL pose size, and
+        divides by the (footprint-capped) worker count.  Biased high; "approximate".
         """
-        if not n_positions:
+        if not n_mutations:
             return None
-        secs = n_positions * self._ROSETTA_DDG_SEC_PER_POS / max(1, workers)
+        from rosetta_bridge import per_mutation_sec
+        secs = n_mutations * per_mutation_sec(n_residues) / max(1, workers)
         return self._format_duration(secs)
 
     def _parse_scan_scope(
@@ -799,30 +818,44 @@ class ToolRouter:
         thorough = bool(self._THOROUGHNESS_RE.search(user_input))
         inp["run_rosetta"] = deep
 
-        # n for the estimate: scoped → len(scope); else the chain length.
-        if scope_requested and positions:
-            n_pos: Optional[int] = len(positions)
-        else:
-            _seq  = self._fetch_sequence(model_id, chain) or ""
-            n_pos = len(_seq) or None
+        # Estimate inputs (only needed when a deep estimate will be surfaced):
+        #   n_pos  — positions to scan (scope, else chain length)
+        #   n_mut  — ACTUAL Rosetta calls = positions × candidates_per_pos (grid),
+        #            capped at the whole-chain max for an unscoped scan
+        #   n_res  — FULL pose residues (all chains; drives per-mutation cost)
+        if deep or thorough:
+            if scope_requested and positions:
+                n_pos: Optional[int] = len(positions)
+            else:
+                _seq  = self._fetch_sequence(model_id, chain) or ""
+                n_pos = len(_seq) or None
+            cands = int(inp.get("candidates_per_pos") or self._DEFAULT_CANDS_PER_POS)
+            if n_pos:
+                n_mut = n_pos * cands
+                if not scope_requested:        # whole-chain scan is capped
+                    n_mut = min(n_mut, self._DEFAULT_MAX_CANDIDATES)
+            else:
+                n_mut = None
+            n_res   = self._pose_residue_count(model_id)
+            workers = self._resolve_deep_workers(n_res)
+            est     = self._estimate_rosetta_runtime(n_mut, n_res, workers)
 
-        # (c) Surfaces — estimate folds in the parallel worker count (FIX D).
-        workers = self._resolve_deep_workers()
+        # (c) Surfaces
         if deep:
-            est = self._estimate_rosetta_runtime(n_pos, workers)
             if est:
                 result.setdefault("warnings", []).append(
                     f"Deep tier (Rosetta ddG, {workers} worker(s)): approximate "
-                    f"runtime {est} for {n_pos} position(s) — shown before launch "
-                    "(no mid-run cancel)."
+                    f"runtime {est} for {n_mut} mutation(s) across {n_pos} "
+                    f"position(s) on a {n_res or '?'}-residue pose — shown before "
+                    "launch (no mid-run cancel)."
                 )
         elif thorough:
             # Thoroughness phrasing does NOT auto-run Rosetta — raise a tier choice.
-            est  = self._estimate_rosetta_runtime(n_pos, workers) or "several minutes"
-            npos = n_pos if n_pos else "the chain"
+            est  = est or "several minutes"
             result["clarification_needed"] = (
                 f"Base tier (CamSol + ESM) ≈ 2 s, or Deep tier (+Rosetta ddG, "
-                f"{workers} worker(s)) {est} for {npos} position(s) — which? (base / deep)"
+                f"{workers} worker(s)) {est} for {n_mut} mutation(s) across "
+                f"{n_pos if n_pos else 'the chain'} position(s) — which? (base / deep)"
             )
             result["_tier_choice"] = True
 

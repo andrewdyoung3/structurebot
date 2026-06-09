@@ -386,6 +386,45 @@ def resolve_rosetta_workers(
     return max(1, min(int(configured), cap_cpu, cap_mem))
 
 
+def count_pdb_residues(pdb_path: str) -> Optional[int]:
+    """Count protein residues across ALL chains in a PDB (unique chain+resseq on
+    ATOM records).  This is the FULL pose Rosetta loads — e.g. the whole 2HHB
+    tetramer (574), not just the scanned chain.  None on failure."""
+    try:
+        seen = set()
+        with open(pdb_path, "r", errors="replace") as fh:
+            for ln in fh:
+                if ln.startswith("ATOM"):
+                    seen.add((ln[21], ln[22:27]))   # chain id + resSeq+iCode
+        return len(seen) or None
+    except Exception:
+        return None
+
+
+def worker_footprint_mb(n_residues: Optional[int]) -> int:
+    """Estimated per-worker PyRosetta RAM for a pose of *n_residues* — scales with
+    pose size so the worker cap shrinks for large complexes (swap prevention).
+    Falls back to the flat ROSETTA_WORKER_FOOTPRINT_MB when size is unknown."""
+    import config as _c
+    if not n_residues:
+        return int(getattr(_c, "ROSETTA_WORKER_FOOTPRINT_MB", 1200))
+    base    = int(getattr(_c, "ROSETTA_WORKER_BASE_MB", 500))
+    per_res = float(getattr(_c, "ROSETTA_WORKER_MB_PER_RES", 2.2))
+    return int(base + per_res * int(n_residues))
+
+
+def per_mutation_sec(n_residues: Optional[int]) -> float:
+    """Estimated SOLO per-mutation FastRelax cost (mutant + symmetric WT re-relax)
+    for a pose of *n_residues*, calibrated SUPER-linearly to measured anchors
+    (1CRN 46→~10 s; 2HHB 574→~940 s, above the >733 s lower bound).  Biased high."""
+    import config as _c
+    base_sec = float(getattr(_c, "ROSETTA_PER_MUT_BASE_SEC", 10.0))
+    base_res = int(getattr(_c, "ROSETTA_PER_MUT_BASE_RES", 46))
+    exp      = float(getattr(_c, "ROSETTA_PER_MUT_EXPONENT", 1.8))
+    n = int(n_residues) if n_residues else base_res
+    return base_sec * (max(1, n) / max(1, base_res)) ** exp
+
+
 def mutation_seed(base_seed: int, mutation_key: str, trajectory: int = 0) -> int:
     """
     Deterministic per-mutation (per-trajectory) RNG seed.
@@ -1276,16 +1315,24 @@ class RosettaBridge:
         num_trajectories = max(1, int(num_trajectories))
 
         # Deep-tier parallelization (FIX D): resolve the in-WSL pool size, capped
-        # to the hardware.  num_workers=None → config default, then capped.
+        # to the hardware.  num_workers=None → config default, then capped.  The
+        # mem cap uses a POSE-SIZE-SCALED footprint (estimate-honesty fix) so a
+        # large complex shrinks the pool and never oversubscribes WSL into swap
+        # (8 workers ≈ 1.75 GB each on the 2HHB tetramer — the flat 1200 MB just
+        # fit by luck).
         if num_workers is None:
             num_workers = getattr(_cfg_traj, "ROSETTA_MAX_WORKERS", 8)
+        _n_res     = count_pdb_residues(pdb_path)
+        _footprint = worker_footprint_mb(_n_res)
         num_workers = resolve_rosetta_workers(
             configured     = int(num_workers),
             physical_cores = getattr(_cfg_traj, "ROSETTA_PHYSICAL_CORES", 8),
             mem_budget_mb  = getattr(_cfg_traj, "ROSETTA_WSL_MEM_BUDGET_MB", 12000),
-            per_worker_mb  = getattr(_cfg_traj, "ROSETTA_WORKER_FOOTPRINT_MB", 1200),
+            per_worker_mb  = _footprint,
         )
         base_seed = int(getattr(_cfg_traj, "ROSETTA_BASE_SEED", 1))
+        _prog(f"  [Rosetta] pool: {num_workers} worker(s) "
+              f"(pose {_n_res or '?'} res, ~{_footprint} MB/worker)")
 
         try:
             from wsl_bridge import WSLBridge

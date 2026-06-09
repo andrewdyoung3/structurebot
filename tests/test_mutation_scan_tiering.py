@@ -53,9 +53,12 @@ def _ms_stub(chain: str = "A") -> Dict[str, Any]:
     }
 
 
-def _route(router: ToolRouter, prompt: str, *, seq_len: int = 141) -> Dict[str, Any]:
-    # _fetch_sequence is used for the n-estimate on unscoped deep/thorough scans.
-    with patch.object(router, "_fetch_sequence", return_value="A" * seq_len):
+def _route(router: ToolRouter, prompt: str, *, seq_len: int = 141,
+           pose_res: int = 141) -> Dict[str, Any]:
+    # _fetch_sequence → chain length (n_pos); _pose_residue_count → full pose size
+    # (drives per-mutation cost). Both mocked so route tests need no network/WSL.
+    with patch.object(router, "_fetch_sequence", return_value="A" * seq_len), \
+         patch.object(router, "_pose_residue_count", return_value=pose_res):
         return router.route(_ms_stub(), user_input=prompt)
 
 
@@ -238,17 +241,49 @@ class TestTierChoiceSurface:
 class TestEstimate:
 
     def test_deep_scoped_emits_estimate(self):
-        r = _route(_make_router(), "rosetta scan on residues 30-45 of chain A")
+        # 16 positions × 3 subs = 48 mutations, pose 574 res
+        r = _route(_make_router(), "rosetta scan on residues 30-45 of chain A",
+                   pose_res=574)
         warns = " ".join(r.get("warnings", []))
         assert "approximate runtime" in warns.lower()
+        assert "48 mutation" in warns          # count, not 16 positions
         assert "16 position" in warns
+        assert "574-residue" in warns
 
-    def test_deep_full_chain_estimate_scales_with_n(self):
-        r = _route(_make_router(), "rosetta scan chain A", seq_len=141)
+    def test_counts_candidates_per_pos_not_positions(self):
+        r = _route(_make_router(), "rosetta scan on residues 30-45 of chain A",
+                   pose_res=574)
         warns = " ".join(r.get("warnings", []))
-        assert "141 position" in warns
-        # 141 * 25 s ≈ 1 h
-        assert "h" in warns or "min" in warns
+        assert "48 mutation" in warns and "16 mutation" not in warns
+
+    def test_REGRESSION_2hhb_scale_is_tens_of_minutes_not_50s(self):
+        # The merge-blocker: ~48 mutations on the 574-res tetramer at the RESOLVED
+        # (footprint-capped) worker count must NOT estimate ~50 s.  Lands ~2 h.
+        router = _make_router()
+        workers = router._resolve_deep_workers(574)          # = 6 (mem-capped)
+        secs = self._secs(router, n_mut=48, n_res=574, workers=workers)
+        assert secs > 1800, f"estimate {secs:.0f}s still undershoots (was ~50s)"
+        assert secs < 6 * 3600, f"estimate {secs:.0f}s implausibly high"
+
+    def test_size_scaling_present_large_vs_small(self):
+        router = _make_router()
+        small = self._secs(router, n_mut=20, n_res=46)
+        large = self._secs(router, n_mut=20, n_res=574)
+        assert large > 20 * small, "per-mutation cost must scale steeply with pose size"
+
+    def test_no_undershoot_at_anchors(self):
+        # estimate must not undershoot either measured anchor (per mutation, solo)
+        from rosetta_bridge import per_mutation_sec
+        assert per_mutation_sec(46) >= 10           # 1CRN anchor
+        assert per_mutation_sec(574) >= 733          # 2HHB lower bound (biased high)
+
+    @staticmethod
+    def _secs(router, *, n_mut, n_res, workers=1):
+        """Parse the human duration string back to seconds (workers=1 to isolate)."""
+        s = router._estimate_rosetta_runtime(n_mut, n_res, workers)
+        assert s is not None
+        v = float(s.strip("~ ").split()[0]); unit = s.split()[-1]
+        return v * {"s": 1, "min": 60, "h": 3600}[unit]
 
 
 # ── 7. effective_weights ───────────────────────────────────────────────────────
@@ -351,11 +386,41 @@ class TestEstimateFoldsWorkers:
 
     def test_estimate_divides_by_workers(self):
         router = _make_router()
-        # 80 positions, 8 workers → 80*25/8 = 250 s ≈ ~4 min; 1 worker → ~33 min
-        e8 = router._estimate_rosetta_runtime(80, 8)
-        e1 = router._estimate_rosetta_runtime(80, 1)
+        from rosetta_bridge import per_mutation_sec
+        per = per_mutation_sec(574)
+        e8 = router._estimate_rosetta_runtime(48, 574, 8)
+        e1 = router._estimate_rosetta_runtime(48, 574, 1)
         assert e8 != e1
-        assert "min" in e8  # ~4 min
-        # parse rough magnitudes: 8-worker estimate is much smaller
-        assert router._estimate_rosetta_runtime(80, 1) == router._format_duration(2000)
-        assert router._estimate_rosetta_runtime(80, 8) == router._format_duration(250)
+        assert e1 == router._format_duration(48 * per / 1)
+        assert e8 == router._format_duration(48 * per / 8)
+
+    def test_estimate_none_when_no_mutations(self):
+        assert _make_router()._estimate_rosetta_runtime(None, 574, 8) is None
+
+
+class TestWorkerCapPoseSize:
+    """FIX 2 — the worker cap now scales with the ACTUAL pose (swap prevention)."""
+
+    def test_footprint_scales_with_residues(self):
+        from rosetta_bridge import worker_footprint_mb
+        assert worker_footprint_mb(574) > worker_footprint_mb(46)
+
+    def test_large_pose_drives_workers_below_8(self):
+        from rosetta_bridge import resolve_rosetta_workers, worker_footprint_mb
+        # 574-res tetramer: ~1763 MB/worker → 12000//1763 = 6 (not the lucky 8)
+        w = resolve_rosetta_workers(8, 24, 12000, worker_footprint_mb(574))
+        assert w == 6, w
+
+    def test_huge_pose_shrinks_further(self):
+        from rosetta_bridge import resolve_rosetta_workers, worker_footprint_mb
+        w = resolve_rosetta_workers(8, 24, 12000, worker_footprint_mb(1500))
+        assert w < 6
+
+    def test_small_pose_keeps_full_pool(self):
+        from rosetta_bridge import resolve_rosetta_workers, worker_footprint_mb
+        assert resolve_rosetta_workers(8, 24, 12000, worker_footprint_mb(46)) == 8
+
+    def test_footprint_fallback_when_size_unknown(self):
+        from rosetta_bridge import worker_footprint_mb
+        import config
+        assert worker_footprint_mb(None) == config.ROSETTA_WORKER_FOOTPRINT_MB
