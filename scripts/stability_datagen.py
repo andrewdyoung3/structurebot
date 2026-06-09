@@ -231,37 +231,42 @@ def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print):
         wc = _whole_chain_voters(pdb_path, chain, pending, log) if Path(pdb_path).is_file() else \
             {"thermo": {}, "rasp": {}, "camsol_pos": {}, "esm_pos": {}, "resnum2seq": {}}
 
-        ros_muts = [m for m in pending if _key(m) in rosetta_keys]
-        dyn_muts = [m for m in pending if _key(m) in dynamut2_keys]
-        # PHYSICS Rosetta = the REAL WSL PyRosetta ("local" backend) — NOT the
-        # default backend (which resolves to dynamut2 here → would collide with the
-        # dynamics voter).  DynaMut2 = the "dynamut2" backend.  Distinct voters.
-        ros = _rosetta_batch(pdb_path, chain, ros_muts, "local", log) if ros_muts else {}
-        dyn = _rosetta_batch(pdb_path, chain, dyn_muts, "dynamut2", log) if dyn_muts else {}
-
-        for m in pending:
-            ck = candidate_key(chain, m["resnum"], m["wt"], m["mut"])
-            rk = f"{m['wt']}{m['resnum']}{m['mut']}"
-            seqi = wc["resnum2seq"].get(m["resnum"])
-            row = {
-                "key": _key(m), "set": m["set"], "pdbid": pdbid, "chain": chain,
-                "resnum": m["resnum"], "wt": m["wt"], "mut": m["mut"], "variant": m["variant"],
-                "exp_ddg": m.get("exp_ddg"), "rosetta_ref_ddg": m.get("rosetta_ref_ddg"),
-                "pair_id": m.get("pair_id"), "antisym_dir": m.get("antisym_dir"),
-                # voters — None == not_computed (NEVER fabricated/0.0)
-                "rosetta_ddg":   ros.get(rk),
-                "rasp_ddg":      wc["rasp"].get(ck),
-                "thermompnn_ddg": wc["thermo"].get(ck),
-                "dynamut2_ddg":  dyn.get(rk),
-                "camsol_score":  wc["camsol_pos"].get(seqi) if seqi else None,
-                "esm_tolerance": (round(1.0 - wc["esm_pos"][seqi], 4)
-                                  if (seqi and seqi in wc["esm_pos"]) else None),
-                "seqindex": seqi,
-                "rosetta_in_subset": _key(m) in rosetta_keys,
-                "dynamut2_in_subset": _key(m) in dynamut2_keys,
-            }
-            fh.write(json.dumps(row) + "\n"); fh.flush()
-            n_written += 1
+        # CHUNK the per-mutation long poles (Rosetta/DynaMut2) so rows are written
+        # incrementally (~every CHUNK muts) — crash-safe + resumable MID-protein, not
+        # only at protein end.  PHYSICS Rosetta = REAL WSL PyRosetta ("local"); the
+        # default backend resolves to dynamut2 here (smoke caught that collision).
+        CHUNK = 20
+        for ci in range(0, len(pending), CHUNK):
+            chunk = pending[ci:ci + CHUNK]
+            cros = [m for m in chunk if _key(m) in rosetta_keys]
+            cdyn = [m for m in chunk if _key(m) in dynamut2_keys]
+            ros = _rosetta_batch(pdb_path, chain, cros, "local", log) if cros else {}
+            dyn = _rosetta_batch(pdb_path, chain, cdyn, "dynamut2", log) if cdyn else {}
+            for m in chunk:
+                ck = candidate_key(chain, m["resnum"], m["wt"], m["mut"])
+                rk = f"{m['wt']}{m['resnum']}{m['mut']}"
+                seqi = wc["resnum2seq"].get(m["resnum"])
+                row = {
+                    "key": _key(m), "set": m["set"], "pdbid": pdbid, "chain": chain,
+                    "resnum": m["resnum"], "wt": m["wt"], "mut": m["mut"], "variant": m["variant"],
+                    "exp_ddg": m.get("exp_ddg"), "rosetta_ref_ddg": m.get("rosetta_ref_ddg"),
+                    "pair_id": m.get("pair_id"), "antisym_dir": m.get("antisym_dir"),
+                    # voters — None == not_computed (NEVER fabricated/0.0)
+                    "rosetta_ddg":   ros.get(rk),
+                    "rasp_ddg":      wc["rasp"].get(ck),
+                    "thermompnn_ddg": wc["thermo"].get(ck),
+                    "dynamut2_ddg":  dyn.get(rk),
+                    "camsol_score":  wc["camsol_pos"].get(seqi) if seqi else None,
+                    "esm_tolerance": (round(1.0 - wc["esm_pos"][seqi], 4)
+                                      if (seqi and seqi in wc["esm_pos"]) else None),
+                    "seqindex": seqi,
+                    "rosetta_in_subset": _key(m) in rosetta_keys,
+                    "dynamut2_in_subset": _key(m) in dynamut2_keys,
+                }
+                fh.write(json.dumps(row) + "\n"); fh.flush()
+                n_written += 1
+            log(f"  [{pdbid}/{chain}] chunk {ci//CHUNK + 1}: +{len(chunk)} rows "
+                f"(total {n_written}); rosetta {len(ros)}/{len(cros)} dynamut2 {len(dyn)}/{len(cdyn)}")
     fh.close()
     log(f"wrote {n_written} new rows → {out_path}")
     return n_written
@@ -269,14 +274,68 @@ def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print):
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
 
+_VOTERS = ["rosetta_ddg", "rasp_ddg", "thermompnn_ddg", "dynamut2_ddg",
+           "camsol_score", "esm_tolerance"]
+
+
+def summarize(jsonl_path: str) -> None:
+    """DESCRIPTIVE-ONLY summary (brief 2.6): counts, coverage, ranges, not_computed
+    tallies, anti-symmetry fwd+rev sums.  NO correlation-as-confidence, NO weights,
+    NO verdicts — this only describes the collected data."""
+    rows = [json.loads(ln) for ln in open(jsonl_path)] if Path(jsonl_path).is_file() else []
+    print(f"=== DESCRIPTIVE SUMMARY (data only — no interpretation) — {jsonl_path}")
+    print(f"rows: {len(rows)}")
+    if not rows:
+        return
+    by_set: Dict[str, int] = {}
+    for r in rows:
+        by_set[r.get("set", "?")] = by_set.get(r.get("set", "?"), 0) + 1
+    print("per-set:", dict(sorted(by_set.items())))
+    # label coverage
+    for lab in ("exp_ddg", "rosetta_ref_ddg"):
+        vals = [r[lab] for r in rows if r.get(lab) is not None]
+        if vals:
+            neg = sum(1 for v in vals if v < 0); pos = sum(1 for v in vals if v > 0)
+            print(f"label {lab}: {len(vals)}/{len(rows)} present | range [{min(vals):.2f},{max(vals):.2f}] | neg {neg} pos {pos}")
+        else:
+            print(f"label {lab}: 0/{len(rows)} present")
+    # per-voter coverage + ranges + not_computed
+    print("per-voter (computed / not_computed | range | median):")
+    for v in _VOTERS:
+        vals = [r[v] for r in rows if r.get(v) is not None]
+        nc = len(rows) - len(vals)
+        if vals:
+            sv = sorted(vals); med = sv[len(sv)//2]
+            print(f"  {v:15s}: {len(vals):4d} computed / {nc:4d} not_computed | "
+                  f"[{min(vals):+.2f},{max(vals):+.2f}] | median {med:+.2f}")
+        else:
+            print(f"  {v:15s}:    0 computed / {nc:4d} not_computed")
+    # anti-symmetry (data only — store fwd+rev sums, NO verdict)
+    pairs: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        if r.get("pair_id"):
+            pairs.setdefault(r["pair_id"], {})[r.get("antisym_dir", "?")] = r
+    complete = [p for p in pairs.values() if "fwd" in p and "rev" in p]
+    print(f"anti-symmetry pairs (fwd+rev both present): {len(complete)}")
+    if not complete:
+        print("  (none — Ssym anti-symmetry deferred this pass; schema is pair-ready)")
+    print("NOTE: correlations / weights / accuracy verdicts are OUT OF SCOPE here "
+          "(the attended calibration step).")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--assemble-report", action="store_true")
+    ap.add_argument("--summary", metavar="JSONL")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--out", default=str(_ROOT / "cache" / "stability_datagen" / "rows.jsonl"))
     ap.add_argument("--rosetta-cap", type=int, default=0)
     ap.add_argument("--dynamut2-cap", type=int, default=0)
     a = ap.parse_args()
+
+    if a.summary:
+        summarize(a.summary)
+        return
 
     manifest = assemble()
     by_set: Dict[str, int] = {}
