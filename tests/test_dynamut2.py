@@ -58,16 +58,34 @@ def enable_dynamut2(monkeypatch):
 # ── 1. SIGN — physical anchor (locked by physics, not a recorded raw number) ───
 
 class TestDynaMut2Sign:
+    """Sign locked by PHYSICS (known mutations), not a recorded raw number.
 
-    def test_known_destabiliser_L99A_comes_out_positive(self):
-        # L99A is a canonical DESTABILISER (exp +5.0). DynaMut2 reports it raw −3.32
-        # (positive=stabilising convention) → normalisation MUST make it system
-        # POSITIVE (destabilising).  Locks the sign by physics.
+    Live single-endpoint sign battery (2026-06-10, flipped DynaMut2 vs experiment):
+      • POPULATION CORRELATION on the T4L panel: Pearson +0.75 / Spearman +0.81
+        (n=8) — decisively positive, at/above DynaMut2's published range (a wrong
+        sign would be strongly NEGATIVE).
+      • DESTABILISER anchor: L99A (exp +5.0) → DynaMut2 raw −3.32 → system +3.32.
+      • STABILISER-TAIL anchor: A149V → raw +0.38 → system −0.38 (stabilising).
+      • ANTI-SYMMETRY: fwd destabilising (+) / rev stabilising-or-neutral (−/≈0),
+        directionally consistent; magnitude compression = the documented benign
+        destabilising bias (NOT a sign inversion).
+    => −1 (config.DYNAMUT2_DDG_SIGN) justified; sign locked by the anchors below."""
+
+    def test_destabiliser_anchor_L99A_comes_out_positive(self):
+        # L99A (canonical destabiliser, exp +5.0): DynaMut2 raw −3.32 → system POSITIVE
         assert normalize_dynamut2_ddg(-3.32) > 0
 
-    def test_dynamut2_stabilising_value_comes_out_negative(self):
-        # a DynaMut2 POSITIVE (stabilising) → system NEGATIVE (stabilising)
+    def test_stabiliser_tail_anchor_A149V_comes_out_negative(self):
+        # A149V (live stabiliser): DynaMut2 raw +0.38 → system NEGATIVE (stabilising)
+        assert normalize_dynamut2_ddg(+0.38) < 0
+        # and a stronger stabiliser stays stabilising
         assert normalize_dynamut2_ddg(+2.0) < 0
+
+    def test_convention_is_pure_sign_flip_antisymmetric(self):
+        # The convention is a PURE sign flip (no offset/scale) — regression guard so
+        # normalisation can never drift to an asymmetric transform.
+        for x in (-3.32, -0.38, 0.0, 0.5, 2.0, 5.1):
+            assert normalize_dynamut2_ddg(x) == pytest.approx(-normalize_dynamut2_ddg(-x))
 
     def test_parser_normalises_to_system(self):
         from rosetta_bridge import _parse_dynamut2_result

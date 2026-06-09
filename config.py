@@ -506,6 +506,15 @@ DYNAMUT2_MAX_WORKERS: int = int(os.environ.get("DYNAMUT2_MAX_WORKERS", "4"))
 # (The pre-2026-06-10 code used the raw value with NO flip → it shipped inverted
 # DynaMut2 ddG for both the single-mutation backend AND the double-mutant path.)
 DYNAMUT2_DDG_SIGN: int = int(os.environ.get("DYNAMUT2_DDG_SIGN", "-1"))
+# The SINGLE-mutation sign (above) is empirically verified (L99A live anchor).  The
+# MULTIPLE-mutation (prediction_mm) sign is only INFERRED from the single-mutation
+# family — the mm endpoint chronically ERRORs, so it could not be live-reconfirmed.
+# Until it is, mm output is tagged sign_unverified so the inferred sign is never
+# trusted silently (the mm fixture sign-corrections are as provisional as this).
+# Set True ONLY after a live anti-symmetry / known-mutation check on prediction_mm.
+DYNAMUT2_MM_SIGN_VERIFIED: bool = (
+    os.environ.get("DYNAMUT2_MM_SIGN_VERIFIED", "false").strip().lower() in ("1", "true", "yes")
+)
 
 # ── DynaMut2 fast-tier DYNAMICS-axis voter (shortlist / round-2) ───────────────
 # DynaMut2 (normal-mode dynamics + graph signature, ML-trained on experimental

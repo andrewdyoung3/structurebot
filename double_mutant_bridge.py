@@ -681,6 +681,14 @@ class DoubleMutantBridge:
                     res = self._query_dynamut2_mm(pdb_path, pair, per_deadline)
                     pair.update(res)
                     pair["backend_used"] = pair["backend"]
+                    if res.get("sign_unverified"):
+                        pair["warnings"] = pair.get("warnings", []) + [
+                            "DynaMut2 mm ddG SIGN is INFERRED (prediction_mm sign not "
+                            "empirically reconfirmed — endpoint errors) → treat the "
+                            "stabilising/destabilising DIRECTION as provisional "
+                            "(magnitude usable; set DYNAMUT2_MM_SIGN_VERIFIED after a "
+                            "live mm anti-symmetry check)."
+                        ]
                     with _cb_lock:
                         _consec_fail[0] = 0
                     return pair   # API succeeded — no fallback needed
@@ -969,11 +977,18 @@ class DoubleMutantBridge:
         except (KeyError, TypeError, ValueError):
             return None
 
+        # GUARD: the mm sign convention is INFERRED, not empirically reconfirmed (the
+        # prediction_mm endpoint errors).  Tag the result sign_unverified until a live
+        # mm check sets DYNAMUT2_MM_SIGN_VERIFIED — so the inferred sign is never
+        # trusted silently if the endpoint recovers.  (Magnitude is still usable.)
+        import config as _cfg
+        sign_unverified = not bool(getattr(_cfg, "DYNAMUT2_MM_SIGN_VERIFIED", False))
         return {
             "ddg_double":       ddg_double,
             "ddg_additive":     ddg_additive,
             "epistasis":        epistasis,
             "avg_distance_api": avg_dist or None,
+            "sign_unverified":  sign_unverified,
         }
 
     # ── Step 4: PyRosetta double-mutant scoring ────────────────────────────────

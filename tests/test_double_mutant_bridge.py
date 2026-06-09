@@ -432,6 +432,10 @@ def test_dynamut2_result_parsing():
     assert parsed["ddg_additive"] == 1.8
     assert parsed["epistasis"]    == round(2.1 - 1.8, 3)  # +0.3
     assert parsed["avg_distance_api"] == 12.4
+    # GUARD: mm sign is INFERRED (prediction_mm endpoint errors → never live-
+    # reconfirmed) → tagged sign_unverified so the inferred sign is never trusted
+    # silently.  (Set DYNAMUT2_MM_SIGN_VERIFIED only after a live mm sign check.)
+    assert parsed["sign_unverified"] is True
 
 
 def test_dynamut2_result_parsing_reversed_order():
