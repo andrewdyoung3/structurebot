@@ -21,3 +21,7 @@ scripts/eval_3dim_*/
 scripts/probe_*.py
 _live_*.txt
 live_test_*.txt
+
+# ThermoMPNN (cloned repo + bundled weights — never commit)
+ThermoMPNN_repo/
+*.ckpt

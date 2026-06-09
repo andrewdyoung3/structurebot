@@ -413,6 +413,39 @@ SEQVIEW_CACHE_DIR: Path = Path(
 )
 SEQVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── ThermoMPNN (fast-tier local stability voter, venv312 GPU) ───────────────────
+# ThermoMPNN (Kuhlman-Lab) — a GNN stability (ddG) predictor built ON ProteinMPNN's
+# encoder.  Runs in venv312 (torch 2.11 + Lightning 2.6.5 confirmed compatible;
+# install does NOT touch torch, so ESM stays intact).  Weights ship in-repo
+# (models/thermoMPNN_default.pt + bundled vanilla_model_weights/).  GRACEFUL: if
+# disabled/absent/failing the scan still works (fast tier renormalises without it).
+THERMOMPNN_DIR: str = os.environ.get(
+    "THERMOMPNN_DIR", str(Path(__file__).parent / "ThermoMPNN_repo")
+)
+# venv312 interpreter for ThermoMPNN inference (reuses the GPU env + ProteinMPNN).
+THERMOMPNN_PYTHON: str = os.environ.get("THERMOMPNN_PYTHON", VENV312_PYTHON)
+THERMOMPNN_MODEL: str = os.environ.get(
+    "THERMOMPNN_MODEL", str(Path(THERMOMPNN_DIR) / "models" / "thermoMPNN_default.pt")
+)
+# Enable the fast-tier ThermoMPNN voter.  "auto" = use it if THERMOMPNN_DIR is a
+# valid install, else skip gracefully.  "false"/"0" disables (scan == pre-ThermoMPNN).
+THERMOMPNN_ENABLE: str = os.environ.get("THERMOMPNN_ENABLE", "auto").strip().lower()
+# Sign normalisation: ThermoMPNN trains on NEGATED Megascale ddG (datasets.py:161),
+# Megascale positive = stabilising → ThermoMPNN predicts negative = stabilising,
+# which ALREADY matches the system convention (positive = destabilising).  So the
+# default multiplier is +1 (no flip).  The live sign-guard test confirms this on a
+# known stabiliser; flip to -1 here ONLY if that test ever shows the opposite.
+THERMOMPNN_DDG_SIGN: int = int(os.environ.get("THERMOMPNN_DDG_SIGN", "1"))
+# PROVISIONAL fast-tier weight — PENDING BENCHMARK CALIBRATION (do not bless this
+# number).  ThermoMPNN is the highest fast-tier voter (stability is the primary
+# goal).  Renormalised with CamSol (_W_SOL) + ESM (_W_TOL) over present voters;
+# CamSol:ESM stays 3:2 so a ThermoMPNN-absent scan falls back EXACTLY to the
+# pre-ThermoMPNN 0.6/0.4.  NOTE for calibration: ThermoMPNN and ESM are NOT fully
+# independent (ThermoMPNN runs on the ProteinMPNN encoder → shares structural
+# context with ESM), whereas CamSol's solubility axis is orthogonal — calibrated
+# weights must account for voter redundancy, not just standalone accuracy.
+THERMOMPNN_WEIGHT: float = float(os.environ.get("THERMOMPNN_WEIGHT", "0.45"))
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable

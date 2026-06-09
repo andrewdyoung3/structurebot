@@ -43,6 +43,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# Chain-aware candidate key shared with the ThermoMPNN bridge (no import cycle —
+# thermompnn_bridge only imports config).
+from thermompnn_bridge import candidate_key as thermompnn_key
+
 # ── Physicochemical tables ─────────────────────────────────────────────────────
 
 # Kyte-Doolittle hydrophobicity (higher = more hydrophobic)
@@ -119,6 +123,44 @@ def combined_score(
         + w_tol * esm_tolerance,
         4,
     )
+
+
+def present_voters_score(
+    rosetta_ddg:    Optional[float],
+    thermompnn_ddg: Optional[float],
+    camsol_delta:   float,
+    esm_tolerance:  float,
+    w_rosetta: float = _W_DDG,
+    w_thermo:  float = 0.45,
+    w_sol:     float = _W_SOL,
+    w_tol:     float = _W_TOL,
+) -> float:
+    """
+    Combined score renormalised over the voters PRESENT (higher = better).
+
+    Voters + contribution (all oriented so higher = better):
+      rosetta_ddg     → −ddg   (negative ddg = stabilising)   [deep tier only]
+      thermompnn_ddg  → −ddg   (negative ddg = stabilising)   [fast-tier voter]
+      camsol_delta    → +delta (solubility improvement)
+      esm_tolerance   → +tol   (evolutionary tolerance)
+
+    Only present voters (non-None ddg; CamSol/ESM always present) contribute, with
+    their weights renormalised to sum to 1.  GRACEFUL/EXACT: with both ddg voters
+    absent this reduces to 0.6·camsol + 0.4·esm (== the pre-ThermoMPNN fast tier),
+    and with only Rosetta absent... etc. — so a ThermoMPNN-disabled scan reproduces
+    the previous scores byte-for-byte (CamSol:ESM stays 3:2).
+    """
+    voters: List[Tuple[float, float]] = []
+    if rosetta_ddg is not None:
+        voters.append((w_rosetta, -rosetta_ddg))
+    if thermompnn_ddg is not None:
+        voters.append((w_thermo, -thermompnn_ddg))
+    voters.append((w_sol, camsol_delta))
+    voters.append((w_tol, esm_tolerance))
+    total = sum(w for w, _ in voters)
+    if total <= 0:
+        return 0.0
+    return round(sum((w / total) * v for w, v in voters), 4)
 
 
 def effective_weights(
@@ -239,6 +281,7 @@ class MutationScanner:
         run_rosetta:        bool = True,
         rosetta_shortlist_k: Optional[int] = None,
         ddg_basis:          str = "symmetric",
+        run_thermompnn:     bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -393,14 +436,28 @@ class MutationScanner:
         # RETAINED with ddg="not_computed" — shortlist DEFERS, never drops.  ddG is
         # decided PER CANDIDATE below (key present in ddg_scores), never a fake 0.0.
 
-        # Fast (CamSol+ESM, renormalised) score for EVERY candidate — used for
-        # ranking, shortlist selection, and as the retained score when ddG is off.
-        _wf_ddg, _wf_sol, _wf_tol = effective_weights(False, w_ddg, w_sol, w_tol)
+        # ThermoMPNN fast-tier voter (cheap, local GPU) — per-candidate stability
+        # ddG, sign-normalised to the system convention.  GRACEFUL: returns {} when
+        # disabled/absent/failed → those candidates fall back to CamSol+ESM only.
+        thermo_ddg, thermo_src = self._run_thermompnn(
+            pdb_path, chain_id, raw_candidates, run_thermompnn
+        )
+        import config as _cfg_tm
+        _w_thermo = float(getattr(_cfg_tm, "THERMOMPNN_WEIGHT", 0.45))
+
+        # Fast score for EVERY candidate — present-voters renormalised over
+        # ThermoMPNN(if present) + CamSol + ESM.  Used for ranking, shortlist
+        # selection, and as the retained score when Rosetta ddG is off.  With
+        # ThermoMPNN absent this is byte-identical to the pre-ThermoMPNN fast tier.
         for cand in raw_candidates:
             _etol = round(1.0 - esm_scores.get(cand["position"], 0.5), 4)
+            _tkey = thermompnn_key(chain_id, cand["position"], cand["from_aa"], cand["to_aa"])
             cand["_esm_tol"]    = _etol
-            cand["_fast_score"] = combined_score(
-                0.0, cand["estimated_camsol_delta"], _etol, _wf_ddg, _wf_sol, _wf_tol
+            cand["_thermo_ddg"] = thermo_ddg.get(_tkey)      # None if not computed
+            cand["_thermo_src"] = thermo_src.get(_tkey, "not_computed")
+            cand["_fast_score"] = present_voters_score(
+                None, cand["_thermo_ddg"], cand["estimated_camsol_delta"], _etol,
+                w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol,
             )
 
         ddg_scores:     Dict[str, float] = {}
@@ -455,20 +512,26 @@ class MutationScanner:
             pos     = cand["position"]
             to_aa   = cand["to_aa"]
             from_aa = cand["from_aa"]
-            key     = f"{from_aa}{pos}{to_aa}"
+            mk      = f"{from_aa}{pos}{to_aa}"              # Rosetta match key (one chain/scan)
+            rec_key = thermompnn_key(chain_id or "A", pos, from_aa, to_aa)  # chain-aware id
             camsol_delta = cand["estimated_camsol_delta"]
             esm_tol      = cand["_esm_tol"]
 
-            if key in ddg_scores:                          # this candidate got Rosetta
-                ddg      = ddg_scores[key]
-                ddg_src  = ddg_source.get(key, "none")
-                ddg_sprd = ddg_spread.get(key)
-                ddg_conf = ddg_confidence.get(key, "single-trajectory")
+            thermo_d = cand.get("_thermo_ddg")             # system-convention ddG | None
+            thermo_s = cand.get("_thermo_src", "not_computed")
+
+            if mk in ddg_scores:                           # this candidate got Rosetta
+                ddg      = ddg_scores[mk]
+                ddg_src  = ddg_source.get(mk, "none")
+                ddg_sprd = ddg_spread.get(mk)
+                ddg_conf = ddg_confidence.get(mk, "single-trajectory")
                 ddg_out  = round(ddg, 3)
                 basis    = ddg_basis                       # "symmetric" | "asymmetric"
                 tier     = "deep"
-                score    = combined_score(ddg, camsol_delta, esm_tol,
-                                          w_ddg, w_sol, w_tol)
+                # present-voters over Rosetta + ThermoMPNN(if any) + CamSol + ESM
+                score    = present_voters_score(
+                    ddg, thermo_d, camsol_delta, esm_tol,
+                    w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol)
             else:                                          # fast tier / deferred by shortlist
                 ddg = ddg_out = None
                 ddg_src  = "not_computed"
@@ -476,7 +539,7 @@ class MutationScanner:
                 ddg_conf = "not_computed"
                 basis    = "none"
                 tier     = "fast"
-                score    = cand["_fast_score"]
+                score    = cand["_fast_score"]             # already includes ThermoMPNN
 
             is_proximal = cand.get("interface_proximal", False)
             rec = _recommendation(ddg, camsol_delta, esm_tol, score)
@@ -484,7 +547,7 @@ class MutationScanner:
                 rec += " — ⚠ interface-proximal, mutate with caution"
 
             results.append({
-                "key":               key,
+                "key":               rec_key,
                 "position":          pos,
                 "chain":             chain_id or "A",
                 "from_aa":           from_aa,
@@ -495,6 +558,8 @@ class MutationScanner:
                 "ddg_confidence":    ddg_conf,
                 "ddg_basis":         basis,
                 "tier":              tier,
+                "thermompnn_ddg":    (round(thermo_d, 4) if thermo_d is not None else None),
+                "thermompnn_source": thermo_s,
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
                 "camsol_score":      round(camsol_scores.get(pos, 0.0), 3),
@@ -870,6 +935,43 @@ class MutationScanner:
             "    Candidates ranked by CamSol + ESM only (ddG = 0.0)."
         )
         return {}, {}, {}, {}
+
+    def _run_thermompnn(
+        self,
+        pdb_path:       Optional[str],
+        chain_id:       Optional[str],
+        raw_candidates: List[Dict[str, Any]],
+        enabled:        bool = True,
+    ) -> Tuple[Dict[str, float], Dict[str, str]]:
+        """
+        Fast-tier ThermoMPNN ddG for *raw_candidates* → ({key: ddg}, {key: source}),
+        keyed chain-aware on (chain, resnum, wt, mut), sign-normalised to the system
+        convention.  GRACEFUL/ERROR-FIRST: disabled/absent/failed → ({}, {}) so the
+        fast tier renormalises over CamSol+ESM exactly as before (no crash, no fake).
+        """
+        if not enabled or not pdb_path or not Path(pdb_path).is_file():
+            return {}, {}
+        try:
+            from thermompnn_bridge import ThermoMPNNBridge
+            bridge = ThermoMPNNBridge()
+            if not bridge.is_available():
+                self._progress(f"  ThermoMPNN: {bridge.status()} — fast tier without it.")
+                return {}, {}
+            cands = [
+                {"position": c["position"], "from_aa": c["from_aa"], "to_aa": c["to_aa"]}
+                for c in raw_candidates
+            ]
+            self._progress(
+                f"  ThermoMPNN: scoring {len(cands)} candidate(s) (fast-tier stability voter)…"
+            )
+            return bridge.score_mutations(
+                pdb_path, chain_id or "A", cands, progress=self._progress
+            )
+        except Exception as exc:
+            self._progress(
+                f"  ThermoMPNN unavailable ({type(exc).__name__}) — fast tier without it."
+            )
+            return {}, {}
 
     @staticmethod
     def _error_result(msg: str) -> List[Dict[str, Any]]:

@@ -472,9 +472,11 @@ class TestDeepCoverage:
     def test_shortlist_picks_highest_fast_score(self):
         scanner, spy, results = self._run(include_positions=[3, 4, 5],
                                           rosetta_shortlist_k=2)
-        deep_keys = set(spy.calls["keys"])
+        # the 2 deep-tier records must be the top-2 by fast score
+        deep = {r["key"] for r in results if r["tier"] == "deep"}
         ranked = sorted(results, key=lambda r: r["fast_score"], reverse=True)
-        assert deep_keys == {ranked[0]["key"], ranked[1]["key"]}
+        assert len(deep) == 2
+        assert deep == {ranked[0]["key"], ranked[1]["key"]}
 
     def test_shortlist_never_auto_selected(self):
         # default deep run (no shortlist_k) → full grid, nothing deferred
