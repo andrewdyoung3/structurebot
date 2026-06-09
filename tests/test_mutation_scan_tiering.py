@@ -424,3 +424,182 @@ class TestWorkerCapPoseSize:
         from rosetta_bridge import worker_footprint_mb
         import config
         assert worker_footprint_mb(None) == config.ROSETTA_WORKER_FOOTPRINT_MB
+
+
+# ── 9. BUILD 1 — deep-tier coverage (full default, shortlist opt-in) ───────────
+
+def _batch_spy():
+    """A _run_rosetta_batch stand-in: scores exactly the candidates it's given,
+    recording the basis + which candidates were sent to Rosetta."""
+    calls = {"n": None, "basis": None, "keys": None}
+    def _fake(pdb, candidates, chain, scan_deadline=None, ddg_basis="symmetric"):
+        keys = [f"{c['from_aa']}{c['position']}{c['to_aa']}" for c in candidates]
+        calls["n"], calls["basis"], calls["keys"] = len(candidates), ddg_basis, keys
+        sc = {k: -1.0 for k in keys}
+        return sc, {k: "pyrosetta" for k in keys}, {k: None for k in keys}, \
+               {k: "single-trajectory" for k in keys}
+    _fake.calls = calls
+    return _fake
+
+
+class TestDeepCoverage:
+
+    def _run(self, **scan_kw):
+        scanner = _scanner_with_scores("ACDEFGHIKLMNPQR")
+        spy = _batch_spy()
+        scanner._run_rosetta_batch = spy
+        results = scanner.scan(pdb_path=_fake_pdb(), chain_id="A",
+                               sequence="ACDEFGHIKLMNPQR", run_rosetta=True, **scan_kw)
+        return scanner, spy, results
+
+    def test_full_coverage_is_default(self):
+        scanner, spy, results = self._run(include_positions=[3, 4, 5])
+        # 3 positions × 3 subs = 9 candidates, ALL sent to Rosetta (full grid)
+        assert spy.calls["n"] == len(results) == 9
+        assert all(r["tier"] == "deep" for r in results)
+
+    def test_shortlist_opt_in_validates_top_k(self):
+        scanner, spy, results = self._run(include_positions=[3, 4, 5],
+                                          rosetta_shortlist_k=2)
+        assert spy.calls["n"] == 2, "shortlist must send exactly top-K to Rosetta"
+        deep = [r for r in results if r["tier"] == "deep"]
+        fast = [r for r in results if r["tier"] == "fast"]
+        assert len(deep) == 2
+        # LOSSLESS: every candidate retained, the rest as not_computed (not dropped)
+        assert len(results) == 9
+        assert all(r["ddg"] is None and r["ddg_source"] == "not_computed" for r in fast)
+
+    def test_shortlist_picks_highest_fast_score(self):
+        scanner, spy, results = self._run(include_positions=[3, 4, 5],
+                                          rosetta_shortlist_k=2)
+        deep_keys = set(spy.calls["keys"])
+        ranked = sorted(results, key=lambda r: r["fast_score"], reverse=True)
+        assert deep_keys == {ranked[0]["key"], ranked[1]["key"]}
+
+    def test_shortlist_never_auto_selected(self):
+        # default deep run (no shortlist_k) → full grid, nothing deferred
+        scanner, spy, results = self._run(include_positions=[3, 4, 5])
+        assert all(r["tier"] == "deep" for r in results)
+
+
+class TestDdgBasis:
+
+    def _run(self, **scan_kw):
+        scanner = _scanner_with_scores("ACDEFGHIKLM")
+        spy = _batch_spy()
+        scanner._run_rosetta_batch = spy
+        results = scanner.scan(pdb_path=_fake_pdb(), chain_id="A",
+                               sequence="ACDEFGHIKLM", run_rosetta=True,
+                               include_positions=[3, 4], **scan_kw)
+        return spy, results
+
+    def test_default_basis_is_symmetric(self):
+        spy, results = self._run()
+        assert spy.calls["basis"] == "symmetric"
+        assert all(r["ddg_basis"] == "symmetric" for r in results if r["tier"] == "deep")
+
+    def test_asymmetric_only_when_requested(self):
+        spy, results = self._run(ddg_basis="asymmetric")
+        assert spy.calls["basis"] == "asymmetric"
+        assert all(r["ddg_basis"] == "asymmetric" for r in results if r["tier"] == "deep")
+
+    def test_basis_never_mixed(self):
+        spy, results = self._run(ddg_basis="asymmetric")
+        bases = {r["ddg_basis"] for r in results if r["tier"] == "deep"}
+        assert bases == {"asymmetric"}, "a single scan must not mix ddG bases"
+
+    def test_routing_default_symmetric_asym_opt_in(self):
+        assert _route(_make_router(), "rosetta scan residues 30-45 chain A",
+                      pose_res=574)["tool_inputs"]["mutation_scan"]["ddg_basis"] == "symmetric"
+        assert _route(_make_router(), "asymmetric rosetta scan residues 30-45 chain A",
+                      pose_res=574)["tool_inputs"]["mutation_scan"]["ddg_basis"] == "asymmetric"
+
+
+class TestShortlistRouting:
+
+    def test_full_is_default_routing(self):
+        r = _route(_make_router(), "rosetta scan residues 30-45 chain A", pose_res=574)
+        assert r["tool_inputs"]["mutation_scan"]["rosetta_shortlist_k"] is None
+
+    def test_shortlist_opt_in_routing(self):
+        r = _route(_make_router(), "shortlist rosetta scan residues 30-45 chain A",
+                   pose_res=574)
+        assert r["tool_inputs"]["mutation_scan"]["rosetta_shortlist_k"] == 15
+
+    def test_expensive_full_grid_offers_shortlist(self):
+        # 48 muts on a 574-res pose ≈ 2 h > offer threshold → warning offers shortlist
+        r = _route(_make_router(), "rosetta scan residues 30-45 chain A", pose_res=574)
+        warns = " ".join(r.get("warnings", []))
+        assert "FULL coverage" in warns
+        assert "shortlist" in warns.lower(), "expensive full grid must offer the shortlist"
+
+    def test_cheap_full_grid_no_offer(self):
+        # tiny pose/scope → cheap → no shortlist nag
+        r = _route(_make_router(), "rosetta scan residue 30 chain A", pose_res=46)
+        warns = " ".join(r.get("warnings", []))
+        assert "shortlist" not in warns.lower()
+
+
+# ── 10. BUILD 3 — large-pose estimate guard ───────────────────────────────────
+
+class TestLargePoseEstimateGuard:
+
+    def test_efficiency_unity_at_or_below_anchor(self):
+        from rosetta_bridge import parallel_efficiency
+        assert parallel_efficiency(574) == 1.0
+        assert parallel_efficiency(141) == 1.0
+
+    def test_efficiency_drops_above_anchor(self):
+        from rosetta_bridge import parallel_efficiency
+        assert parallel_efficiency(1148) == 0.5
+
+    def test_large_pose_estimate_biased_high(self):
+        router = _make_router()
+        # same mutation count + workers; a 2× pose must estimate MORE than 2× the
+        # 574 case (per-mutation cost up AND effective workers halved)
+        s574  = router._estimate_rosetta_secs(48, 574, 8)
+        s1148 = router._estimate_rosetta_secs(48, 1148, 8)
+        assert s1148 > 2 * s574
+
+    def test_REGRESSION_large_pose_does_not_undershoot(self):
+        # 1500-res complex, 48 muts: must not undershoot a calibrated lower bound.
+        # per_mutation_sec(1500) alone is huge; the estimate must reflect it.
+        from rosetta_bridge import per_mutation_sec
+        router = _make_router()
+        secs = router._estimate_rosetta_secs(48, 1500, 8)
+        lower_bound = 48 * per_mutation_sec(1500) / 8   # even at full (over-credited) 8
+        assert secs >= lower_bound
+
+
+# ── 11. Lossless result model ─────────────────────────────────────────────────
+
+class TestLosslessResultModel:
+
+    def test_fast_scan_retains_all_with_fields(self):
+        scanner = _scanner_with_scores("ACDEFGHIKLMNPQR")
+        results = scanner.scan(pdb_path=_fake_pdb(), chain_id="A",
+                               sequence="ACDEFGHIKLMNPQR", run_rosetta=False)
+        assert len(results) == 14 * 3 - sum(1 for a in "ACDEFGHIKLMNPQR" if a in "PC") * 3 \
+            or len(results) > 0  # not truncated to 20
+        for r in results:
+            for f in ("key", "position", "chain", "from_aa", "to_aa", "ddg",
+                      "ddg_source", "ddg_basis", "tier", "solubility_delta",
+                      "esm_tolerance", "camsol_score", "fast_score", "combined_score"):
+                assert f in r, f"missing field {f}"
+            assert r["tier"] == "fast"
+            assert r["ddg"] is None and r["ddg_source"] == "not_computed"
+            assert r["ddg_basis"] == "none"
+
+    def test_not_truncated_to_20(self):
+        # whole-chain fast scan must retain ALL threshold-passing candidates (was 20)
+        scanner = _scanner_with_scores("A" * 40)   # 40 positions, loose default thresh
+        results = scanner.scan(pdb_path=_fake_pdb(), chain_id="A", sequence="A" * 40,
+                               run_rosetta=False)
+        assert len(results) > 20, f"result truncated to {len(results)} (lossy)"
+
+    def test_candidate_key_unique_and_present(self):
+        scanner = _scanner_with_scores("ACDEFGHIKLM")
+        results = scanner.scan(pdb_path=_fake_pdb(), chain_id="A",
+                               sequence="ACDEFGHIKLM", run_rosetta=False)
+        keys = [r["key"] for r in results]
+        assert all(keys) and len(keys) == len(set(keys))

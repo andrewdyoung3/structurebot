@@ -328,6 +328,28 @@ ROSETTA_PER_MUT_EXPONENT:  float = float(os.environ.get("ROSETTA_PER_MUT_EXPONEN
 ROSETTA_WORKER_BASE_MB:    int   = int(os.environ.get("ROSETTA_WORKER_BASE_MB", "500"))
 ROSETTA_WORKER_MB_PER_RES: float = float(os.environ.get("ROSETTA_WORKER_MB_PER_RES", "2.2"))
 
+# Deep-tier coverage: FULL grid (all scoped positions × candidates_per_pos) is the
+# DEFAULT (max data — the user's stated bias; safe because Rosetta is opt-in + the
+# estimate is honest).  SHORTLIST is an explicit speed opt-in that validates only
+# the fast tier's top-K by combined score; the rest are RETAINED as "not_computed"
+# (shortlist never silently drops candidates).  When the full-grid estimate exceeds
+# OFFER_SEC, the confirm/tier surface presents BOTH options with their estimates.
+ROSETTA_SHORTLIST_K:        int   = int(os.environ.get("ROSETTA_SHORTLIST_K", "15"))
+ROSETTA_FULL_GRID_OFFER_SEC: int  = int(os.environ.get("ROSETTA_FULL_GRID_OFFER_SEC", "300"))
+
+# ddG basis: SYMMETRIC (per-mutation paired WT re-relax — variance-reduced, the
+# reason to opt into Rosetta) is the DEFAULT.  ASYMMETRIC (score against the single
+# cached global-WT relax) ~halves deep cost but is a DIFFERENT, noisier ddG basis —
+# explicit fast-validation opt-in only, always labelled; the two are never mixed.
+ROSETTA_DDG_BASIS:         str   = os.environ.get("ROSETTA_DDG_BASIS", "symmetric").strip().lower()
+
+# Estimate large-pose guard (BUILD 3): the /workers divisor assumes ~linear speedup,
+# but single-channel DDR5 is bandwidth-bound so parallel efficiency falls for poses
+# LARGER than the measured 2HHB anchor.  Above REF_RES the estimate's effective
+# worker count is scaled by efficiency = REF_RES / n_res (≤1) so it stays BIASED
+# HIGH for big complexes (never undershoots).  At/below the anchor → no change.
+ROSETTA_PARALLEL_EFF_REF_RES: int = int(os.environ.get("ROSETTA_PARALLEL_EFF_REF_RES", "574"))
+
 # Median-absolute-deviation spread (kcal/mol) above which a multi-trajectory
 # ddG prediction is flagged low-confidence.
 ROSETTA_SPREAD_LOW_CONFIDENCE: float = float(

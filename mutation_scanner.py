@@ -237,6 +237,8 @@ class MutationScanner:
         scan_timeout:       int = 600,      # overall wall-clock budget (seconds)
         include_positions:  Optional[List[int]] = None,
         run_rosetta:        bool = True,
+        rosetta_shortlist_k: Optional[int] = None,
+        ddg_basis:          str = "symmetric",
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -267,6 +269,17 @@ class MutationScanner:
                              False (fast/default triage tier) skip it entirely (no
                              WSL2/PyRosetta spawned), report ddG as "not computed",
                              and renormalise the score over CamSol + ESM.
+        rosetta_shortlist_k: deep-tier coverage.  None (DEFAULT) = FULL grid — run
+                             Rosetta on every generated candidate (max data).  An
+                             int = SHORTLIST — run Rosetta only on the top-K by
+                             fast (CamSol+ESM) score; the rest are RETAINED with
+                             ddg="not_computed" (never dropped, only deferred).
+        ddg_basis          : "symmetric" (DEFAULT — per-mutation paired WT re-relax,
+                             variance-reduced) or "asymmetric" (score against the
+                             single cached WT; ~2× faster, noisier, labelled).  The
+                             RESULT is fully LOSSLESS: every generated candidate is
+                             retained with all per-measure fields + the tier/basis
+                             that produced each (substrate for export + aggregation).
 
         Returns
         -------
@@ -281,7 +294,11 @@ class MutationScanner:
         filt               = filters or {}
         camsol_thr         = filt.get("camsol_threshold",   -0.5)
         esm_thr            = filt.get("esm_threshold",       0.3)
-        max_candidates     = filt.get("max_candidates",      20)
+        # LOSSLESS / full-coverage default: None = no generation cap (retain every
+        # candidate that passes the CamSol/ESM thresholds).  An explicit int still
+        # caps generation if a caller wants it.  (Rosetta cost is governed by the
+        # opt-in deep tier + shortlist, NOT by truncating the evaluated set.)
+        max_candidates     = filt.get("max_candidates", None)
         cands_per_pos      = filt.get("candidates_per_pos",  3)
         protected          = set(filt.get("binding_site_residues", []))
         w_ddg              = filt.get("w_ddg", _W_DDG)
@@ -337,7 +354,8 @@ class MutationScanner:
                     "  Requested scan scope resolved to no positions — nothing to scan."
                 )
                 return []
-            max_candidates = max(max_candidates, len(_include_set) * cands_per_pos)
+            # (Full coverage is default — max_candidates None means no cap, so the
+            # whole scope × cands_per_pos grid is generated; no cap-raise needed.)
 
         raw_candidates = self._identify_candidates(
             sequence           = sequence,
@@ -368,93 +386,105 @@ class MutationScanner:
             f"  Generating candidates: complete ({time.perf_counter() - _t0:.1f}s)"
         )
 
-        # ── Step 4: Rosetta ddG scoring (OPT-IN deep tier) ────────────────────
-        # Triage→validate split: the DEFAULT (fast) tier does NOT run Rosetta — it
-        # ranks on CamSol + ESM in seconds, with the ddG voter dropped + the score
-        # renormalised (see effective_weights).  Rosetta runs ONLY when run_rosetta
-        # is True (the user opted in).  ddg_computed gates honest reporting below:
-        # when False, ddG is reported as None ("not computed"), never a fake 0.0.
+        # ── Step 4: Rosetta ddG (OPT-IN deep tier) ────────────────────────────
+        # The full grid above is ALWAYS scored on CamSol + ESM (lossless).  The
+        # deep tier runs Rosetta on EVERY candidate (full coverage, default) OR the
+        # top-K by fast score (shortlist opt-in); non-Rosetta'd candidates are
+        # RETAINED with ddg="not_computed" — shortlist DEFERS, never drops.  ddG is
+        # decided PER CANDIDATE below (key present in ddg_scores), never a fake 0.0.
+
+        # Fast (CamSol+ESM, renormalised) score for EVERY candidate — used for
+        # ranking, shortlist selection, and as the retained score when ddG is off.
+        _wf_ddg, _wf_sol, _wf_tol = effective_weights(False, w_ddg, w_sol, w_tol)
+        for cand in raw_candidates:
+            _etol = round(1.0 - esm_scores.get(cand["position"], 0.5), 4)
+            cand["_esm_tol"]    = _etol
+            cand["_fast_score"] = combined_score(
+                0.0, cand["estimated_camsol_delta"], _etol, _wf_ddg, _wf_sol, _wf_tol
+            )
+
         ddg_scores:     Dict[str, float] = {}
         ddg_source:     Dict[str, str]   = {}
         ddg_spread:     Dict[str, Any]   = {}
         ddg_confidence: Dict[str, str]   = {}
-        ddg_computed = False
 
         if not run_rosetta:
             self._progress(
-                f"  Fast tier (CamSol + ESM only) — Rosetta ddG skipped. "
-                f"Ranking {len(raw_candidates)} candidate(s) without ddG; "
-                "re-run with 'rosetta' for the deep ddG-validated tier."
+                f"  Fast tier (CamSol + ESM only) — Rosetta ddG skipped for all "
+                f"{len(raw_candidates)} candidate(s); re-run with 'rosetta' for the "
+                "deep ddG-validated tier."
             )
         else:
             _remaining = _scan_deadline - time.perf_counter()
             if _remaining <= 30:
                 self._progress(
-                    f"  Overall scan timeout ({scan_timeout}s) reached before ddG scoring. "
-                    "Candidates ranked by CamSol + ESM only (ddG not computed)."
+                    f"  Overall scan timeout ({scan_timeout}s) reached before ddG "
+                    "scoring — candidates ranked by CamSol + ESM (ddG not computed)."
                 )
             else:
-                self._progress(
-                    f"Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations..."
-                )
+                if rosetta_shortlist_k and rosetta_shortlist_k < len(raw_candidates):
+                    rosetta_cands = sorted(
+                        raw_candidates, key=lambda c: c["_fast_score"], reverse=True
+                    )[:rosetta_shortlist_k]
+                    self._progress(
+                        f"Step 4/4: Rosetta ddG — SHORTLIST top {len(rosetta_cands)} "
+                        f"of {len(raw_candidates)} by fast score ({ddg_basis} basis); "
+                        "the rest retained as 'not computed'."
+                    )
+                else:
+                    rosetta_cands = raw_candidates
+                    self._progress(
+                        f"Step 4/4: Rosetta ddG — FULL coverage, "
+                        f"{len(rosetta_cands)} mutation(s) ({ddg_basis} basis)..."
+                    )
                 _t0 = time.perf_counter()
                 ddg_scores, ddg_source, ddg_spread, ddg_confidence = self._run_rosetta_batch(
-                    pdb_path, raw_candidates, chain_id,
-                    scan_deadline=_scan_deadline,
+                    pdb_path, rosetta_cands, chain_id,
+                    scan_deadline=_scan_deadline, ddg_basis=ddg_basis,
                 )
-                ddg_computed = True
-                self._progress(f"  DynaMut2: complete ({time.perf_counter() - _t0:.1f}s)")
+                self._progress(f"  Rosetta: complete ({time.perf_counter() - _t0:.1f}s)")
 
-        # Weights: drop+renormalise the ddG voter when it was not computed.
-        w_ddg_eff, w_sol_eff, w_tol_eff = effective_weights(
-            ddg_computed, w_ddg, w_sol, w_tol
-        )
-
-        # ── Assemble and rank ─────────────────────────────────────────────────
+        # ── Assemble (LOSSLESS — EVERY generated candidate retained) + rank ───
+        # One structured record per candidate keyed by (from,pos,to), carrying all
+        # per-measure values + the tier/basis that produced the ddG.  Deep-scored
+        # candidates use the full ddG-inclusive score; the rest keep their fast
+        # (CamSol+ESM) score and an explicit not_computed ddG.  Nothing truncated —
+        # this is the substrate for the future export + cross-layer aggregation.
         results: List[Dict[str, Any]] = []
         for cand in raw_candidates:
             pos     = cand["position"]
             to_aa   = cand["to_aa"]
             from_aa = cand["from_aa"]
             key     = f"{from_aa}{pos}{to_aa}"
+            camsol_delta = cand["estimated_camsol_delta"]
+            esm_tol      = cand["_esm_tol"]
 
-            camsol_delta  = cand["estimated_camsol_delta"]
-            esm_cons      = esm_scores.get(pos, 0.5)
-            esm_tol       = round(1.0 - esm_cons, 4)
-
-            if ddg_computed:
-                ddg     = ddg_scores.get(key, 0.0)
-                # "pyrosetta" / "empirical" / backend label, or "none" when this
-                # mutation failed within an otherwise-deep tier (defaulted to 0.0).
+            if key in ddg_scores:                          # this candidate got Rosetta
+                ddg      = ddg_scores[key]
                 ddg_src  = ddg_source.get(key, "none")
-                ddg_sprd = ddg_spread.get(key)            # MAD, or None (single-traj)
+                ddg_sprd = ddg_spread.get(key)
                 ddg_conf = ddg_confidence.get(key, "single-trajectory")
                 ddg_out  = round(ddg, 3)
-                _ddg_for_score = ddg
-            else:
-                # Fast/default tier — ddG NOT computed.  Report honestly (None →
-                # "not computed (opt in with 'rosetta')" in the display layer);
-                # never a fake 0.0.  Score uses the renormalised CamSol+ESM weights.
-                ddg     = None
+                basis    = ddg_basis                       # "symmetric" | "asymmetric"
+                tier     = "deep"
+                score    = combined_score(ddg, camsol_delta, esm_tol,
+                                          w_ddg, w_sol, w_tol)
+            else:                                          # fast tier / deferred by shortlist
+                ddg = ddg_out = None
                 ddg_src  = "not_computed"
                 ddg_sprd = None
                 ddg_conf = "not_computed"
-                ddg_out  = None
-                _ddg_for_score = 0.0   # zeroed; w_ddg_eff is 0.0 so it contributes nothing
+                basis    = "none"
+                tier     = "fast"
+                score    = cand["_fast_score"]
 
-            score = combined_score(
-                _ddg_for_score, camsol_delta, esm_tol,
-                w_ddg_eff, w_sol_eff, w_tol_eff,
-            )
-
-            # Check interface-proximal: within 3 positions of an interface residue
             is_proximal = cand.get("interface_proximal", False)
-
             rec = _recommendation(ddg, camsol_delta, esm_tol, score)
             if is_proximal:
                 rec += " — ⚠ interface-proximal, mutate with caution"
 
             results.append({
+                "key":               key,
                 "position":          pos,
                 "chain":             chain_id or "A",
                 "from_aa":           from_aa,
@@ -463,10 +493,13 @@ class MutationScanner:
                 "ddg_source":        ddg_src,
                 "ddg_spread":        ddg_sprd,
                 "ddg_confidence":    ddg_conf,
+                "ddg_basis":         basis,
+                "tier":              tier,
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
-                "combined_score":    score,
                 "camsol_score":      round(camsol_scores.get(pos, 0.0), 3),
+                "fast_score":        cand["_fast_score"],
+                "combined_score":    score,
                 "recommendation":    rec,
                 "interface_proximal": is_proximal,
                 "analysis_mode":     getattr(self, "_analysis_mode", "monomer"),
@@ -731,7 +764,7 @@ class MutationScanner:
                     "estimated_camsol_delta": camsol_delta,
                     "interface_proximal":     is_proximal,
                 })
-                if len(candidates) >= max_candidates:
+                if max_candidates is not None and len(candidates) >= max_candidates:
                     return candidates
 
         return candidates
@@ -769,6 +802,7 @@ class MutationScanner:
         candidates:    List[Dict[str, Any]],
         chain_id:      Optional[str],
         scan_deadline: Optional[float] = None,
+        ddg_basis:     str = "symmetric",
     ) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, Any], Dict[str, str]]:
         """
         Run Rosetta ddG for all candidate mutations in one batch call.
@@ -815,6 +849,7 @@ class MutationScanner:
             chain             = chain_id,
             progress_callback = self._progress,
             scan_deadline     = scan_deadline,
+            ddg_basis         = ddg_basis,
         )
 
         if result.success:

@@ -425,6 +425,21 @@ def per_mutation_sec(n_residues: Optional[int]) -> float:
     return base_sec * (max(1, n) / max(1, base_res)) ** exp
 
 
+def parallel_efficiency(n_residues: Optional[int]) -> float:
+    """Estimate-only parallel efficiency (≤1.0) for a pose of *n_residues*.
+
+    At/below the measured anchor (ROSETTA_PARALLEL_EFF_REF_RES, the 2HHB 574-res
+    point) efficiency is 1.0 — the /workers divisor is trusted.  ABOVE it we have
+    no data and single-channel DDR5 is bandwidth-bound, so efficiency falls as
+    REF/n_res, shrinking the effective worker count → the estimate stays BIASED
+    HIGH (never undershoots a complex larger than the anchor)."""
+    import config as _c
+    ref = int(getattr(_c, "ROSETTA_PARALLEL_EFF_REF_RES", 574))
+    if not n_residues or n_residues <= ref:
+        return 1.0
+    return ref / float(n_residues)
+
+
 def mutation_seed(base_seed: int, mutation_key: str, trajectory: int = 0) -> int:
     """
     Deterministic per-mutation (per-trajectory) RNG seed.
@@ -475,6 +490,7 @@ class RosettaBridge:
         chain:             Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         scan_deadline:     Optional[float] = None,
+        ddg_basis:         str = "symmetric",
     ) -> ToolStepResult:
         """
         Calculate ddG for one or more mutations.
@@ -511,7 +527,8 @@ class RosettaBridge:
                 )
             elif self._backend == "local":
                 return self._run_rosetta_local(
-                    pdb_path, mutations, model_id, chain, progress_callback
+                    pdb_path, mutations, model_id, chain, progress_callback,
+                    ddg_basis=ddg_basis,
                 )
             else:
                 return self._run_dynamut2(
@@ -1265,6 +1282,7 @@ class RosettaBridge:
         relax_cycles: int = 3,
         num_trajectories: Optional[int] = None,
         num_workers: Optional[int] = None,
+        ddg_basis: str = "symmetric",
     ) -> "ToolStepResult":
         """
         PyRosetta cartesian_ddg protocol via WSL2.
@@ -1331,8 +1349,14 @@ class RosettaBridge:
             per_worker_mb  = _footprint,
         )
         base_seed = int(getattr(_cfg_traj, "ROSETTA_BASE_SEED", 1))
+        # ddG basis: symmetric (paired per-mutation WT re-relax, default) vs
+        # asymmetric (score each mutant against the single cached global-WT relax;
+        # ~2× faster, noisier — explicit opt-in, labelled in output).
+        _symmetric    = str(ddg_basis).strip().lower() != "asymmetric"
+        _symmetric_py = "True" if _symmetric else "False"
         _prog(f"  [Rosetta] pool: {num_workers} worker(s) "
-              f"(pose {_n_res or '?'} res, ~{_footprint} MB/worker)")
+              f"(pose {_n_res or '?'} res, ~{_footprint} MB/worker); "
+              f"ddG basis: {'symmetric' if _symmetric else 'asymmetric'}")
 
         try:
             from wsl_bridge import WSLBridge
@@ -1515,6 +1539,7 @@ try:
     _n_traj = {num_trajectories}
     _n_workers = {num_workers}
     _base_seed = {base_seed}
+    _symmetric = {_symmetric_py}
     print(f"[Rosetta] Starting mutation scoring, {{len(mutations)}} mutation(s) "
           f"({{_n_traj}} trajectory/ies x {relax_cycles} relax cycles, "
           f"{{_n_workers}} worker(s))", flush=True)
@@ -1555,9 +1580,16 @@ try:
                 mut_pose = wt_pose.clone()
                 MutateResidue(target=res_num, new_res=to_aa3).apply(mut_pose)
                 FastRelax(scorefxn_std, {relax_cycles}).apply(mut_pose)
-                wt_re = wt_pose.clone()
-                FastRelax(scorefxn_std, {relax_cycles}).apply(wt_re)
-                _ddg_t = scorefxn_std(mut_pose) - scorefxn_std(wt_re)
+                if _symmetric:
+                    # paired WT re-relax under the SAME seed → cancels relax bias
+                    wt_re = wt_pose.clone()
+                    FastRelax(scorefxn_std, {relax_cycles}).apply(wt_re)
+                    _ref = scorefxn_std(wt_re)
+                else:
+                    # asymmetric: reference is the single cached global-WT relax
+                    # (no per-mutation re-relax → ~half the cost, noisier basis)
+                    _ref = scorefxn_std(wt_pose)
+                _ddg_t = scorefxn_std(mut_pose) - _ref
                 _traj.append(round(float(_ddg_t), 3))
                 print(f"[Rosetta] {{key}} traj {{_t+1}}/{{_n_traj}}: "
                       f"ddG = {{_ddg_t:+.2f}} kcal/mol", flush=True)

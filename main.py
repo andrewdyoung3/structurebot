@@ -744,17 +744,23 @@ class StructureBot:
             # The tier-choice surface is a local question, not a re-translation.
             # Interpret the answer and set run_rosetta directly — never re-route.
             if result.get("_tier_choice"):
-                _want_deep = bool(re.search(
-                    r"\b(deep|rosetta|rosie|full|yes|2)\b", answer, re.IGNORECASE
+                _ans = answer.lower()
+                _want_shortlist = bool(re.search(r"\b(shortlist|short-list|top)\b", _ans))
+                _want_deep = _want_shortlist or bool(re.search(
+                    r"\b(deep|rosetta|rosie|full|yes|2)\b", _ans
                 ))
                 _ti = (result.get("tool_inputs") or {}).get("mutation_scan")
                 if isinstance(_ti, dict):
                     _ti["run_rosetta"] = _want_deep
+                    if _want_shortlist:
+                        import config as _cfg
+                        _ti["rosetta_shortlist_k"] = int(getattr(_cfg, "ROSETTA_SHORTLIST_K", 15))
                 result["clarification_needed"] = None
                 result.pop("_tier_choice", None)
-                console.print(
-                    f"[dim]Running the {'deep (+Rosetta ddG)' if _want_deep else 'fast (CamSol+ESM)'} tier.[/dim]"
-                )
+                _label = ("deep-shortlist (top-K Rosetta ddG)" if _want_shortlist
+                          else "deep (full Rosetta ddG)" if _want_deep
+                          else "fast (CamSol+ESM)")
+                console.print(f"[dim]Running the {_label} tier.[/dim]")
                 break
 
             # ── Fast-path: bypass retranslation for known tool intents ─────────

@@ -673,6 +673,13 @@ class ToolRouter:
     _SELECTION_SCOPE_RE = re.compile(
         r"\b(?:selected|selection|highlighted)\b", re.IGNORECASE
     )
+    # Deep-tier SHORTLIST opt-in (validate top-K instead of the full grid).
+    _SHORTLIST_RE = re.compile(
+        r"\b(?:shortlist|short-list|top[- ]?\d+|top\s+candidates|"
+        r"just\s+the\s+top|best\s+candidates)\b", re.IGNORECASE
+    )
+    # ASYMMETRIC ddG opt-in (single cached-WT reference; faster, noisier basis).
+    _ASYMMETRIC_RE = re.compile(r"\basymmetric\b", re.IGNORECASE)
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -724,11 +731,24 @@ class ToolRouter:
         scales per-mutation cost SUPER-linearly with the FULL pose size, and
         divides by the (footprint-capped) worker count.  Biased high; "approximate".
         """
+        secs = self._estimate_rosetta_secs(n_mutations, n_residues, workers)
+        return self._format_duration(secs) if secs is not None else None
+
+    def _estimate_rosetta_secs(
+        self,
+        n_mutations: Optional[int],
+        n_residues:  Optional[int],
+        workers:     int = 1,
+    ) -> Optional[float]:
+        """Raw seconds for the deep-tier estimate (None if mutation count unknown)."""
         if not n_mutations:
             return None
-        from rosetta_bridge import per_mutation_sec
-        secs = n_mutations * per_mutation_sec(n_residues) / max(1, workers)
-        return self._format_duration(secs)
+        from rosetta_bridge import per_mutation_sec, parallel_efficiency
+        # Large-pose guard (BUILD 3): above the measured anchor, single-channel
+        # DDR5 makes parallel scaling sub-linear, so shrink the effective worker
+        # count → estimate stays biased HIGH (never undershoots a big complex).
+        eff_workers = max(1.0, max(1, workers) * parallel_efficiency(n_residues))
+        return n_mutations * per_mutation_sec(n_residues) / eff_workers
 
     def _parse_scan_scope(
         self,
@@ -813,15 +833,22 @@ class ToolRouter:
         if scope_requested:
             inp["scan_positions"] = positions   # may be [] → _run_mutation_scan errors
 
-        # (b) Tier
-        deep     = bool(self._TIER_ROSETTA_RE.search(user_input))
-        thorough = bool(self._THOROUGHNESS_RE.search(user_input))
+        # (b) Tier + options
+        import config as _cfg
+        deep      = bool(self._TIER_ROSETTA_RE.search(user_input))
+        thorough  = bool(self._THOROUGHNESS_RE.search(user_input))
+        shortlist = bool(self._SHORTLIST_RE.search(user_input))
+        asym      = bool(self._ASYMMETRIC_RE.search(user_input))
         inp["run_rosetta"] = deep
+        inp["ddg_basis"]   = "asymmetric" if asym else getattr(_cfg, "ROSETTA_DDG_BASIS", "symmetric")
+        _K = int(getattr(_cfg, "ROSETTA_SHORTLIST_K", 15))
+        # FULL coverage is the default (max data, the user's bias); shortlist is an
+        # explicit opt-in (never silent).  rosetta_shortlist_k=None → full grid.
+        inp["rosetta_shortlist_k"] = _K if shortlist else None
 
         # Estimate inputs (only needed when a deep estimate will be surfaced):
         #   n_pos  — positions to scan (scope, else chain length)
-        #   n_mut  — ACTUAL Rosetta calls = positions × candidates_per_pos (grid),
-        #            capped at the whole-chain max for an unscoped scan
+        #   n_mut  — ACTUAL full-grid Rosetta calls = positions × candidates_per_pos
         #   n_res  — FULL pose residues (all chains; drives per-mutation cost)
         if deep or thorough:
             if scope_requested and positions:
@@ -836,26 +863,50 @@ class ToolRouter:
                     n_mut = min(n_mut, self._DEFAULT_MAX_CANDIDATES)
             else:
                 n_mut = None
-            n_res   = self._pose_residue_count(model_id)
-            workers = self._resolve_deep_workers(n_res)
-            est     = self._estimate_rosetta_runtime(n_mut, n_res, workers)
+            n_res    = self._pose_residue_count(model_id)
+            workers  = self._resolve_deep_workers(n_res)
+            n_short  = min(_K, n_mut) if n_mut else None
+            full_s   = self._estimate_rosetta_secs(n_mut, n_res, workers)
+            full_est = self._format_duration(full_s) if full_s is not None else None
+            short_est = self._estimate_rosetta_runtime(n_short, n_res, workers)
+            offer_sec = int(getattr(_cfg, "ROSETTA_FULL_GRID_OFFER_SEC", 300))
+            _basis_note = "" if not asym else " [asymmetric ddG basis — faster, noisier]"
 
         # (c) Surfaces
         if deep:
-            if est:
+            if shortlist and short_est:
                 result.setdefault("warnings", []).append(
-                    f"Deep tier (Rosetta ddG, {workers} worker(s)): approximate "
-                    f"runtime {est} for {n_mut} mutation(s) across {n_pos} "
-                    f"position(s) on a {n_res or '?'}-residue pose — shown before "
-                    "launch (no mid-run cancel)."
+                    f"Deep tier — SHORTLIST top {n_short} of {n_mut} candidates by "
+                    f"fast score ({workers} worker(s)): approximate runtime "
+                    f"{short_est} on a {n_res or '?'}-residue pose{_basis_note}. "
+                    "The rest are retained as 'not computed'."
                 )
+            elif full_est:
+                _msg = (
+                    f"Deep tier — FULL coverage ({workers} worker(s)): approximate "
+                    f"runtime {full_est} for {n_mut} mutation(s) across {n_pos} "
+                    f"position(s) on a {n_res or '?'}-residue pose{_basis_note} — "
+                    "shown before launch (no mid-run cancel)."
+                )
+                # Offer the shortlist alternative when the full grid is expensive
+                # (data-vs-speed becomes an explicit, estimated choice — never silent).
+                if full_s and full_s > offer_sec and short_est and n_mut and n_mut > _K:
+                    _msg += (
+                        f"  Faster option: say 'shortlist' to validate just the top "
+                        f"{_K} by fast score (≈ {short_est}); the rest stay 'not computed'."
+                    )
+                result.setdefault("warnings", []).append(_msg)
         elif thorough:
             # Thoroughness phrasing does NOT auto-run Rosetta — raise a tier choice.
-            est  = est or "several minutes"
+            _fe = full_est or "several minutes"
+            _extra = ""
+            if full_s and full_s > offer_sec and short_est and n_mut and n_mut > _K:
+                _extra = f", or Deep-shortlist (top {_K}) ≈ {short_est}"
             result["clarification_needed"] = (
                 f"Base tier (CamSol + ESM) ≈ 2 s, or Deep tier (+Rosetta ddG, "
-                f"{workers} worker(s)) {est} for {n_mut} mutation(s) across "
-                f"{n_pos if n_pos else 'the chain'} position(s) — which? (base / deep)"
+                f"{workers} worker(s)) full {_fe} for {n_mut} mutation(s) across "
+                f"{n_pos if n_pos else 'the chain'} position(s){_extra} — which? "
+                "(base / deep / shortlist)"
             )
             result["_tier_choice"] = True
 
@@ -3405,6 +3456,8 @@ class ToolRouter:
         # opt-in Rosetta.  Defaults: whole chain, FAST tier (no Rosetta).
         scan_positions = inputs.get("scan_positions")        # None | list (maybe [])
         run_rosetta    = bool(inputs.get("run_rosetta", False))
+        shortlist_k    = inputs.get("rosetta_shortlist_k")   # None = full coverage
+        ddg_basis      = inputs.get("ddg_basis") or "symmetric"
 
         # A scope that was requested but resolved to nothing → ERROR, no full-chain
         # fallback (mirrors the ProteinMPNN restricted-design convention).
@@ -3478,6 +3531,8 @@ class ToolRouter:
             analysis_mode      = analysis_mode,
             include_positions  = scan_positions,
             run_rosetta        = run_rosetta,
+            rosetta_shortlist_k = shortlist_k,
+            ddg_basis          = ddg_basis,
         )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
