@@ -8,7 +8,7 @@ section and append a new entry." -->
 
 | Field | Value |
 |-------|-------|
-| Generated | 2026-06-08 (emission-guard origin scoping (FIX 1) + surface verb-tier (FIX 2) + live-verify close-out; direction fix earlier same day) |
+| Generated | 2026-06-09 (ThermoMPNN fast-tier stability voter + aggregate ddG-weighting forward spec; same-day stack: color op-class, translator cap latch, mutation-scan tiering/scope/opt-in/parallelization, estimate honesty + pose-size cap, full/shortlist coverage + sym/asym ddG + lossless result model) |
 | Test count at generation | **1326 passing / 20 skipped / 0 failures** (`pytest tests/ -q`; 20 skipped = 12 PyRosetta + 5 ColabFold live benchmarks + 3 other opt-in tests requiring live envs; gated suite excluding the two live-benchmark files = 1326 passed / 3 skipped) |
 | Regenerate with | `claude "Read PROJECT_CONTEXT.md for regeneration instructions, then regenerate it in full by reading the entire codebase. Preserve the Changelog section and append a new entry."` |
 
@@ -713,6 +713,42 @@ This phase is also the natural home for the interpretive natural-language summar
 validate-design v1 and the confirmation-surfaces echo-back (Backlog) — all of it is "make the
 outputs trustworthy and legible" work.
 
+### Aggregate ddG weighting — independence × confidence, staged by round
+
+> **FORWARD SPEC for the not-yet-built aggregate layer. Do NOT implement from this. Numbers are
+> placeholders pending the benchmark.**
+
+Each source's weight = **(diversity allocation to its independence axis) × (confidence of the
+estimator filling it)**. Two distinct reasons to up/down-weight, both applied:
+- **INDEPENDENCE:** correlated sources don't double-vote. RaSP and Rosetta are ONE physics axis
+  (RaSP is a trained Rosetta surrogate) — never both at once.
+- **CONFIDENCE:** a more reliable estimator carries more of its axis's weight. Rosetta > RaSP is
+  principled, not a preference — a surrogate can't be more accurate than what it approximates.
+
+**Independence axes (stability; corroborate → agreement feeds confidence):**
+- **PHYSICS** — RaSP (proxy, low confidence) OR Rosetta (real, high confidence); handoff per candidate.
+- **ML / STATIC** — ThermoMPNN.
+- **DYNAMICS** — DynaMut2 (most differentiated).
+
+**Property axes (integrated, not corroborated):** CamSol (solubility), ESM (fitness).
+
+**Staged by round (driven by what's dense/cheap vs sparse/expensive):**
+- **ROUND 1 — dense, local:** RaSP + ThermoMPNN (+ CamSol, ESM). DynaMut2 absent (remote API,
+  can't be dense). Physics (RaSP) weighted LOW (proxy). Two stability axes.
+- **ROUND 2 — shortlist / opt-in:** Rosetta + ThermoMPNN + DynaMut2 (+ properties). RaSP → 0
+  (handoff); physics (Rosetta) weighted HIGHER (confidence); dynamics axis enters. Three stability
+  axes — more diverse AND more confident.
+
+Per candidate, **renormalise over present axes (sum to 1)**. RaSP is RETAINED even when zeroed —
+the **RaSP − Rosetta delta is a proxy-QC signal, not corroboration**.
+
+**NUMBERS ARE PLACEHOLDER** — illustrative round-1 ~RaSP/Thermo and round-2 ~Rosetta/Thermo/Dyna
+ratios pending the benchmark, which **measures** the diversity (independence) and confidence
+(accuracy-vs-experiment) factors directly rather than guessing them. Test runs will iron these out.
+
+(Today's `present_voters_score` already renormalises over present voters — the per-candidate,
+sum-to-1 substrate this spec extends; ThermoMPNN is the ML/STATIC axis, already wired.)
+
 ---
 
 ## 10. External Dependencies
@@ -857,6 +893,7 @@ A `.gitignore` is now in place. **Untracked** (intentionally not committed): `ca
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-06-09 | 1326 (doc-only) | docs(§9): captured the **aggregate ddG-weighting principle — independence × confidence, staged by round** (forward spec for the not-yet-built aggregate layer). Each source's weight = diversity-allocation-to-its-independence-axis × estimator-confidence. Independence axes: PHYSICS (RaSP-proxy OR Rosetta-real, handoff per candidate, never both), ML/STATIC (ThermoMPNN), DYNAMICS (DynaMut2); property axes (CamSol, ESM) integrated not corroborated. Round 1 = dense local (RaSP+ThermoMPNN, physics low); Round 2 = shortlist (Rosetta+ThermoMPNN+DynaMut2, RaSP→0, physics higher, dynamics enters). Per-candidate renormalise over present axes; RaSP−Rosetta delta = proxy-QC. Numbers placeholder pending the benchmark. NO code/tests. |
 | 2026-06-09 | 1326 (1326✓/3s/0❌) | feat(thermompnn): **ThermoMPNN as a fast-tier local stability voter (first instance of the redundant-ddG ensemble).** `thermompnn_bridge.py` (NEW) + `tests/test_thermompnn.py` (17). **ENV (gated):** venv312-first chosen after a REAL end-to-end inference smoke test (not just import) — pip dry-run confirmed install would NOT touch torch (the load-bearing ESM dep), install verified torch 2.11.0+cu128 + ESM intact, then ThermoMPNN inference reproduced the repo's reference CSV byte-for-byte under Lightning 2.6.5. Deps added to venv312: pytorch-lightning, omegaconf, pandas, biopython, wandb. ThermoMPNN cloned to `ThermoMPNN_repo/` (gitignored; weights bundled in-repo, no external host). **BRIDGE:** subprocesses the tool's `custom_inference.py` (SSM, one GPU pass) → CSV; mirrors esm_bridge (execution) + DynaMut2 (`{key: ddg}` contract). **SIGN** traced to training code (`datasets.py:161` negates Megascale ddG → predicts negative=stabilising = system convention; `THERMOMPNN_DDG_SIGN`=+1), live-confirmed (2HHB chain A: 24 stabilising/117 destabilising, min −0.61/max +2.81 — physically correct). **POSITION→RESNUM** gotcha: CSV `position` = author_resnum−min_author (not sequential) → bridge maps `author=position+min_author` and **verifies wildtype** (drops unverified rows, bails batch if <80% verify — never mis-attributes). **CHAIN-AWARE key** `f"{chain}:{wt}{resnum}{mut}"` (no multimer collision; the lossless record `key` is now chain-aware). **RENORMALISE:** `present_voters_score` renormalises over present voters (Rosetta + ThermoMPNN + CamSol + ESM); both ddG voters absent → exactly 0.6·camsol+0.4·esm → **a ThermoMPNN-disabled scan == pre-ThermoMPNN byte-for-byte** (graceful). **Keep-both:** Rosetta + ThermoMPNN retained as independent voters (agreement → future aggregate confidence). `THERMOMPNN_WEIGHT`=0.45 PROVISIONAL pending benchmark calibration (note: ThermoMPNN/ESM share structural context, CamSol orthogonal). **Lossless:** records gain `thermompnn_ddg`/`thermompnn_source` (`not_computed` where absent), nothing dropped. Also FIXED the §4 16→12 GB RTX 5070 Ti card line. **Tests +14** (sign, hard-PDB mapping incl. non-1-start/gap/insertion + wt-mismatch-drop guard, present-voters graceful exactness, scanner integration); verified-mechanism tests UNALTERED. Suite **1326 / 0 / 3**. **LIVE-VERIFIED (real 2HHB GPU):** fast-tier scan 18/18 mapped in 10 s, sign correct, combined score reflects ThermoMPNN; disabled run still works. Branch `feat/thermompnn-fasttier`; **merge HELD**. NEXT: RaSP (same voter pattern) → exporter + cross-layer aggregate confidence. §3/§4/§9 updated. |
 | 2026-06-09 | 1312 (1312✓/3s/0❌) | feat(mutation-scan+rosetta): **deep-tier coverage (full default + shortlist opt-in), symmetric/asymmetric ddG, large-pose estimate guard, lossless result model.** Resolves the two §9 decisions + adds the export/aggregate substrate. **BUILD 1 — coverage:** FULL grid is the deep DEFAULT (every scoped position × `candidates_per_pos`, max data); **shortlist** (top-K=`ROSETTA_SHORTLIST_K` 15 by fast score) is an explicit opt-in ("shortlist"); deferred candidates are RETAINED as `not_computed`, never dropped. When the full-grid estimate exceeds `ROSETTA_FULL_GRID_OFFER_SEC` (300 s) the confirm/tier surface offers BOTH with distinct estimates (data-vs-speed, never silent). **BUILD 2 — ddG basis:** symmetric (paired WT re-relax) stays default; **asymmetric** (single cached-WT reference, ~2× faster, noisier) is an explicit opt-in ("asymmetric"), labelled in output, never mixed (`ROSETTA_DDG_BASIS`). Worker `_score_one` branches on `_symmetric`. **BUILD 3 — large-pose estimate guard:** `parallel_efficiency(n_res)` (=1 ≤ 2HHB anchor, REF/n above) shrinks the estimate's effective workers for bandwidth-bound big complexes → biased high, never undershoots a pose larger than the anchor (`ROSETTA_PARALLEL_EFF_REF_RES`). **DATA MODEL — lossless:** the candidate-gen 20-cap is removed (full grid generated + CamSol/ESM-scored); every result record keyed by `key`=(from,pos,to) with `ddg_basis`, `tier` (fast/deep), `fast_score` + all per-measure fields; `not_computed` markers, never 0.0/blank — the substrate for the NEXT Excel export + cross-layer aggregate (NOT built this pass). **Tests +19** (`tests/test_mutation_scan_tiering.py`: coverage full/shortlist/never-auto, ddG basis default/opt-in/never-mixed, large-pose estimate guard + regression, lossless retention/key/no-truncation); verified-mechanism tests UNALTERED. Suite **1312 / 0 / 3**. **LIVE-VERIFIED (real 2HHB + pyrosetta_wsl2):** full default + shortlist offer (~2.1 h vs ~39 min) with both estimates biased high; shortlist narrows to top-15; asymmetric labelled. Branch `feat/mutation-scan-tiering`; **merge HELD pending explicit go**. §3/§4/§9 updated. |
 | 2026-06-09 | 1293 (1293✓/3s/0❌) | fix(mutation-scan+rosetta): **deep-tier estimate-honesty + pose-size worker cap (merge-blocker for the tiering work).** The opt-in confirm-gate estimate is the entire user-facing surface of base-vs-deep; it said **~50 s** for a job that really ran **75+ min** (~90× optimistic) — re-creating the original 80-min surprise one layer up. **Two stacked causes:** (1) it counted **positions** (16) not dispatched **mutations** (16 × `candidates_per_pos` 3 = 48 — the deep tier re-grids); (2) a flat ~25 s/position constant with **no pose-size scaling**, so a 574-res tetramer mutation was costed like a tiny monomer. **FIX 1 (estimate):** `_estimate_rosetta_runtime(n_mutations, n_residues, workers)` = actual mutation count × `per_mutation_sec(full_pose_residues)` ÷ footprint-capped workers; per-mutation cost **super-linear** in pose size, calibrated to measured anchors (1CRN 46 res ≈ 10 s/mut; 2HHB 574 res ≳ 733 s killed-before-finish lower bound → model ~940 s), **biased high**. Full pose residue count via `_pose_residue_count` (ALL chains from the real PDB — 574, not chain-A 141). **FIX 2 (worker cap):** per-worker footprint **scales with pose size** (`worker_footprint_mb` = 500 + 2.2×n; 2HHB ≈ 1763 MB ⇒ 6 workers not the lucky 8) so big complexes shrink the pool and never oversubscribe WSL into swap; applied in BOTH the estimate and the real `_run_rosetta_local`. New config: `ROSETTA_PER_MUT_BASE_SEC/_BASE_RES/_EXPONENT`, `ROSETTA_WORKER_BASE_MB/_MB_PER_RES` (§4). **PROBE-only findings (reported, NOT implemented — §9 decision rows):** deep tier is a GRID (positions×subs) not a shortlist (shortlist = dominant speedup for bandwidth-bound multimers); per-mutation WT re-relax is a deliberate SYMMETRIC 2× cost (asymmetric would ~halve it). **Tests +9 net** (estimate rewritten to count+size formula incl. a 2HHB-scale regression guard that fails on ~50 s; pose-size worker-cap tests; anchors-not-undershot); tiering/scope/trigger/seed/concurrency tests UNALTERED. **LIVE-VERIFIED:** new estimate reads **~2.1 h** for the 2HHB scoped 48-mut case (was ~50 s; ~1.7× the real 75-min run, biased high); backend `pyrosetta_wsl2` real. Suite **1293 / 0 / 3**. Branch `feat/mutation-scan-tiering`; **merge HELD** pending the two §9 decisions. §3/§4/§9 updated. |
