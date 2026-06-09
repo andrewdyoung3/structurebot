@@ -362,6 +362,45 @@ def _ddg_confidence_label(spread: Optional[float], n_trajectories: Optional[int]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Deep-tier parallelization helpers (FIX D)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def resolve_rosetta_workers(
+    configured:        int,
+    physical_cores:    int,
+    mem_budget_mb:     int,
+    per_worker_mb:     int,
+) -> int:
+    """
+    Resolve the actual pool size for the deep (Rosetta) tier.
+
+    cap = min(configured, physical_cores − 2 headroom, mem_budget / per_worker).
+    Always ≥ 1.  Deliberately CPU/RAM-bounded — never the logical-thread count
+    (HT + E-cores + single-channel DDR5 + 140 W laptop throttle make that a loss).
+    """
+    cap_cpu = max(1, int(physical_cores) - 2)
+    if per_worker_mb and per_worker_mb > 0:
+        cap_mem = max(1, int(mem_budget_mb) // int(per_worker_mb))
+    else:
+        cap_mem = max(1, int(configured))
+    return max(1, min(int(configured), cap_cpu, cap_mem))
+
+
+def mutation_seed(base_seed: int, mutation_key: str, trajectory: int = 0) -> int:
+    """
+    Deterministic per-mutation (per-trajectory) RNG seed.
+
+    Depends ONLY on (base_seed, mutation_key, trajectory) — NOT on worker id or
+    scheduling order — so a parallel scan reproduces the serial scan byte-for-byte
+    (the identical-results contract for FIX D).  Stable across processes (hashlib,
+    not the salted built-in hash()).
+    """
+    import hashlib
+    h = hashlib.sha256(f"{base_seed}:{mutation_key}:{trajectory}".encode()).hexdigest()
+    return int(h[:8], 16) % 2147483647
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Public bridge class
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1186,6 +1225,7 @@ class RosettaBridge:
         progress_callback: Optional[Callable[[str], None]] = None,
         relax_cycles: int = 3,
         num_trajectories: Optional[int] = None,
+        num_workers: Optional[int] = None,
     ) -> "ToolStepResult":
         """
         PyRosetta cartesian_ddg protocol via WSL2.
@@ -1234,6 +1274,18 @@ class RosettaBridge:
         if num_trajectories is None:
             num_trajectories = getattr(_cfg_traj, "ROSETTA_NUM_TRAJECTORIES", 1)
         num_trajectories = max(1, int(num_trajectories))
+
+        # Deep-tier parallelization (FIX D): resolve the in-WSL pool size, capped
+        # to the hardware.  num_workers=None → config default, then capped.
+        if num_workers is None:
+            num_workers = getattr(_cfg_traj, "ROSETTA_MAX_WORKERS", 8)
+        num_workers = resolve_rosetta_workers(
+            configured     = int(num_workers),
+            physical_cores = getattr(_cfg_traj, "ROSETTA_PHYSICAL_CORES", 8),
+            mem_budget_mb  = getattr(_cfg_traj, "ROSETTA_WSL_MEM_BUDGET_MB", 12000),
+            per_worker_mb  = getattr(_cfg_traj, "ROSETTA_WORKER_FOOTPRINT_MB", 1200),
+        )
+        base_seed = int(getattr(_cfg_traj, "ROSETTA_BASE_SEED", 1))
 
         try:
             from wsl_bridge import WSLBridge
@@ -1412,22 +1464,30 @@ try:
         print(f"[Rosetta] Relax complete → {{relaxed}}", flush=True)
 
     import statistics as _stats
-    import random as _pyrng
+    import hashlib as _hl
     _n_traj = {num_trajectories}
-    _base_seed = _pyrng.SystemRandom().randint(1, 2000000000)
+    _n_workers = {num_workers}
+    _base_seed = {base_seed}
     print(f"[Rosetta] Starting mutation scoring, {{len(mutations)}} mutation(s) "
-          f"({{_n_traj}} trajectory/ies x {relax_cycles} relax cycles)", flush=True)
+          f"({{_n_traj}} trajectory/ies x {relax_cycles} relax cycles, "
+          f"{{_n_workers}} worker(s))", flush=True)
     scorefxn_std = pyrosetta.create_score_function("ref2015")
-    results = {{}}
-    for mut in mutations:
+
+    def _seed_for(_key, _t):
+        # DETERMINISTIC per-mutation (per-trajectory) seed — depends only on
+        # (base_seed, key, t), NOT on worker id / order → parallel == serial.
+        _h = _hl.sha256(f"{{_base_seed}}:{{_key}}:{{_t}}".encode()).hexdigest()
+        return int(_h[:8], 16) % 2147483647
+
+    def _score_one(mut):
+        from pyrosetta.rosetta.protocols.simple_moves import MutateResidue
+        from pyrosetta.rosetta.protocols.relax import FastRelax
         chain_id = mut["chain"]
         pos      = int(mut["pos"])
         from_aa  = mut["from_aa"]
         to_aa    = mut["to_aa"]
         key      = f"{{from_aa}}{{pos}}{{to_aa}}"
         try:
-            from pyrosetta.rosetta.protocols.simple_moves import MutateResidue
-            from pyrosetta.rosetta.protocols.relax import FastRelax
             _aa1to3 = {{'A':'ALA','C':'CYS','D':'ASP','E':'GLU','F':'PHE',
                         'G':'GLY','H':'HIS','I':'ILE','K':'LYS','L':'LEU',
                         'M':'MET','N':'ASN','P':'PRO','Q':'GLN','R':'ARG',
@@ -1438,14 +1498,13 @@ try:
                 raise ValueError(f"Residue {{pos}}{{chain_id}} not found in pose")
             _traj = []
             for _t in range(_n_traj):
-                # Independent random seed per trajectory (only when N>1, so the
-                # N=1 production path is identical to the previous single run).
-                if _n_traj > 1:
-                    try:
-                        from pyrosetta.rosetta.numeric.random import rg as _rg
-                        _rg().set_seed(int((_base_seed + _t * 104729) % 2147483647))
-                    except Exception:
-                        pass  # seeding best-effort; the global RNG still advances
+                # Deterministic seed every trajectory (incl. N=1) → reproducible
+                # AND identical whether run serially or pooled.
+                try:
+                    from pyrosetta.rosetta.numeric.random import rg as _rg
+                    _rg().set_seed(_seed_for(key, _t))
+                except Exception:
+                    pass  # seeding best-effort; the global RNG still advances
                 mut_pose = wt_pose.clone()
                 MutateResidue(target=res_num, new_res=to_aa3).apply(mut_pose)
                 FastRelax(scorefxn_std, {relax_cycles}).apply(mut_pose)
@@ -1458,17 +1517,35 @@ try:
             _median = _stats.median(_traj)
             # Median absolute deviation — robust spread, consistent with median.
             _mad = _stats.median([abs(x - _median) for x in _traj]) if len(_traj) > 1 else 0.0
-            results[key] = {{"ddg": round(float(_median), 3),
-                             "spread": round(float(_mad), 3),
-                             "n": len(_traj),
-                             "trajectories": _traj}}
             print(f"[Rosetta] {{key}}: median ddG = {{_median:+.2f}} kcal/mol "
                   f"(spread {{_mad:.2f}}, n={{len(_traj)}})", flush=True)
+            return key, {{"ddg": round(float(_median), 3),
+                          "spread": round(float(_mad), 3),
+                          "n": len(_traj),
+                          "trajectories": _traj}}
         except Exception as e:
             import traceback
-            results[key] = None
             print(f"[Rosetta] {{key}} failed: {{e}}", flush=True)
             traceback.print_exc()
+            return key, None
+
+    # Independent per-mutation FastRelax units → run them through a fork pool
+    # (one wsl.exe spawn; WT relax already cached + shared copy-on-write).  Results
+    # are identical to serial because each mutation is deterministically seeded.
+    _pairs = None
+    if _n_workers > 1 and len(mutations) > 1:
+        try:
+            import multiprocessing as _mp
+            _ctx = _mp.get_context("fork")
+            with _ctx.Pool(processes=min(_n_workers, len(mutations))) as _pool:
+                _pairs = _pool.map(_score_one, mutations)
+            print(f"[Rosetta] Parallel pool complete ({{_n_workers}} workers).", flush=True)
+        except Exception as _pe:
+            print(f"[Rosetta] Pool failed ({{_pe}}) — serial fallback.", flush=True)
+            _pairs = None
+    if _pairs is None:
+        _pairs = [_score_one(m) for m in mutations]
+    results = {{k: v for (k, v) in _pairs}}
 
     with open({wsl_results_path!r}, "w") as f:
         json.dump(results, f)

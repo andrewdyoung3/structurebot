@@ -740,6 +740,23 @@ class StructureBot:
                 console.print("[dim]No answer — cancelling.[/dim]")
                 return
 
+            # ── Fast-path: mutation-scan tier choice (base vs deep) ────────────
+            # The tier-choice surface is a local question, not a re-translation.
+            # Interpret the answer and set run_rosetta directly — never re-route.
+            if result.get("_tier_choice"):
+                _want_deep = bool(re.search(
+                    r"\b(deep|rosetta|rosie|full|yes|2)\b", answer, re.IGNORECASE
+                ))
+                _ti = (result.get("tool_inputs") or {}).get("mutation_scan")
+                if isinstance(_ti, dict):
+                    _ti["run_rosetta"] = _want_deep
+                result["clarification_needed"] = None
+                result.pop("_tier_choice", None)
+                console.print(
+                    f"[dim]Running the {'deep (+Rosetta ddG)' if _want_deep else 'fast (CamSol+ESM)'} tier.[/dim]"
+                )
+                break
+
             # ── Fast-path: bypass retranslation for known tool intents ─────────
             # If the original user_input already contains glycan (or other
             # recognised) keywords, re-routing through translate() would send a

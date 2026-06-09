@@ -121,16 +121,48 @@ def combined_score(
     )
 
 
+def effective_weights(
+    use_ddg: bool,
+    w_ddg: float = _W_DDG,
+    w_sol: float = _W_SOL,
+    w_tol: float = _W_TOL,
+) -> Tuple[float, float, float]:
+    """
+    Return the weights to use for the combined score given which voters are active.
+
+    Triage→validate tiering: the DEFAULT (fast) tier runs CamSol + ESM only and
+    drops the ddG voter; its weight is RENORMALISED across the remaining voters so
+    the score stays on the same scale (default 0.3/0.2 → 0.6/0.4).  When the ddG
+    voter is active (opt-in Rosetta deep tier) the original weights are used.
+
+    Structured so additional fast-tier voters (ThermoMPNN / RaSP) can join later:
+    set ddG inactive, add their weights to the active set, and renormalise the same
+    way.
+    """
+    if use_ddg:
+        return w_ddg, w_sol, w_tol
+    total = w_sol + w_tol
+    if total <= 0:
+        return 0.0, 0.0, 0.0
+    return 0.0, round(w_sol / total, 4), round(w_tol / total, 4)
+
+
 def _recommendation(
-    ddg:           float,
+    ddg:           Optional[float],
     camsol_delta:  float,
     esm_tolerance: float,
     score:         float,
 ) -> str:
-    """Generate a human-readable recommendation for a candidate mutation."""
+    """Generate a human-readable recommendation for a candidate mutation.
+
+    *ddg* may be None (fast/default tier — Rosetta not run): the stability clause
+    is omitted rather than fabricated.
+    """
     parts: List[str] = []
 
-    if ddg <= -1.0:
+    if ddg is None:
+        parts.append("stability not computed (opt in with 'rosetta')")
+    elif ddg <= -1.0:
         parts.append("strongly stabilising")
     elif ddg < 0:
         parts.append("mildly stabilising")
@@ -203,6 +235,8 @@ class MutationScanner:
         protected_residues: Optional[List[int]] = None,
         analysis_mode:      str = "monomer",
         scan_timeout:       int = 600,      # overall wall-clock budget (seconds)
+        include_positions:  Optional[List[int]] = None,
+        run_rosetta:        bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -224,6 +258,15 @@ class MutationScanner:
                              (e.g. interface residues from AssemblyAnalyser in
                              multimer mode).  Merged with binding_site_residues.
         analysis_mode      : "monomer" | "multimer" — used for reporting only.
+        include_positions  : if given, scan ONLY these residue numbers (assignable
+                             scope) — bypasses the CamSol/ESM pre-filter so every
+                             named position is scanned; default None = whole chain
+                             (current behaviour).  A non-None-but-empty scope means
+                             the request resolved to nothing → returns [].
+        run_rosetta        : when True (deep tier) run the Rosetta ddG voter; when
+                             False (fast/default triage tier) skip it entirely (no
+                             WSL2/PyRosetta spawned), report ddG as "not computed",
+                             and renormalise the score over CamSol + ESM.
 
         Returns
         -------
@@ -283,6 +326,19 @@ class MutationScanner:
                 f"at chain interface (multimer mode)."
             )
 
+        # Assignable scope: when an explicit position set is given, scan ONLY those
+        # positions and raise the candidate cap so every scoped position is covered
+        # (a scope of 16 positions must not be truncated by the default cap of 20).
+        _include_set: Optional[set] = None
+        if include_positions is not None:
+            _include_set = {int(p) for p in include_positions}
+            if not _include_set:
+                self._progress(
+                    "  Requested scan scope resolved to no positions — nothing to scan."
+                )
+                return []
+            max_candidates = max(max_candidates, len(_include_set) * cands_per_pos)
+
         raw_candidates = self._identify_candidates(
             sequence           = sequence,
             camsol_scores      = camsol_scores,
@@ -294,6 +350,7 @@ class MutationScanner:
             max_candidates     = max_candidates,
             chain_id           = chain_id,
             interface_residues = _interface_protected,
+            include_positions  = _include_set,
         )
 
         if not raw_candidates:
@@ -311,27 +368,47 @@ class MutationScanner:
             f"  Generating candidates: complete ({time.perf_counter() - _t0:.1f}s)"
         )
 
-        # ── Step 4: Rosetta ddG scoring ───────────────────────────────────────
-        _remaining = _scan_deadline - time.perf_counter()
-        if _remaining <= 30:
+        # ── Step 4: Rosetta ddG scoring (OPT-IN deep tier) ────────────────────
+        # Triage→validate split: the DEFAULT (fast) tier does NOT run Rosetta — it
+        # ranks on CamSol + ESM in seconds, with the ddG voter dropped + the score
+        # renormalised (see effective_weights).  Rosetta runs ONLY when run_rosetta
+        # is True (the user opted in).  ddg_computed gates honest reporting below:
+        # when False, ddG is reported as None ("not computed"), never a fake 0.0.
+        ddg_scores:     Dict[str, float] = {}
+        ddg_source:     Dict[str, str]   = {}
+        ddg_spread:     Dict[str, Any]   = {}
+        ddg_confidence: Dict[str, str]   = {}
+        ddg_computed = False
+
+        if not run_rosetta:
             self._progress(
-                f"  Overall scan timeout ({scan_timeout}s) reached before ddG scoring. "
-                "Candidates ranked by CamSol + ESM only (ddG = 0.0)."
+                f"  Fast tier (CamSol + ESM only) — Rosetta ddG skipped. "
+                f"Ranking {len(raw_candidates)} candidate(s) without ddG; "
+                "re-run with 'rosetta' for the deep ddG-validated tier."
             )
-            ddg_scores:     Dict[str, float] = {}
-            ddg_source:     Dict[str, str]   = {}
-            ddg_spread:     Dict[str, Any]   = {}
-            ddg_confidence: Dict[str, str]   = {}
         else:
-            self._progress(
-                f"Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations..."
-            )
-            _t0 = time.perf_counter()
-            ddg_scores, ddg_source, ddg_spread, ddg_confidence = self._run_rosetta_batch(
-                pdb_path, raw_candidates, chain_id,
-                scan_deadline=_scan_deadline,
-            )
-            self._progress(f"  DynaMut2: complete ({time.perf_counter() - _t0:.1f}s)")
+            _remaining = _scan_deadline - time.perf_counter()
+            if _remaining <= 30:
+                self._progress(
+                    f"  Overall scan timeout ({scan_timeout}s) reached before ddG scoring. "
+                    "Candidates ranked by CamSol + ESM only (ddG not computed)."
+                )
+            else:
+                self._progress(
+                    f"Step 4/4: Rosetta ddG for {len(raw_candidates)} mutations..."
+                )
+                _t0 = time.perf_counter()
+                ddg_scores, ddg_source, ddg_spread, ddg_confidence = self._run_rosetta_batch(
+                    pdb_path, raw_candidates, chain_id,
+                    scan_deadline=_scan_deadline,
+                )
+                ddg_computed = True
+                self._progress(f"  DynaMut2: complete ({time.perf_counter() - _t0:.1f}s)")
+
+        # Weights: drop+renormalise the ddG voter when it was not computed.
+        w_ddg_eff, w_sol_eff, w_tol_eff = effective_weights(
+            ddg_computed, w_ddg, w_sol, w_tol
+        )
 
         # ── Assemble and rank ─────────────────────────────────────────────────
         results: List[Dict[str, Any]] = []
@@ -341,17 +418,34 @@ class MutationScanner:
             from_aa = cand["from_aa"]
             key     = f"{from_aa}{pos}{to_aa}"
 
-            ddg           = ddg_scores.get(key, 0.0)
-            # Provenance: "pyrosetta" / "empirical" / backend label, or "none"
-            # when ddG was not computed (timeout/failure → defaulted to 0.0).
-            ddg_src       = ddg_source.get(key, "none")
-            ddg_sprd      = ddg_spread.get(key)            # MAD, or None (single-traj)
-            ddg_conf      = ddg_confidence.get(key, "single-trajectory")
             camsol_delta  = cand["estimated_camsol_delta"]
             esm_cons      = esm_scores.get(pos, 0.5)
             esm_tol       = round(1.0 - esm_cons, 4)
 
-            score = combined_score(ddg, camsol_delta, esm_tol, w_ddg, w_sol, w_tol)
+            if ddg_computed:
+                ddg     = ddg_scores.get(key, 0.0)
+                # "pyrosetta" / "empirical" / backend label, or "none" when this
+                # mutation failed within an otherwise-deep tier (defaulted to 0.0).
+                ddg_src  = ddg_source.get(key, "none")
+                ddg_sprd = ddg_spread.get(key)            # MAD, or None (single-traj)
+                ddg_conf = ddg_confidence.get(key, "single-trajectory")
+                ddg_out  = round(ddg, 3)
+                _ddg_for_score = ddg
+            else:
+                # Fast/default tier — ddG NOT computed.  Report honestly (None →
+                # "not computed (opt in with 'rosetta')" in the display layer);
+                # never a fake 0.0.  Score uses the renormalised CamSol+ESM weights.
+                ddg     = None
+                ddg_src  = "not_computed"
+                ddg_sprd = None
+                ddg_conf = "not_computed"
+                ddg_out  = None
+                _ddg_for_score = 0.0   # zeroed; w_ddg_eff is 0.0 so it contributes nothing
+
+            score = combined_score(
+                _ddg_for_score, camsol_delta, esm_tol,
+                w_ddg_eff, w_sol_eff, w_tol_eff,
+            )
 
             # Check interface-proximal: within 3 positions of an interface residue
             is_proximal = cand.get("interface_proximal", False)
@@ -365,7 +459,7 @@ class MutationScanner:
                 "chain":             chain_id or "A",
                 "from_aa":           from_aa,
                 "to_aa":             to_aa,
-                "ddg":               round(ddg, 3),
+                "ddg":               ddg_out,
                 "ddg_source":        ddg_src,
                 "ddg_spread":        ddg_sprd,
                 "ddg_confidence":    ddg_conf,
@@ -580,6 +674,7 @@ class MutationScanner:
         max_candidates:    int,
         chain_id:          Optional[str],
         interface_residues: Optional[set] = None,
+        include_positions: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
         Build the list of (position, from_aa, to_aa, estimated_camsol_delta) dicts
@@ -588,6 +683,11 @@ class MutationScanner:
         Positions in *interface_residues* are excluded (already in *protected*).
         Positions within 3 residues of an interface residue are flagged as
         interface_proximal=True — still included, but labelled "mutate with caution".
+
+        *include_positions* (assignable scope): when given, ONLY these residue
+        numbers are considered AND the CamSol/ESM pre-filter is bypassed — the user
+        named the positions, so every one is scanned (still excluding *protected*
+        and the Pro/Cys substitution rules in _substitution_candidates).
         """
         candidates: List[Dict[str, Any]] = []
         iface_set = interface_residues or set()
@@ -600,18 +700,23 @@ class MutationScanner:
                     proximal_set.add(ir + offset)
             proximal_set -= iface_set  # exclude direct interface residues
 
+        scoped = include_positions is not None
+
         for pos, from_aa in enumerate(sequence, 1):
+            if scoped and pos not in include_positions:
+                continue     # outside the assigned scope
             if pos in protected:
                 continue
 
-            camsol_val = camsol_scores.get(pos, 0.0)
-            esm_val    = esm_scores.get(pos, 0.5)
-
-            # Apply both filters
-            if camsol_val >= camsol_thr:
-                continue     # not aggregation-prone enough
-            if esm_val >= esm_thr:
-                continue     # too conserved — risky to mutate
+            # Threshold pre-filter applies ONLY to whole-chain scans.  An explicit
+            # scope means the user named these positions → scan them all.
+            if not scoped:
+                camsol_val = camsol_scores.get(pos, 0.0)
+                esm_val    = esm_scores.get(pos, 0.5)
+                if camsol_val >= camsol_thr:
+                    continue     # not aggregation-prone enough
+                if esm_val >= esm_thr:
+                    continue     # too conserved — risky to mutate
 
             is_proximal = pos in proximal_set
 
@@ -760,17 +865,21 @@ class MutationScanner:
             from_aa = c.get("from_aa", "?")
             to_aa   = c.get("to_aa", "?")
             score   = c.get("combined_score", 0.0)
-            ddg     = c.get("ddg", 0.0)
+            ddg     = c.get("ddg")
             src     = c.get("ddg_source", "?")
             conf    = c.get("ddg_confidence", "single-trajectory")
             sprd    = c.get("ddg_spread")
             sol     = c.get("solubility_delta", 0.0)
             tol     = c.get("esm_tolerance", 0.0)
-            # Show provenance + confidence; include spread only when multi-trajectory.
-            _prov = f"[{src}, {conf}" + (f", spread {sprd:.2f}]" if sprd is not None else "]")
+            # ddG honesty: None → "not computed (opt in)" rather than a fake 0.0.
+            if ddg is None:
+                ddg_str = "ddG=not computed (opt in with 'rosetta')"
+            else:
+                _prov = f"[{src}, {conf}" + (f", spread {sprd:.2f}]" if sprd is not None else "]")
+                ddg_str = f"ddG={ddg:+.3f} kcal/mol {_prov}"
             lines.append(
                 f"  #{rank}  {chain}{pos}: {from_aa} -> {to_aa}  "
-                f"score={score:+.2f}  ddG={ddg:+.3f} kcal/mol {_prov}  "
+                f"score={score:+.2f}  {ddg_str}  "
                 f"solubility+={sol:+.2f}  ESM_tol={tol:.2f}"
             )
 

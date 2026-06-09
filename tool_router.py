@@ -652,6 +652,180 @@ class ToolRouter:
             return True
         return any(kw in lower for kw in cls._MUTATION_SCAN_KEYWORDS)
 
+    # ── Mutation-scan tiering: scope + opt-in Rosetta (Priority 1) ─────────────
+    # Coarse per-position Rosetta ddG cost, calibrated from prior runs at this
+    # protein size (~141-residue chain ≈ 1 h on this box → ~25 s/position).  Used
+    # ONLY to surface an APPROXIMATE pre-launch estimate; not a hard budget.
+    _ROSETTA_DDG_SEC_PER_POS = 25
+
+    # Explicit deep-tier trigger.  Word-boundary so bare "rose" does NOT match
+    # ("rosette", "the value rose", "rosé") — same class as the viewer
+    # "drop"-in-"hydrophobic" fix.
+    _TIER_ROSETTA_RE = re.compile(r"\b(?:rosetta|rosie)\b", re.IGNORECASE)
+    # Thoroughness phrases do NOT auto-run deep — they raise a tier-choice surface.
+    _THOROUGHNESS_RE = re.compile(
+        r"\b(?:exhaustive|deep[\s-]?dive|comprehensive|"
+        r"gold[\s-]?standard|gold[\s-]?quality)\b",
+        re.IGNORECASE,
+    )
+    # Live-selection scope phrases.
+    _SELECTION_SCOPE_RE = re.compile(
+        r"\b(?:selected|selection|highlighted)\b", re.IGNORECASE
+    )
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds < 90:
+            return f"~{int(round(seconds))} s"
+        if seconds < 3600:
+            return f"~{seconds / 60:.0f} min"
+        return f"~{seconds / 3600:.1f} h"
+
+    def _resolve_deep_workers(self) -> int:
+        """Resolved deep-tier pool size for the runtime estimate (config-capped)."""
+        import config as _cfg
+        try:
+            from rosetta_bridge import resolve_rosetta_workers
+            return resolve_rosetta_workers(
+                configured     = getattr(_cfg, "ROSETTA_MAX_WORKERS", 8),
+                physical_cores = getattr(_cfg, "ROSETTA_PHYSICAL_CORES", 8),
+                mem_budget_mb  = getattr(_cfg, "ROSETTA_WSL_MEM_BUDGET_MB", 12000),
+                per_worker_mb  = getattr(_cfg, "ROSETTA_WORKER_FOOTPRINT_MB", 1200),
+            )
+        except Exception:
+            return 1
+
+    def _estimate_rosetta_runtime(
+        self,
+        n_positions: Optional[int],
+        workers:     int = 1,
+    ) -> Optional[str]:
+        """
+        Coarse n-scaled deep-tier estimate string, or None if n unknown.
+
+        Folds in parallelism: t ≈ n × per-pos-sec / workers — so the estimate
+        shrinks with BOTH scope (FIX A) and worker count (FIX D).
+        """
+        if not n_positions:
+            return None
+        secs = n_positions * self._ROSETTA_DDG_SEC_PER_POS / max(1, workers)
+        return self._format_duration(secs)
+
+    def _parse_scan_scope(
+        self,
+        user_input: str,
+        model_id:   str,
+        chain:      str,
+    ) -> Tuple[Optional[List[int]], bool]:
+        """
+        Parse an assignable scan scope from *user_input*.
+
+        Returns (positions, scope_requested):
+          - (None, False) — no scope named → whole chain (current behaviour).
+          - (list, True)  — explicit residues/range OR the live ChimeraX selection
+                            (may be [] when a scope was requested but resolved to
+                            nothing → caller errors, no full-chain fallback).
+        """
+        text = user_input or ""
+
+        # (1) Live-selection scope ("the selected residues", "current selection").
+        if self._SELECTION_SCOPE_RE.search(text):
+            try:
+                sel = self._read_selected_residues(model_id, chain)
+            except Exception:
+                sel = []
+            return sorted(set(sel)), True
+
+        # (2) Explicit range: "residues 30-45", "positions 30 to 45", or bare "30-45".
+        rng = re.search(
+            r"(?:residues?|positions?|res)\s+(\d+)\s*(?:-|–|—|to|through)\s*(\d+)",
+            text, re.IGNORECASE,
+        ) or re.search(r"\b(\d+)\s*(?:-|–|—)\s*(\d+)\b", text)
+        if rng:
+            a, b = int(rng.group(1)), int(rng.group(2))
+            if a > b:
+                a, b = b, a
+            return list(range(a, b + 1)), True
+
+        # (3) Explicit list: "residues 30, 32, 40" / "positions 12 and 15".
+        lst = re.search(
+            r"(?:residues?|positions?)\s+((?:\d+\s*(?:,|and|&)\s*)+\d+)",
+            text, re.IGNORECASE,
+        )
+        if lst:
+            nums = [int(x) for x in re.findall(r"\d+", lst.group(1))]
+            return sorted(set(nums)), True
+
+        # (4) Single residue: "residue 30".
+        one = re.search(r"\b(?:residue|position)\s+(\d+)\b", text, re.IGNORECASE)
+        if one:
+            return [int(one.group(1))], True
+
+        return None, False
+
+    def _apply_mutation_scan_tiering(
+        self,
+        result:     Dict[str, Any],
+        user_input: str,
+    ) -> None:
+        """
+        Augment a routed `mutation_scan` request with (a) assignable scope, (b) the
+        triage→validate tier (default = fast CamSol+ESM; opt-in Rosetta), and (c)
+        the pre-launch surfaces (deep-tier estimate warning / tier-choice prompt).
+
+        Mutates *result* in place; no-op when the request is not a mutation scan.
+        """
+        if not user_input:
+            return
+        if "mutation_scan" not in (result.get("tools_needed") or []):
+            return
+
+        ti  = result.setdefault("tool_inputs", {})
+        inp = ti.get("mutation_scan")
+        if not isinstance(inp, dict):
+            inp = {}
+            ti["mutation_scan"] = inp
+
+        model_id = str(inp.get("model_id") or self._primary_model_id())
+        chain    = inp.get("chain") or "A"
+
+        # (a) Scope
+        positions, scope_requested = self._parse_scan_scope(user_input, model_id, chain)
+        if scope_requested:
+            inp["scan_positions"] = positions   # may be [] → _run_mutation_scan errors
+
+        # (b) Tier
+        deep     = bool(self._TIER_ROSETTA_RE.search(user_input))
+        thorough = bool(self._THOROUGHNESS_RE.search(user_input))
+        inp["run_rosetta"] = deep
+
+        # n for the estimate: scoped → len(scope); else the chain length.
+        if scope_requested and positions:
+            n_pos: Optional[int] = len(positions)
+        else:
+            _seq  = self._fetch_sequence(model_id, chain) or ""
+            n_pos = len(_seq) or None
+
+        # (c) Surfaces — estimate folds in the parallel worker count (FIX D).
+        workers = self._resolve_deep_workers()
+        if deep:
+            est = self._estimate_rosetta_runtime(n_pos, workers)
+            if est:
+                result.setdefault("warnings", []).append(
+                    f"Deep tier (Rosetta ddG, {workers} worker(s)): approximate "
+                    f"runtime {est} for {n_pos} position(s) — shown before launch "
+                    "(no mid-run cancel)."
+                )
+        elif thorough:
+            # Thoroughness phrasing does NOT auto-run Rosetta — raise a tier choice.
+            est  = self._estimate_rosetta_runtime(n_pos, workers) or "several minutes"
+            npos = n_pos if n_pos else "the chain"
+            result["clarification_needed"] = (
+                f"Base tier (CamSol + ESM) ≈ 2 s, or Deep tier (+Rosetta ddG, "
+                f"{workers} worker(s)) {est} for {npos} position(s) — which? (base / deep)"
+            )
+            result["_tier_choice"] = True
+
     # ── Double mutant intent helpers ──────────────────────────────────────────
 
     @classmethod
@@ -1284,6 +1458,11 @@ class ToolRouter:
             result["commands"]     = []
             result["explanations"] = []
 
+        # Mutation-scan tiering (Priority 1): assignable scope + triage→validate
+        # (default fast CamSol+ESM, opt-in Rosetta) + pre-launch estimate / tier
+        # choice.  Runs for any routed mutation_scan (translator- or fallback-routed).
+        self._apply_mutation_scan_tiering(result, user_input)
+
         # ── Bug 4c: suppress translator commands that duplicate a fold/design tool ──
         # When colabfold / validate_design / esmfold / mpnn_esmfold is dispatched,
         # the tool opens, folds, and visualises the result itself.  Any `open` or
@@ -1677,7 +1856,7 @@ class ToolRouter:
                         "top_n":    3,
                     }
                     return self._run_glycan(glycan_inputs)
-                return self._run_mutation_scan(inputs)
+                return self._run_mutation_scan(inputs, user_input=user_input)
             if tool == "double_mutant":
                 return self._run_double_mutant(inputs, user_input=user_input)
             if tool == "validate_ddg":
@@ -3178,13 +3357,33 @@ class ToolRouter:
             elapsed_ms       = elapsed_ms,
         )
 
-    def _run_mutation_scan(self, inputs: Dict[str, Any]) -> ToolStepResult:
+    def _run_mutation_scan(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
         model_id       = inputs.get("model_id") or self._first_model_id()
         chain          = inputs.get("chain", "A")
         focus          = inputs.get("focus", "solubility")
         analysis_mode  = inputs.get("analysis_mode", "monomer")
         sequence       = inputs.get("sequence") or self._fetch_sequence(model_id, chain)
         pdb_path       = inputs.get("pdb_path") or self._ensure_pdb_file(model_id)
+        # Tiering (set by route()._apply_mutation_scan_tiering): assignable scope +
+        # opt-in Rosetta.  Defaults: whole chain, FAST tier (no Rosetta).
+        scan_positions = inputs.get("scan_positions")        # None | list (maybe [])
+        run_rosetta    = bool(inputs.get("run_rosetta", False))
+
+        # A scope that was requested but resolved to nothing → ERROR, no full-chain
+        # fallback (mirrors the ProteinMPNN restricted-design convention).
+        if scan_positions is not None and len(scan_positions) == 0:
+            return ToolStepResult(
+                tool="mutation_scan", success=False,
+                error=(
+                    "The requested scan scope resolved to no residues — nothing is "
+                    "selected in ChimeraX, or the named range is out of bounds. "
+                    "Select residues (or name a valid range), then retry."
+                ),
+            )
 
         if not sequence:
             return ToolStepResult(
@@ -3244,6 +3443,8 @@ class ToolRouter:
             filters            = filters,
             protected_residues = protected_residues,
             analysis_mode      = analysis_mode,
+            include_positions  = scan_positions,
+            run_rosetta        = run_rosetta,
         )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
@@ -3273,11 +3474,19 @@ class ToolRouter:
                 f" [{len(protected_residues)} interface position(s) excluded]"
             )
 
+        _top_ddg = top.get("ddg")
+        _ddg_txt = (
+            f"ddG={_top_ddg:+.3f} kcal/mol [{top.get('ddg_source', '?')}]"
+            if _top_ddg is not None
+            else "ddG=not computed (opt in with 'rosetta')"
+        )
+        _tier_txt = "deep" if run_rosetta else "fast (CamSol+ESM)"
         one_liner = (
-            f"Mutation scan [{analysis_mode} mode]: {len(results)} candidate(s) found.{excluded_note} "
+            f"Mutation scan [{analysis_mode} mode, {_tier_txt} tier]: "
+            f"{len(results)} candidate(s) found.{excluded_note} "
             f"Top: {top['from_aa']}{top['position']}{top['to_aa']} "
             f"(score={top['combined_score']:+.2f}, "
-            f"ddG={top['ddg']:+.3f} kcal/mol [{top.get('ddg_source', '?')}], "
+            f"{_ddg_txt}, "
             f"solubility delta={top['solubility_delta']:+.2f})"
         )
 
@@ -3366,7 +3575,7 @@ class ToolRouter:
                 "position":          m.get("position"),
                 "from_aa":           m.get("from_aa"),
                 "to_aa":             m.get("to_aa"),
-                "ddg":               m.get("ddg", 0.0),
+                "ddg":               m.get("ddg") or 0.0,   # fast-tier scan → None; treat as 0.0
                 "camsol_delta":      m.get("solubility_delta") or m.get("camsol_delta", 0.0),
                 "esm_tolerance":     m.get("esm_tolerance", 1.0),
                 "interface_proximal": m.get("interface_proximal", False),

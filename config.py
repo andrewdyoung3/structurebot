@@ -275,6 +275,37 @@ ROSETTA_VALIDATION_TRAJECTORIES: int = int(
 )
 ROSETTA_VALIDATION_CYCLES: int = int(os.environ.get("ROSETTA_VALIDATION_CYCLES", "8"))
 
+# ── Deep-tier (PyRosetta) parallelization ───────────────────────────────────────
+# The per-mutation FastRelax units are independent → run them through a pool inside
+# the single WSL2 worker (one wsl.exe spawn; amortises the PyRosetta import + the
+# cached WT relax).  Pure speedup with IDENTICAL results: each mutation's RNG is
+# seeded deterministically from (ROSETTA_BASE_SEED, mutation_key), independent of
+# worker/order, so parallel output == serial output.
+#
+# Worker count is CAPPED at runtime (rosetta_bridge.resolve_rosetta_workers) to
+# min(configured, physical_cores − 2 headroom, wsl_mem_budget / per_worker_footprint).
+# DEFAULT 8 = the P-core count of the i9-14900HX (8 P + 16 E; E-cores ~½ speed for
+# FastRelax, single-channel DDR5 is bandwidth-limited, 140 W laptop throttles
+# sustained all-core) — NOT the 32 logical threads (that throttles/swaps).
+ROSETTA_MAX_WORKERS: int = int(os.environ.get("ROSETTA_MAX_WORKERS", "8"))
+# Physical cores for the CPU cap (default best-effort = logical count; on this box
+# set ROSETTA_PHYSICAL_CORES=24).  The cap leaves 2 cores of host headroom.
+ROSETTA_PHYSICAL_CORES: int = int(
+    os.environ.get("ROSETTA_PHYSICAL_CORES", str(os.cpu_count() or 8))
+)
+# WSL2 RAM available to the pool (default WSL = ~50% host; ~16 GB on 32 GB box).
+# Leave host headroom (Chrome/Windows share the 32 GB) → budget 12 GB by default.
+ROSETTA_WSL_MEM_BUDGET_MB: int = int(
+    os.environ.get("ROSETTA_WSL_MEM_BUDGET_MB", "12000")
+)
+# Measured per-worker PyRosetta footprint (~1 GB on the 2HHB tetramer) + margin.
+ROSETTA_WORKER_FOOTPRINT_MB: int = int(
+    os.environ.get("ROSETTA_WORKER_FOOTPRINT_MB", "1200")
+)
+# Fixed base seed → deterministic, reproducible ddG and the parallel==serial
+# identical-results contract.  (Ranking/sign are seed-independent regardless.)
+ROSETTA_BASE_SEED: int = int(os.environ.get("ROSETTA_BASE_SEED", "1"))
+
 # Median-absolute-deviation spread (kcal/mol) above which a multi-trajectory
 # ddG prediction is flagged low-confidence.
 ROSETTA_SPREAD_LOW_CONFIDENCE: float = float(
