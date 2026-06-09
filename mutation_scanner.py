@@ -138,6 +138,8 @@ def present_voters_score(
     w_tol:     float = _W_TOL,
     rasp_ddg:  Optional[float] = None,
     w_rasp:    Optional[float] = None,
+    dynamut2_ddg: Optional[float] = None,
+    w_dyna:    float = 0.45,
 ) -> float:
     """
     Combined score renormalised over the AXES PRESENT (higher = better).
@@ -172,6 +174,11 @@ def present_voters_score(
         voters.append((w_rasp, -rasp_ddg))
     if thermompnn_ddg is not None:
         voters.append((w_thermo, -thermompnn_ddg))
+    # DYNAMICS axis (DynaMut2) — INDEPENDENT: always counted when present, NEVER
+    # zeroed/handed off (the inverse of the RaSP physics handoff).  −ddg so that
+    # negative ddg (stabilising) raises the score, same orientation as the others.
+    if dynamut2_ddg is not None:
+        voters.append((w_dyna, -dynamut2_ddg))
     voters.append((w_sol, camsol_delta))
     voters.append((w_tol, esm_tolerance))
     total = sum(w for w, _ in voters)
@@ -315,6 +322,7 @@ class MutationScanner:
         ddg_basis:          str = "symmetric",
         run_thermompnn:     bool = True,
         run_rasp:           bool = True,
+        run_dynamut2:       bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -501,6 +509,7 @@ class MutationScanner:
             pdb_path, chain_id, raw_candidates, run_rasp
         )
         _w_rasp = float(getattr(_cfg_tm, "RASP_WEIGHT", w_ddg))
+        _w_dyna = float(getattr(_cfg_tm, "DYNAMUT2_WEIGHT", 0.45))
 
         # Fast score for EVERY candidate — present-voters renormalised over
         # ThermoMPNN(if present) + CamSol + ESM.  Used for ranking, shortlist
@@ -526,6 +535,8 @@ class MutationScanner:
         ddg_source:     Dict[str, str]   = {}
         ddg_spread:     Dict[str, Any]   = {}
         ddg_confidence: Dict[str, str]   = {}
+        dynamut2_ddg:   Dict[str, float] = {}   # DYNAMICS axis — shortlist-only
+        dynamut2_src:   Dict[str, str]   = {}
 
         if not run_rosetta:
             self._progress(
@@ -557,11 +568,28 @@ class MutationScanner:
                         f"{len(rosetta_cands)} mutation(s) ({ddg_basis} basis)..."
                     )
                 _t0 = time.perf_counter()
+                # DynaMut2 (remote API I/O) runs CONCURRENTLY with Rosetta (local
+                # CPU) so the deep run's wall-time is ~max(rosetta, dynamut2), not the
+                # sum.  INDEPENDENT DYNAMICS axis on the SAME deep set (capped); never
+                # collapses/hands off (the inverse of RaSP).  GRACEFUL: API failure /
+                # over-cap → those candidates dynamics not_computed; the deep run
+                # (Rosetta + others) is UNAFFECTED — an outage never breaks a scan.
+                import threading
+                _dyna_box: Dict[str, Any] = {}
+                def _dyna_worker():
+                    _dyna_box["v"] = self._run_dynamut2(
+                        pdb_path, chain_id, rosetta_cands, run_dynamut2
+                    )
+                _dyna_thread = threading.Thread(target=_dyna_worker, daemon=True)
+                _dyna_thread.start()
+
                 ddg_scores, ddg_source, ddg_spread, ddg_confidence = self._run_rosetta_batch(
                     pdb_path, rosetta_cands, chain_id,
                     scan_deadline=_scan_deadline, ddg_basis=ddg_basis,
                 )
                 self._progress(f"  Rosetta: complete ({time.perf_counter() - _t0:.1f}s)")
+                _dyna_thread.join()
+                dynamut2_ddg, dynamut2_src = _dyna_box.get("v", ({}, {}))
 
         # ── Assemble (LOSSLESS — EVERY generated candidate retained) + rank ───
         # One structured record per candidate keyed by (from,pos,to), carrying all
@@ -584,6 +612,8 @@ class MutationScanner:
             thermo_s = cand.get("_thermo_src", "not_computed")
             rasp_d   = cand.get("_rasp_ddg")               # physics proxy ddG | None
             rasp_s   = cand.get("_rasp_src", "not_computed")
+            dynamut2_d = dynamut2_ddg.get(rec_key)         # DYNAMICS ddG | None (shortlist)
+            dynamut2_s = dynamut2_src.get(rec_key, "not_computed")
 
             if mk in ddg_scores:                           # this candidate got Rosetta
                 ddg      = ddg_scores[mk]
@@ -596,10 +626,13 @@ class MutationScanner:
                 # PHYSICS HANDOFF: real Rosetta fills the physics axis; RaSP's score
                 # contribution → 0 (passed as rasp_ddg=None so it cannot double-count),
                 # but RaSP's value is RETAINED below + the RaSP−Rosetta delta stored.
+                # + DYNAMICS (DynaMut2) as an INDEPENDENT axis when present (covered
+                # shortlist candidate) — counted, never handed off.
                 score    = present_voters_score(
                     ddg, thermo_d, camsol_delta, esm_tol,
                     w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol,
-                    rasp_ddg=None, w_rasp=_w_rasp)
+                    rasp_ddg=None, w_rasp=_w_rasp,
+                    dynamut2_ddg=dynamut2_d, w_dyna=_w_dyna)
             else:                                          # fast tier / deferred by shortlist
                 ddg = ddg_out = None
                 ddg_src  = "not_computed"
@@ -607,7 +640,18 @@ class MutationScanner:
                 ddg_conf = "not_computed"
                 basis    = "none"
                 tier     = "fast"
-                score    = cand["_fast_score"]             # physics = RaSP proxy (if any)
+                # Almost always == _fast_score (DynaMut2 is deep/shortlist-only, so
+                # dynamut2_d is None here); recompute only for the rare candidate that
+                # got DynaMut2 but not Rosetta (e.g. partial Rosetta failure), so its
+                # dynamics axis still counts.  dynamut2_d=None → byte-identical fallback.
+                if dynamut2_d is None:
+                    score = cand["_fast_score"]            # physics = RaSP proxy (if any)
+                else:
+                    score = present_voters_score(
+                        None, thermo_d, camsol_delta, esm_tol,
+                        w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol,
+                        rasp_ddg=rasp_d, w_rasp=_w_rasp,
+                        dynamut2_ddg=dynamut2_d, w_dyna=_w_dyna)
 
             # physics provenance + proxy-QC delta (RaSP vs Rosetta; both system sign)
             physics_src = "rosetta" if ddg is not None else (
@@ -641,6 +685,8 @@ class MutationScanner:
                 "rasp_source":       rasp_s,
                 "physics_source":    physics_src,          # rosetta | rasp | not_computed
                 "rasp_minus_rosetta": rasp_minus_rosetta,  # proxy-QC delta (None unless both)
+                "dynamut2_ddg":      (round(dynamut2_d, 4) if dynamut2_d is not None else None),
+                "dynamut2_source":   dynamut2_s,           # DYNAMICS axis (independent)
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
                 "camsol_score":      round(camsol_scores.get(seqidx, 0.0), 3),
@@ -1101,6 +1147,84 @@ class MutationScanner:
         except Exception as exc:
             self._progress(
                 f"  RaSP unavailable ({type(exc).__name__}) — fast tier without it."
+            )
+            return {}, {}
+
+    def _run_dynamut2(
+        self,
+        pdb_path:       Optional[str],
+        chain_id:       Optional[str],
+        deep_candidates: List[Dict[str, Any]],
+        enabled:        bool = True,
+    ) -> Tuple[Dict[str, float], Dict[str, str]]:
+        """
+        DYNAMICS-axis DynaMut2 ddG for the DEEP candidate set → ({key: ddg},
+        {key: source='dynamut2'}), keyed chain-aware on (chain, resnum, wt, mut),
+        SIGN-NORMALISED to the system convention (the bridge parser applies
+        DYNAMUT2_DDG_SIGN).  REMOTE API → SPARSE + CAPPED: over DYNAMUT2_MAX_CANDIDATES
+        → cover the top-N by fast score, the rest stay dynamics not_computed.
+        GRACEFUL/ERROR-FIRST: disabled / API failure / over-cap → those candidates
+        not_computed; the deep run (Rosetta + others) is UNAFFECTED.
+        """
+        import config as _c
+        if (not enabled or not deep_candidates or not pdb_path
+                or not Path(pdb_path).is_file()):
+            return {}, {}
+        if str(getattr(_c, "DYNAMUT2_ENABLE", "auto")).strip().lower() in ("false", "0", "no", "off"):
+            return {}, {}
+        try:
+            cap = int(getattr(_c, "DYNAMUT2_MAX_CANDIDATES", 25))
+            covered = deep_candidates
+            if len(deep_candidates) > cap:                  # cover top-N by fast score
+                covered = sorted(
+                    deep_candidates, key=lambda c: c.get("_fast_score", 0.0), reverse=True
+                )[:cap]
+                self._progress(
+                    f"  DynaMut2: deep set ({len(deep_candidates)}) exceeds cap ({cap}) "
+                    f"— covering top {cap} by fast score; the rest dynamics not_computed."
+                )
+            from rosetta_bridge import RosettaBridge
+            bridge = RosettaBridge()
+            bridge._backend = "dynamut2"                    # force the API axis (independent)
+            mutations = [
+                {"chain": c.get("chain", chain_id or "A"),
+                 "position": c.get("resnum", c["position"]),
+                 "from_aa": c["from_aa"], "to_aa": c["to_aa"]}
+                for c in covered
+            ]
+            self._progress(
+                f"  DynaMut2: scoring {len(mutations)} candidate(s) "
+                "(dynamics-axis voter, remote API)…"
+            )
+            result = bridge.analyze(
+                pdb_path=pdb_path, mutations=mutations, session=self.session,
+                model_id=self.model_id, chain=chain_id, progress_callback=self._progress,
+            )
+            if not result.success:
+                self._progress(
+                    f"  DynaMut2 unavailable ({(result.error or '')[:80]}) — "
+                    "dynamics not_computed; deep run continues."
+                )
+                return {}, {}
+            scores = result.data.get("ddg_scores", {})      # keyed f"{wt}{resnum}{mut}", system sign
+            # EXCLUDE empirical fallbacks — a BLOSUM/B-factor estimate is NOT a
+            # dynamics signal.  An API failure that fell back to empirical → that
+            # candidate is dynamics not_computed (the deep run's other axes stand).
+            empirical = set(result.data.get("empirical_fallbacks", []))
+            ddg_out: Dict[str, float] = {}
+            src_out: Dict[str, str]   = {}
+            for c in covered:
+                rk = f"{c['from_aa']}{c.get('resnum', c['position'])}{c['to_aa']}"
+                if rk in scores and rk not in empirical:
+                    key = thermompnn_key(chain_id or "A", c.get("resnum", c["position"]),
+                                         c["from_aa"], c["to_aa"])
+                    ddg_out[key] = round(float(scores[rk]), 4)
+                    src_out[key] = "dynamut2"
+            return ddg_out, src_out
+        except Exception as exc:
+            self._progress(
+                f"  DynaMut2 unavailable ({type(exc).__name__}) — dynamics not_computed; "
+                "deep run continues."
             )
             return {}, {}
 

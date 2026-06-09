@@ -427,9 +427,10 @@ def test_dynamut2_result_parsing():
         pair_key="V82A+I64E",
     )
     assert parsed is not None, "Should successfully parse the mock response"
-    assert parsed["ddg_double"]   == -2.1
-    assert parsed["ddg_additive"] == -1.8
-    assert parsed["epistasis"]    == round(-2.1 - (-1.8), 3)  # -0.3
+    # mm sign normalised to system (raw -2.1 -> +2.1; DynaMut2 positive=stabilising)
+    assert parsed["ddg_double"]   == 2.1
+    assert parsed["ddg_additive"] == 1.8
+    assert parsed["epistasis"]    == round(2.1 - 1.8, 3)  # +0.3
     assert parsed["avg_distance_api"] == 12.4
 
 
@@ -449,7 +450,7 @@ def test_dynamut2_result_parsing_reversed_order():
         pair_key="V82A+I64E",
     )
     assert parsed is not None, "Should find result when key order is reversed"
-    assert parsed["ddg_double"] == -2.1
+    assert parsed["ddg_double"] == 2.1   # raw -2.1 -> system +2.1 (sign-normalised)
 
 
 def test_dynamut2_result_parsing_fallback_single_entry():
@@ -468,7 +469,7 @@ def test_dynamut2_result_parsing_fallback_single_entry():
         pair_key="V82A+I64E",
     )
     assert parsed is not None
-    assert parsed["ddg_double"] == 1.5
+    assert parsed["ddg_double"] == -1.5   # raw 1.5 -> system -1.5 (sign-normalised)
 
 
 def test_dynamut2_result_parsing_missing_fields():

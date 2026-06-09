@@ -412,13 +412,13 @@ def test_dynamut2_response_parsing() -> None:
     _assert(
         _parse_dynamut2_result(
             {"prediction": 1.47, "chain": "A", "res_number": 82}, "V82A"
-        ) == 1.47,
-        "parses 'prediction' from complete result"
+        ) == -1.47,   # raw 1.47 -> system -1.47 (DYNAMUT2_DDG_SIGN=-1)
+        "parses 'prediction' and normalises sign to system convention"
     )
     # Negative value
     _assert(
-        _parse_dynamut2_result({"prediction": -0.82, "chain": "A"}, "L10K") == -0.82,
-        "parses negative prediction"
+        _parse_dynamut2_result({"prediction": -0.82, "chain": "A"}, "L10K") == 0.82,   # raw -0.82 (DynaMut2 stabilising) -> system +0.82
+        "negative DynaMut2 (stabilising) -> positive system (destabilising)"
     )
 
 
@@ -448,7 +448,7 @@ def test_dynamut2_rate_limit_retry() -> None:
             bridge = RosettaBridge()
             ddg = bridge._query_dynamut2_single(pdb_path, mut, progress=lambda s: None)
 
-        _assert(ddg == 1.47, "succeeds after one 429 retry", str(ddg))
+        _assert(ddg == -1.47, "succeeds after one 429 retry (sign-normalised)", str(ddg))
 
     finally:
         os.environ.pop("ROSETTA_BACKEND", None)
@@ -469,8 +469,9 @@ def test_dynamut2_single_status_done_parsed() -> None:
         "results_page": "http://example/x",
     }
     ddg = _parse_dynamut2_result(data, "I72R")
-    _assert(ddg == 0.789, "status=DONE prediction parsed", str(ddg))
-    assert ddg == 0.789
+    # raw 0.789 -> system -0.789 (DynaMut2 reports positive=stabilising; we flip)
+    _assert(ddg == -0.789, "status=DONE prediction parsed + sign-normalised", str(ddg))
+    assert ddg == -0.789
 
 
 def test_dynamut2_single_status_running_continues() -> None:
@@ -514,8 +515,8 @@ def test_dynamut2_single_status_running_continues() -> None:
 
         _assert(mock_get.call_count == 2,
                 "polled twice (RUNNING then DONE)", str(mock_get.call_count))
-        _assert(ddg == 0.789, "returns prediction after RUNNING poll", str(ddg))
-        assert mock_get.call_count == 2 and ddg == 0.789
+        _assert(ddg == -0.789, "returns sign-normalised prediction after RUNNING poll", str(ddg))
+        assert mock_get.call_count == 2 and ddg == -0.789
     finally:
         os.environ.pop("ROSETTA_BACKEND", None)
         Path(pdb_path).unlink(missing_ok=True)
@@ -526,9 +527,9 @@ def test_dynamut2_single_prediction_string_cast() -> None:
     from rosetta_bridge import _parse_dynamut2_result
 
     ddg = _parse_dynamut2_result({"status": "DONE", "prediction": "1.4"}, "I72R")
-    _assert(ddg == 1.4, "string prediction cast to float", str(ddg))
+    _assert(ddg == -1.4, "string prediction cast to float + sign-normalised", str(ddg))
     _assert(isinstance(ddg, float), "extracted ddg is a float")
-    assert ddg == 1.4 and isinstance(ddg, float)
+    assert ddg == -1.4 and isinstance(ddg, float)
 
 
 def test_dynamut2_single_error_not_zero() -> None:

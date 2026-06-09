@@ -957,10 +957,15 @@ class DoubleMutantBridge:
             return None
 
         try:
-            ddg_double  = round(float(entry["prediction"]), 3)
-            ddg_additive = round(float(entry["sum_ddg"]), 3)
-            epistasis   = round(ddg_double - ddg_additive, 3)
-            avg_dist    = round(float(entry.get("avg_distance", 0) or 0), 2)
+            # SIGN: DynaMut2 mm reports positive = STABILISING (mCSM family) — route
+            # the raw ddG through the SHARED normaliser so the double-mutant path uses
+            # the identical system convention as the single-mutation path (defined
+            # once in rosetta_bridge.normalize_dynamut2_ddg; config.DYNAMUT2_DDG_SIGN).
+            from rosetta_bridge import normalize_dynamut2_ddg
+            ddg_double   = normalize_dynamut2_ddg(entry["prediction"])
+            ddg_additive = normalize_dynamut2_ddg(entry["sum_ddg"])
+            epistasis    = round(ddg_double - ddg_additive, 3)
+            avg_dist     = round(float(entry.get("avg_distance", 0) or 0), 2)
         except (KeyError, TypeError, ValueError):
             return None
 

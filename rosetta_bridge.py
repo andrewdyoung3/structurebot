@@ -193,6 +193,19 @@ def _select_backend() -> str:
 
 # ── DynaMut2 response parsing ──────────────────────────────────────────────────
 
+def normalize_dynamut2_ddg(raw: Any) -> float:
+    """Normalise a RAW DynaMut2 ΔΔG to the SYSTEM convention (positive =
+    destabilising).  THE single place the DynaMut2 sign is defined — both the
+    single-mutation parser and the double-mutant mm path route through it, so the
+    convention can never drift between paths.
+
+    DynaMut2 reports positive = STABILISING (mCSM family, empirically verified —
+    L99A → −3.32), the OPPOSITE of the system, so config.DYNAMUT2_DDG_SIGN is −1.
+    """
+    import config as _c
+    return round(int(getattr(_c, "DYNAMUT2_DDG_SIGN", -1)) * float(raw), 3)
+
+
 def _parse_dynamut2_result(data: Dict[str, Any], mutation_str: str) -> float:
     """
     Extract ΔΔG (kcal/mol) from a completed DynaMut2 result JSON.
@@ -204,8 +217,10 @@ def _parse_dynamut2_result(data: Dict[str, Any], mutation_str: str) -> float:
     Legacy format (still accepted):
       {"prediction": "1.4", "chain": "A", "res_number": 82, ...}
 
-    Sign convention: positive = destabilising, negative = stabilising
-    (matches StructureBot's internal convention — no flip needed).
+    Sign convention: DynaMut2 reports positive = STABILISING (mCSM family) — the
+    OPPOSITE of the system.  The raw value is normalised to the system convention
+    (positive = destabilising) via normalize_dynamut2_ddg (config.DYNAMUT2_DDG_SIGN,
+    default −1).  [Empirically verified 2026-06-10: L99A → raw −3.32 → +3.32.]
 
     Raises:
       RuntimeError if the job reports a server-side error (status=ERROR) —
@@ -236,7 +251,7 @@ def _parse_dynamut2_result(data: Dict[str, Any], mutation_str: str) -> float:
     # returns a float, the legacy docs show a string).
     if data.get("prediction") is not None:
         try:
-            return round(float(data["prediction"]), 3)
+            return normalize_dynamut2_ddg(data["prediction"])   # → system convention
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"DynaMut2 'prediction' field for {mutation_str!r} is not numeric: "
@@ -695,6 +710,10 @@ class RosettaBridge:
                 "stability_change": round(stability_change, 3),
                 "confidence":       confidence,
                 "backend":          backend_lbl,
+                # mutation keys that FELL BACK to the empirical BLOSUM/B-factor
+                # estimate (NOT a real DynaMut2 value) — consumers that need a
+                # genuine DynaMut2 signal (the dynamics-axis voter) must exclude these.
+                "empirical_fallbacks": list(empirical_fallbacks),
                 "warnings":         warnings,
                 "method_note":      method_note,
                 "job_id":           None,

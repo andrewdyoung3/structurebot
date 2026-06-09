@@ -497,6 +497,31 @@ ESM_USE_VENV312: str = os.environ.get("ESM_USE_VENV312", "auto").strip()
 # 4 is conservative — server handles up to ~5.  Set to 1 to disable parallelism.
 DYNAMUT2_MAX_WORKERS: int = int(os.environ.get("DYNAMUT2_MAX_WORKERS", "4"))
 
+# ── DynaMut2 SIGN normalisation (defined ONCE; both the single-mutation parser and
+# the double-mutant mm path route through normalize_dynamut2_ddg) ──────────────
+# EMPIRICALLY VERIFIED OPPOSITE: DynaMut2 reports positive = STABILISING (mCSM
+# family), the OPPOSITE of the system convention (positive = destabilising).
+# Live anchor on 2LZM: L99A (canonical destabiliser, exp +5.0) → DynaMut2 −3.32;
+# V149A (exp +2.0) → −2.06.  So the multiplier is −1 (flip to system convention).
+# (The pre-2026-06-10 code used the raw value with NO flip → it shipped inverted
+# DynaMut2 ddG for both the single-mutation backend AND the double-mutant path.)
+DYNAMUT2_DDG_SIGN: int = int(os.environ.get("DYNAMUT2_DDG_SIGN", "-1"))
+
+# ── DynaMut2 fast-tier DYNAMICS-axis voter (shortlist / round-2) ───────────────
+# DynaMut2 (normal-mode dynamics + graph signature, ML-trained on experimental
+# ddG) is the DYNAMICS axis — an INDEPENDENT voter (unlike RaSP it does NOT hand
+# off / collapse; it always counts when present).  REMOTE API → SPARSE: runs only
+# on the deep/round-2 candidate set (rides the deep opt-in), capped.
+DYNAMUT2_ENABLE: str = os.environ.get("DYNAMUT2_ENABLE", "auto").strip().lower()
+# Max candidates DynaMut2 scores per deep run (remote API can't do hundreds).  Over
+# the cap → cover the top-N by combined score, mark the rest dynamics not_computed.
+DYNAMUT2_MAX_CANDIDATES: int = int(os.environ.get("DYNAMUT2_MAX_CANDIDATES", "25"))
+# PROVISIONAL dynamics-axis weight — PENDING BENCHMARK.  DynaMut2 is its OWN axis
+# (no handoff); always counted when present, renormalised over present axes.  Note
+# for calibration: DynaMut2 shares experimental supervision with ThermoMPNN →
+# partial correlation, to be handled in the §9 aggregate-weighting benchmark.
+DYNAMUT2_WEIGHT: float = float(os.environ.get("DYNAMUT2_WEIGHT", "0.45"))
+
 # ── Double mutant scoring ─────────────────────────────────────────────────────
 
 # Cα-Cα distance threshold (Å) above which DynaMut2 is reliable for double mutants.
