@@ -446,6 +446,45 @@ THERMOMPNN_DDG_SIGN: int = int(os.environ.get("THERMOMPNN_DDG_SIGN", "1"))
 # weights must account for voter redundancy, not just standalone accuracy.
 THERMOMPNN_WEIGHT: float = float(os.environ.get("THERMOMPNN_WEIGHT", "0.45"))
 
+# ── RaSP — fast-tier PHYSICS-PROXY ddG voter (Rosetta surrogate) ───────────────
+# RaSP (KULL-Centre/_2022_ML-ddG-Blaabjerg) is a trained surrogate for Rosetta
+# ddG, so it fills the PHYSICS axis as a fast proxy — it is NOT an independent
+# voter: when real Rosetta ddG exists for a candidate it HANDS OFF (RaSP's score
+# contribution → 0, value retained as a proxy-QC delta).  Runs in a dedicated
+# WSL2 venv (`~/rasp_env`, modern torch-CPU + openmm + pdbfixer + compiled reduce;
+# the README's 2022 conda stack does not fit), subprocessed like the WSL bridges.
+# GRACEFUL: disabled/absent/failing → fast tier renormalises over present axes.
+RASP_DIR: str = os.environ.get("RASP_DIR", "/home/andre/RaSP_repo")
+# WSL2 interpreter for RaSP inference (the dedicated rasp_env venv).
+RASP_PYTHON: str = os.environ.get("RASP_PYTHON", "/home/andre/rasp_env/bin/python")
+RASP_WSL_DISTRO: str = os.environ.get("RASP_WSL_DISTRO", "Ubuntu-24.04")
+# Enable the fast-tier RaSP voter.  "auto" = use it if WSL + rasp_env are present,
+# else skip gracefully.  "false"/"0" disables (scan == pre-RaSP, byte-for-byte).
+RASP_ENABLE: str = os.environ.get("RASP_ENABLE", "auto").strip().lower()
+# Sign normalisation: RaSP trains on Rosetta ddG (positive = destabilising), so it
+# ALREADY matches the system convention; default +1 (no flip).  Live-confirmed on
+# 1PGA (positive=destabilising, Pearson 0.88 vs the shipped Rosetta reference).
+RASP_DDG_SIGN: int = int(os.environ.get("RASP_DDG_SIGN", "1"))
+# PROVISIONAL physics-axis weight — PENDING BENCHMARK CALIBRATION (do not bless
+# this number).  RaSP fills the PHYSICS slot ONLY when real Rosetta is absent for a
+# candidate (per-candidate handoff); it never votes alongside Rosetta.  The §9
+# aggregate-weighting spec (independence × confidence, staged by round) calibrates
+# the physics-axis weight later — RaSP is the low-confidence proxy, Rosetta the
+# high-confidence real value.  Kept equal to the Rosetta deep weight for now so the
+# fast tier's physics slot is on the same scale; calibration will lower the proxy.
+RASP_WEIGHT: float = float(os.environ.get("RASP_WEIGHT", "0.50"))
+# Cache-busting tag folded into the RaSP result cache key alongside (pdb-hash,
+# chain).  Bump when the sign, model, or port changes so a config change busts the
+# cache instead of silently serving stale ddG.
+RASP_VERSION_TAG: str = os.environ.get(
+    "RASP_VERSION_TAG", f"rasp-v1;sign={RASP_DDG_SIGN};ds10;port=openmm8+srSASA"
+)
+# Wall-clock budget for one RaSP worker run (clean+extract+CPU inference).
+RASP_TIMEOUT: int = int(os.environ.get("RASP_TIMEOUT", "600"))
+# Per-(pdb,chain,version) RaSP result cache so a re-scan is free.
+RASP_CACHE_DIR: Path = Path(os.environ.get("RASP_CACHE_DIR", str(_BASE / "cache" / "rasp")))
+RASP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable

@@ -190,7 +190,7 @@ class TestEndToEndUnfriendly:
         sc, seq = _scanner_for(pdb, "A")
         # user scope "residues 55-57" = AUTHOR resnums; seqindex would be 6-8 (wrong)
         res = sc.scan(pdb_path=pdb, chain_id="A", sequence=seq,
-                      include_positions=[55, 56, 57], run_rosetta=False, run_thermompnn=False)
+                      include_positions=[55, 56, 57], run_rosetta=False, run_thermompnn=False, run_rasp=False)
         sel = sorted({r["resnum"] for r in res})
         assert sel == [55, 56, 57], f"scope hit {sel}, expected author 55-57"
         assert all(r["position"] == r["resnum"] for r in res)   # record identity = author
@@ -202,7 +202,7 @@ class TestEndToEndUnfriendly:
         with patch.object(ThermoMPNNBridge, "is_available", lambda self: True), \
              patch.object(ThermoMPNNBridge, "_run_inference", lambda self, p, c, log: csv):
             res = sc.scan(pdb_path=pdb, chain_id="A", sequence=seq,
-                          include_positions=[55, 56], run_rosetta=False)
+                          include_positions=[55, 56], run_rosetta=False, run_rasp=False)
         got = {r["resnum"]: r for r in res}
         assert 55 in got and 56 in got
         # CROSS-SOURCE IDENTITY: the ThermoMPNN value for resnum 55 must be 55's value
@@ -230,7 +230,7 @@ class TestEndToEndUnfriendly:
                       "backend": "pyrosetta_wsl2"})
         with patch.object(rosetta_bridge.RosettaBridge, "analyze", fake_analyze):
             sc.scan(pdb_path=pdb, chain_id="A", sequence=seq,
-                    include_positions=[55, 56], run_rosetta=True, run_thermompnn=False)
+                    include_positions=[55, 56], run_rosetta=True, run_thermompnn=False, run_rasp=False)
         # Rosetta received AUTHOR resnums (55,56) — NOT seqindex (6,7)
         assert captured["positions"] == [55, 56], captured["positions"]
 
@@ -238,7 +238,7 @@ class TestEndToEndUnfriendly:
         pdb = _write_pdb([(a, 50 + i, "", "A") for i, a in enumerate("ACDEFGHIKL")])
         sc, seq = _scanner_for(pdb, "A")
         res = sc.scan(pdb_path=pdb, chain_id="A", sequence=seq,
-                      include_positions=[52, 53], run_rosetta=False, run_thermompnn=False)
+                      include_positions=[52, 53], run_rosetta=False, run_thermompnn=False, run_rasp=False)
         for r in res:
             assert r["thermompnn_ddg"] is None and r["thermompnn_source"] == "not_computed"
             assert r["combined_score"] == combined_score(
@@ -249,6 +249,6 @@ class TestEndToEndUnfriendly:
         pdb = _write_pdb([(a, 1 + i, "", "A") for i, a in enumerate("ACDEFGHIKL")])
         sc, seq = _scanner_for(pdb, "A")
         res = sc.scan(pdb_path=pdb, chain_id="A", sequence=seq,
-                      include_positions=[3, 4, 5], run_rosetta=False, run_thermompnn=False)
+                      include_positions=[3, 4, 5], run_rosetta=False, run_thermompnn=False, run_rasp=False)
         assert sorted({r["resnum"] for r in res}) == [3, 4, 5]
         assert all(r["position"] == r["seqindex"] for r in res)   # coincide when 1-based

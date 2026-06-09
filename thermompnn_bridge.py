@@ -45,49 +45,15 @@ _CREATE_NO_WINDOW: int = (
     subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # type: ignore[attr-defined]
 )
 
-# 3-letter → 1-letter for the PDB wildtype cross-check (standard AAs only).
-_THREE_TO_ONE: Dict[str, str] = {
-    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
-    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
-    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
-    "TYR": "Y", "VAL": "V",
-}
-
-def candidate_key(chain: str, resnum: int, wt: str, mut: str) -> str:
-    """Chain-aware candidate key — never collides across chains in a multimer."""
-    return f"{chain}:{wt}{resnum}{mut}"
-
-
-def ordered_chain_residues(pdb_path, chain):
-    """The chain's coordinate residues in AUTHOR order → [(resnum, icode, aa)].
-
-    SHARED by the scanner (seqindex→resnum spine) and the ThermoMPNN bridge
-    (WT-anchored alignment) so BOTH see the identical residue set + order — the
-    invariant that makes the alignment's resnum keys match the candidate keys.
-    Standard residues only; insertion-coded residues ARE included (author order:
-    base then insertion) so ThermoMPNN's extra insertion rows line up 1:1.
-    Empty on failure → callers use the legacy seqindex==resnum path.
-    """
-    if not pdb_path:
-        return []
-    try:
-        from Bio.PDB import PDBParser
-        structure = PDBParser(QUIET=True).get_structure("s", str(pdb_path))
-        model = next(iter(structure))
-        ch = chain or next(iter(model)).id
-        if ch not in [c.id for c in model]:
-            return []
-        out = []
-        for r in model[ch]:
-            het, resseq, icode = r.id
-            if het.strip():                    # skip HETATM / water / ligand
-                continue
-            one = _THREE_TO_ONE.get(r.resname.strip().upper())
-            if one:
-                out.append((int(resseq), (icode or "").strip(), one))
-        return out
-    except Exception:
-        return []
+# The residue-identity primitives now live in the shared `residue_mapping` module
+# so every fast-tier voter (ThermoMPNN, RaSP, …) reuses the IDENTICAL spine +
+# WT-anchored alignment.  Re-exported here for backward-compatible imports.
+from residue_mapping import (          # noqa: F401  (re-export)
+    _THREE_TO_ONE,
+    candidate_key,
+    ordered_chain_residues,
+    align_predictions_to_resnums,
+)
 
 
 class ThermoMPNNBridge:
@@ -185,26 +151,11 @@ class ThermoMPNNBridge:
             _log(f"  ThermoMPNN: failed parsing output ({str(exc)[:120]}) — skipped.")
             return {}, {}
 
-        # 4. WT-ANCHORED ALIGNMENT (exact across gaps AND insertion codes; no offset,
-        # no coincidence).  ThermoMPNN's present positions, in order, ARE the chain's
-        # residues in author order — so the k-th unique present position maps to the
-        # k-th ordered residue, REQUIRING the wildtype AA to match at each step.  Any
-        # length/AA divergence is a HARD ERROR (drop the whole batch to not_computed)
-        # — never a probabilistic pass, never a mis-attribution.
-        upos = sorted(pos_wt)
-        if len(upos) != len(ordered):
-            _log(f"  ThermoMPNN: alignment ABORTED — {len(upos)} predicted positions "
-                 f"vs {len(ordered)} structure residues (set divergence). not_computed.")
+        # 4. WT-ANCHORED ALIGNMENT (shared helper; exact across gaps AND insertion
+        # codes; hard-error on divergence → not_computed, never a mis-attribution).
+        pos_to_resnum = align_predictions_to_resnums(ordered, pos_wt, _log, tool="ThermoMPNN")
+        if pos_to_resnum is None:
             return {}, {}
-        pos_to_resnum: Dict[int, int] = {}
-        for k, p in enumerate(upos):
-            rn, _ic, aa = ordered[k]
-            if pos_wt[p] != aa:
-                _log(f"  ThermoMPNN: alignment ABORTED — wildtype mismatch at residue "
-                     f"#{k} (predicted {pos_wt[p]} vs structure {aa}@{rn}). not_computed "
-                     "(never mis-attribute).")
-                return {}, {}
-            pos_to_resnum[p] = rn
 
         ddg_all: Dict[str, float] = {}
         for pos, wt, mut, ddg in rows:

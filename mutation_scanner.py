@@ -136,25 +136,40 @@ def present_voters_score(
     w_thermo:  float = 0.45,
     w_sol:     float = _W_SOL,
     w_tol:     float = _W_TOL,
+    rasp_ddg:  Optional[float] = None,
+    w_rasp:    Optional[float] = None,
 ) -> float:
     """
-    Combined score renormalised over the voters PRESENT (higher = better).
+    Combined score renormalised over the AXES PRESENT (higher = better).
 
-    Voters + contribution (all oriented so higher = better):
-      rosetta_ddg     → −ddg   (negative ddg = stabilising)   [deep tier only]
-      thermompnn_ddg  → −ddg   (negative ddg = stabilising)   [fast-tier voter]
-      camsol_delta    → +delta (solubility improvement)
-      esm_tolerance   → +tol   (evolutionary tolerance)
+    AXES + contribution (all oriented so higher = better):
+      PHYSICS         → −ddg   (negative ddg = stabilising)
+                        ONE slot: Rosetta if computed for this candidate, ELSE RaSP
+                        (the proxy).  Rosetta and RaSP NEVER both vote — RaSP is a
+                        trained Rosetta surrogate, so it HANDS OFF to the real value
+                        per candidate (no additive double-count).  Weight = w_rosetta
+                        when filled by Rosetta, w_rasp when filled by the proxy.
+      thermompnn_ddg  → −ddg   ML/static stability axis (independent)
+      camsol_delta    → +delta solubility axis (orthogonal)
+      esm_tolerance   → +tol   evolutionary axis
 
-    Only present voters (non-None ddg; CamSol/ESM always present) contribute, with
-    their weights renormalised to sum to 1.  GRACEFUL/EXACT: with both ddg voters
-    absent this reduces to 0.6·camsol + 0.4·esm (== the pre-ThermoMPNN fast tier),
-    and with only Rosetta absent... etc. — so a ThermoMPNN-disabled scan reproduces
-    the previous scores byte-for-byte (CamSol:ESM stays 3:2).
+    Only present axes contribute, weights renormalised to sum to 1.  GRACEFUL/EXACT:
+    with NO physics value (rosetta and rasp both None) and no ThermoMPNN this reduces
+    to 0.6·camsol + 0.4·esm — so a RaSP/ThermoMPNN-disabled scan reproduces the
+    pre-voter scores byte-for-byte (CamSol:ESM stays 3:2).
+
+    NOTE: w_rasp/w_rosetta are PROVISIONAL pending the §9 aggregate-weighting
+    benchmark (independence × confidence); the handoff MECHANISM is what's built
+    here, not final numbers.
     """
+    if w_rasp is None:
+        w_rasp = w_rosetta          # provisional: proxy on the same scale (calibrate later)
     voters: List[Tuple[float, float]] = []
+    # PHYSICS axis — real (Rosetta) supersedes proxy (RaSP); never both.
     if rosetta_ddg is not None:
         voters.append((w_rosetta, -rosetta_ddg))
+    elif rasp_ddg is not None:
+        voters.append((w_rasp, -rasp_ddg))
     if thermompnn_ddg is not None:
         voters.append((w_thermo, -thermompnn_ddg))
     voters.append((w_sol, camsol_delta))
@@ -299,6 +314,7 @@ class MutationScanner:
         rosetta_shortlist_k: Optional[int] = None,
         ddg_basis:          str = "symmetric",
         run_thermompnn:     bool = True,
+        run_rasp:           bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -477,19 +493,33 @@ class MutationScanner:
         import config as _cfg_tm
         _w_thermo = float(getattr(_cfg_tm, "THERMOMPNN_WEIGHT", 0.45))
 
+        # RaSP fast-tier PHYSICS-PROXY voter (Rosetta surrogate; WSL CPU, cached).
+        # Fills the physics axis as a fast proxy; HANDS OFF to real Rosetta per
+        # candidate in present_voters_score (no double-count).  GRACEFUL: {} when
+        # disabled/absent/failed/diverged → physics slot simply unfilled.
+        rasp_ddg, rasp_src = self._run_rasp(
+            pdb_path, chain_id, raw_candidates, run_rasp
+        )
+        _w_rasp = float(getattr(_cfg_tm, "RASP_WEIGHT", w_ddg))
+
         # Fast score for EVERY candidate — present-voters renormalised over
         # ThermoMPNN(if present) + CamSol + ESM.  Used for ranking, shortlist
         # selection, and as the retained score when Rosetta ddG is off.  With
         # ThermoMPNN absent this is byte-identical to the pre-ThermoMPNN fast tier.
         for cand in raw_candidates:
             _etol = round(1.0 - esm_scores.get(cand["position"], 0.5), 4)  # SEQINDEX
-            _tkey = thermompnn_key(chain_id, cand["resnum"], cand["from_aa"], cand["to_aa"])
+            _key  = thermompnn_key(chain_id, cand["resnum"], cand["from_aa"], cand["to_aa"])
             cand["_esm_tol"]    = _etol
-            cand["_thermo_ddg"] = thermo_ddg.get(_tkey)      # None if not computed
-            cand["_thermo_src"] = thermo_src.get(_tkey, "not_computed")
+            cand["_thermo_ddg"] = thermo_ddg.get(_key)       # None if not computed
+            cand["_thermo_src"] = thermo_src.get(_key, "not_computed")
+            cand["_rasp_ddg"]   = rasp_ddg.get(_key)         # physics proxy | None
+            cand["_rasp_src"]   = rasp_src.get(_key, "not_computed")
+            # Fast tier: physics slot filled by RaSP (no Rosetta yet) → it HANDS OFF
+            # to Rosetta in the deep tier below.
             cand["_fast_score"] = present_voters_score(
                 None, cand["_thermo_ddg"], cand["estimated_camsol_delta"], _etol,
                 w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol,
+                rasp_ddg=cand["_rasp_ddg"], w_rasp=_w_rasp,
             )
 
         ddg_scores:     Dict[str, float] = {}
@@ -552,6 +582,8 @@ class MutationScanner:
 
             thermo_d = cand.get("_thermo_ddg")             # system-convention ddG | None
             thermo_s = cand.get("_thermo_src", "not_computed")
+            rasp_d   = cand.get("_rasp_ddg")               # physics proxy ddG | None
+            rasp_s   = cand.get("_rasp_src", "not_computed")
 
             if mk in ddg_scores:                           # this candidate got Rosetta
                 ddg      = ddg_scores[mk]
@@ -561,10 +593,13 @@ class MutationScanner:
                 ddg_out  = round(ddg, 3)
                 basis    = ddg_basis                       # "symmetric" | "asymmetric"
                 tier     = "deep"
-                # present-voters over Rosetta + ThermoMPNN(if any) + CamSol + ESM
+                # PHYSICS HANDOFF: real Rosetta fills the physics axis; RaSP's score
+                # contribution → 0 (passed as rasp_ddg=None so it cannot double-count),
+                # but RaSP's value is RETAINED below + the RaSP−Rosetta delta stored.
                 score    = present_voters_score(
                     ddg, thermo_d, camsol_delta, esm_tol,
-                    w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol)
+                    w_rosetta=w_ddg, w_thermo=_w_thermo, w_sol=w_sol, w_tol=w_tol,
+                    rasp_ddg=None, w_rasp=_w_rasp)
             else:                                          # fast tier / deferred by shortlist
                 ddg = ddg_out = None
                 ddg_src  = "not_computed"
@@ -572,7 +607,13 @@ class MutationScanner:
                 ddg_conf = "not_computed"
                 basis    = "none"
                 tier     = "fast"
-                score    = cand["_fast_score"]             # already includes ThermoMPNN
+                score    = cand["_fast_score"]             # physics = RaSP proxy (if any)
+
+            # physics provenance + proxy-QC delta (RaSP vs Rosetta; both system sign)
+            physics_src = "rosetta" if ddg is not None else (
+                "rasp" if rasp_d is not None else "not_computed")
+            rasp_minus_rosetta = (
+                round(rasp_d - ddg, 4) if (ddg is not None and rasp_d is not None) else None)
 
             is_proximal = cand.get("interface_proximal", False)
             rec = _recommendation(ddg, camsol_delta, esm_tol, score)
@@ -596,6 +637,10 @@ class MutationScanner:
                 "tier":              tier,
                 "thermompnn_ddg":    (round(thermo_d, 4) if thermo_d is not None else None),
                 "thermompnn_source": thermo_s,
+                "rasp_ddg":          (round(rasp_d, 4) if rasp_d is not None else None),
+                "rasp_source":       rasp_s,
+                "physics_source":    physics_src,          # rosetta | rasp | not_computed
+                "rasp_minus_rosetta": rasp_minus_rosetta,  # proxy-QC delta (None unless both)
                 "solubility_delta":  camsol_delta,
                 "esm_tolerance":     esm_tol,
                 "camsol_score":      round(camsol_scores.get(seqidx, 0.0), 3),
@@ -1015,6 +1060,47 @@ class MutationScanner:
         except Exception as exc:
             self._progress(
                 f"  ThermoMPNN unavailable ({type(exc).__name__}) — fast tier without it."
+            )
+            return {}, {}
+
+    def _run_rasp(
+        self,
+        pdb_path:       Optional[str],
+        chain_id:       Optional[str],
+        raw_candidates: List[Dict[str, Any]],
+        enabled:        bool = True,
+    ) -> Tuple[Dict[str, float], Dict[str, str]]:
+        """
+        Fast-tier RaSP ddG (physics proxy) for *raw_candidates* → ({key: ddg},
+        {key: source}), keyed chain-aware on (chain, resnum, wt, mut) via the SHARED
+        spine + WT-anchored alignment, sign-normalised to the system convention.
+        GRACEFUL/ERROR-FIRST: disabled/absent/failed/diverged → ({}, {}) so the fast
+        tier renormalises over the present axes exactly as before (no crash, no fake).
+        """
+        if not enabled or not pdb_path or not Path(pdb_path).is_file():
+            return {}, {}
+        try:
+            from rasp_bridge import RaSPBridge
+            bridge = RaSPBridge()
+            if not bridge.is_available():
+                self._progress(f"  RaSP: {bridge.status()} — fast tier without it.")
+                return {}, {}
+            # RaSP keys by AUTHOR resnum (its WT-anchored map returns resnum); pass
+            # resnum so the candidate keys match.
+            cands = [
+                {"position": c.get("resnum", c["position"]),
+                 "from_aa": c["from_aa"], "to_aa": c["to_aa"]}
+                for c in raw_candidates
+            ]
+            self._progress(
+                f"  RaSP: scoring {len(cands)} candidate(s) (fast-tier physics proxy)…"
+            )
+            return bridge.score_mutations(
+                pdb_path, chain_id or "A", cands, progress=self._progress
+            )
+        except Exception as exc:
+            self._progress(
+                f"  RaSP unavailable ({type(exc).__name__}) — fast tier without it."
             )
             return {}, {}
 

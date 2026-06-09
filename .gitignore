@@ -25,3 +25,6 @@ live_test_*.txt
 # ThermoMPNN (cloned repo + bundled weights — never commit)
 ThermoMPNN_repo/
 *.ckpt
+
+# RaSP (cloned for probe; not committed — weights bundled in-repo)
+RaSP_repo/
