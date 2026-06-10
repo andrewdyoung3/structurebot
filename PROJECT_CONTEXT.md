@@ -765,6 +765,80 @@ ratios pending the benchmark, which **measures** the diversity (independence) an
 (Today's `present_voters_score` already renormalises over present voters — the per-candidate,
 sum-to-1 substrate this spec extends; ThermoMPNN is the ML/STATIC axis, already wired.)
 
+### Stability-Model Calibration & Validation Benchmark — PLAN, NOT YET EXECUTED
+
+> **🚧 PLAN — NOT YET EXECUTED.** This is the design for the benchmark that **resolves the
+> placeholder weights above** and validates the §9 axes empirically. Nothing here has been run; no
+> weights have been set; no in-pipeline calibration exists. Do NOT read any number below as a
+> result — the only numbers present are dry-run *motivation*, explicitly flagged as such.
+
+**Purpose.** One diverse-protein run that produces, from the same data, six outputs:
+1. **Per-voter confidence** — leakage-controlled, outlier-robust correlation vs experiment.
+2. **Cross-voter independence** — pairwise correlation structure, to validate the §9 axes empirically.
+3. **Agreement-as-confidence premise validation** — cross-voter spread vs error vs experiment.
+4. **Per-voter bias** — offset + slope and their cross-protein reproducibility.
+5. **Anti-symmetry at scale** — Ssym fwd/rev.
+6. **Calibrated weights** — §9 independence × confidence, resolving the provisional placeholders.
+
+**Design principles (hard-won).**
+- **Diversity over volume.** The calibration set's value is protein diversity and
+  training-disjointness, NOT row count. Many proteins from disjoint training distributions beat
+  thousands of rows from a voter's training set. (See dry-run findings below — volume of the wrong
+  data is the trap.)
+- **Held-out is per-voter, not global.** Each voter has a different training set (ThermoMPNN →
+  Tsuboyama mega-scale; DynaMut2 → S2648/VariBench family; RaSP → Rosetta ddG, so RaSP-vs-Rosetta is
+  always circular; Rosetta → physics, the leakage-free anchor). Score each voter only on ITS
+  training-disjoint subset. **The per-voter provenance audit is the gating first step** — no analysis
+  until each voter's evaluation subset is confirmed disjoint from its training.
+- **"Calibratable" = reproduces across proteins.** Measure offset/slope PER protein; examine the
+  spread. Tight spread → stable systematic bias → calibrate with pooled values (spread = the honest
+  error bar). Wide spread → protein-dependent bias → a single global correction would misfire → do
+  NOT calibrate globally; carry the bias range and account for it instead.
+- **Robust statistics mandatory.** Rosetta carries a clash tail (clash artifacts > +10, e.g.
+  K50P ≈ +97 REU vs experiment capped ~5). Use rank-based/robust methods; flag clash artifacts as
+  low-confidence rather than treating them as real ddG.
+- **Property axes characterized separately.** CamSol (solubility) and ESM (fitness) are NOT ddG; do
+  not fold them into the stability correlation or the stability vote. Characterize on their own terms.
+- **DynaMut2 stays subset-limited.** Remote API (~20–30 s/mut, capped) → a smaller fixed diverse
+  subset; it remains the least-powered voter.
+
+**Dual output (the delivered artifact).** Every candidate carries **Raw/Unmodified ddG** (lossless
+source of truth — never overwritten) AND **Calibrated ddG** (a derived view), for user
+discrimination. The calibrated value is produced only at the aggregate/interpretation layer over the
+lossless record, and carries: **provenance** (which dataset, the offset/slope applied), a **version
+tag** (recalibration must not silently change old results), an **uncertainty** (from the
+cross-protein spread), and an **out-of-distribution caveat** (a calibration fit on benchmark proteins
+may not transfer to very different targets).
+
+**Execution model — ATTENDED.** CC may compute the mechanical analysis (correlations,
+spread-vs-error, bias decomposition, the provenance audit). The **judgment** — interpreting leakage
+vs signal, deciding weights, accepting/refuting the premise, calibrate-or-not — is the attended
+human+Claude step. **No autonomous weight-setting or in-pipeline calibration.**
+
+**Dry-run findings (motivation, NOT results).** 917 rows, 1PGA-dominated + T4L; one protein,
+ThermoMPNN-leakage-contaminated — recorded as the motivation for the design above, NOT as benchmark
+results:
+- **Leakage trap demonstrated:** ThermoMPNN +0.83 vs exp (Protein G ≈ its Tsuboyama training set);
+  the 3-voter consensus (+0.785) "lost" to it — a naive read would wrongly say "drop the aggregate."
+  This is why diversity + provenance audit are non-negotiable.
+- **Premise holds directionally:** spread→error Spearman +0.377, monotonic across quartiles.
+- **RaSP~Rosetta only ≈ 0.61** (NOT near-redundant as §9's one-physics-axis handoff assumes) —
+  candidate cause: data-gen Rosetta (WSL PyRosetta) may run a different protocol than the Rosetta RaSP
+  approximates. To investigate.
+- **DynaMut2 most differentiated** (0.31–0.48 with others) — validates the dynamics-axis
+  independence claim.
+- **Property axes orthogonal** (CamSol −0.15, ESM −0.13 to exp).
+- **Destabilizing bias** is real, systematic, regime-localized to the stabilizing tail, and largely a
+  per-voter constant offset (RaSP +0.45 slope ≈ 0.93; ThermoMPNN +0.57 with slope-compression
+  ≈ 0.63). Removing the offset alone nearly restores each voter's stabilizing-tail median to
+  experiment → the bias is knowable as per-voter metadata. Matters most for engineering (stabilizer
+  hunting lives on that tail).
+
+**Future robustness queue.** Anti-symmetry at scale (Ssym; needs the fwd/rev mapping the data-gen
+deferred); RaSP-vs-deployed-Rosetta protocol check; out-of-distribution proteins (does the
+calibration transfer?); DynaMut2 mm-sign live reconfirmation (lift `DYNAMUT2_MM_SIGN_VERIFIED` only
+when the endpoint recovers and the mm sign battery converges).
+
 ---
 
 ## 10. External Dependencies
@@ -910,6 +984,7 @@ A `.gitignore` is now in place. **Untracked** (intentionally not committed): `ca
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-06-10 | 1358 (doc-only) | docs(§9): captured the **Stability-Model Calibration & Validation Benchmark — PLAN, NOT YET EXECUTED** (forward spec; folded under §9 next to the weighting placeholder it resolves, rather than a post-changelog §14 — keeps numbering intact). One diverse-protein run → six outputs (per-voter confidence, cross-voter independence, agreement-as-confidence premise validation, per-voter bias, anti-symmetry at scale, calibrated weights). Design principles: **diversity over volume**; **held-out is per-voter not global** (provenance audit is the gating first step — RaSP-vs-Rosetta always circular, Rosetta = leakage-free anchor); **"calibratable" = reproduces across proteins** (per-protein offset/slope spread decides global-calibrate vs carry-the-range); **robust stats mandatory** (Rosetta clash tail); **property axes (CamSol/ESM) characterized separately, not folded into the stability vote**; **DynaMut2 subset-limited**. **Dual output** = lossless Raw ddG + derived Calibrated ddG (provenance + version tag + uncertainty + OOD caveat). **Execution model ATTENDED** — CC computes the mechanics; weight-setting/calibrate-or-not is the human+Claude judgment step; **no autonomous weight-setting or in-pipeline calibration**. Dry-run findings (917 rows, 1PGA-dominated, ThermoMPNN-leakage-contaminated) recorded as **motivation, NOT results** (leakage trap; premise holds directionally; RaSP~Rosetta only ≈0.61; DynaMut2 most differentiated; property axes orthogonal; per-voter destabilizing-offset bias). Future-robustness queue captured (Ssym at scale, RaSP-vs-deployed-Rosetta protocol check, OOD transfer, DynaMut2 mm-sign live reconfirm). **NO code/tests** — meta count unchanged 1358. §9 updated. |
 | 2026-06-10 | 1358 (1358✓/3s/0❌) | harden(dynamut2): **mm sign-unverified guard is now ENFORCED → not_computed (was flag-only).** The brief requires the guard PREVENT the inferred mm sign from being emitted, not merely tag it. `_score_one` now, when an mm result is `sign_unverified` (default — `DYNAMUT2_MM_SIGN_VERIFIED` False), does NOT accept the mm value: it falls through to the additive fallback (a sum of the VERIFIED single-mutant ddGs) with a surfaced warning — the sign-normalised mm value is never emitted even if the endpoint recovers. Also fixed a latent bug where `analyze()` OVERWROTE per-pair warnings (line ~356) → now appends, so the guard warning (+ additive-fallback note) is never silenced. +1 enforcement test (mm sign_unverified → backend additive_fallback, ddg = additive not the mm value, warning surfaced). Gated suite **1358 / 0 / 3**. Completes Part-1 of the chained data-gen run (DynaMut2 was already merged @ dcce5ab; this is the enforced-guard hardening the brief mandates). §4 updated. |
 | 2026-06-10 | 1357 (1357✓/3s/0❌) | test+guard(dynamut2): **pre-merge completion — single-endpoint sign battery (−1 justified) + mm sign-unverified guard.** **SIGN BATTERY (live, convergent):** (1) POPULATION CORRELATION on the T4L panel, flipped DynaMut2 vs experimental ΔΔG — **Pearson +0.75 / Spearman +0.81 (n=8)**, decisively positive, at/above DynaMut2's published range (a wrong sign → strongly negative); (2) STABILISER-TAIL anchor **A149V → −0.38** (stabilising, system convention) alongside the **L99A → +3.32** destabiliser anchor — both tails correct; (3) ANTI-SYMMETRY spot-check (fwd X→A on WT / rev A→X on an ALA-truncated structure) — directionally consistent (fwd +, rev −/≈0), magnitude compression = the documented benign destabilising bias (NOT a sign inversion). All converge → **−1 (`DYNAMUT2_DDG_SIGN`) confirmed**; sign locked by the L99A + A149V anchors + a pure-sign-flip (anti-symmetry-of-convention) regression test. **mm GUARD:** the prediction_mm sign is only INFERRED (endpoint chronically ERRORs), so `_parse_mm_result` now tags results `sign_unverified=True` (gated by `DYNAMUT2_MM_SIGN_VERIFIED`, default False) + a per-pair warning — the inferred mm sign is never trusted silently if the endpoint recovers; the mm fixture sign-corrections are flagged equally provisional. §13 PRIOR-OUTPUT FLAG (earlier DynaMut2 single + double-mutant output sign-inverted) STANDS. Tests +1 (sign anchors + pure-flip + mm sign_unverified). Gated suite **1357 / 0 / 3**. Branch `feat/dynamut2-voter`; merges after this. |
 | 2026-06-10 | 1356 (1356✓/3s/0❌) | feat(dynamut2): **DynaMut2 wired as the DYNAMICS-axis shortlist voter + a SHARED sign-normalisation that FIXES a pre-existing inverted-sign bug.** `_run_dynamut2` (mutation_scanner) + `normalize_dynamut2_ddg` (rosetta_bridge) + config knobs + `tests/test_dynamut2.py` (15). **🔴 SIGN BUG FOUND + FIXED (empirically):** DynaMut2 reports positive=STABILISING (mCSM family) — OPPOSITE the system (positive=destabilising). Live anchor on 2LZM: L99A (exp +5.0 destabilising) → DynaMut2 raw −3.32; V149A (+2.0) → −2.06. The pre-existing parser used the raw value with NO flip (docstring wrongly claimed "no flip needed"), so the single-mutation `dynamut2` backend AND the double-mutant mm path **shipped INVERTED ddG** (stabilising/destabilising swapped) — never caught because the 2LZM benchmark ran on the PyRosetta/local backend. **FIX (defined ONCE):** `normalize_dynamut2_ddg` applies `DYNAMUT2_DDG_SIGN`(−1); BOTH `_parse_dynamut2_result` and `double_mutant_bridge._parse_mm_result` route through it (no drift). ⚠️ **PRIOR-OUTPUT FLAG:** any earlier output from the DynaMut2 single-mutation backend or the double-mutant bridge was sign-inverted — **re-interpret/re-run any recorded DynaMut2 double-mutant predictions** (double-mutant work likely ran through this path; the local backend masked it only for single-mutation benchmarks). mm sign could NOT be live-re-verified (the prediction_mm endpoint chronically ERRORs) → inferred from the single-mutation family (same server/model) + flagged to re-confirm when mm recovers. **VOTER:** dynamics-axis on the deep set (capped `DYNAMUT2_MAX_CANDIDATES`=25, top-N by fast score), CONCURRENT with Rosetta (thread; wall ≈ max). `present_voters_score` DYNAMICS slot is **INDEPENDENT — always counted, never zeroed/handed off (the inverse of the RaSP handoff; a dedicated test guards this)**. Empirical fallbacks EXCLUDED (BLOSUM ≠ dynamics → not_computed). Reuses author-resnum identity + chain-aware key (round-trips; no SSM alignment). GRACEFUL: API failure/disabled/over-cap → dynamics not_computed; deep run unaffected. Sign-corrected the test fixtures that encoded the raw (buggy) sign (test_rosetta + test_double_mutant — fixing tests, not weakening) + added a PHYSICAL L99A sign anchor. **Gated suite 1356 / 0 / 3** (Δ +15; no verified-mechanism test weakened). **LIVE-VERIFIED:** real deep scan (2LZM + non-1-start renumbered 2HHB) — ALL 4 AXES present on one residue, DynaMut2 sign correct (buried L99 → +1.9), cross-source identity holds, API-failure → deep completes (dynamics not_computed), disabled → None. **ALL 4 ddG AXES NOW IN** (physics Rosetta/RaSP, ML ThermoMPNN, dynamics DynaMut2 + property CamSol/ESM). Branch `feat/dynamut2-voter`; **merge HELD**. NEXT: exporter + cross-layer aggregate + the weight-calibrating benchmark. §3/§4/§9 updated. |
