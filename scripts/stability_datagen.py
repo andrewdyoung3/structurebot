@@ -414,6 +414,9 @@ def main():
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--manifest", metavar="JSON",
                     help="drive assembly from a Task-1 calibration manifest (multi-protein)")
+    ap.add_argument("--ssym", action="store_true",
+                    help="assemble VERIFIED Ssym fwd/rev anti-symmetry pairs (Task 4); "
+                         "machinery only — does NOT launch the anti-symmetry sweep")
     ap.add_argument("--all-entries", action="store_true",
                     help="with --manifest: include ALL entries, not just proposed_include")
     ap.add_argument("--list", action="store_true",
@@ -427,8 +430,15 @@ def main():
         summarize(a.summary)
         return
 
-    manifest = (assemble_from_manifest(a.manifest, proposed_only=not a.all_entries)
-                if a.manifest else assemble())
+    if a.ssym:
+        from ssym_mapping import build_ssym_pairs, ssym_pair_mutations, summarize
+        pairs = build_ssym_pairs()
+        summarize(pairs)
+        manifest = ssym_pair_mutations(pairs)
+    elif a.manifest:
+        manifest = assemble_from_manifest(a.manifest, proposed_only=not a.all_entries)
+    else:
+        manifest = assemble()
     by_set: Dict[str, int] = {}
     for m in manifest:
         by_set[m["set"]] = by_set.get(m["set"], 0) + 1
