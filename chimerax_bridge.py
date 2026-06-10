@@ -96,7 +96,11 @@ class ChimeraXBridge:
     ):
         self.chimerax_path: Optional[str] = chimerax_path or find_chimerax()
         self.port: int = port
-        self.base_url: str = f"http://localhost:{port}"
+        # Use 127.0.0.1, NOT "localhost": on Windows "localhost" resolves IPv6-first
+        # (::1) and the REST server binds IPv4 only, so each connection eats a ~2 s
+        # IPv6 connect-stall before falling back to IPv4 (measured: localhost 2054 ms
+        # vs 127.0.0.1 29 ms per call). The hot REST path multiplies this per click.
+        self.base_url: str = f"http://127.0.0.1:{port}"
         self.run_url: str = f"{self.base_url}/run"
         self._process: Optional[subprocess.Popen] = None
         self._command_queue: queue.Queue = queue.Queue()
