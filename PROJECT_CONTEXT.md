@@ -767,10 +767,18 @@ sum-to-1 substrate this spec extends; ThermoMPNN is the ML/STATIC axis, already 
 
 ### Stability-Model Calibration & Validation Benchmark — PLAN, NOT YET EXECUTED
 
-> **🚧 PLAN — NOT YET EXECUTED.** This is the design for the benchmark that **resolves the
-> placeholder weights above** and validates the §9 axes empirically. Nothing here has been run; no
-> weights have been set; no in-pipeline calibration exists. Do NOT read any number below as a
-> result — the only numbers present are dry-run *motivation*, explicitly flagged as such.
+> **🚧 BENCHMARK = PLAN, NOT YET EXECUTED.** This is the design for the benchmark that **resolves the
+> placeholder weights above** and validates the §9 axes empirically. **No weights have been set; no
+> attended calibration analysis has been run; no in-pipeline calibration exists.** Do NOT read any
+> number below as a result — the only numbers present are dry-run *motivation*, explicitly flagged as
+> such.
+>
+> **What HAS run (2026-06-10):** the Part-2 **data-generation harness** (`scripts/stability_datagen.py`,
+> committed `a6c7bc2`/`75d396f`) executed once → **917 rows** at `cache/stability_datagen/rows.jsonl`
+> (gitignored, local-only; all 6 voters per mutation + exp + Rosetta reference). That is **collection
+> only** — the dry-run set below, NOT the diverse calibration set the benchmark needs. The benchmark
+> proper (diverse training-disjoint proteins, the per-voter provenance audit, the attended analysis,
+> the weight-setting) is **still unexecuted.**
 
 **Purpose.** One diverse-protein run that produces, from the same data, six outputs:
 1. **Per-voter confidence** — leakage-controlled, outlier-robust correlation vs experiment.
@@ -817,7 +825,11 @@ human+Claude step. **No autonomous weight-setting or in-pipeline calibration.**
 
 **Dry-run findings (motivation, NOT results).** 917 rows, 1PGA-dominated + T4L; one protein,
 ThermoMPNN-leakage-contaminated — recorded as the motivation for the design above, NOT as benchmark
-results:
+results. **Provenance of these numbers:** the run lives at `cache/stability_datagen/rows.jsonl`
+(917 rows) + a descriptive `SUMMARY.txt` (counts/ranges/medians only). The **raw rows and the
+descriptive summary are the only saved artifacts**; the correlation / spread-vs-error / offset-slope
+findings below were computed in-session and are **NOT independently saved** — re-derivable from
+`rows.jsonl`, but currently unverified against an artifact:
 - **Leakage trap demonstrated:** ThermoMPNN +0.83 vs exp (Protein G ≈ its Tsuboyama training set);
   the 3-voter consensus (+0.785) "lost" to it — a naive read would wrongly say "drop the aggregate."
   This is why diversity + provenance audit are non-negotiable.
@@ -984,6 +996,7 @@ A `.gitignore` is now in place. **Untracked** (intentionally not committed): `ca
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-06-10 | 1358 (doc-only) | docs(§9): **record that the Part-2 data-generation harness has now been EXECUTED — benchmark/calibration itself stays PLAN.** The §9 calibration-benchmark banner + dry-run paragraph now distinguish *collection* (done) from *calibration* (not done): `scripts/stability_datagen.py` (`a6c7bc2`/`75d396f`) ran once → **917 rows** at `cache/stability_datagen/rows.jsonl` (gitignored, local-only; all 6 voters + exp + Rosetta ref per mutation; Protein_G 907 + T4L 10; DynaMut2 sparse 45/917 as designed; Rosetta clash tail present, max +97.18). This is the **dry-run set, NOT the diverse calibration set** — so the banner still reads **no weights set / no attended analysis run / no in-pipeline calibration**. **Honesty fix:** flagged that only the raw rows + descriptive `SUMMARY.txt` (counts/ranges/medians) are SAVED artifacts; the §9 dry-run correlation/offset findings were computed in a since-wiped session and are **NOT independently saved** (re-derivable from `rows.jsonl`, currently unverified against an artifact). **NO code/tests** — meta count unchanged 1358. §9 updated. |
 | 2026-06-10 | 1358 (doc-only) | docs(§9): captured the **Stability-Model Calibration & Validation Benchmark — PLAN, NOT YET EXECUTED** (forward spec; folded under §9 next to the weighting placeholder it resolves, rather than a post-changelog §14 — keeps numbering intact). One diverse-protein run → six outputs (per-voter confidence, cross-voter independence, agreement-as-confidence premise validation, per-voter bias, anti-symmetry at scale, calibrated weights). Design principles: **diversity over volume**; **held-out is per-voter not global** (provenance audit is the gating first step — RaSP-vs-Rosetta always circular, Rosetta = leakage-free anchor); **"calibratable" = reproduces across proteins** (per-protein offset/slope spread decides global-calibrate vs carry-the-range); **robust stats mandatory** (Rosetta clash tail); **property axes (CamSol/ESM) characterized separately, not folded into the stability vote**; **DynaMut2 subset-limited**. **Dual output** = lossless Raw ddG + derived Calibrated ddG (provenance + version tag + uncertainty + OOD caveat). **Execution model ATTENDED** — CC computes the mechanics; weight-setting/calibrate-or-not is the human+Claude judgment step; **no autonomous weight-setting or in-pipeline calibration**. Dry-run findings (917 rows, 1PGA-dominated, ThermoMPNN-leakage-contaminated) recorded as **motivation, NOT results** (leakage trap; premise holds directionally; RaSP~Rosetta only ≈0.61; DynaMut2 most differentiated; property axes orthogonal; per-voter destabilizing-offset bias). Future-robustness queue captured (Ssym at scale, RaSP-vs-deployed-Rosetta protocol check, OOD transfer, DynaMut2 mm-sign live reconfirm). **NO code/tests** — meta count unchanged 1358. §9 updated. |
 | 2026-06-10 | 1358 (1358✓/3s/0❌) | harden(dynamut2): **mm sign-unverified guard is now ENFORCED → not_computed (was flag-only).** The brief requires the guard PREVENT the inferred mm sign from being emitted, not merely tag it. `_score_one` now, when an mm result is `sign_unverified` (default — `DYNAMUT2_MM_SIGN_VERIFIED` False), does NOT accept the mm value: it falls through to the additive fallback (a sum of the VERIFIED single-mutant ddGs) with a surfaced warning — the sign-normalised mm value is never emitted even if the endpoint recovers. Also fixed a latent bug where `analyze()` OVERWROTE per-pair warnings (line ~356) → now appends, so the guard warning (+ additive-fallback note) is never silenced. +1 enforcement test (mm sign_unverified → backend additive_fallback, ddg = additive not the mm value, warning surfaced). Gated suite **1358 / 0 / 3**. Completes Part-1 of the chained data-gen run (DynaMut2 was already merged @ dcce5ab; this is the enforced-guard hardening the brief mandates). §4 updated. |
 | 2026-06-10 | 1357 (1357✓/3s/0❌) | test+guard(dynamut2): **pre-merge completion — single-endpoint sign battery (−1 justified) + mm sign-unverified guard.** **SIGN BATTERY (live, convergent):** (1) POPULATION CORRELATION on the T4L panel, flipped DynaMut2 vs experimental ΔΔG — **Pearson +0.75 / Spearman +0.81 (n=8)**, decisively positive, at/above DynaMut2's published range (a wrong sign → strongly negative); (2) STABILISER-TAIL anchor **A149V → −0.38** (stabilising, system convention) alongside the **L99A → +3.32** destabiliser anchor — both tails correct; (3) ANTI-SYMMETRY spot-check (fwd X→A on WT / rev A→X on an ALA-truncated structure) — directionally consistent (fwd +, rev −/≈0), magnitude compression = the documented benign destabilising bias (NOT a sign inversion). All converge → **−1 (`DYNAMUT2_DDG_SIGN`) confirmed**; sign locked by the L99A + A149V anchors + a pure-sign-flip (anti-symmetry-of-convention) regression test. **mm GUARD:** the prediction_mm sign is only INFERRED (endpoint chronically ERRORs), so `_parse_mm_result` now tags results `sign_unverified=True` (gated by `DYNAMUT2_MM_SIGN_VERIFIED`, default False) + a per-pair warning — the inferred mm sign is never trusted silently if the endpoint recovers; the mm fixture sign-corrections are flagged equally provisional. §13 PRIOR-OUTPUT FLAG (earlier DynaMut2 single + double-mutant output sign-inverted) STANDS. Tests +1 (sign anchors + pure-flip + mm sign_unverified). Gated suite **1357 / 0 / 3**. Branch `feat/dynamut2-voter`; merges after this. |
