@@ -1,9 +1,26 @@
 {
   "manifest_version": 1,
-  "status": "DRAFT \u2014 NOT LOCKED; final selection is an attended decision (Task 1 STOP).",
+  "status": "DRAFT \u2014 LOCK BLOCKED by Task A1 gate (ThermoMPNN contamination found); attended review required before locking.",
+  "verification": {
+    "A1_thermompnn": {
+      "method": "identity overlap vs authoritative ThermoMPNN training CSVs (scripts/verify_split_disjointness.py); deployed model = megascale (thermoMPNN_default.pt)",
+      "S669_contaminated": [
+        "1O6X",
+        "2HBB",
+        "2WQG"
+      ],
+      "Ssym_contaminated": [],
+      "outcome": "CONTAMINATION \u2014 3 S669 proteins in deployed megascale training; Ssym clean. A1 gate => do NOT lock without review."
+    },
+    "A2_dynamut2": {
+      "method": "authoritative DynaMut2 training list not obtainable (reachable repos ship other tools' datasets)",
+      "S669_overlap": "unknown",
+      "outcome": "UNKNOWN-FLAGGED \u2014 DynaMut2 S669 vs-experiment scores are PROVISIONAL (not assumed clean). Ssym stays DynaMut2-training."
+    }
+  },
   "provenance_rules": "see scripts/build_calibration_manifest.py docstring + audit md",
   "set_notes": {
-    "S669": "94 proteins; ThermoMPNN+DynaMut2 held-out; the diversity backbone.",
+    "S669": "94 proteins; ThermoMPNN held-out EXCEPT the 3 megascale-overlap proteins (A1: 1O6X/2HBB/2WQG \u2192 training). DynaMut2 overlap UNKNOWN (A2: authoritative DynaMut2 training list not obtainable) \u2192 DynaMut2 S669 scores PROVISIONAL. The diversity backbone.",
     "Ssym_dir": "S2648-family \u2192 DynaMut2 TRAINING (score DynaMut2 with caution/flag); fwd half of the anti-symmetry pair (Task 4).",
     "Ssym_inv": "Reverse mutant structures; pairs with Ssym_dir for anti-symmetry (Task 4).",
     "Rocklin": "164 designed mini-proteins = Megascale lineage \u2192 ThermoMPNN TRAINING; 164k rows, low protein-diversity value \u2192 EXCLUDE from proposal (available).",
@@ -21,7 +38,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -39,7 +56,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -57,7 +74,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -75,7 +92,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -93,7 +110,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -111,7 +128,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -129,7 +146,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -147,7 +164,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -165,7 +182,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -183,7 +200,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -201,7 +218,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -219,7 +236,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -237,7 +254,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -255,7 +272,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -273,7 +290,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -291,7 +308,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -309,7 +326,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -327,7 +344,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -345,7 +362,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -363,7 +380,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -381,7 +398,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -399,7 +416,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -417,7 +434,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -435,7 +452,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -453,7 +470,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -471,7 +488,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -489,7 +506,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -507,7 +524,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -525,7 +542,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -543,7 +560,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -561,7 +578,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -579,7 +596,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -597,7 +614,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -615,7 +632,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -632,8 +649,8 @@
       "struct_dir": "RaSP_repo/data/test/S669/structure/raw",
       "structure_present": true,
       "provenance": {
-        "thermompnn": "clean",
-        "dynamut2": "clean",
+        "thermompnn": "training",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -651,7 +668,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -669,7 +686,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -687,7 +704,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -705,7 +722,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -723,7 +740,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -741,7 +758,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -759,7 +776,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -777,7 +794,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -795,7 +812,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -813,7 +830,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -831,7 +848,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -849,7 +866,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -867,7 +884,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -885,7 +902,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -903,7 +920,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -921,7 +938,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -939,7 +956,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -956,8 +973,8 @@
       "struct_dir": "RaSP_repo/data/test/S669/structure/raw",
       "structure_present": true,
       "provenance": {
-        "thermompnn": "clean",
-        "dynamut2": "clean",
+        "thermompnn": "training",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -975,7 +992,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -993,7 +1010,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1011,7 +1028,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1029,7 +1046,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1047,7 +1064,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1065,7 +1082,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1083,7 +1100,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1101,7 +1118,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1119,7 +1136,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1137,7 +1154,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1155,7 +1172,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1173,7 +1190,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1191,7 +1208,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1209,7 +1226,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1226,8 +1243,8 @@
       "struct_dir": "RaSP_repo/data/test/S669/structure/raw",
       "structure_present": true,
       "provenance": {
-        "thermompnn": "clean",
-        "dynamut2": "clean",
+        "thermompnn": "training",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1245,7 +1262,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1263,7 +1280,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1281,7 +1298,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1299,7 +1316,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1317,7 +1334,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1335,7 +1352,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1353,7 +1370,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1371,7 +1388,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1389,7 +1406,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1407,7 +1424,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1425,7 +1442,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1443,7 +1460,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1461,7 +1478,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1479,7 +1496,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1497,7 +1514,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1515,7 +1532,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1533,7 +1550,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1551,7 +1568,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1569,7 +1586,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1587,7 +1604,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1605,7 +1622,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1623,7 +1640,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1641,7 +1658,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1659,7 +1676,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1677,7 +1694,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
@@ -1695,7 +1712,7 @@
       "structure_present": true,
       "provenance": {
         "thermompnn": "clean",
-        "dynamut2": "clean",
+        "dynamut2": "unknown",
         "rasp": "circular_vs_rosetta",
         "rosetta": "clean"
       },
