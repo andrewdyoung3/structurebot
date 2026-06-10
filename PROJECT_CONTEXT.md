@@ -658,6 +658,7 @@ Realistic thresholds for the current single-trajectory protocol: `r > 0.30`, `RM
 | 1 | ~~**Symmetric vs asymmetric ddG**~~ ✅ **RESOLVED 2026-06-09** | Decision: **symmetric (paired WT re-relax) stays the default** (the variance-reduced, higher-quality ddG); **asymmetric is an explicit opt-in** ("asymmetric" — single cached-WT reference, ~2× faster, noisier), always **labelled** in output, never mixed within a scan. `ROSETTA_DDG_BASIS`=symmetric. Built + live-verified |
 | 1 | **Excel export + cross-layer aggregate scoring** (NEXT — the lossless result model is now its substrate) | The scan result is now LOSSLESS (every candidate keyed by (chain,pos,wt,mut) with camsol/esm/ddg/ddg_basis/ddg_source/tier/fast_score/combined_score, `not_computed` where a tier didn't run). NEXT: (a) a clean serialization to Excel/CSV (one row per candidate, all measures); (b) **cross-layer aggregate scoring** joining future voters (ThermoMPNN/RaSP) on the same candidate key → the evidence-rich, per-source-transparent, agreement-based aggregate-confidence direction (§9 Strategic direction). Do NOT collapse/truncate the per-candidate data |
 | 1 | **RFdiffusion activation — LOCAL-FIRST via a dedicated WSL2 env** (supersedes the prior stub note) | De novo backbone/binder generation; completes the design loop (RFdiffusion → ProteinMPNN → ColabFold → validate-design — the last three already local). **Root cause of the stub block:** RFdiffusion needs Python 3.9–3.11, fitting neither the 3.14 main venv nor the 3.12 GPU venv — the SAME class of problem already solved for ColabFold (`~/colabfold_env`) and PyRosetta: install in its **own WSL2 conda env**, invoke via the existing `wsl_bridge` worker pattern. NOT coupled to ColabFold (its torch/SE3-Transformer stack is its own Blackwell sm_120 problem). **Version guidance** (all legitimate open-source Baker-lab releases — Neurosnap only hosts them): **start with v1** (most mature self-host; binders, motif scaffolding, symmetric oligomers — the cases that pair with the existing MPNN→ColabFold path); **v3** (Dec 2025, open source — all-atom, DNA/ligand binders, ~10× faster) as the upgrade once v1 is proven; **v2 is enzyme-active-site-specific → DEPRIORITIZED** given minimal enzyme work. For *stabilization*, RFdiffusion is only a secondary route (partial-diffusion loop/terminus rebuild) — the ddG ensemble is the workhorse |
+| 1 (parallel track) | **Standalone Sequence Viewer/Editor** — NEW user-initiated GUI capability (the project's FIRST standalone GUI surface); PLAN, NOT YET BUILT | External StructureBot-owned amino-acid sequence viewer/editor (CLC Main Workbench-style) linked to ChimeraX over REST: sequences displayed, residues selectable + editable, WT-vs-iteration alignment, one-click ColabFold of edited sequences. **Distinct from `sequence_viewer.py`** (the built-in viewer). REUSES the sequence/numbering/alignment/selection/fold spine (`sequence_viewer.py`, `proteinmpnn_bridge`, `selection.py`, `colabfold_bridge`); NEW = the GUI toolkit (PySide6/PyQt vs local web — foundation decision), reverse-sync (ChimeraX→window, on-command not real-time in MVP), and indel-as-variant edit semantics. **MVP scaffold first** (pull seqs → click→select-in-3D → on-command reverse-sync → substitution → fold); DEFERS real-time sync / indels / full alignment manager. **Parallel to the stability track, not blocking.** See the §9 PLAN subsection. |
 | 2 | **Validate-design refinements** | (a) ~~MPNN-result sequence auto-pull~~ ✅ **DONE 2026-06-06** ("validate the top design" needs no paste); (b) the **polished interpretive text summary** (deferred from v1 — currently evidence-only); (c) surface per-residue pLDDT/PAE plots in the report panel |
 | 3 | **Local-translator quality** (was "ProteinMPNN selection-capture hardening", re-scoped 2026-06-02; benchmark RESOLVED 2026-06-03) | The **live-selection path is now deterministic** via the selection feature (`selection.read_selection` / `handle_selection_command` — the user's 3D/Sequence-Viewer selection is read on-command from `info residues sel`), so that half is DONE. What remains: (a) **PARTLY ADDRESSED — `tool_inputs` argument/scope checking now EXISTS** in the new model-independent harness (`eval_harness.py` Accuracy scorer: `scope`/`exclude_cys`/`forbidden` checked in `tool_inputs`); the **old** `translator_benchmark.py` "% of Claude" number remains routing+syntax-only (now marked superseded). **The bridge-honouring half is now DONE** (2026-06-03 — `bias_toward:"soluble"`→hydrophilic bias, `design_positions` prompt instruction, interface-without-selection→BioPython fallback, restricted→ERROR; live-validated on 1IL8; see the DONE note below). What REMAINS open: author the 150–200 case corpus so the 3-dimension number actually gets produced; (b) **local-backend translation quality — RESOLVED for routing+syntax.** The original "FULL 57%, camsol 0%/selection 0%/mpnn 18%/esm 28%" was a **`num_ctx=8192` truncation throttle, not the model** (see `SERVING_CONFIG_BILL_OF_HEALTH.md`). On the cleaned config (`0e08e5b`) the definitive 93×5 run is **qwen3:8b FULL 92% [92–92]** (camsol 89, mpnn 78, proline 75, viz 88, zone 89; the rest 100) vs Claude 99% — so the local 8B now **clears a sensible fallback bar for routing+syntax**; the residual <100 is model routing/syntax (few-shot from the disjoint `EXAMPLE_POOL` or a stronger model). Also: the resnum→sequence-position mapping is per-chain order — revisit if multi-chain *design* (`--pdb_path_chains` > 1) is ever enabled |
 | 4 | **Sequence-Viewer colour mirror — remaining consumers** | The `sequence_viewer.py` SCF layer (PART B) is built and wired for **CamSol** only this session. Fast-follow: each remaining per-residue colouring just calls `build_scf_file` + `build_scf_runscript` with its own `{resnum: rgb}` map (and the chain's ordered resnums for non-1 starts), then appends the `sequence chain` + `runscript` commands to its viz output — exactly like `CamsolBridge._build_sequence_viewer_viz`. Targets: **ESM-2 conservation** (blue↔red gradient), **MPNN** changed-position colours (replace/augment the current selection-through-association decoration with true coloured regions), **proline** candidate positions, **disulfide** pair residues, **validate-design** per-residue Kabsch deviation (blue→red). Each is small + independent; keep error-first (degrade, never break structure colouring) |
@@ -853,6 +854,68 @@ when the endpoint recovers and the mm sign battery converges).
 
 ---
 
+### Standalone Sequence Viewer/Editor — PLAN, NOT YET BUILT (MVP scaffold first)
+
+> **🚧 PLAN, NOT YET BUILT.** A new external GUI capability — the project's **first standalone GUI
+> surface**. Parallel track to the stability exporter/aggregate, **not blocking** it. MVP scaffold is
+> the next step.
+
+**What.** A separate-window amino-acid sequence viewer/editor (CLC Main Workbench-style) linked to the
+ChimeraX structure viewer — displays the loaded models' sequences, residues selectable + editable, with
+WT-vs-iteration alignment and one-click fold (ColabFold) of edited sequences. **Distinct from
+`sequence_viewer.py`** (which integrates ChimeraX's BUILT-IN Sequence Viewer); this is an EXTERNAL
+StructureBot-owned window.
+
+**Why external (not the built-in viewer).** The built-in viewer can't edit sequences, manage
+WT/iteration variants, or launch folds. **TRADE-OFF (explicit):** the built-in viewer gets real-time
+bidirectional 3D↔sequence linkage natively; an external window re-implements that over REST and gives
+up the free native sync (see sync model). The external editor is a different tool (editor + variant/
+iteration manager + fold launcher), **not** a replacement for the built-in viewer's annotation/coloring
+role.
+
+**Reuses (most of the data spine already exists).**
+- Sequences/chains/resnums over REST + gap-aware numbering + resnum↔position: `sequence_viewer.py`,
+  `proteinmpnn_bridge.chain_resnum_to_seqpos`.
+- WT-vs-iteration alignment: `proteinmpnn_bridge.build_alignment_fasta` (ungapped 1:1 today; generalize
+  for iterations).
+- Selection read/parse over REST, source-agnostic: `selection.py` (`read_selection`, `Selection`).
+- Fold an edited sequence: `colabfold_bridge.py` (complete; MPNN→ColabFold auto-pull already wired at
+  the router).
+- Substitution = mutation: existing `swapaa` / mutation machinery.
+
+**New (the actual build).**
+- **GUI layer** — StructureBot's FIRST standalone GUI surface (so far: REPL/chat + ChimeraX windows +
+  Rich console; no custom GUI event loop). TOOLKIT = a foundation decision (PySide6/PyQt native vs local
+  web UI — see below).
+- **Reverse sync (ChimeraX→window)** — the main cost-center. REST is request-response, no event push;
+  the project is poll-on-command (no background polling). MVP syncs the window from ChimeraX selection
+  **ON COMMAND/REFRESH** (consistent with the existing design), NOT real-time. Real-time later via a
+  polling timer (departs from no-background-polling) OR a ChimeraX-side bundle hooking the
+  `selection changed` trigger (event-driven, adds a ChimeraX-side component). Viewer→ChimeraX (push a
+  `select` command) is free either way.
+- **Edit semantics — split:** substitution (A30V) → maps to a mutation (`swapaa` / variant track),
+  easy. Insertion/deletion → changes length, breaks resnum alignment, no structural equivalent → a
+  sequence-level VARIANT decoupled from the loaded structure, resolved by re-folding (ColabFold). The
+  edit→fold loop is the coherent home for indels.
+
+**MVP slice (scaffold first):** standalone window → pull loaded models' sequences (reuse) → click
+residue → select in 3D (push) → reverse-sync on command/refresh (not real-time) → apply a substitution
+→ fold the edited sequence via the existing ColabFold path. **DEFER:** real-time reverse sync, indel
+editing, full alignment/iteration manager.
+
+**Growth arc:** real-time bidirectional sync (timer or ChimeraX bundle); indel editing + variant/
+iteration management; WT-vs-iterations alignment view; exportable iterations; richer CLC-like editing +
+coloring parity.
+
+**Discipline:** error-first (a sync/fold failure degrades, never crashes the window or the REPL);
+lossless (variants tracked, never overwritten); reuse the existing sequence/numbering/alignment spine
+(don't re-implement resnum mapping); probe-before-build (verify the toolkit + REST reads against a live
+model in the MVP smoke). §0 Intent/Render doesn't apply (GUI, not an LLM-translation op).
+
+**Status:** PLAN, NOT YET BUILT. MVP scaffold is the next step.
+
+---
+
 ## 10. External Dependencies
 
 ### Main venv (`venv/`, Python 3.14)
@@ -996,6 +1059,7 @@ A `.gitignore` is now in place. **Untracked** (intentionally not committed): `ca
 
 | Date | Tests | What changed |
 |------|-------|-------------|
+| 2026-06-10 | doc-only (gated suite 1384/0/3 at branch HEAD) | docs(§9): **add the Standalone Sequence Viewer/Editor PLAN (NOT YET BUILT) + a §9 queue row.** A NEW user-initiated GUI capability — the project's **first standalone GUI surface** — captured as a §9 PLAN subsection (next to the benchmark PLAN, same "PLAN, NOT YET BUILT" convention) + a one-line Priority row (1, parallel track). **What:** an EXTERNAL StructureBot-owned amino-acid sequence viewer/editor (CLC Main Workbench-style) linked to ChimeraX over REST — sequences displayed, residues selectable + editable, WT-vs-iteration alignment, one-click ColabFold of edited sequences; **distinct from `sequence_viewer.py`** (the built-in ChimeraX Sequence Viewer). **Reuses** the existing sequence/numbering/alignment/selection/fold spine (`sequence_viewer.py`, `proteinmpnn_bridge.chain_resnum_to_seqpos`/`build_alignment_fasta`, `selection.py`, `colabfold_bridge`, `swapaa`); **NEW** = the GUI toolkit (PySide6/PyQt-native vs local-web — a foundation decision), reverse-sync (ChimeraX→window, **on-command not real-time** in MVP, consistent with no-background-polling; real-time later via timer or a ChimeraX `selection changed` bundle), and **indel-as-variant** edit semantics (substitution→mutation; insert/delete→sequence-level variant resolved by re-fold). **MVP scaffold first** (window → pull seqs → click→select-in-3D → on-command reverse-sync → substitution → fold); DEFERS real-time sync / indels / full alignment manager. **Parallel to the stability exporter/aggregate track, not blocking.** Discipline: error-first (degrade, never crash the window/REPL), lossless (variants tracked, never overwritten), reuse the spine, probe-before-build; §0 Intent/Render N/A (GUI, not an LLM-translation op). **NO code/tests** — Meta count unchanged. §9 updated. |
 | 2026-06-10 | 1358 (doc-only) | docs(§9): **record that the Part-2 data-generation harness has now been EXECUTED — benchmark/calibration itself stays PLAN.** The §9 calibration-benchmark banner + dry-run paragraph now distinguish *collection* (done) from *calibration* (not done): `scripts/stability_datagen.py` (`a6c7bc2`/`75d396f`) ran once → **917 rows** at `cache/stability_datagen/rows.jsonl` (gitignored, local-only; all 6 voters + exp + Rosetta ref per mutation; Protein_G 907 + T4L 10; DynaMut2 sparse 45/917 as designed; Rosetta clash tail present, max +97.18). This is the **dry-run set, NOT the diverse calibration set** — so the banner still reads **no weights set / no attended analysis run / no in-pipeline calibration**. **Honesty fix:** flagged that only the raw rows + descriptive `SUMMARY.txt` (counts/ranges/medians) are SAVED artifacts; the §9 dry-run correlation/offset findings were computed in a since-wiped session and are **NOT independently saved** (re-derivable from `rows.jsonl`, currently unverified against an artifact). **NO code/tests** — meta count unchanged 1358. §9 updated. |
 | 2026-06-10 | 1358 (doc-only) | docs(§9): captured the **Stability-Model Calibration & Validation Benchmark — PLAN, NOT YET EXECUTED** (forward spec; folded under §9 next to the weighting placeholder it resolves, rather than a post-changelog §14 — keeps numbering intact). One diverse-protein run → six outputs (per-voter confidence, cross-voter independence, agreement-as-confidence premise validation, per-voter bias, anti-symmetry at scale, calibrated weights). Design principles: **diversity over volume**; **held-out is per-voter not global** (provenance audit is the gating first step — RaSP-vs-Rosetta always circular, Rosetta = leakage-free anchor); **"calibratable" = reproduces across proteins** (per-protein offset/slope spread decides global-calibrate vs carry-the-range); **robust stats mandatory** (Rosetta clash tail); **property axes (CamSol/ESM) characterized separately, not folded into the stability vote**; **DynaMut2 subset-limited**. **Dual output** = lossless Raw ddG + derived Calibrated ddG (provenance + version tag + uncertainty + OOD caveat). **Execution model ATTENDED** — CC computes the mechanics; weight-setting/calibrate-or-not is the human+Claude judgment step; **no autonomous weight-setting or in-pipeline calibration**. Dry-run findings (917 rows, 1PGA-dominated, ThermoMPNN-leakage-contaminated) recorded as **motivation, NOT results** (leakage trap; premise holds directionally; RaSP~Rosetta only ≈0.61; DynaMut2 most differentiated; property axes orthogonal; per-voter destabilizing-offset bias). Future-robustness queue captured (Ssym at scale, RaSP-vs-deployed-Rosetta protocol check, OOD transfer, DynaMut2 mm-sign live reconfirm). **NO code/tests** — meta count unchanged 1358. §9 updated. |
 | 2026-06-10 | 1358 (1358✓/3s/0❌) | harden(dynamut2): **mm sign-unverified guard is now ENFORCED → not_computed (was flag-only).** The brief requires the guard PREVENT the inferred mm sign from being emitted, not merely tag it. `_score_one` now, when an mm result is `sign_unverified` (default — `DYNAMUT2_MM_SIGN_VERIFIED` False), does NOT accept the mm value: it falls through to the additive fallback (a sum of the VERIFIED single-mutant ddGs) with a surfaced warning — the sign-normalised mm value is never emitted even if the endpoint recovers. Also fixed a latent bug where `analyze()` OVERWROTE per-pair warnings (line ~356) → now appends, so the guard warning (+ additive-fallback note) is never silenced. +1 enforcement test (mm sign_unverified → backend additive_fallback, ddg = additive not the mm value, warning surfaced). Gated suite **1358 / 0 / 3**. Completes Part-1 of the chained data-gen run (DynaMut2 was already merged @ dcce5ab; this is the enforced-guard hardening the brief mandates). §4 updated. |
