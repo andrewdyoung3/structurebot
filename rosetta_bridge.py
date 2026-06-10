@@ -1732,7 +1732,9 @@ except Exception as exc:
                 summary          = _summary,
             )
 
-        _prog("⚗️  [Rosetta] Running PyRosetta cartesian_ddg (may take 2–5 min per mutation)...")
+        _prog("⚗️  [Rosetta] Running PyRosetta torsion-space FastRelax ΔΔG "
+              "(ref2015; a cartesian_ddg approximation, NOT canonical cartesian_ddg) "
+              "(may take 2–5 min per mutation)...")
         # Scale the WSL2 process timeout to the workload: ALL num_trajectories
         # trajectories run inside one worker process, so the budget must cover
         # the whole batch. N=1, cycles=3 (production) → 1800s, unchanged.
@@ -1843,7 +1845,9 @@ except Exception as exc:
                 "backend":          "pyrosetta_wsl2",
                 "warnings":         warnings,
                 "method_note":      (
-                    "PyRosetta CartesianDDG via WSL2 (Park et al. 2016). "
+                    "PyRosetta torsion-space FastRelax ΔΔG via WSL2 — a ref2015 "
+                    "approximation modeled on cartesian_ddg (Park et al. 2016), NOT "
+                    "canonical cartesian_ddg; raw uncalibrated REU. "
                     + (f"Median of {num_trajectories} independent trajectories "
                        f"({relax_cycles} relax cycles); spread reported as MAD. "
                        "Ranking-grade — absolute magnitudes approximate."
