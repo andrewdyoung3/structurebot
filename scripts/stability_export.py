@@ -37,6 +37,9 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rosetta_clash import rosetta_confidence  # noqa: E402
+
 # Calibration is identity for now; this tag versions the (non-)transform so a later
 # recalibration never silently reinterprets an old export.
 CAL_VERSION = "identity_passthrough_v0"
@@ -73,6 +76,7 @@ _CAL_META = ["cal_version", "cal_status", "cal_offset", "cal_slope",
              "cal_uncertainty", "cal_ood_caveat"]
 _PROPERTY = ["property_camsol_solubility", "property_esm_fitness_tolerance"]
 _PROVENANCE = ["prov_rosetta", "prov_rasp", "prov_thermompnn", "prov_dynamut2"]
+_QC = ["rosetta_confidence"]   # clash-artifact flag (raw value untouched)
 _FLAGS = ["rosetta_in_subset", "dynamut2_in_subset"]
 
 
@@ -85,6 +89,7 @@ def _columns() -> List[Tuple[str, str]]:
     cols += [("calibration metadata", c) for c in _CAL_META]
     cols += [("property axes (NOT ddG)", c) for c in _PROPERTY]
     cols += [("provenance (per-voter training-disjointness)", c) for c in _PROVENANCE]
+    cols += [("QC flags (raw never altered)", c) for c in _QC]
     cols += [("subset flags", c) for c in _FLAGS]
     return cols
 
@@ -116,6 +121,9 @@ def _row_values(rec: Dict[str, Any]) -> Dict[str, Any]:
     out["property_esm_fitness_tolerance"] = rec.get("esm_tolerance")
     for c in _PROVENANCE:
         out[c] = rec.get(c)
+    # QC: Rosetta clash-artifact flag — DERIVED from the raw value, which is left
+    # untouched in rosetta_ddg_raw above (flag, never delete/alter).
+    out["rosetta_confidence"] = rosetta_confidence(rec.get("rosetta_ddg"))
     for c in _FLAGS:
         out[c] = rec.get(c)
     return out

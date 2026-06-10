@@ -96,6 +96,34 @@ def test_csv_roundtrip_raw_lossless_and_cal_identity(tmp_path):
     assert r1[idx["prov_rosetta"]] == ""
 
 
+def test_clash_flag_does_not_alter_raw(tmp_path):
+    recs = [
+        {"key": "X:A:K50P", "set": "S", "pdbid": "X", "chain": "A", "resnum": 50,
+         "wt": "K", "mut": "P", "variant": "K50P", "rosetta_ddg": 97.18},   # clash tail
+        {"key": "X:A:M1A", "set": "S", "pdbid": "X", "chain": "A", "resnum": 1,
+         "wt": "M", "mut": "A", "variant": "M1A", "rosetta_ddg": 4.2},       # normal
+        {"key": "X:A:V5G", "set": "S", "pdbid": "X", "chain": "A", "resnum": 5,
+         "wt": "V", "mut": "G", "variant": "V5G", "rosetta_ddg": None},      # absent
+    ]
+    jp = _write_jsonl(tmp_path, recs)
+    out = tmp_path / "c.csv"
+    sx.export(str(jp), str(out), log=lambda *_: None)
+    with open(out, newline="", encoding="utf-8") as fh:
+        rdr = list(csv.reader(fh))
+    header, data = rdr[1], rdr[2:]
+    idx = {nm: i for i, nm in enumerate(header)}
+    by_key = {row[idx["key"]]: row for row in data}
+    # clash: flagged low-confidence BUT raw kept verbatim (never altered)
+    clash = by_key["X:A:K50P"]
+    assert clash[idx["rosetta_confidence"]] == "low_confidence_clash_artifact"
+    assert clash[idx["rosetta_ddg_raw"]] == "97.18"
+    # normal: ok
+    assert by_key["X:A:M1A"][idx["rosetta_confidence"]] == "ok"
+    # absent: blank flag, blank raw
+    absent = by_key["X:A:V5G"]
+    assert absent[idx["rosetta_confidence"]] == "" and absent[idx["rosetta_ddg_raw"]] == ""
+
+
 # ── XLSX round-trip (openpyxl) ───────────────────────────────────────────────────
 
 def test_xlsx_roundtrip(tmp_path):
