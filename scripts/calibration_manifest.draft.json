@@ -1,21 +1,54 @@
 {
   "manifest_version": 1,
-  "status": "DRAFT \u2014 LOCK BLOCKED by Task A1 gate (ThermoMPNN contamination found); attended review required before locking.",
+  "status": "LOCKED \u2014 Task A resolution approved (2026-06-10). S669 + Ssym; Rocklin + Protein_G excluded. Per-voter scoring scopes below are authoritative.",
   "verification": {
     "A1_thermompnn": {
-      "method": "identity overlap vs authoritative ThermoMPNN training CSVs (scripts/verify_split_disjointness.py); deployed model = megascale (thermoMPNN_default.pt)",
-      "S669_contaminated": [
+      "method": "identity overlap vs the AUTHORITATIVE ThermoMPNN training CSVs (data_all/training/mega_*.csv + fireprot_*.csv) via scripts/verify_split_disjointness.py; deployed model = megascale (thermoMPNN_default.pt)",
+      "S669_contaminated_proteins": [
         "1O6X",
         "2HBB",
         "2WQG"
       ],
+      "S669_contaminated_mutations": 95,
+      "S669_thermompnn_clean_mutations": 574,
+      "megascale_training_rows_per_protein": {
+        "1O6X": 1361,
+        "2HBB": 786,
+        "2WQG": 658
+      },
       "Ssym_contaminated": [],
-      "outcome": "CONTAMINATION \u2014 3 S669 proteins in deployed megascale training; Ssym clean. A1 gate => do NOT lock without review."
+      "outcome": "CONTAMINATION CONFIRMED \u2014 3 S669 proteins also in the deployed megascale training set (verified real entries: 1O6X 1361 rows, 2HBB 786, 2WQG 658); Ssym clean. RESOLUTION (approved): these 3 (95 muts) are EXCLUDED FROM ThermoMPNN vs-experiment scoring ONLY \u2014 kept in the dataset, valid for Rosetta/RaSP/DynaMut2. Not deleted."
     },
     "A2_dynamut2": {
-      "method": "authoritative DynaMut2 training list not obtainable (reachable repos ship other tools' datasets)",
+      "method": "authoritative DynaMut2 training list not obtainable (reachable repos ship other tools' datasets, not DynaMut2's)",
       "S669_overlap": "unknown",
-      "outcome": "UNKNOWN-FLAGGED \u2014 DynaMut2 S669 vs-experiment scores are PROVISIONAL (not assumed clean). Ssym stays DynaMut2-training."
+      "outcome": "UNKNOWN-FLAGGED \u2014 DynaMut2 S669 vs-experiment scores are PROVISIONAL (flagged, NOT excluded). Ssym = DynaMut2 training \u2192 Ssym EXCLUDED from DynaMut2 vs-experiment (still used for reference-free anti-symmetry)."
+    }
+  },
+  "scoring_scopes": {
+    "_note": "Per-voter VS-EXPERIMENT confidence scopes (what each voter is scored on). Anti-symmetry (Ssym fwd vs rev) is reference-free and separate.",
+    "thermompnn": {
+      "vs_experiment": "S669 MINUS {1O6X,2HBB,2WQG} (574 muts) + Ssym",
+      "excluded": "1O6X/2HBB/2WQG (megascale training); Rocklin + Protein_G",
+      "status": "clean"
+    },
+    "rosetta": {
+      "vs_experiment": "FULL set (S669 + Ssym)",
+      "note": "leakage-free physics anchor (no training)",
+      "status": "clean"
+    },
+    "rasp": {
+      "vs_experiment": "FULL set (S669 + Ssym) \u2014 generalization (never saw experiment)",
+      "note": "RaSP-vs-ROSETTA stays flagged CIRCULAR (RaSP is a Rosetta surrogate); never report RaSP-vs-Rosetta agreement as corroboration",
+      "status": "clean_vs_experiment / circular_vs_rosetta"
+    },
+    "dynamut2": {
+      "vs_experiment": "S669 only, PROVISIONAL (disjointness unknown); Ssym EXCLUDED (training)",
+      "anti_symmetry": "Ssym fwd vs rev (reference-free) \u2014 INCLUDED for all voters",
+      "status": "provisional"
+    },
+    "anti_symmetry": {
+      "scope": "Ssym fwd (Ssym_dir) vs rev (Ssym_inv), reference-free \u2014 ALL voters incl. DynaMut2 (no experiment leakage in an anti-symmetry check)"
     }
   },
   "provenance_rules": "see scripts/build_calibration_manifest.py docstring + audit md",

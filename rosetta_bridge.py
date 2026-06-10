@@ -1218,7 +1218,12 @@ class RosettaBridge:
         progress_callback: Optional[Callable[[str], None]],
     ) -> ToolStepResult:
         """
-        PyRosetta CartesianDDG protocol — documented stub.
+        PyRosetta CartesianDDG protocol — documented stub (NOT the wired path).
+
+        DOC FIX (2026-06-10, comment-only): this is an aspirational OUTLINE of canonical
+        cartesian_ddg (ref2015_cart) that is NOT what the deployed scan runs — the wired
+        path is `_run_rosetta_local` (torsion-space FastRelax + plain ref2015; see its
+        docstring + PROJECT_CONTEXT §7). Kept only as a reference outline.
 
         Full implementation outline (for Python <= 3.13 + valid wheel):
         ─────────────────────────────────────────────────────────────────
@@ -1304,7 +1309,18 @@ class RosettaBridge:
         ddg_basis: str = "symmetric",
     ) -> "ToolStepResult":
         """
-        PyRosetta cartesian_ddg protocol via WSL2.
+        PyRosetta per-mutation FastRelax ΔΔG via WSL2.
+
+        DOC FIX (2026-06-10, comment-only — no logic change): this is NOT canonical
+        Rosetta cartesian_ddg. The implemented protocol is a manual symmetric-relax in
+        TORSION space with plain `ref2015` (clone relaxed WT → MutateResidue →
+        FastRelax mutant; independently FastRelax a re-cloned WT; subtract full-pose
+        ref2015 scores; median over trajectories). It is NOT `cartesian_ddg`, NOT
+        `ref2015_cart`, and uses NO cartesian minimisation. Magnitudes are raw,
+        uncalibrated REU (Park's 2.94 factor does not apply). The earlier
+        "cartesian_ddg/CartesianDDG" wording was aspirational, never what the code ran
+        (see PROJECT_CONTEXT §7). A selectable cartesian_ddg arm exists for the
+        calibration benchmark only (scripts/rosetta_cartesian_bench.py), not here.
 
         relax_cycles : FastRelax cycles for the per-mutation mutant relax AND
             the symmetric WT re-relax (default 3 = production behaviour; do not
@@ -1325,11 +1341,12 @@ class RosettaBridge:
                          pyrosetta_installer.install_pyrosetta()"
         3. ROSETTA_BACKEND=local in .env.local
 
-        Protocol
+        Protocol (actual — torsion-space FastRelax, not cartesian_ddg)
         --------
         1. Copy PDB to WSL2 /tmp
-        2. FastRelax the structure (cache result by PDB hash in ROSETTA_RELAX_CACHE)
-        3. CartesianDDG for each mutation
+        2. FastRelax the WT in TORSION space (cache by PDB hash in ROSETTA_RELAX_CACHE)
+        3. Per mutation: MutateResidue → torsion-space FastRelax → ddG = score(mut) −
+           score(WT), full-pose ref2015 (NOT CartesianDDG)
         4. Copy results back, parse ΔΔG values
 
         Pearson r ~0.8 vs experimental.  Runtime: 2–5 min per mutation on CPU.

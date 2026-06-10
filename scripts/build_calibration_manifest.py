@@ -130,26 +130,73 @@ def build() -> Dict[str, Any]:
     thermompnn_contam = sorted({e["pdbid"] for e in entries
                                 if e["provenance"]["thermompnn"] == "training"
                                 and e["set"] == "S669"})
+    contam_muts = sum(e["n_mutations"] for e in entries
+                      if e["set"] == "S669" and e["pdbid"] in thermompnn_contam)
+    s669_muts = sum(e["n_mutations"] for e in entries if e["set"] == "S669")
+    # authoritative megascale training-row counts for the 3 contaminated proteins
+    # (from scripts/verify_split_disjointness.py against ThermoMPNN's mega_train/val CSVs)
+    contam_train_rows = {"1O6X": 1361, "2HBB": 786, "2WQG": 658}
     return {
         "manifest_version": 1,
-        "status": "DRAFT — LOCK BLOCKED by Task A1 gate (ThermoMPNN contamination found); "
-                  "attended review required before locking.",
+        "status": "LOCKED — Task A resolution approved (2026-06-10). S669 + Ssym; "
+                  "Rocklin + Protein_G excluded. Per-voter scoring scopes below are "
+                  "authoritative.",
         "verification": {
             "A1_thermompnn": {
-                "method": "identity overlap vs authoritative ThermoMPNN training CSVs "
-                          "(scripts/verify_split_disjointness.py); deployed model = "
-                          "megascale (thermoMPNN_default.pt)",
-                "S669_contaminated": thermompnn_contam,
+                "method": "identity overlap vs the AUTHORITATIVE ThermoMPNN training CSVs "
+                          "(data_all/training/mega_*.csv + fireprot_*.csv) via "
+                          "scripts/verify_split_disjointness.py; deployed model = megascale "
+                          "(thermoMPNN_default.pt)",
+                "S669_contaminated_proteins": thermompnn_contam,
+                "S669_contaminated_mutations": contam_muts,
+                "S669_thermompnn_clean_mutations": s669_muts - contam_muts,
+                "megascale_training_rows_per_protein": contam_train_rows,
                 "Ssym_contaminated": [],
-                "outcome": "CONTAMINATION — 3 S669 proteins in deployed megascale "
-                           "training; Ssym clean. A1 gate => do NOT lock without review.",
+                "outcome": "CONTAMINATION CONFIRMED — 3 S669 proteins also in the deployed "
+                           "megascale training set (verified real entries: 1O6X 1361 rows, "
+                           "2HBB 786, 2WQG 658); Ssym clean. RESOLUTION (approved): these 3 "
+                           "(95 muts) are EXCLUDED FROM ThermoMPNN vs-experiment scoring ONLY "
+                           "— kept in the dataset, valid for Rosetta/RaSP/DynaMut2. Not deleted.",
             },
             "A2_dynamut2": {
                 "method": "authoritative DynaMut2 training list not obtainable "
-                          "(reachable repos ship other tools' datasets)",
+                          "(reachable repos ship other tools' datasets, not DynaMut2's)",
                 "S669_overlap": "unknown",
                 "outcome": "UNKNOWN-FLAGGED — DynaMut2 S669 vs-experiment scores are "
-                           "PROVISIONAL (not assumed clean). Ssym stays DynaMut2-training.",
+                           "PROVISIONAL (flagged, NOT excluded). Ssym = DynaMut2 training → "
+                           "Ssym EXCLUDED from DynaMut2 vs-experiment (still used for "
+                           "reference-free anti-symmetry).",
+            },
+        },
+        "scoring_scopes": {
+            "_note": "Per-voter VS-EXPERIMENT confidence scopes (what each voter is scored "
+                     "on). Anti-symmetry (Ssym fwd vs rev) is reference-free and separate.",
+            "thermompnn": {
+                "vs_experiment": "S669 MINUS {1O6X,2HBB,2WQG} (574 muts) + Ssym",
+                "excluded": "1O6X/2HBB/2WQG (megascale training); Rocklin + Protein_G",
+                "status": "clean",
+            },
+            "rosetta": {
+                "vs_experiment": "FULL set (S669 + Ssym)",
+                "note": "leakage-free physics anchor (no training)",
+                "status": "clean",
+            },
+            "rasp": {
+                "vs_experiment": "FULL set (S669 + Ssym) — generalization (never saw "
+                                 "experiment)",
+                "note": "RaSP-vs-ROSETTA stays flagged CIRCULAR (RaSP is a Rosetta "
+                        "surrogate); never report RaSP-vs-Rosetta agreement as corroboration",
+                "status": "clean_vs_experiment / circular_vs_rosetta",
+            },
+            "dynamut2": {
+                "vs_experiment": "S669 only, PROVISIONAL (disjointness unknown); Ssym "
+                                 "EXCLUDED (training)",
+                "anti_symmetry": "Ssym fwd vs rev (reference-free) — INCLUDED for all voters",
+                "status": "provisional",
+            },
+            "anti_symmetry": {
+                "scope": "Ssym fwd (Ssym_dir) vs rev (Ssym_inv), reference-free — ALL voters "
+                         "incl. DynaMut2 (no experiment leakage in an anti-symmetry check)",
             },
         },
         "provenance_rules": "see scripts/build_calibration_manifest.py docstring + audit md",
@@ -165,27 +212,33 @@ def write_audit_md(manifest: Dict[str, Any], path: Path) -> None:
         by_set.setdefault(row["set"], []).append(row)
     v = manifest.get("verification", {})
     L: List[str] = []
-    L.append("# Calibration-set provenance audit (Task A — VERIFIED; LOCK BLOCKED)\n")
+    L.append("# Calibration-set provenance audit (Task A — VERIFIED; **LOCKED** 2026-06-10)\n")
     L.append("Generated by `scripts/build_calibration_manifest.py` from LOCAL "
-             "`RaSP_repo/data/test/*`, with provenance now from the **authoritative** "
+             "`RaSP_repo/data/test/*`, with provenance from the **authoritative** "
              "Task A1/A2 verification (`scripts/verify_split_disjointness.py`), not the "
              "README. Tags: `clean` = training-disjoint, `training` = in that voter's "
              "training set (leakage), `circular_vs_rosetta` = RaSP-vs-Rosetta circular "
              "(RaSP-vs-experiment OK), `unknown` = not confirmable.\n")
-    L.append("## ⚠ Verification outcome — LOCK BLOCKED (A1 gate)\n")
+    L.append(f"**STATUS: {manifest['status']}**\n")
     a1 = v.get("A1_thermompnn", {}); a2 = v.get("A2_dynamut2", {})
+    L.append("## Authoritative-split verification result (traceable provenance)\n")
+    rows_pp = a1.get("megascale_training_rows_per_protein", {})
+    rows_str = ", ".join(f"{k} {rows_pp[k]} rows" for k in sorted(rows_pp))
     L.append(f"- **A1 (ThermoMPNN, deployed = megascale `thermoMPNN_default.pt`):** "
-             f"**CONTAMINATION** — S669 proteins also in megascale training: "
-             f"`{a1.get('S669_contaminated')}` (3 proteins / 95 mutations). Ssym CLEAN. "
-             f"Per the A1 gate (\"if any appear → STOP, do not lock\"), the set is **not "
-             f"locked**; awaiting review. (FireProt overlaps exist but pertain to the "
-             f"un-deployed FireProt model — not contamination for us.)")
-    L.append(f"- **A2 (DynaMut2):** **UNKNOWN-FLAGGED** — authoritative DynaMut2 training "
-             f"list not obtainable; S669∩DynaMut2 unknown → DynaMut2 S669 vs-experiment "
-             f"scores are **PROVISIONAL**, not assumed clean. Ssym stays DynaMut2-training.")
-    L.append("- **Recommended resolution (for review):** keep S669+Ssym, but EXCLUDE "
-             "`1O6X/2HBB/2WQG` from ThermoMPNN vs-experiment scoring (they stay valid for "
-             "Rosetta/RaSP/DynaMut2); treat DynaMut2 S669 as provisional. Then lock.\n")
+             f"identity overlap vs ThermoMPNN's training CSVs (`data_all/training/"
+             f"mega_*.csv`). **CONTAMINATION CONFIRMED** — S669 proteins also present in the "
+             f"deployed megascale training set: `{a1.get('S669_contaminated_proteins')}` "
+             f"(**{a1.get('S669_contaminated_mutations')} mutations**), verified as real "
+             f"megascale entries ({rows_str}). **Ssym ∩ megascale = CLEAN.** (FireProt "
+             f"overlaps exist but pertain to the un-deployed FireProt model — not "
+             f"contamination for the deployed megascale model.)")
+    L.append(f"- **A2 (DynaMut2):** authoritative DynaMut2 training list not obtainable → "
+             f"S669∩DynaMut2 **UNKNOWN** → DynaMut2 S669 scores **PROVISIONAL** (flagged, "
+             f"not excluded). Ssym = DynaMut2 training family.")
+    L.append(f"- **Resolution (APPROVED, applied):** keep S669 + Ssym; the 3 contaminated "
+             f"proteins ({a1.get('S669_contaminated_mutations')} muts) are EXCLUDED FROM "
+             f"ThermoMPNN vs-experiment scoring ONLY — **retained in the dataset and valid "
+             f"for Rosetta / RaSP / DynaMut2. Not deleted.**\n")
     # set-level table
     L.append("## Set-level audit (protein groups × voter)\n")
     L.append("| Set | Proteins | Muts | Struct OK | ThermoMPNN | DynaMut2 | RaSP | Rosetta | Proposed | Role |")
@@ -198,35 +251,36 @@ def write_audit_md(manifest: Dict[str, Any], path: Path) -> None:
                  f"{p['thermompnn']} | {p['dynamut2']} | {p['rasp']} | {p['rosetta']} | "
                  f"{'INCLUDE' if rows[0]['proposed_include'] else 'exclude'} | {rows[0]['role']} |")
     L.append("")
-    # per-voter held-out scoring subset (verified)
-    L.append("## Per-voter vs-experiment scoring subsets (verified; applies once locked)\n")
-    L.append("- **ThermoMPNN** → score on **S669 + Ssym MINUS the 3 megascale-overlap "
-             "proteins (1O6X/2HBB/2WQG)**; EXCLUDE Rocklin + Protein_G (Megascale training). "
-             "Clean ThermoMPNN S669 = 91 proteins / 574 mutations.")
-    L.append("- **DynaMut2** → score on **S669 only, PROVISIONAL** (S669∩DynaMut2 unknown — "
-             "A2); EXCLUDE Ssym from vs-experiment (S2648 training family); small fixed "
-             "subset (remote API). Ssym is still used for anti-symmetry (reference-free).")
-    L.append("- **RaSP** → score vs **EXPERIMENT** on all (generalization test — never saw "
-             "experiment); NEVER report RaSP-vs-Rosetta agreement as corroboration (circular).")
-    L.append("- **Rosetta** → score on **all** (physics, leakage-free anchor everywhere).")
-    L.append("- **Anti-symmetry (Ssym fwd vs rev)** → reference-free across ALL voters "
-             "(fwd vs rev, not vs experiment); DynaMut2 included here (no experiment leakage "
-             "in an anti-symmetry check) but excluded from Ssym vs-experiment confidence.")
+    # per-voter vs-experiment scoring scopes (LOCKED)
+    L.append("## Per-voter vs-experiment scoring scopes (LOCKED — authoritative)\n")
+    L.append("| Voter | vs-experiment scope | Excluded | Status |")
+    L.append("|-------|---------------------|----------|--------|")
+    L.append("| **ThermoMPNN** | S669 minus {1O6X,2HBB,2WQG} (574 muts) + Ssym | "
+             "1O6X/2HBB/2WQG (megascale training); Rocklin + Protein_G | clean |")
+    L.append("| **Rosetta** | FULL set (S669 + Ssym) | — (leakage-free anchor, no training) | "
+             "clean |")
+    L.append("| **RaSP** | FULL set (S669 + Ssym) — generalization | — | "
+             "clean vs-exp / **circular vs-Rosetta** |")
+    L.append("| **DynaMut2** | S669 only (PROVISIONAL); Ssym excluded | Ssym (training family) | "
+             "provisional |")
     L.append("")
-    L.append("## Proposed draft set (NOT locked)\n")
+    L.append("- **Anti-symmetry (Ssym fwd vs rev)** is **reference-free** (fwd vs rev, not vs "
+             "experiment) and runs across **ALL voters incl. DynaMut2** (no experiment leakage "
+             "in an anti-symmetry check). This is separate from the vs-experiment scopes above.")
+    L.append("- **RaSP-vs-Rosetta** stays flagged **circular** (RaSP is a Rosetta surrogate); "
+             "never reported as corroboration.")
+    L.append("- The 3 ThermoMPNN-contaminated proteins remain fully in the dataset and are "
+             "scored by Rosetta/RaSP/DynaMut2; they are dropped from ThermoMPNN vs-experiment "
+             "confidence ONLY. **Nothing is deleted.**")
+    L.append("")
+    L.append("## Locked set\n")
     inc = sorted({r["set"] for r in e if r["proposed_include"]})
     exc = sorted({r["set"] for r in e if not r["proposed_include"]})
-    L.append(f"- **INCLUDE:** {', '.join(inc)}")
-    L.append(f"- **EXCLUDE (available, flagged):** {', '.join(exc)}")
+    L.append(f"- **INCLUDE (locked):** {', '.join(inc)}")
+    L.append(f"- **EXCLUDE (available, not in set):** {', '.join(exc)}")
     L.append("")
     for s in by_set:
         L.append(f"  - `{s}`: {manifest['set_notes'][s]}")
-    L.append("")
-    L.append("## Awaiting attended decision (lock blocked by A1)\n")
-    L.append("Confirm/adjust: (1) approve the recommended resolution above (exclude "
-             "1O6X/2HBB/2WQG from ThermoMPNN scoring + DynaMut2 S669 provisional) and LOCK; "
-             "(2) or treat the 3 contaminated proteins differently; (3) decide whether to "
-             "obtain the authoritative DynaMut2 training list to upgrade A2 from unknown.")
     path.write_text("\n".join(L), encoding="utf-8")
 
 
