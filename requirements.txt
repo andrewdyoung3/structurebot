@@ -2,6 +2,12 @@ anthropic>=0.40.0
 requests>=2.31.0
 rich>=13.7.0
 
+# Standalone Sequence Editor GUI (seq_editor/ — the project's first GUI surface).
+# PySide6 ships abi3/cp310 wheels that install + run on the Python 3.14 main venv
+# (verified 6.11.1). LGPL. Only needed to LAUNCH the editor; the rest of the app and
+# the controller unit tests don't import it.
+PySide6>=6.6
+
 # ── Computational biology tools (optional) ────────────────────────────────────
 #
 # ESM-2 protein language model (evolutionary conservation scoring)
