@@ -165,10 +165,20 @@ class SequenceEditorController:
         return f"select #{model}/{chain}:{spec}"
 
     def select_in_3d(self, model: str, chain: str, resnums: List[int]):
-        """Push a selection to ChimeraX. No-op (returns None) on empty resnum list."""
+        """Push a selection to ChimeraX. No-op (returns None) on empty resnum list.
+
+        ERROR-FIRST: never raises — a failed REST call returns {"value": None,
+        "error": str} so the async worker can surface it in the Messages log without
+        crashing the UI thread. The select command itself is unchanged (one combined
+        `select #M/C:r1,r2,…` — this is also the coalesced form)."""
         if not resnums:
             return None
-        return self._run(self.build_select_command(model, chain, resnums))
+        cmd = self.build_select_command(model, chain, resnums)
+        try:
+            r = self._run(cmd)
+        except Exception as exc:
+            return {"value": None, "error": f"{type(exc).__name__}: {exc}"}
+        return r if isinstance(r, dict) else {"value": r, "error": None}
 
     # ── 3D → viewer reverse sync (ON COMMAND — no polling) ────────────────────────
 

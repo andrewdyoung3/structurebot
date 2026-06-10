@@ -114,6 +114,32 @@ def test_select_in_3d_pushes_command():
     assert runner.commands.count("select #1/A:") == 0
 
 
+def test_coalesced_clicks_produce_one_combined_command():
+    # Rapid clicks accumulate into ONE select command for the whole set — not N.
+    runner = MockRunner()
+    c = SequenceEditorController(runner, MockFold())
+    c.load_models()
+    clicked = []
+    for rn in (53, 50, 51, 50):                         # out-of-order + a duplicate click
+        clicked.append(rn)
+    combined = sorted(set(clicked))                     # the coalesced selection set
+    cmd = c.build_select_command("1", "A", combined)
+    assert cmd == "select #1/A:50,51,53"               # one command, exactly the clicked set
+    c.select_in_3d("1", "A", combined)
+    selects = [x for x in runner.commands if x.startswith("select ")]
+    assert selects == ["select #1/A:50,51,53"]         # a single round-trip, not 4
+
+
+def test_select_in_3d_is_error_first():
+    def boom(_cmd):
+        raise ConnectionError("ChimeraX gone")
+    c = SequenceEditorController(boom, MockFold())
+    out = c.select_in_3d("1", "A", [50])
+    assert out is not None and out.get("error") and "ConnectionError" in out["error"]
+    assert "value" in out                              # shaped like a result dict, not raised
+    assert c.select_in_3d("1", "A", []) is None        # empty still a clean no-op
+
+
 # ── reverse sync (on command) ────────────────────────────────────────────────────
 
 def test_sync_from_chimerax_filters_unloaded():

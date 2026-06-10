@@ -47,6 +47,52 @@ class _FoldWorker(QtCore.QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class _SelectSignals(QtCore.QObject):
+    done = QtCore.Signal(dict)                          # {"error": str|None}
+    failed = QtCore.Signal(str)
+
+
+class _SelectWorker(QtCore.QRunnable):
+    """Runs controller.select_in_3d off the UI thread (the HTTP select). HTTP only —
+    the result returns via signal; the cell highlight is already painted locally by Qt
+    on click, so the UI never waits on REST. Mirrors _FoldWorker (the proven pattern)."""
+
+    def __init__(self, controller, model, chain, resnums):
+        super().__init__()
+        self._c, self._model, self._chain, self._resnums = controller, model, chain, resnums
+        self.signals = _SelectSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            res = self._c.select_in_3d(self._model, self._chain, self._resnums)
+            self.signals.done.emit(res if isinstance(res, dict) else {"error": None})
+        except Exception as exc:                        # error-first: never crash the pool
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class _SyncSignals(QtCore.QObject):
+    done = QtCore.Signal(list)                          # [(model, chain, resnum), …]
+    failed = QtCore.Signal(str)
+
+
+class _SyncWorker(QtCore.QRunnable):
+    """Reads the live 3D selection off the UI thread (the `info residues sel` HTTP read);
+    the main thread applies the highlights. Same pattern as the select/fold workers."""
+
+    def __init__(self, controller):
+        super().__init__()
+        self._c = controller
+        self.signals = _SyncSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.signals.done.emit(self._c.sync_from_chimerax())
+        except Exception as exc:
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # ── one chain's residue grid ─────────────────────────────────────────────────────
 
 class _ChainGrid(QtWidgets.QTableWidget):
@@ -123,6 +169,14 @@ class SequenceEditorWindow(QtWidgets.QMainWindow):
         self._fold_quick = fold_quick
         self._pool = QtCore.QThreadPool.globalInstance()
         self._grids: dict = {}                         # (model,chain) -> _ChainGrid
+        # Debounce/coalesce rapid clicks: each selection change (re)starts a 40 ms
+        # single-shot timer; on timeout ONE combined select is dispatched off-thread
+        # for the whole current selection (so N quick clicks = 1 round-trip, not N).
+        self._pending_grid = None
+        self._sel_timer = QtCore.QTimer(self)
+        self._sel_timer.setSingleShot(True)
+        self._sel_timer.setInterval(40)
+        self._sel_timer.timeout.connect(self._flush_selection)
         self.setWindowTitle("StructureBot — Sequence Editor (MVP)")
         self.resize(900, 600)
 
@@ -175,35 +229,56 @@ class SequenceEditorWindow(QtWidgets.QMainWindow):
             for ch in chains:
                 grid = _ChainGrid(ch)
                 grid.selectionPushRequested.connect(
-                    lambda g=grid: self._push_selection(g))
+                    lambda g=grid: self._on_selection_changed(g))
                 self._grids[ch.key] = grid
                 self.tabs.addTab(grid, f"#{ch.model}/{ch.chain}  ({len(ch.cells)} aa)")
             self._msg(f"Loaded {len(chains)} chain(s).")
         except Exception as exc:
             self._msg(f"reload failed: {type(exc).__name__}: {exc}")
 
-    def _push_selection(self, grid: _ChainGrid):
-        try:
-            resnums = grid.selected_resnums()
-            if resnums:
-                self._c.select_in_3d(grid.chain.model, grid.chain.chain, resnums)
-        except Exception as exc:
-            self._msg(f"select push failed: {type(exc).__name__}: {exc}")
+    def _on_selection_changed(self, grid: _ChainGrid):
+        # Returns immediately — Qt has already painted the cell highlight locally; we
+        # only (re)arm the debounce timer, so the event loop never blocks on REST.
+        self._pending_grid = grid
+        self._sel_timer.start()                         # restart → coalesces rapid clicks
+
+    def _flush_selection(self):
+        grid = self._pending_grid
+        if grid is None:
+            return
+        resnums = grid.selected_resnums()               # the FULL current selection → 1 command
+        if not resnums:
+            return
+        worker = _SelectWorker(self._c, grid.chain.model, grid.chain.chain, resnums)
+        worker.signals.done.connect(self._on_select_done)
+        worker.signals.failed.connect(
+            lambda e: self._msg(f"select failed: {e}"))
+        self._pool.start(worker)                         # HTTP off the UI thread
+
+    @QtCore.Slot(dict)
+    def _on_select_done(self, res: dict):
+        err = res.get("error") if isinstance(res, dict) else None
+        if err:                                          # error-first: surface, never swallow
+            self._msg(f"select failed: {err}")
 
     def sync_from_chimerax(self):
-        try:
-            synced = self._c.sync_from_chimerax()
-            if not synced:
-                self._msg("Nothing selected in ChimeraX (or none in a loaded chain).")
-                return
-            by_key: dict = {}
-            for (m, c, rn) in synced:
-                by_key.setdefault((m, c), []).append(rn)
-            for key, grid in self._grids.items():
-                grid.highlight_resnums(by_key.get(key, []), _SYNC_BG)
-            self._msg(f"Synced {len(synced)} selected residue(s) from ChimeraX.")
-        except Exception as exc:
-            self._msg(f"sync failed: {type(exc).__name__}: {exc}")
+        # Off-thread the `info residues sel` read so the button never freezes the UI.
+        worker = _SyncWorker(self._c)
+        worker.signals.done.connect(self._apply_sync)
+        worker.signals.failed.connect(lambda e: self._msg(f"sync failed: {e}"))
+        self._pool.start(worker)
+
+    @QtCore.Slot(list)
+    def _apply_sync(self, synced):
+        if not synced:
+            self._msg("Nothing selected in ChimeraX (or none in a loaded chain).")
+            return
+        by_key: dict = {}
+        for (m, c, rn) in synced:
+            by_key.setdefault((m, c), []).append(rn)
+        for key, grid in self._grids.items():           # widget updates on the main thread
+            grid.highlight_resnums(by_key.get(key, []), _SYNC_BG)
+        self._msg(f"Synced {len(synced)} selected residue(s) from ChimeraX.")
 
     def apply_substitution(self):
         grid = self._active_grid()
