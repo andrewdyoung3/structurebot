@@ -93,3 +93,73 @@ experiment. Do **not** silently keep treating 0.62 as redundancy.
 - RaSP's cartesian_ddg training target is established from the RaSP paper + the shipped
   `ddG_Rosetta` reference; the label-generation protocol is not re-derivable from the local
   RaSP repo code (only the trained model + reference labels ship locally).
+
+---
+
+# Task B — protocol-resolution prep (added; no production change)
+
+## B1 — Why the deployed Rosetta uses torsion-space FastRelax, not cartesian_ddg
+
+Inspected §7, `scripts/rosetta_validation_notes.md`, the Rosetta config, and git history.
+**Honest finding: the deviation was never recorded as a deliberate "we evaluated
+cartesian_ddg and rejected it for speed/memory" decision.** The evidence:
+
+- The local Rosetta path was an **incremental from-scratch PyRosetta implementation**
+  (first appears `68b931e feat: add Rosetta/Robetta ddG bridge`, then `7cf9807`/`acbfaf9`):
+  cleanATOM → FastRelax (torsion) → MutateResidue + FastRelax → subtract full-pose
+  `ref2015` scores. The docstrings call it "CartesianDDG"/"ref2015_cart" but §7 explicitly
+  flags those as **aspirational labels the running code never matched** — i.e., the name was
+  intended, the cartesian implementation never landed. So the "choice" was largely
+  **incidental**, later surfaced by the §7 audit, not a costed trade-off.
+- That said, the constraints that **would** bound a cartesian deployment are real and
+  documented, and plausibly explain why nobody upgraded it:
+  - **Runtime:** the torsion arm already costs ~12–20 min/mutation (validation notes L154);
+    cartesian minimisation + `ref2015_cart` is heavier still.
+  - **WSL memory envelope / worker cap:** the deployment runs PyRosetta inside WSL2 under a
+    bounded RAM budget — `ROSETTA_WSL_MEM_BUDGET_MB=12000`, per-worker footprint
+    `500 + 2.2·n_res` MB capped at `ROSETTA_WORKER_FOOTPRINT_MB=1200`, workers =
+    `min(8, physical−2, mem_budget/footprint)` (added in the 2HHB pose-size worker-cap fix
+    `929df5f`, to avoid oversubscribing WSL into swap). A heavier per-worker protocol shrinks
+    the worker pool and/or risks the swap wall the cap exists to prevent.
+- §7 also records that adopting **canonical cartesian_ddg wholesale** (cartesian relax +
+  `ref2015_cart` + averaging + the 2.94 REU→kcal/mol factor) is already the **stated backlog
+  path** if calibrated absolute magnitudes ever become a requirement.
+
+**Conclusion:** the torsion-space protocol is best described as an un-upgraded initial
+implementation, not a deliberate speed/memory optimisation — but the memory/worker-cap and
+runtime envelope are the real reasons it has not been upgraded, and they bound B2/B3.
+
+## B2 — cartesian_ddg feasibility in the current environment
+
+Probed live (WSL2 Ubuntu-24.04 + `~/pyrosetta_env`):
+
+- `ref2015_cart` score function: **available**.
+- `CartesianddGMover` class: **NOT exposed** in this PyRosetta build (ImportError). The
+  cartesian protocol must therefore be reproduced **manually via cartesian-mode FastRelax**
+  (`FastRelax.cartesian(True)` + `ref2015_cart`) — structurally the same manual pattern the
+  deployed code already uses for the torsion protocol.
+- Bounded run (1PGA, 56 res, 1 cartesian relax cycle): **runs in ~4 s, peak RSS ≈ 832 MB.**
+- Single-mutation cartesian_ddg smoke (1PGA M1A / K50P): **M1A +6.34, K50P +9.45 REU**
+  (both destabilising; correct sign). Notably K50P cartesian +9.45 vs the deployed torsion
+  **+97.18** — cartesian relieves the proline clash the torsion arm (static waters, no
+  cartesian min) blows up on. (Reported as a protocol difference, NOT a verdict.)
+
+**Does it re-hit the §7 constraint?** At calibration-set protein sizes — **no.** 832 MB for
+56 res sits under the 1200 MB per-worker footprint cap and far under the 12 GB WSL budget.
+S669/Ssym are small-to-medium domains (mostly <200 res), so cartesian is feasible there.
+**Caveat:** cartesian is ~1.3× the torsion memory model's prediction at 56 res and scales with
+pose size, so for large multimers it would shrink the worker pool — a conservative footprint
+estimate should be used if the benchmark ever runs large poses, and per-mutation runtime will
+exceed the torsion arm's. For the diverse-but-small calibration set, none of this blocks.
+
+## B3 — benchmark-only cartesian arm: WIRED (production untouched)
+
+Wired `scripts/rosetta_cartesian_bench.py` (standalone; does **not** import or modify
+`rosetta_bridge.py`, the deep-tier path, the handoff, or any default) + a `--rosetta-cart`
+flag on the data-gen harness. When set, the cartesian arm runs on the **same** mutations as
+the deployed torsion arm and writes `rosetta_cart_ddg` ALONGSIDE `rosetta_ddg`, so the
+overnight benchmark can score **both protocols vs experiment** and let the data decide.
+Default OFF → the row schema is byte-for-byte unchanged. Verified: standalone smoke produces
+correct-sign cartesian ddG; harness wiring tested (off → field absent; on → field written),
+suite green. **No protocol decision is made here** — only the capability + rationale are
+prepared, per the brief.

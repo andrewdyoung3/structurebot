@@ -280,7 +280,15 @@ def _key(m) -> str:
     return f"{m['pdbid']}:{m['chain']}:{m['wt']}{m['resnum']}{m['mut']}"
 
 
-def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print):
+def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print,
+        rosetta_cart_keys=None, cart_cycles=1):
+    # rosetta_cart_keys (BENCHMARK-ONLY, default None=OFF): when provided, the
+    # cartesian_ddg arm (scripts/rosetta_cartesian_bench.py) is ALSO computed for
+    # those mutations and written as `rosetta_cart_ddg`, ALONGSIDE the deployed
+    # torsion `rosetta_ddg` — so the benchmark can score both protocols vs
+    # experiment.  Production is untouched; with rosetta_cart_keys=None the row
+    # schema is byte-for-byte unchanged.
+    rosetta_cart_keys = rosetta_cart_keys or set()
     done = set()
     if Path(out_path).is_file():
         for ln in open(out_path):
@@ -318,6 +326,15 @@ def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print):
             cdyn = [m for m in chunk if _key(m) in dynamut2_keys]
             ros = _rosetta_batch(pdb_path, chain, cros, "local", log) if cros else {}
             dyn = _rosetta_batch(pdb_path, chain, cdyn, "dynamut2", log) if cdyn else {}
+            # BENCHMARK-ONLY cartesian_ddg arm (opt-in; default OFF)
+            ccart = [m for m in chunk if _key(m) in rosetta_cart_keys] if rosetta_cart_keys else []
+            cart = {}
+            if ccart and Path(pdb_path).is_file():
+                from rosetta_cartesian_bench import score_cartesian
+                cart = score_cartesian(pdb_path, chain,
+                                       [{"resnum": m["resnum"], "wt": m["wt"],
+                                         "mut": m["mut"], "variant": m["variant"]} for m in ccart],
+                                       cart_cycles=cart_cycles, log=log)
             for m in chunk:
                 ck = candidate_key(chain, m["resnum"], m["wt"], m["mut"])
                 rk = f"{m['wt']}{m['resnum']}{m['mut']}"
@@ -347,6 +364,11 @@ def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print):
                     "prov_rasp": (m.get("provenance") or {}).get("rasp"),
                     "prov_rosetta": (m.get("provenance") or {}).get("rosetta"),
                 }
+                # BENCHMARK-ONLY: add the cartesian arm field ONLY when enabled, so a
+                # normal run's schema stays byte-for-byte unchanged.
+                if rosetta_cart_keys:
+                    row["rosetta_cart_ddg"] = cart.get(m["variant"])
+                    row["rosetta_cart_in_subset"] = _key(m) in rosetta_cart_keys
                 fh.write(json.dumps(row) + "\n"); fh.flush()
                 n_written += 1
             log(f"  [{pdbid}/{chain}] chunk {ci//CHUNK + 1}: +{len(chunk)} rows "
@@ -424,6 +446,12 @@ def main():
     ap.add_argument("--out", default=str(_ROOT / "cache" / "stability_datagen" / "rows.jsonl"))
     ap.add_argument("--rosetta-cap", type=int, default=0)
     ap.add_argument("--dynamut2-cap", type=int, default=0)
+    ap.add_argument("--rosetta-cart", action="store_true",
+                    help="BENCHMARK-ONLY: also run the cartesian_ddg arm (ref2015_cart) on "
+                         "the Rosetta subset → rosetta_cart_ddg, alongside the deployed "
+                         "torsion arm. Production protocol UNCHANGED; off by default.")
+    ap.add_argument("--cart-cycles", type=int, default=1,
+                    help="cartesian FastRelax cycles for the benchmark cartesian arm")
     a = ap.parse_args()
 
     if a.summary:
@@ -481,8 +509,12 @@ def main():
 
     # full run — caller supplies caps; build the rosetta/dynamut2 subsets
     ros_keys, dyn_keys = _select_subsets(manifest, a.rosetta_cap, a.dynamut2_cap)
-    print(f"rosetta subset: {len(ros_keys)} | dynamut2 subset: {len(dyn_keys)}")
-    run(manifest, a.out, ros_keys, dyn_keys)
+    # BENCHMARK-ONLY cartesian arm runs on the SAME mutations as the torsion arm
+    cart_keys = set(ros_keys) if a.rosetta_cart else None
+    print(f"rosetta subset: {len(ros_keys)} | dynamut2 subset: {len(dyn_keys)}"
+          f"{f' | rosetta_cart subset: {len(cart_keys)}' if cart_keys else ''}")
+    run(manifest, a.out, ros_keys, dyn_keys,
+        rosetta_cart_keys=cart_keys, cart_cycles=a.cart_cycles)
 
 
 def _both_tail_sample(rows, cap):

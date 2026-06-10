@@ -163,3 +163,32 @@ def test_dynamut2_subset_prefers_clean_proteins(tmp_path):
     assert sdg._key(bbbb) in ros_keys                      # Rosetta = anchor on all
     assert sdg._key(bbbb) not in dyn_keys                  # DynaMut2 skips training protein
     assert sdg._key(aaaa) in dyn_keys                      # DynaMut2 kept on clean protein
+
+
+# ── benchmark-only cartesian arm wiring (B3) — production unchanged when OFF ──────
+
+def test_rosetta_cart_off_keeps_schema_unchanged(tmp_path, stub_voters):
+    mpath = _write_manifest(tmp_path)
+    muts = sdg.assemble_from_manifest(str(mpath), log=lambda *_: None)
+    keys = {sdg._key(m) for m in muts}
+    out = tmp_path / "rows.jsonl"
+    sdg.run(muts, str(out), keys, keys, log=lambda *_: None)   # cart OFF (default)
+    rows = [json.loads(ln) for ln in out.read_text(encoding="utf-8").splitlines()]
+    assert all("rosetta_cart_ddg" not in r for r in rows)      # field absent → byte-for-byte
+
+
+def test_rosetta_cart_on_adds_field(tmp_path, stub_voters, monkeypatch):
+    import rosetta_cartesian_bench as rcb
+    # stub the WSL cartesian arm → deterministic, no PyRosetta/WSL
+    monkeypatch.setattr(rcb, "score_cartesian",
+                        lambda pdb, chain, muts, **kw: {m["variant"]: 1.23 for m in muts})
+    mpath = _write_manifest(tmp_path)
+    muts = sdg.assemble_from_manifest(str(mpath), log=lambda *_: None)
+    keys = {sdg._key(m) for m in muts}
+    out = tmp_path / "rows.jsonl"
+    sdg.run(muts, str(out), keys, keys, log=lambda *_: None, rosetta_cart_keys=keys)
+    rows = [json.loads(ln) for ln in out.read_text(encoding="utf-8").splitlines()]
+    assert all(r["rosetta_cart_ddg"] == 1.23 for r in rows)    # cartesian arm written
+    assert all(r["rosetta_cart_in_subset"] is True for r in rows)
+    # deployed torsion arm still present + distinct (both protocols side by side)
+    assert all(r["rosetta_ddg"] == 3.3 for r in rows)
