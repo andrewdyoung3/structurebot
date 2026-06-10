@@ -35,6 +35,11 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
+# Windows UTF-8 stdout convention (§5): log lines use →/Greek; cp1252 would raise.
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import config  # noqa: E402
 from residue_mapping import candidate_key, ordered_chain_residues  # noqa: E402
 
@@ -117,6 +122,77 @@ def assemble() -> List[Dict[str, Any]]:
     # Ssym mapping file.  Out of scope for this windowed pass; anti-symmetry was
     # already empirically validated in Part-1's sign battery (§13).  The row schema
     # (pair_id / antisym_dir) is anti-symmetry-ready for a focused follow-up.
+    return muts
+
+
+# ── Manifest-driven assembly (Task 2 — arbitrary multi-protein, provenance-tagged) ─
+
+def _resolve(path: str) -> Path:
+    """Resolve a manifest path: absolute as-is, else relative to the repo root."""
+    p = Path(path)
+    return p if p.is_absolute() else (_ROOT / path)
+
+
+def _index_csv_by_pdbid(path: str) -> Dict[str, List[Dict[str, str]]]:
+    idx: Dict[str, List[Dict[str, str]]] = {}
+    p = _resolve(path)
+    if not p.is_file():
+        return idx
+    for row in csv.DictReader(open(p)):
+        pid = (row.get("pdbid") or "").strip()
+        if pid:
+            idx.setdefault(pid, []).append(row)
+    return idx
+
+
+def assemble_from_manifest(manifest_path: str, proposed_only: bool = True,
+                           log=print) -> List[Dict[str, Any]]:
+    """Assemble an arbitrary multi-protein set from a Task-1 manifest.
+
+    Consumes scripts/calibration_manifest.draft.json's `entries` (per-(set,pdbid,chain)
+    + provenance + struct/exp/rosetta-ref pointers).  Loads each protein's mutations
+    from its experimental CSV, attaches the Rosetta reference where present, resolves
+    the structure via the struct_dir glob, and CARRIES the per-voter provenance tags +
+    role onto every mutation (lossless — collection stays complete; the analysis layer
+    filters by provenance).  Pure assembly; runs no voters."""
+    data = json.loads(_resolve(manifest_path).read_text(encoding="utf-8"))
+    entries = data.get("entries", [])
+    if proposed_only:
+        entries = [e for e in entries if e.get("proposed_include")]
+    exp_cache: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+    ref_cache: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+    muts: List[Dict[str, Any]] = []
+    n_missing_struct = 0
+    for e in entries:
+        exp_idx = exp_cache.setdefault(e["exp_csv"], _index_csv_by_pdbid(e["exp_csv"]))
+        ref_path = e.get("rosetta_ref_csv")
+        ref_idx = (ref_cache.setdefault(ref_path, _index_csv_by_pdbid(ref_path))
+                   if ref_path else {})
+        struct_dir = _resolve(e["struct_dir"])
+        cand = sorted(struct_dir.glob(f"{e['pdbid']}*.pdb"))
+        pdb_path = str(cand[0]) if cand else str(struct_dir / f"{e['pdbid']}.pdb")
+        if not cand:
+            n_missing_struct += 1
+        ref_by_var = {(r.get("variant") or "").strip(): _f(r.get("score"))
+                      for r in ref_idx.get(e["pdbid"], [])}
+        for r in exp_idx.get(e["pdbid"], []):
+            pv = _parse_variant(r.get("variant", ""))
+            if not pv:
+                continue
+            wt, resnum, mut = pv
+            var = f"{wt}{resnum}{mut}"
+            muts.append({
+                "set": e["set"], "pdbid": e["pdbid"],
+                "chain": (r.get("chainid") or e.get("chain") or "A").strip() or "A",
+                "wt": wt, "resnum": resnum, "mut": mut, "variant": var,
+                "exp_ddg": _f(r.get("score")),
+                "rosetta_ref_ddg": ref_by_var.get(var),
+                "pdb_path": pdb_path,
+                "pair_id": None, "antisym_dir": None,
+                "provenance": e.get("provenance") or {}, "role": e.get("role"),
+            })
+    log(f"manifest: {len(entries)} protein entries → {len(muts)} mutations"
+        f"{f' ({n_missing_struct} missing structures)' if n_missing_struct else ''}")
     return muts
 
 
@@ -262,6 +338,14 @@ def run(manifest, out_path, rosetta_keys, dynamut2_keys, log=print):
                     "seqindex": seqi,
                     "rosetta_in_subset": _key(m) in rosetta_keys,
                     "dynamut2_in_subset": _key(m) in dynamut2_keys,
+                    # provenance tags carried from the manifest (lossless; the
+                    # analysis layer filters per-voter by training-disjointness).
+                    # Legacy (non-manifest) rows leave these None.
+                    "role": m.get("role"),
+                    "prov_thermompnn": (m.get("provenance") or {}).get("thermompnn"),
+                    "prov_dynamut2": (m.get("provenance") or {}).get("dynamut2"),
+                    "prov_rasp": (m.get("provenance") or {}).get("rasp"),
+                    "prov_rosetta": (m.get("provenance") or {}).get("rosetta"),
                 }
                 fh.write(json.dumps(row) + "\n"); fh.flush()
                 n_written += 1
@@ -328,6 +412,12 @@ def main():
     ap.add_argument("--assemble-report", action="store_true")
     ap.add_argument("--summary", metavar="JSONL")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--manifest", metavar="JSON",
+                    help="drive assembly from a Task-1 calibration manifest (multi-protein)")
+    ap.add_argument("--all-entries", action="store_true",
+                    help="with --manifest: include ALL entries, not just proposed_include")
+    ap.add_argument("--list", action="store_true",
+                    help="list assembled proteins/mutation counts and exit (no voters)")
     ap.add_argument("--out", default=str(_ROOT / "cache" / "stability_datagen" / "rows.jsonl"))
     ap.add_argument("--rosetta-cap", type=int, default=0)
     ap.add_argument("--dynamut2-cap", type=int, default=0)
@@ -337,13 +427,24 @@ def main():
         summarize(a.summary)
         return
 
-    manifest = assemble()
+    manifest = (assemble_from_manifest(a.manifest, proposed_only=not a.all_entries)
+                if a.manifest else assemble())
     by_set: Dict[str, int] = {}
     for m in manifest:
         by_set[m["set"]] = by_set.get(m["set"], 0) + 1
     print(f"ASSEMBLED {len(manifest)} mutations across {len({m['pdbid'] for m in manifest})} structures")
     for s, n in sorted(by_set.items()):
         print(f"  {s}: {n}")
+    if a.list:
+        # per-protein listing + provenance (no voters) — proves manifest iteration
+        per: Dict[Tuple[str, str], int] = {}
+        for m in manifest:
+            per[(m["set"], m["pdbid"])] = per.get((m["set"], m["pdbid"]), 0) + 1
+        for (s, pid), n in sorted(per.items()):
+            prov = next((m.get("provenance") for m in manifest
+                         if m["pdbid"] == pid and m["set"] == s), {}) or {}
+            print(f"  {s}/{pid}: {n} muts | prov={prov}")
+        return
     if a.assemble_report:
         return
 
@@ -374,23 +475,36 @@ def main():
     run(manifest, a.out, ros_keys, dyn_keys)
 
 
+def _both_tail_sample(rows, cap):
+    """Even stride across the exp-sorted range → spans both tails.  cap<=0 → all."""
+    labeled = [m for m in rows if m.get("exp_ddg") is not None]
+    labeled.sort(key=lambda m: m["exp_ddg"])
+    if cap <= 0 or cap >= len(labeled):
+        return labeled
+    step = len(labeled) / cap
+    return [labeled[int(i * step)] for i in range(cap)]
+
+
 def _select_subsets(manifest, rosetta_cap, dynamut2_cap):
-    """Rosetta subset: prefer 1PGA both-tails + anti-symmetry pairs, capped.
-    DynaMut2 subset: small fixed sample incl. anti-symmetry pairs + both tails."""
-    def both_tail_sample(rows, cap):
-        labeled = [m for m in rows if m.get("exp_ddg") is not None]
-        labeled.sort(key=lambda m: m["exp_ddg"])
-        if cap <= 0 or cap >= len(labeled):
-            return labeled
-        # even stride across the sorted-by-exp range → spans both tails
-        step = len(labeled) / cap
-        return [labeled[int(i*step)] for i in range(cap)]
-    ros = both_tail_sample([m for m in manifest if m["pdbid"] == "1PGA"], rosetta_cap)
-    # always include the anti-symmetry (Ssym) pairs + T4L anchors in rosetta if present
-    extra = [m for m in manifest if m.get("pair_id") or m["set"] == "T4L_2LZM"]
+    """Multi-protein subset selection for the two PER-MUTATION long poles.
+
+    ROSETTA (leakage-free anchor — wanted broadly): both-tail sample across ALL
+    proteins, capped; anti-symmetry pairs + T4L anchors always included.
+    DYNAMUT2 (remote API, capped, S2648-overlapping): small fixed both-tail sample,
+    PREFERRING dynamut2-clean proteins (provenance != 'training') so the scarce
+    DynaMut2 budget is spent where it is training-disjoint; falls back to the whole
+    set when no provenance tags are present (legacy)."""
+    ros = _both_tail_sample(manifest, rosetta_cap)
+    extra = [m for m in manifest if m.get("pair_id") or m.get("set") == "T4L_2LZM"]
     ros_keys = {_key(m) for m in ros} | {_key(m) for m in extra}
-    dyn = both_tail_sample([m for m in manifest if m["pdbid"] == "1PGA"], dynamut2_cap)
-    dyn_keys = {_key(m) for m in dyn} | {_key(m) for m in manifest if m["set"] == "T4L_2LZM"}
+
+    dyn_pool = [m for m in manifest
+                if (m.get("provenance") or {}).get("dynamut2") != "training"]
+    if not dyn_pool:                       # legacy / untagged → whole set
+        dyn_pool = manifest
+    dyn = _both_tail_sample(dyn_pool, dynamut2_cap)
+    dyn_keys = {_key(m) for m in dyn} | {_key(m) for m in manifest
+                                         if m.get("set") == "T4L_2LZM"}
     return ros_keys, dyn_keys
 
 
