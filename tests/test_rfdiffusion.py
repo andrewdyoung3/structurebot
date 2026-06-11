@@ -129,20 +129,18 @@ def test_analyze_symmetric_no_pdb_required() -> None:
         with patch.object(_rfd_mod, "_RFDIFFUSION_DIR", td):
             b = RFdiffusionBridge()
 
-        def fake_run(cmd, **kwargs):
-            # Write a dummy PDB to the expected output location
-            out_idx = cmd.index("inference.output_prefix=") if any(
-                "inference.output_prefix=" in c for c in cmd
-            ) else -1
-            # Nothing to do for this test - just let it proceed
-            raise RuntimeError("subprocess skipped in test")
+        # Execution is the single wsl.exe -> RFDIFFUSION_PYTHON dispatch; mock at
+        # that seam (not a Windows subprocess) and confirm symmetric mode reaches
+        # dispatch rather than failing pdb validation.
+        def fake_dispatch(self, cmd, run_dir):
+            raise RuntimeError("dispatch skipped in test")
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch.object(_rfd_mod.RFdiffusionBridge, "_dispatch", fake_dispatch):
             result = b.analyze({"mode": "symmetric", "symmetry": "C3"})
-    # Should fail at subprocess (RuntimeError), not at validation
+    # Should fail at dispatch (RuntimeError), not at validation
     _assert(not result.success, "symmetric mode proceeds past validation")
-    _assert("subprocess skipped" in (result.error or "") or result.error is not None,
-            "fails at subprocess, not pdb validation",
+    _assert("dispatch skipped" in (result.error or "") or result.error is not None,
+            "fails at dispatch, not pdb validation",
             f"error: {result.error!r}")
 
 
@@ -226,7 +224,7 @@ def test_build_cmd_unknown_mode_raises() -> None:
 # -- D. Full pipeline (mocked subprocess) --------------------------------------
 
 def test_full_pipeline_binder_mock() -> None:
-    """Full analyze() binder pipeline with subprocess.run mocked."""
+    """Full analyze() binder pipeline with the WSL dispatch seam mocked."""
     print("\n=== D. Full pipeline (mocked) ===")
 
     with tempfile.TemporaryDirectory() as td:
@@ -238,20 +236,16 @@ def test_full_pipeline_binder_mock() -> None:
         pdb_file = Path(td) / "target.pdb"
         pdb_file.write_text(pdb_content)
 
-        def fake_run(cmd, **kwargs):
-            """Write dummy PDB files to the output prefix location."""
-            for c in cmd:
-                if c.startswith("inference.output_prefix="):
-                    prefix = Path(c.split("=", 1)[1])
-                    prefix.parent.mkdir(parents=True, exist_ok=True)
-                    for i in range(2):
-                        (prefix.parent / f"binder_{i}.pdb").write_text(
-                            f"REMARK Design {i}\n"
-                        )
-                    return
-            raise RuntimeError("output_prefix not found in cmd")
+        # Mock the single dispatch seam: emulate RFdiffusion writing its PDBs into
+        # the (cache) run_dir, exactly where the bridge collects them. Intent
+        # preserved: build-cmd (tested in C) / dispatch / collect-PDB.
+        def fake_dispatch(self, cmd, run_dir):
+            run_dir.mkdir(parents=True, exist_ok=True)
+            for i in range(2):
+                (run_dir / f"binder_{i}.pdb").write_text(f"REMARK Design {i}\n")
 
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch.object(_rfd_mod._cfg, "RFDIFFUSION_CACHE_DIR", Path(td)), \
+             patch.object(_rfd_mod.RFdiffusionBridge, "_dispatch", fake_dispatch):
             result = b.analyze({
                 "mode":             "binder",
                 "pdb_path":         str(pdb_file),

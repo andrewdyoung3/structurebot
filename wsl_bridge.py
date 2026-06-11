@@ -41,6 +41,13 @@ PYROSETTA_PYTHON = "/home/andre/pyrosetta_env/bin/python"
 # pyrosetta_env. The colabfold_bridge (future task) will run colabfold_batch via
 # this interpreter; defined here now so that bridge can import it. See §10/§11.
 COLABFOLD_PYTHON = "/home/andre/colabfold_env/bin/python"
+# RFdiffusion env (WSL2, Python 3.9-3.11, Linux CUDA torch + SE3-Transformer).
+# RFdiffusion has NO working Windows / Python-3.12 path, so the bridge ALWAYS
+# runs run_inference.py through this interpreter — never VENV312. The env itself
+# is NOT created here; this constant is defined so rfdiffusion_bridge can import
+# it and so is_available() can probe for it (mirror of COLABFOLD_PYTHON). The
+# attended GPU-activation session builds ~/rfdiffusion_env. See §9/§11.
+RFDIFFUSION_PYTHON = "/home/andre/rfdiffusion_env/bin/python"
 
 # ── WSL availability cache ────────────────────────────────────────────────────
 
@@ -360,6 +367,25 @@ class WSLBridge:
         _cf_batch = COLABFOLD_PYTHON.rsplit("/", 1)[0] + "/colabfold_batch"
         result = self.run_command(
             f"test -x {COLABFOLD_PYTHON} && test -x {_cf_batch} && echo {chr(79)+chr(75)}",
+            timeout=30,
+        )
+        return result["ok"] and "OK" in result["stdout"]
+
+    def check_rfdiffusion(self, rfd_dir: str = "/home/andre/RFdiffusion") -> bool:
+        """
+        Return True if the RFdiffusion env interpreter AND a run_inference.py
+        (repo root or scripts/) exist in WSL2.  Mirror of check_colabfold.
+
+        *rfd_dir* is the WSL2 clone path; run_inference.py lives at the repo root
+        in some RFdiffusion versions and under scripts/ in others, so accept
+        either.  The interpreter (~/rfdiffusion_env) is the hard requirement.
+        """
+        if not self.is_available():
+            return False
+        result = self.run_command(
+            f"test -x {RFDIFFUSION_PYTHON} && "
+            f"( test -f {rfd_dir}/run_inference.py || "
+            f"test -f {rfd_dir}/scripts/run_inference.py ) && echo {chr(79)+chr(75)}",
             timeout=30,
         )
         return result["ok"] and "OK" in result["stdout"]
