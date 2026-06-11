@@ -693,6 +693,18 @@ COLABFOLD_CACHE_DIR: Path = Path(
 )
 COLABFOLD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── RFdiffusion (WSL2 ~/rfdiffusion_env, de novo backbone diffusion) ────────────
+# Cache dir for completed backbone-generation runs, keyed by a content hash of the
+# resolved inputs (mode + contigs + hotspots + designs + steps + seed). A re-run
+# of an identical request returns the cached PDB set instantly — mirror of the
+# ColabFold fold cache. The bridge writes generated PDBs here (a Windows path that
+# is also WSL-visible via /mnt/c, so the WSL run_inference.py writes straight into
+# it and the Windows side collects them without a copy-back).
+RFDIFFUSION_CACHE_DIR: Path = Path(
+    os.environ.get("RFDIFFUSION_CACHE_DIR", str(_BASE / "cache" / "rfdiffusion"))
+)
+RFDIFFUSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # JAX persistent compilation cache dir — a WSL2 ext4 path (NOT under /mnt/c; the
 # Windows-boundary I/O penalty would defeat the point). The fold result cache
 # (above) only saves IDENTICAL re-folds; this lets XLA reuse compiled executables
