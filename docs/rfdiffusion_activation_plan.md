@@ -1,4 +1,30 @@
-# RFdiffusion Activation Plan (deferred — attended, GPU-healthy session)
+# RFdiffusion Activation Plan (✅ EXECUTED 2026-06-12)
+
+> **✅ EXECUTED 2026-06-12 — RFdiffusion is ACTIVATED on the RTX 5070 Ti (Blackwell `sm_120`).**
+> `~/rfdiffusion_env` is built and the live smoke passes; `is_available()` is now True.
+> **Resolved stack (native WSL2 venv, NOT Docker):** deadsnakes **py3.11** · **torch 2.11.0+cu128**
+> (`get_device_capability()==(12,0)` confirmed) · **dgl 2.5 built from source** (pinned `dmlc/dgl@3d16000`)
+> with **real sm_120 kernels** · **SE3Transformer UNMODIFIED**. Only two adaptations: e3nn
+> `o3/_wigner.py` → `torch.load(..., weights_only=False)`, and `numpy<2`.
+>
+> **The dgl long-pole, resolved (the crux this plan flagged as unresolved):** dgl does **not** read
+> `TORCH_CUDA_ARCH_LIST` or `CMAKE_CUDA_ARCHITECTURES`. Its arch lever is the legacy
+> `dgl_select_nvcc_arch_flags` path: **`-DCUDA_ARCH_NAME=Manual -DCUDA_ARCH_BIN=120 -DCUDA_ARCH_PTX=120`**
+> (drives libdgl `-gencode` *and* graphbolt `CUDAARCHS`). sm_120 is absent from dgl's
+> `dgl_known_gpu_archs` default, so omitting this flag silently builds ≤sm_90 → runtime "no kernel
+> image." The §2 routes (CPU dgl / conda dgl) were both wrong: the working route is a **CUDA source
+> build of dgl 2.5 against torch 2.11** with that flag — the SE3Transformer↔dgl "API chasm" feared
+> below did **not** materialize (it installs unmodified; the only patches are the e3nn + numpy ones).
+>
+> **Recipe basis:** the `JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090` dependency closure,
+> replayed as a native WSL venv so the existing `RFDIFFUSION_PYTHON` bridge contract holds with **zero
+> bridge change** — *with the arch flag JMB omitted* (which is why JMB reports no working smoke).
+> **Build gotchas:** the dgl CUDA compile OOMs at high `-j` → WSL `.wslconfig` 22 GB + 8 GB swap and
+> cap **all** parallelism at `-j3` (main ninja + the bare `make -j` in `graphbolt`/`dgl_sparse`).
+> **Verified:** arch pre-check → dgl GPU micro-smoke (`dgl.ops.copy_e_sum`/`edge_softmax` on CUDA) →
+> Block-E smoke (`contigmap.contigs=[100-100]` → valid 100-res backbone, 50 timesteps) → full
+> RFdiffusion→ProteinMPNN→ColabFold handoff. See PROJECT_CONTEXT §8/§9/§13. The forward-looking
+> §2/§5 below is retained as the historical investigation; the resolved facts above supersede it.
 
 This is the **written** activation recipe + reachability investigation produced by
 the GPU-independent scaffold task. **Nothing here was installed, downloaded, or
