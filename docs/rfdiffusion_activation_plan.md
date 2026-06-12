@@ -166,32 +166,59 @@ set, confirm `torch.cuda.get_device_capability() == (12, 0)` inside
 
 ---
 
-## 5. Install recipe (WSL2, deferred)
+## 5. Install recipe (AS-BUILT — executed 2026-06-12)
+
+This is the recipe that actually built the working env (py3.11, not the original 3.10 guess).
+**Machine prep (durable):** the dgl CUDA compile OOMs on WSL's default ~15.5 GB — set
+`C:\Users\andre\.wslconfig` to `[wsl2]\nmemory=22GB\nswap=8GB` then `wsl --shutdown` first.
 
 ```bash
-# 1. Interpreter (WSL has only 3.12; RFdiffusion needs 3.9-3.11)
-sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt update
-sudo apt install -y python3.10 python3.10-venv python3.10-dev
+# 1. Toolchain (sudo). py3.11 + FULL CUDA 12.8 toolkit (nvcc, to compile dgl for sm_120) + gcc/g++-11.
+sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt-get update
+sudo apt-get install -y python3.11 python3.11-venv python3.11-dev \
+    build-essential gcc-11 g++-11 git wget curl ca-certificates gnupg
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update && sudo apt-get install -y cuda-toolkit-12-8
 
-# 2. Clone + weights (files.ipd.uw.edu — reachable; total size to-confirm, §4)
-git clone https://github.com/RosettaCommons/RFdiffusion ~/RFdiffusion
-cd ~/RFdiffusion && bash scripts/download_models.sh models/
+# 2. venv + torch (confirm sm_120: get_device_capability()==(12,0))
+python3.11 -m venv ~/rfdiffusion_env && source ~/rfdiffusion_env/bin/activate
+pip install -U pip wheel setuptools "cmake>=3.29,<4" ninja   # cmake <4: dgl uses pre-4.0 CMake policies
+pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
-# 3. Env (NOT the stock SE3nv.yml torch — see §2; ALL pins here are verify-at-build)
-python3.10 -m venv ~/rfdiffusion_env
-~/rfdiffusion_env/bin/pip install torch==2.11.0+cu128 \
-    --index-url https://download.pytorch.org/whl/cu128   # confirm sm_120 on the built env
-# dgl: choose the §2 route (CPU dgl, or a cu12x build), then:
-cd env/SE3Transformer
-~/rfdiffusion_env/bin/pip install --no-cache-dir -r requirements.txt
-~/rfdiffusion_env/bin/python setup.py install
-~/rfdiffusion_env/bin/pip install hydra-core pyrsistent e3nn
-cd ~/RFdiffusion && ~/rfdiffusion_env/bin/pip install -e .
+# 3. dgl 2.5 FROM SOURCE with sm_120 kernels (the long-pole; >1h compile, OOM-prone -> -j3 everywhere)
+export CUDA_HOME=/usr/local/cuda-12.8 && export PATH=$CUDA_HOME/bin:$PATH \
+    LD_LIBRARY_PATH=$CUDA_HOME/lib64 CC=/usr/bin/gcc-11 CXX=/usr/bin/g++-11 DGL_HOME=$HOME/dgl
+git clone --recursive https://github.com/dmlc/dgl.git ~/dgl && cd ~/dgl
+git checkout 3d16000b4170fa741ed9e9667f22ba84d3493026 && git submodule update --init --recursive
+sed -i -E 's/make -j([^0-9]|$)/make -j3\1/g' graphbolt/build.sh dgl_sparse/build.sh  # else 32 jobs -> OOM
+mkdir build && cd build
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON \
+    -DCUDA_TOOLKIT_ROOT_DIR=$CUDA_HOME -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 \
+    -DCUDA_ARCH_NAME=Manual -DCUDA_ARCH_BIN=120 -DCUDA_ARCH_PTX=120 ..   # <-- THE FIX (see top banner)
+ninja -j3 && cd ../python && pip install .
+# verify sm_120 kernels run (no "no kernel image"):
+python -c "import torch,dgl; dgl.ops.copy_e_sum(dgl.graph(([0],[1])).to('cuda'), torch.ones(1,4,device='cuda')); print('dgl sm_120 OK')"
 
-# 4. Smoke (proves sm_120 + weights):
-~/rfdiffusion_env/bin/python scripts/run_inference.py \
-    'contigmap.contigs=[100-100]' inference.output_prefix=test/sm120 \
-    inference.num_designs=1
+# 4. SE3Transformer (UNMODIFIED) + RFdiffusion + the runtime deps its setup.py does NOT declare
+cd ~/RFdiffusion/env/SE3Transformer && pip install -r requirements.txt && python setup.py install
+pip install git+https://github.com/NVIDIA/dllogger.git
+cd ~/RFdiffusion && pip install -e .
+pip install "hydra-core==1.3.2" "pyrsistent>=0.19.3" pandas "pydantic>=2.0" wandb pynvml torchdata decorator gitpython  # NOT e3nn (keep SE3's 0.3.3)
+
+# 5. The two (and only two) adaptations
+WIG=$(python -c "import e3nn,os;print(os.path.join(os.path.dirname(e3nn.__file__),'o3','_wigner.py'))")
+sed -i "s/'constants.pt'))/'constants.pt'), weights_only=False)/" "$WIG"   # torch>=2.6 weights_only default
+pip install "numpy<2"
+
+# 6. Weights (Base_ckpt only suffices for the smoke + monomer/unconditional; binder/complex need the full
+#    7-ckpt set via scripts/download_models.sh — deferred, see PROJECT_CONTEXT §9). NOTE: the URL path
+#    segment is NOT the file md5 (no upstream checksum exists); verify by byte-size = 483616107.
+cd ~/RFdiffusion && mkdir -p models && wget -O models/Base_ckpt.pt \
+    http://files.ipd.uw.edu/pub/RFdiffusion/6f5902ac237024bdd0c176cb93063dc4/Base_ckpt.pt
+
+# 7. Smoke (proves sm_120 + weights -> a real backbone)
+python scripts/run_inference.py 'contigmap.contigs=[100-100]' \
+    inference.output_prefix=$HOME/rfd_smoke/mono inference.num_designs=1
 ```
 
 After this, the bridge's WSL probe (`check_rfdiffusion`) flips `is_available()` to
