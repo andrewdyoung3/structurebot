@@ -31,20 +31,6 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-# ── Windows-only keyboard polling ─────────────────────────────────────────────
-if sys.platform == "win32":
-    import msvcrt
-    def _kbhit() -> bool:
-        return msvcrt.kbhit()
-    def _getch() -> None:
-        msvcrt.getch()
-else:
-    import select
-    def _kbhit() -> bool:
-        return bool(select.select([sys.stdin], [], [], 0)[0])
-    def _getch() -> None:
-        sys.stdin.read(1)
-
 # ── Rich UI ───────────────────────────────────────────────────────────────────
 try:
     from rich.console import Console
@@ -62,6 +48,8 @@ from chimerax_bridge import ChimeraXBridge
 from translator import CommandTranslator, RefusalError, is_usage_cap_error, probe_chimerax_verbs
 from session_state import SessionState
 from tool_router import ToolRouter
+from presenter import ConsolePresenter
+from request_engine import RequestEngine
 
 # ── Console ───────────────────────────────────────────────────────────────────
 
@@ -172,58 +160,6 @@ HELP_TEXT = """
 """
 
 
-# ── Elapsed-time progress ticker ──────────────────────────────────────────────
-
-class _ElapsedTicker:
-    """
-    Background thread that prints an elapsed-time message every *interval* seconds.
-    Designed for long-running computational tool phases.
-
-    Usage::
-        with _ElapsedTicker("Running mutation_scan", interval=30):
-            results = scanner.scan(...)
-    """
-
-    def __init__(self, prefix: str, interval: int = 30, eta_s: float = 0.0):
-        self._prefix   = prefix
-        self._interval = interval
-        self._eta_s    = max(0.0, float(eta_s))   # 0 = unknown; omit ETA from the line
-        self._start    = time.time()
-        self._stop     = threading.Event()
-        self._thread   = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> "_ElapsedTicker":
-        self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2)
-
-    def _run(self) -> None:
-        while not self._stop.wait(timeout=self._interval):
-            elapsed = int(time.time() - self._start)
-            mins, secs = divmod(elapsed, 60)
-            # When an approximate ETA is known, show "elapsed / ~ETA" so a long
-            # fold reads as progress rather than a hang.
-            if self._eta_s > 0:
-                em, es = divmod(int(self._eta_s), 60)
-                tail = f" / ~{em:02d}:{es:02d} est"
-            else:
-                tail = ""
-            msg = f"  {self._prefix}... ({mins:02d}:{secs:02d} elapsed{tail})"
-            try:
-                print(msg, flush=True)
-            except Exception:
-                pass
-
-    def __enter__(self) -> "_ElapsedTicker":
-        return self.start()
-
-    def __exit__(self, *_) -> None:
-        self.stop()
-
-
 # ════════════════════════════════════════════════════════════════════════════════
 # Application
 # ════════════════════════════════════════════════════════════════════════════════
@@ -260,6 +196,13 @@ class StructureBot:
         # Log file path
         log_name = datetime.now().strftime("session_%Y%m%d_%H%M%S.jsonl")
         self.log_file = config.LOG_DIR / log_name
+
+        # Request orchestration: the UI-agnostic engine + the console presenter.
+        # The console REPL drives RequestEngine through ConsolePresenter (the parity
+        # oracle); a future GUI hosts the same engine through a Qt presenter.
+        self.presenter = None
+        self.engine = None
+        self._ensure_engine()
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -619,605 +562,36 @@ class StructureBot:
 
     # ── Natural language pipeline ─────────────────────────────────────────────
 
-    def _report_translation_decline(self, exc: Exception) -> None:
-        """
-        Transparently report a declined/empty translation. Shows the REAL reason
-        (the actual stop_reason carried in *exc*), NOT a generic "safety filter"
-        framing — the translator already retried once automatically, and routine
-        structural-biology requests are not blocked by StructureBot's own logic.
-        """
-        console.print(
-            f"[warn]⚠ The model returned no usable translation: {escape(str(exc))}[/warn]"
-        )
-        console.print(
-            "[dim]An automatic retry was already attempted. This is usually "
-            "transient — try the same request again, or rephrase it slightly. "
-            "(The request is fine for a structural-biology tool.)[/dim]"
-        )
-
-    def _report_translation_error(self, exc: Exception) -> None:
-        """Surface an UNEXPECTED translation failure as a clean one-line message and
-        return to the prompt — the REPL must never crash on a backend error. The full
-        error goes to stderr for diagnosis (§5 error-first). A Claude usage/spend-cap
-        is special-cased with actionable guidance (the cap message carries the reset
-        date)."""
-        sys.stderr.write(f"[main] translation error: {type(exc).__name__}: {exc}\n")
-        if is_usage_cap_error(exc):
-            console.print(
-                f"[warn]⚠ Claude API usage limit reached: {escape(str(exc))}[/warn]"
+    def _ensure_engine(self) -> None:
+        """Build the ConsolePresenter + RequestEngine on first use. Idempotent so a
+        StructureBot built via object.__new__ (tests) still gets a working engine on
+        the first request."""
+        if getattr(self, "engine", None) is None:
+            self.presenter = ConsolePresenter(
+                console,
+                auto_proceed=getattr(self, "auto_proceed", True),
+                auto_proceed_delay=getattr(self, "auto_proceed_delay", 2),
             )
-            console.print(
-                "[dim]Set TRANSLATOR_BACKEND=ollama to use the local model, or wait "
-                "for the limit to reset (see the date above).[/dim]"
-            )
-        else:
-            console.print(
-                f"[warn]⚠ Couldn't translate that request: {escape(str(exc))}[/warn]"
-            )
-            console.print(
-                "[dim]Returning to the prompt — try again, or rephrase it.[/dim]"
-            )
+            self.engine = RequestEngine(self)
 
     def _handle_request(self, user_input: str, is_retry: bool = False) -> None:
         # Populate the verb-guard registry once per bridge connection (idempotent).
         # Must run BEFORE translate() so Tier 2 of _validate_command_verbs fires.
         if self.bridge:
             probe_chimerax_verbs(self.bridge.run_command)
-
-        # 1. Pre-translate interception: covered intent categories bypass translation.
-        # For covered ops, the intent registry resolves and renders deterministically;
-        # the translator is not invoked at all (§0 Intent/Render separation principle).
-        # Uncovered requests fall through to the normal translation path below.
-        from intent_registry import (
-            VIEWER_REGISTRY as _vreg, COLOR_REGISTRY as _creg,
-        )
-        if _vreg.detect_category_phrase(user_input):
-            _repr_key = _vreg.resolve_alias(user_input)  # None → LLM tier in execute()
-            result = {
-                "commands":             [],
-                "explanations":         [],
-                "warnings":             [],
-                "clarification_needed": None,
-                "confidence":           "high",
-                "tools_needed":         ["representation"],
-                "tool_inputs":          {
-                    "representation": {
-                        "_user_input": user_input,
-                        "intent_key":  _repr_key,
-                    }
-                },
-            }
-        elif _creg.detect_category_phrase(user_input, "color"):
-            _color_key = _creg.resolve_alias(user_input)  # None → LLM/solid in execute()
-            result = {
-                "commands":             [],
-                "explanations":         [],
-                "warnings":             [],
-                "clarification_needed": None,
-                "confidence":           "high",
-                "tools_needed":         ["color"],
-                "tool_inputs":          {
-                    "color": {
-                        "_user_input": user_input,
-                        "intent_key":  _color_key,
-                    }
-                },
-            }
-        else:
-            # 1b. Translate (existing path — uncovered requests only)
-            try:
-                with console.status("[cyan]Translating…[/cyan]"):
-                    result = self.translator.translate(user_input, self.session)
-            except RefusalError as exc:
-                self._report_translation_decline(exc)
-                return
-            except ValueError as exc:
-                # Legacy/other path: only treat as a decline if the message clearly
-                # indicates an empty/declined translation; otherwise re-raise.
-                if any(k in str(exc).lower() for k in ("refusal", "safety", "stop_reason")):
-                    self._report_translation_decline(exc)
-                    return
-                raise
-            except Exception as exc:
-                # Backstop for the NON-refusal escape path: any other unexpected
-                # translation failure (e.g. a Claude usage-cap BadRequestError that the
-                # one-way fallback couldn't reroute when fallback is off) must surface
-                # cleanly and return to the prompt — the REPL never crashes on it.
-                self._report_translation_error(exc)
-                return
-
-        # 2. Route (augment with tool pipeline info; no execution yet)
-        result = self.router.route(result, user_input=user_input)
-
-        # 3. Clarification loop (max 2 rounds)
-        for _ in range(2):
-            q = result.get("clarification_needed")
-            if not q:
-                break
-            console.print(f"\n[warn]❓ {escape(q)}[/warn]")
-            answer = Prompt.ask("[hi]Answer[/hi]").strip()
-            if not answer:
-                console.print("[dim]No answer — cancelling.[/dim]")
-                return
-
-            # ── Fast-path: mutation-scan tier choice (base vs deep) ────────────
-            # The tier-choice surface is a local question, not a re-translation.
-            # Interpret the answer and set run_rosetta directly — never re-route.
-            if result.get("_tier_choice"):
-                _ans = answer.lower()
-                _want_shortlist = bool(re.search(r"\b(shortlist|short-list|top)\b", _ans))
-                _want_deep = _want_shortlist or bool(re.search(
-                    r"\b(deep|rosetta|rosie|full|yes|2)\b", _ans
-                ))
-                _ti = (result.get("tool_inputs") or {}).get("mutation_scan")
-                if isinstance(_ti, dict):
-                    _ti["run_rosetta"] = _want_deep
-                    if _want_shortlist:
-                        import config as _cfg
-                        _ti["rosetta_shortlist_k"] = int(getattr(_cfg, "ROSETTA_SHORTLIST_K", 15))
-                result["clarification_needed"] = None
-                result.pop("_tier_choice", None)
-                _label = ("deep-shortlist (top-K Rosetta ddG)" if _want_shortlist
-                          else "deep (full Rosetta ddG)" if _want_deep
-                          else "fast (CamSol+ESM)")
-                console.print(f"[dim]Running the {_label} tier.[/dim]")
-                break
-
-            # ── Fast-path: bypass retranslation for known tool intents ─────────
-            # If the original user_input already contains glycan (or other
-            # recognised) keywords, re-routing through translate() would send a
-            # bare short answer ("chain A") to the model with no prior context,
-            # causing a stop_reason='refusal' crash.  Detect the intent here and
-            # dispatch directly instead.
-            if self.router._detect_glycan_intent(user_input):
-                result = self.router.route(
-                    {
-                        "commands":             [],
-                        "explanations":         [],
-                        "warnings":             [],
-                        "clarification_needed": None,
-                        "confidence":           "high",
-                        "tools_needed":         ["glycan"],
-                        "tool_inputs":          {},
-                    },
-                    user_input=user_input,
-                )
-                break
-
-            self.translator.add_clarification(answer)
-            try:
-                with console.status("[cyan]Retranslating…[/cyan]"):
-                    result = self.translator.translate(answer, self.session)
-            except ValueError as exc:
-                err_str = str(exc)
-                if "refusal" in err_str.lower() or "stop_reason" in err_str.lower():
-                    console.print(
-                        "[warn]Sorry, I couldn't process that answer. "
-                        "Try rephrasing your original request directly, "
-                        "e.g. 'suggest glycosylation sites on chain A'[/warn]"
-                    )
-                else:
-                    console.print(
-                        f"[warn]Translation error: {escape(err_str[:120])}[/warn]"
-                    )
-                return
-            except Exception as exc:
-                console.print(
-                    "[warn]Sorry, I couldn't process that answer. "
-                    "Try rephrasing your original request directly.[/warn]"
-                )
-                return
-            result = self.router.route(result, user_input=user_input)
-
-        if result.get("clarification_needed"):
-            console.print("[warn]Still ambiguous — please rephrase.[/warn]")
-            return
-
-        commands:     List[str] = result.get("commands", [])
-        explanations: List[str] = result.get("explanations", [])
-        warnings:     List[str] = result.get("warnings", [])
-        confidence:   str       = result.get("confidence", "medium")
-        has_extra     = result.get("has_extra_tools", False)
-        tools_needed: List[str] = result.get("tools_needed", ["chimerax"])
-
-        # Require at least commands OR extra tools
-        if not commands and not has_extra:
-            console.print("[warn]No commands generated.[/warn]")
-            return
-
-        # 4. Show warnings
-        for w in warnings:
-            console.print(f"[warn]⚠ {escape(w)}[/warn]")
-
-        # 5. Preview
-        console.print()
-        if has_extra:
-            self._show_tool_pipeline(result)
-        if commands:
-            self._show_preview(commands, explanations, confidence)
-        elif has_extra:
-            # No initial ChimeraX commands — tool output will generate viz
-            console.print(
-                "[dim]  (visualization commands will be generated after "
-                "the tool completes)[/dim]"
-            )
-
-        # 6. Take pre-scan snapshot (before confirmation so state is clean)
-        _pre_scan_snapshot = self.session.snapshot()
-
-        # 7. Confirm / auto-proceed / edit
-        should_execute = self._confirm_execution(confidence)
-        if should_execute is None:
-            return  # cancelled
-        if should_execute == "edit" and commands:
-            commands = self._edit_commands(commands)
-            if not commands:
-                return
-
-        console.print()
-
-        # Initialize execution state (used after try/except block)
-        all_commands: list = list(commands)
-        success      = True
-        failed_cmd:  Optional[str] = None
-        error_msg:   Optional[str] = None
-
-        try:
-            # 8. Execute initial ChimeraX commands (if any)
-
-            if commands:
-                success, failed_cmd, error_msg = self._execute_commands(commands)  # noqa: F841
-
-            # 9. Execute extra tools (CamSol, ESM, etc.) if initial phase succeeded
-            if success and has_extra:
-                def _status(msg: str) -> None:
-                    console.print(f"  [info]{msg}[/info]")
-
-                # For long-running pipelines, show elapsed time every 30s
-                _long_tools = {"mutation_scan", "disulfide", "rosetta", "colabfold",
-                               "validate_design"}
-                _needs_timer = bool(set(tools_needed) & _long_tools)
-                _ticker_label = (
-                    "Running " + "/".join(
-                        t for t in tools_needed if t in _long_tools
-                    )
-                )
-
-                # ColabFold: surface a rough ETA beside the elapsed counter when
-                # the sequence is known up front (approximate; see ColabFoldBridge).
-                _eta_s = 0.0
-                if "colabfold" in tools_needed:
-                    try:
-                        _cf_in = (result.get("tool_inputs") or {}).get("colabfold", {})
-                        _seq   = _cf_in.get("sequence") or ""
-                        _cop   = int(_cf_in.get("copies", 1) or 1)
-                        if _seq:
-                            from colabfold_bridge import ColabFoldBridge
-                            _eta_s = ColabFoldBridge().estimate_runtime_s(
-                                len(_seq) * _cop, 5, 3
-                            )
-                    except Exception:
-                        _eta_s = 0.0
-
-                if _needs_timer:
-                    _ticker = _ElapsedTicker(_ticker_label, interval=30, eta_s=_eta_s)
-                    _ticker.start()
-                else:
-                    _ticker = None
-
-                try:
-                    with console.status("[cyan]Running computational tools…[/cyan]"):
-                        result = self.router.execute(result, status_callback=_status)
-                finally:
-                    if _ticker is not None:
-                        _ticker.stop()
-
-                # Show assembly interface summary (before other summaries)
-                self._show_interface_summary(result)
-
-                # Show tool summaries
-                summaries = result.get("tool_summaries", {})
-                for tool, summary in summaries.items():
-                    icon = ToolRouter._TOOL_ICONS.get(tool, "⚙️")
-                    if result.get("pipeline_success"):
-                        console.print(f"  [ok]✓[/ok] {icon} {escape(summary)}")
-                    else:
-                        err = result.get("pipeline_error", "unknown error")
-                        console.print(f"  [err]✗[/err] {icon} {tool}: {escape(err)}")
-
-                if not result.get("pipeline_success"):
-                    err = result.get("pipeline_error", "")
-                    console.print(f"\n[err]Tool pipeline failed: {escape(err[:120])}[/err]")
-                    # Keep going — viz commands might still be partially available
-
-                # 10. Execute visualization commands generated by the tools
-                viz_cmds = result.get("all_viz_commands", [])
-                viz_exps = result.get("all_viz_explanations", [])
-                if viz_cmds:
-                    console.print()
-                    console.print("[dim]  Applying visualization…[/dim]")
-                    self._show_preview(viz_cmds, viz_exps, "high")
-                    viz_ok, viz_failed, viz_err = self._execute_commands(viz_cmds, origin="tool_viz")
-                    if not viz_ok:
-                        console.print(f"[warn]  Visualization command failed: {escape(viz_err or '')}[/warn]")
-                    all_commands.extend(viz_cmds)
-
-                # 11. Show actionable summary panel for tools that produced one
-                for step in result.get("tool_step_results", []):
-                    if (step.get("success") and step.get("summary")
-                            and "\n" in step.get("summary", "")):
-                        console.print()
-                        console.print(Panel(
-                            step["summary"],
-                            title="[bold green]Analysis Summary[/bold green]",
-                            border_style="green",
-                            padding=(1, 2),
-                        ))
-
-        except KeyboardInterrupt:
-            console.print("\n[warn]Warning: Scan cancelled by user.[/warn]")
-            console.print("[dim]Restoring session state to pre-scan snapshot...[/dim]")
-            self.session.restore(_pre_scan_snapshot)
-            console.print("[dim]Session state restored.[/dim]")
-            return
-
-        # 10. Auto-fix on first failure (once only, ChimeraX commands only)
-        if not success and not is_retry and failed_cmd and error_msg:
-            console.print("\n[warn]Asking for a corrected command…[/warn]")
-            # Bug 6a: the actual error text is fed into translate_error_fix so the
-            # model cannot re-propose the same command blind (already handled by
-            # translate_error_fix, which builds the prompt from failed_command +
-            # error_message verbatim — no silent re-prompt).
-            fix = self.translator.translate_error_fix(failed_cmd, error_msg, self.session)
-            fix_cmds = fix.get("commands", [])
-            fix_exps = fix.get("explanations", [])
-
-            # Bug 6b: no-progress detection — halt cleanly instead of looping.
-            # No progress = the correction is empty (guards blocked it or model
-            # refused) OR the model re-proposed the identical failing command.
-            _same_cmd = bool(
-                fix_cmds
-                and fix_cmds[0].strip().lower() == failed_cmd.strip().lower()
-            )
-            # Bug 6c (3b fix): halt if the correction reuses the SAME non-existent
-            # verb that was just rejected.  The verb guard in translate_error_fix
-            # blocks the command and empties fix_cmds, but when the registry is
-            # unavailable and the verb isn't in the denylist it may slip through.
-            # Extract the leading verb of the failed command; if the correction's
-            # first command starts with the same verb, it's the same hallucination.
-            _failed_verb = failed_cmd.strip().split()[0].lower() if failed_cmd.strip() else ""
-            _fix_verb    = fix_cmds[0].strip().split()[0].lower() if fix_cmds else ""
-            _same_verb   = bool(
-                _failed_verb and _fix_verb and _failed_verb == _fix_verb
-                and _failed_verb not in ("open", "close", "color", "colour",
-                                         "select", "hide", "show", "cartoon",
-                                         "surface", "style", "align", "view",
-                                         "transparency", "sym", "matchmaker")
-            )
-            if not fix_cmds or _same_cmd or _same_verb:
-                console.print(
-                    f"[warn]Couldn't auto-correct — "
-                    f"error: {escape(error_msg[:200])}[/warn]"
-                )
-                _reason = (
-                    "Correction re-proposed the same non-existent verb "
-                    f"'{_failed_verb}' — halting to prevent a loop."
-                    if _same_verb else
-                    "Correction re-proposed the same command or was blocked "
-                    "by a validation guard.  Try rephrasing your request."
-                )
-                console.print(f"[dim]{_reason}[/dim]")
-            else:
-                console.print("\n[warn]Suggested correction:[/warn]")
-                self._show_preview(fix_cmds, fix_exps, fix.get("confidence", "medium"))
-                choice = Prompt.ask(
-                    "[hi]Apply fix?[/hi] [dim][[y]es / [n]o][/dim]",
-                    default="y",
-                ).strip().lower()
-                if choice in ("y", "yes", ""):
-                    fix_success, _, _ = self._execute_commands(fix_cmds)
-                    if fix_success:
-                        all_commands.extend(fix_cmds)
-
-        # 11. Update state
-        self.session.add_to_history(user_input, all_commands, success=success, error=error_msg)
-        self._maybe_update_structure_state(all_commands)
-        self.translator.trim_history()
-
-        # Build enhanced tool-step log entries from tool pipeline results
-        _tool_steps: List[dict] = []
-        for step in result.get("tool_step_results", []):
-            if step.get("skipped"):
-                continue
-            tool  = step.get("tool", "")
-            data  = step.get("data", {})
-            entry: dict = {
-                "tool":       tool,
-                "elapsed_ms": step.get("elapsed_ms", 0),
-                "success":    step.get("success", False),
-            }
-            # Tool-specific enrichment
-            if tool == "mutation_scan":
-                cands = data.get("candidates", [])
-                entry["n_candidates"]  = len(cands)
-                entry["top_candidate"] = cands[0].get("mutation_key", "") if cands else ""
-                entry["top_ddg"]       = cands[0].get("ddg", None)        if cands else None
-                entry["backend"]       = cands[0].get("backend", "")      if cands else ""
-            elif tool == "disulfide":
-                entry["n_candidates"] = data.get("count", 0)
-            elif tool in ("camsol", "esm", "proteinmpnn", "rfdiffusion"):
-                pass  # no extra enrichment needed
-            _tool_steps.append(entry)
-
-        self._log_exchange(user_input, all_commands, success, error_msg,
-                           tool_steps=_tool_steps if _tool_steps else None)
-
-    def _show_tool_pipeline(self, result: dict) -> None:
-        """Display the tool pipeline before the ChimeraX command preview."""
-        steps = result.get("tool_steps_info", [])
-        if not steps:
-            return
-        table = Table(title="[bold]Tool Pipeline[/bold]", border_style="magenta", show_lines=True)
-        table.add_column("#",    style="dim",   width=3,  no_wrap=True)
-        table.add_column("Tool", style="bold",  width=14, no_wrap=True)
-        table.add_column("Action", style="white")
-        for i, step in enumerate(steps, 1):
-            icon = step.get("icon", "⚙️")
-            tool = step.get("tool", "?")
-            desc = step.get("description", "")
-            table.add_row(str(i), f"{icon} {tool}", escape(desc))
-        console.print(table)
-        console.print()
-
-    def _show_preview(
-        self,
-        commands:     List[str],
-        explanations: List[str],
-        confidence:   str,
-    ) -> None:
-        conf_color = {"high": "green", "medium": "yellow", "low": "red"}.get(confidence, "white")
-        title = (
-            f"[bold]Proposed Commands[/bold]  "
-            f"[{conf_color}]confidence: {confidence}[/{conf_color}]"
-        )
-        table = Table(title=title, border_style="blue", show_lines=True)
-        table.add_column("#",          style="dim",  width=3, no_wrap=True)
-        table.add_column("Command",    style="cmd",  min_width=36)
-        table.add_column("What it does", style="white")
-        for i, (cmd, exp) in enumerate(zip(commands, explanations), 1):
-            table.add_row(str(i), escape(cmd), escape(exp or "—"))
-        console.print(table)
-
-    def _confirm_execution(self, confidence: str) -> Optional[str]:
-        """
-        Returns "proceed", "edit", or None (cancel).
-        High/medium confidence → auto-proceed countdown if auto_proceed is on.
-        Low confidence → always prompt.
-        ESC during countdown → cancel immediately (return None).
-        """
-        if self.auto_proceed and confidence in ("high", "medium"):
-            result = self._countdown(self.auto_proceed_delay)
-            if result == "escaped":
-                console.print("[dim]Cancelled.[/dim]")
-                return None
-            return "proceed" if result else self._manual_confirm()
-        return self._manual_confirm()
-
-    def _manual_confirm(self) -> Optional[str]:
-        choice = Prompt.ask(
-            "\n[hi]Execute?[/hi] [dim][[y]es / [n]o / [e]dit][/dim]",
-            default="y",
-        ).strip().lower()
-        if choice in ("n", "no"):
-            console.print("[dim]Cancelled.[/dim]")
-            return None
-        if choice in ("e", "edit"):
-            return "edit"
-        return "proceed"
-
-    def _countdown(self, seconds: int):
-        """
-        Countdown before auto-executing.
-        Returns True to proceed, False if the user pressed any other key,
-        or "escaped" if the user pressed ESC.
-
-        ESC ('\x1b') cancels immediately without showing a y/n prompt.
-        Any other key pauses the countdown and returns False so _manual_confirm
-        is shown.
-        """
-        for remaining in range(seconds, 0, -1):
-            console.print(
-                f"\r  [dim]Auto-executing in {remaining}s… "
-                f"(press any key to pause, ESC to cancel)[/dim]",
-                end="",
-            )
-            deadline = time.time() + 1.0
-            while time.time() < deadline:
-                if _kbhit():
-                    if sys.platform == "win32":
-                        ch = msvcrt.getwch()
-                    else:
-                        ch = sys.stdin.read(1)
-                    console.print()
-                    if ch == "\x1b":
-                        return "escaped"
-                    return False
-                time.sleep(0.05)
-        console.print()
-        return True
-
-    def _edit_commands(self, original: List[str]) -> List[str]:
-        console.print("[warn]Edit mode — enter each command, blank line to finish:[/warn]")
-        for cmd in original:
-            console.print(f"  [cmd]{escape(cmd)}[/cmd]")
-        console.print()
-        edited: List[str] = []
-        while True:
-            line = Prompt.ask("[dim]>[/dim]", default="").strip()
-            if not line:
-                break
-            edited.append(line)
-        return edited
+        self._ensure_engine()
+        self.engine.handle_request(user_input, self.presenter, is_retry=is_retry)
 
     def _execute_commands(
         self,
         commands: List[str],
         origin: str = "translation",
     ) -> Tuple[bool, Optional[str], Optional[str]]:
-        """Execute via bridge, print results. Returns (all_ok, failed_cmd, error_msg).
-
-        origin — "translation" (default): free-translated commands from the LLM; the
-                  emission guard fires here to block representation-shaped commands.
-                 "tool_viz": visualization commands generated by tool steps (ColabFold,
-                  double-mutant, etc.); these are trusted and bypass the guard.
-        """
-        # Emission guard (§0): representation-shaped commands must originate from
-        # the render layer (_run_representation), never from free-translation.
-        # Tool-viz commands (origin="tool_viz") are trusted and exempt.
-        if origin == "translation":
-            from intent_registry import is_representation_shaped
-            for cmd in (c.strip() for c in commands if c.strip()):
-                if is_representation_shaped(cmd):
-                    err = (
-                        f"Representation command {cmd!r} blocked — "
-                        "use a representation phrase (cartoon/sticks/surface/…) "
-                        "so it routes via the render layer."
-                    )
-                    console.print(
-                        f"  [err]✗ Blocked (emission guard):[/err] [cmd]{escape(cmd)}[/cmd]"
-                    )
-                    console.print(f"      [err]{escape(err[:140])}[/err]")
-                    return False, cmd, err
-
-        with console.status("[cyan]Executing…[/cyan]"):
-            results = self.bridge.run_commands(commands)
-
-        first_err_cmd: Optional[str] = None
-        first_err_msg: Optional[str] = None
-
-        for r in results:
-            cmd = r["command"]
-            res = r["result"]
-            err = res.get("error")
-            val = (res.get("value") or "").replace("\n", " ").strip()[:60]
-
-            if err:
-                console.print(f"  [err]✗[/err] [cmd]{escape(cmd)}[/cmd]")
-                console.print(f"      [err]{escape(str(err)[:120])}[/err]")
-                if first_err_cmd is None:
-                    first_err_cmd = cmd
-                    first_err_msg = str(err)
-            else:
-                suffix = f" [dim]→ {escape(val)}[/dim]" if val else ""
-                console.print(f"  [ok]✓[/ok] [cmd]{escape(cmd)}[/cmd]{suffix}")
-                # Surface blank-image warnings from the bridge's post-save check
-                if res.get("warning"):
-                    console.print(f"      [warn]⚠ {escape(str(res['warning']))}[/warn]")
-
-        all_ok = first_err_cmd is None
-        if all_ok:
-            console.print(f"\n  [dim]Completed {len(results)} command(s).[/dim]")
-        return all_ok, first_err_cmd, first_err_msg
+        """Execute via the request engine (presenter-rendered). Returns
+        (all_ok, failed_cmd, error_msg). Thin wrapper so existing callers and tests
+        (bot._execute_commands(...)) are unchanged."""
+        self._ensure_engine()
+        return self.engine.execute_commands(commands, self.presenter, origin=origin)
 
     # ── Session state update from executed commands ────────────────────────────
 
@@ -1300,28 +674,6 @@ class StructureBot:
                         pass  # mismatch note is non-critical
         except Exception:
             pass  # assembly info is non-critical; never interrupt the flow
-
-    def _show_interface_summary(self, result: dict) -> None:
-        """Show interface summary from assembly_analyser step results."""
-        step_results = result.get("tool_step_results", [])
-        for step in step_results:
-            if step.get("tool") == "assembly_analyser" and step.get("success"):
-                data = step.get("data", {})
-                summary = data.get("interface_summary", "")
-                header  = data.get("header", "")
-                warnings = data.get("warnings", [])
-
-                if header:
-                    console.print(f"\n  [bold]🔗 {escape(header)}[/bold]")
-                if summary:
-                    console.print(f"  [info]{escape(summary)}[/info]")
-                for w in warnings:
-                    console.print(f"  [warn]⚠ {escape(w)}[/warn]")
-                excluded = data.get("excluded_count", 0)
-                if excluded:
-                    console.print(
-                        f"  [dim]  → {excluded} residue(s) will be excluded from mutation scan[/dim]"
-                    )
 
     # ── Logging ───────────────────────────────────────────────────────────────
 

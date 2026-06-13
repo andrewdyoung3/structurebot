@@ -264,16 +264,19 @@ class TestTranslationErrorBackstop:
         assert "couldn't translate" in printed, printed
 
     def test_refusal_path_still_declines(self):
-        """The existing RefusalError → _report_translation_decline path is intact
-        (the backstop is ADDITIONAL, not a replacement)."""
+        """The existing RefusalError → translation-decline path is intact (the backstop
+        is ADDITIONAL, not a replacement). Post-extraction the decline is rendered by
+        the presenter, so the mock target moves to presenter.translation_declined —
+        same assertion strength."""
         from translator import RefusalError
         bot = _make_mock_bot()
-        bot._report_translation_decline = MagicMock()
+        bot._ensure_engine()                      # build the presenter so we can mock it
+        bot.presenter.translation_declined = MagicMock()
         bot.translator.translate.side_effect = RefusalError("stop_reason=refusal")
 
         bot._handle_request("open 1hsg")          # must NOT raise
 
-        bot._report_translation_decline.assert_called_once()
+        bot.presenter.translation_declined.assert_called_once()
         bot.router.route.assert_not_called()
 
 
