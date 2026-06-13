@@ -19,12 +19,17 @@ from __future__ import annotations
 
 import ctypes
 import json
+import queue
 import re
+import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+
+import requests
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from rich.markup import escape
@@ -111,6 +116,75 @@ class _LoadModelWorker(QtCore.QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+# ── managed background service (detached / windowless / logged / tracked) ──────────
+
+class ManagedService:
+    """A background process the app started (e.g. `ollama serve`): detached, windowless,
+    its output logged. Tracked so teardown stops EXACTLY what the app started."""
+
+    def __init__(self, name: str, args: list, log_path):
+        self.name = name
+        self.args = args
+        self.log_path = Path(log_path)
+        self.proc: Optional[subprocess.Popen] = None
+        self._log = None
+
+    def start(self) -> "ManagedService":
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log = open(self.log_path, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            self._log = None
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        self.proc = subprocess.Popen(
+            self.args,
+            stdout=self._log, stderr=(subprocess.STDOUT if self._log is not None else None),
+            creationflags=flags,
+        )
+        return self
+
+    def stop(self) -> None:
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=4)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+        if self._log is not None:
+            try:
+                self._log.close()
+            except Exception:
+                pass
+            self._log = None
+
+
+class _PreflightSignals(QtCore.QObject):
+    done = QtCore.Signal()
+
+
+class _PreflightWorker(QtCore.QRunnable):
+    """Runs the startup preflight (ChimeraX + Ollama bring-up, checklist, restore) off
+    the UI thread so the window paints immediately and never freezes."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.win = window
+        self.signals = _PreflightSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.win._run_preflight()
+        except Exception as exc:                       # error-first: never crash the pool
+            self.win.presenter.error(f"Preflight error: {type(exc).__name__}: {exc}")
+        self.signals.done.emit()
+
+
 # ── the window (== the engine host) ───────────────────────────────────────────────
 
 class StructureBotWindow(QtWidgets.QMainWindow):
@@ -141,10 +215,20 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._in_flight = False
         self._pending_q = None            # clarification answer queue (input-box driven)
         self._worker: Optional[_RequestWorker] = None
-        self._pending_focus: List[str] = []   # model ids to focus after the request
+        self._pending_focus: List[str] = []   # next_model_id() guesses — focus FALLBACK
+        self._opened_mids: List[str] = []     # REAL opened ids from the bridge — focus TRUTH
+        self._services: List[ManagedService] = []   # things WE started → teardown on close
+        self._started_chimerax = False
+
+        # Ground-truth tab focus: the bridge hands us the REAL opened model id.
+        self.bridge.on_structure_opened = self._note_opened
 
         self._build_ui()
         self._connect()
+        # Self-launching preflight (ChimeraX + Ollama) runs once the event loop starts,
+        # off the UI thread; input is disabled until it finishes.
+        self.input.setEnabled(False)
+        QtCore.QTimer.singleShot(0, self._start_preflight)
 
     # ── UI ──────────────────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -208,6 +292,16 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         elif kind == "yesno":
             r = QtWidgets.QMessageBox.question(self, "StructureBot", str(payload))
             q.put(r == QtWidgets.QMessageBox.StandardButton.Yes)
+        elif kind == "restore":
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Previous session found")
+            box.setText(str(payload) + "\n\nRestore it?")
+            r_btn = box.addButton("Restore", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Start fresh", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            c_btn = box.addButton("Clear it", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            box.exec()
+            clicked = box.clickedButton()
+            q.put("restore" if clicked is r_btn else "clear" if clicked is c_btn else "fresh")
         else:
             q.put(CANCEL)
 
@@ -271,6 +365,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
     def _start_request(self, text: str) -> None:
         self._in_flight = True
         self._pending_focus = []
+        self._opened_mids = []
         self.presenter.cancelled = False
         self.input.setEnabled(False)
         self.cancel_action.setEnabled(True)
@@ -282,10 +377,18 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_request_done(self) -> None:
-        focus = list(self._pending_focus)
+        # Ground truth first: the REAL opened ids the bridge captured; the next_model_id()
+        # guesses are only the fallback when the bridge saw no open result.
+        focus = list(self._opened_mids) if self._opened_mids else list(self._pending_focus)
         self._finish_request()
         for mid in focus:                       # after an open, focus the new model's tab
             self.show_model(mid)
+
+    def _note_opened(self, model_id) -> None:
+        """Bridge post-open hook (worker thread): record the REAL opened model id."""
+        mid = str(model_id).lstrip("#").strip()
+        if mid:
+            self._opened_mids.append(mid)
 
     @QtCore.Slot(str)
     def _on_request_failed(self, err: str) -> None:
@@ -430,6 +533,168 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                         pass
         except Exception:
             pass  # assembly info is non-critical; never interrupt the flow
+
+    # ── startup preflight (ported from main.startup, rendered to the pane) ─────────
+    def _start_preflight(self) -> None:
+        self.statusBar().showMessage("Starting up…")
+        w = _PreflightWorker(self)
+        w.signals.done.connect(self._on_preflight_done)
+        self._pool.start(w)
+
+    @QtCore.Slot()
+    def _on_preflight_done(self) -> None:
+        self.input.setEnabled(True)
+        self.input.setFocus()
+        self.statusBar().showMessage("Ready")
+
+    def _run_preflight(self) -> None:
+        """Worker-thread preflight: bring up ChimeraX + Ollama, render the ✓ checklist to
+        the pane, offer session restore. Error-first — any dependency that won't come up
+        is reported and the GUI stays usable."""
+        import os
+        p = self.presenter
+        p.info("StructureBot — starting up…")
+        # API key: DEGRADE (don't hard-exit) — Claude is optional/capped; Ollama is local.
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            p.warn("⚠ ANTHROPIC_API_KEY not set — Claude unavailable; using local Ollama "
+                   "(set TRANSLATOR_BACKEND=ollama).")
+        self._preflight_chimerax()
+        self._preflight_ollama()
+        self._preflight_wsl()
+        self._preflight_restore()
+        p.dim("Startup complete.")
+
+    def _preflight_chimerax(self) -> None:
+        p = self.presenter
+        cx = self.bridge.chimerax_path
+        if not cx or not Path(cx).is_file():
+            p.warn("⚠ ChimeraX not found (set CHIMERAX_PATH). Open ChimeraX manually and run "
+                   "'remotecontrol rest start port 60001'.")
+            return
+        p.dim(f"ChimeraX: {cx}")
+        if self.bridge.is_running():
+            p.success(f"✓ Connected to ChimeraX on port {self.bridge.port}")
+        else:
+            p.info("ChimeraX REST not found — launching ChimeraX… (may take 20–40 s)")
+            try:
+                self.bridge.start(timeout=60)
+                self._started_chimerax = True
+                p.success(f"✓ ChimeraX started — REST on port {self.bridge.port}")
+            except Exception as exc:
+                p.error(f"✗ Failed to start ChimeraX: {exc}")
+                p.dim("Manual fix: open ChimeraX → 'remotecontrol rest start port 60001'.")
+                return
+        ping = self.bridge.ping()
+        if ping.get("ok"):
+            ver = (ping["result"].get("value") or "")[:40].strip()
+            p.success(f"✓ Ping OK ({ping['latency_ms']} ms) — {ver}")
+        else:
+            p.warn(f"⚠ Ping failed: {ping['result'].get('error')}")
+
+    def _preflight_ollama(self) -> None:
+        p = self.presenter
+        base = config.OLLAMA_BASE_URL
+
+        def tags():
+            try:
+                r = requests.get(f"{base}/api/tags", timeout=3)
+                return r.json() if r.status_code == 200 else None
+            except Exception:
+                return None
+
+        t = tags()
+        if t is None:
+            p.info("Ollama not running — starting `ollama serve` (windowless, logged)…")
+            svc = ManagedService("ollama", ["ollama", "serve"],
+                                 config.LOG_DIR / "ollama_serve.log")
+            try:
+                svc.start()
+                self._services.append(svc)
+            except FileNotFoundError:
+                p.warn("⚠ `ollama` not on PATH — local translation unavailable (install Ollama).")
+                return
+            except Exception as exc:
+                p.warn(f"⚠ Couldn't start Ollama: {exc}")
+                return
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                t = tags()
+                if t is not None:
+                    break
+                time.sleep(0.5)
+            if t is None:
+                p.warn("⚠ Ollama did not become ready within 30 s.")
+                return
+            p.success("✓ Ollama serve is up (port 11434)")
+        else:
+            p.success("✓ Connected to Ollama (port 11434)")
+        names = [m.get("name", "") for m in (t.get("models") or [])]
+        model = config.OLLAMA_MODEL
+        stem = model.split(":")[0]
+        if any(n == model or n.startswith(stem) for n in names):
+            p.dim(f"  model {model} present")
+        else:
+            p.warn(f"⚠ Ollama model {model} not found — run `ollama pull {model}`.")
+
+    def _preflight_wsl(self) -> None:
+        p = self.presenter
+        try:
+            from wsl_bridge import WSLBridge
+            wsl = WSLBridge()
+            if wsl.is_available():
+                if wsl.check_pyrosetta():
+                    p.success("✓ Rosetta: local (PyRosetta via WSL2) — publication quality")
+                else:
+                    p.warn("⚠ WSL2 available — PyRosetta not installed (run pyrosetta_installer).")
+                self.session.wsl_available = True
+            else:
+                p.dim("✓ Rosetta: DynaMut2 (screening quality) — WSL2 not installed")
+                self.session.wsl_available = False
+        except Exception:
+            pass  # WSL2 status is informational only
+
+    def _preflight_restore(self) -> None:
+        from session_state import SessionState
+        state, err = SessionState.try_load("session.json")
+        if err or state is None:
+            return
+        if not (state.structures or state.scan_results
+                or getattr(state, "double_mutant_results", None) or state.command_history):
+            return
+        summary = (f"{len(state.structures)} structure(s), "
+                   f"{len(state.scan_results)} scan result(s), "
+                   f"{len(state.command_history)} prior command(s).")
+        choice = self._blocking_restore(summary)
+        if choice == "restore":
+            self.session = state
+            self.router = ToolRouter(self.bridge, self.session)
+            self.presenter.success(f"✓ Restored session: {summary}")
+        elif choice == "clear":
+            try:
+                Path("session.json").unlink()
+            except Exception:
+                pass
+            self.presenter.dim("Previous session cleared.")
+        else:
+            self.presenter.dim("Starting fresh (previous session kept).")
+
+    def _blocking_restore(self, summary: str) -> str:
+        """Worker-thread blocking restore prompt (reuses the Stage-2 worker-block seam)."""
+        q: "queue.Queue" = queue.Queue(maxsize=1)
+        self._sig.ask.emit("restore", f"A previous session was found: {summary}", q)
+        return q.get()
+
+    # ── teardown: stop exactly what the app started ───────────────────────────────
+    def closeEvent(self, event) -> None:
+        # Ollama (a bundled daemon WE started) is stopped. ChimeraX is left running like
+        # the console REPL — it is the user's structure viewer; killing it on window close
+        # would discard their loaded models.
+        for svc in self._services:
+            try:
+                svc.stop()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
 
 def main(argv=None) -> int:

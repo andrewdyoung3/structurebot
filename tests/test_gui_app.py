@@ -142,3 +142,102 @@ def test_show_model_adds_and_focuses_tab(_app):
     assert ("2", "A") in w._grids
     assert w.tabs.count() == 1
     assert w.tabs.currentWidget().chain.key == ("2", "A")
+
+
+# ── Stage 3: managed service, Ollama preflight, ground-truth tab focus ────────────
+
+def test_managed_service_windowless_logged(_app, monkeypatch, tmp_path):
+    cap = {}
+
+    class FakeProc:
+        def poll(self): return None
+
+    def fake_popen(args, **kw):
+        cap["args"], cap["kw"] = args, kw
+        return FakeProc()
+
+    monkeypatch.setattr(gui_app.subprocess, "Popen", fake_popen)
+    svc = gui_app.ManagedService("ollama", ["ollama", "serve"], tmp_path / "o.log")
+    svc.start()
+    assert cap["args"] == ["ollama", "serve"]
+    assert cap["kw"].get("stdout") is not None                 # logged, not inherited
+    if sys.platform == "win32":
+        assert cap["kw"].get("creationflags") == gui_app.subprocess.CREATE_NO_WINDOW
+    assert (tmp_path / "o.log").exists()
+
+
+def test_managed_service_stop_terminates(_app):
+    svc = gui_app.ManagedService("x", ["x"], Path("nul"))
+
+    class FakeProc:
+        def __init__(self): self.killed = False
+        def poll(self): return None
+        def terminate(self): self.killed = True
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    fp = FakeProc()
+    svc.proc = fp
+    svc.stop()
+    assert fp.killed and svc.proc is None
+
+
+def _preflight_fake(**attrs):
+    obj = types.SimpleNamespace(presenter=MagicMock(), _services=[], **attrs)
+    obj._preflight_ollama = types.MethodType(W._preflight_ollama, obj)
+    return obj
+
+
+def test_preflight_ollama_already_up(_app, monkeypatch):
+    class Resp:
+        status_code = 200
+        def json(self): return {"models": [{"name": "qwen3:8b"}]}
+    monkeypatch.setattr(gui_app.requests, "get", lambda *a, **k: Resp())
+    w = _preflight_fake()
+    w._preflight_ollama()
+    msgs = " ".join(str(c) for c in w.presenter.success.call_args_list)
+    assert "Ollama" in msgs                                   # connected
+    assert not w._services                                    # nothing spawned (already up)
+
+
+def test_preflight_ollama_model_missing_warns(_app, monkeypatch):
+    class Resp:
+        status_code = 200
+        def json(self): return {"models": [{"name": "llama3:8b"}]}   # qwen3 absent
+    monkeypatch.setattr(gui_app.requests, "get", lambda *a, **k: Resp())
+    w = _preflight_fake()
+    w._preflight_ollama()
+    warns = " ".join(str(c) for c in w.presenter.warn.call_args_list)
+    assert "not found" in warns and "pull" in warns
+
+
+def test_bridge_on_structure_opened_fires(_app, monkeypatch):
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge.__new__(ChimeraXBridge)
+    b._lean_layout_applied = True
+    got = []
+    b.on_structure_opened = lambda mid: got.append(mid)
+    monkeypatch.setattr(b, "run_command", lambda c, timeout=30: {"value": "opened #3", "error": None})
+    monkeypatch.setattr(b, "_maybe_apply_presentation_on_open", lambda: None)
+    monkeypatch.setattr(b, "_maybe_apply_lean_layout", lambda: None)
+    monkeypatch.setattr(b, "_maybe_show_sequence_on_open", lambda mid: None)
+    b.run_commands(["open foo.pdb"])
+    assert got == ["3"]                                       # the REAL opened id, from the bridge
+
+
+def test_opened_mid_focus_uses_ground_truth(_app):
+    shown = []
+    w = types.SimpleNamespace(_opened_mids=["3"], _pending_focus=["1"])
+    w._finish_request = lambda: None
+    w.show_model = lambda mid: shown.append(mid)
+    W._on_request_done(w)
+    assert shown == ["3"]                                     # real id wins over next_model_id guess
+
+
+def test_opened_mid_focus_falls_back_to_guess(_app):
+    shown = []
+    w = types.SimpleNamespace(_opened_mids=[], _pending_focus=["1"])
+    w._finish_request = lambda: None
+    w.show_model = lambda mid: shown.append(mid)
+    W._on_request_done(w)
+    assert shown == ["1"]                                     # fallback when bridge saw no open

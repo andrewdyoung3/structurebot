@@ -189,8 +189,11 @@ OLLAMA_NUM_PREDICT: int = int(os.environ.get("OLLAMA_NUM_PREDICT", "1024"))
 # translator.ensure_translator_unloaded() is the real contract — do NOT rely on
 # this idle timer alone (a mid-run OOM is the failure mode to prevent).
 OLLAMA_KEEP_ALIVE: str = os.environ.get("OLLAMA_KEEP_ALIVE", "30s")
-# Per-request HTTP timeout (a cold model load on first call can be slow).
-OLLAMA_TIMEOUT: int = int(os.environ.get("OLLAMA_TIMEOUT", "180"))
+# Per-request HTTP read timeout. A CPU-only first translate (cold load + a long
+# system prompt) can run well past 3 min; 180s was timing out mid-translate. 600s lets
+# a slow CPU translation COMPLETE rather than fail (comfortable interactive speed is the
+# separate Ollama-on-GPU track — this only stops the premature timeout).
+OLLAMA_TIMEOUT: int = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
 
 # Maximum number of user/assistant exchange *pairs* kept in rolling history.
 # Each turn consumes input tokens; prompt caching absorbs the static block cost.
