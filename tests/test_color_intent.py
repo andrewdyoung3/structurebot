@@ -511,7 +511,7 @@ class TestIntegrationHandleRequest:
         bridge.run_command.return_value  = {"value": "", "error": None}
         bridge.run_commands.return_value = []
 
-        with patch("main.probe_chimerax_verbs"):
+        with patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot(bridge)
             bot._handle_request("color chain A red")
 
@@ -526,7 +526,7 @@ class TestIntegrationHandleRequest:
         bridge.run_command.return_value  = {"value": "", "error": None}
         bridge.run_commands.return_value = []
 
-        with patch("main.probe_chimerax_verbs"):
+        with patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot(bridge)
             bot._handle_request("color by chain")
 
@@ -535,7 +535,7 @@ class TestIntegrationHandleRequest:
         assert "color #1 bychain" in executed, executed
 
     def test_non_color_phrase_reaches_translation(self):
-        with patch("main.probe_chimerax_verbs"):
+        with patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot()
             bot._handle_request("fold the top design")
         bot.translator.translate.assert_called_once()
@@ -548,7 +548,7 @@ class TestIntegrationHandleRequest:
 
         classifier = MagicMock(return_value=None)
         with patch("intent_registry.make_llm_classify_fn", return_value=classifier), \
-             patch("main.probe_chimerax_verbs"):
+             patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot(bridge)
             bot._handle_request("color it in some artistic way")
 

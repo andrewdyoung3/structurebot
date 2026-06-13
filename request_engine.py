@@ -15,14 +15,15 @@ not a rewrite (§0 intent/render unchanged — the LLM still infers intent).
 The engine is bound to a *host* (StructureBot today, the GUI app later) for its
 collaborators (bridge/translator/router/session) and a couple of side-effect hooks
 (_log_exchange, _maybe_update_structure_state) that mutate session/write the log. The
-verb-guard probe (probe_chimerax_verbs) is run by the host BEFORE handle_request.
+verb-guard probe (probe_chimerax_verbs) runs once at the top of handle_request — the
+single translate entry every front-end reaches.
 """
 from __future__ import annotations
 
 import re
 from typing import List, Optional, Tuple
 
-from translator import RefusalError
+from translator import RefusalError, probe_chimerax_verbs
 from tool_router import ToolRouter
 
 
@@ -77,6 +78,12 @@ class RequestEngine:
 
     # ── the request pipeline ──────────────────────────────────────────────────
     def handle_request(self, user_input: str, presenter, is_retry: bool = False) -> None:
+        # 0. Populate the verb-guard registry once per bridge connection (idempotent).
+        # MUST run before translate() so Tier 2 of _validate_command_verbs fires. This is
+        # the single home for the probe — every front-end reaches translate through here.
+        if self.bridge:
+            probe_chimerax_verbs(self.bridge.run_command)
+
         # 1. Pre-translate interception: covered intent categories bypass translation.
         # For covered ops, the intent registry resolves and renders deterministically;
         # the translator is not invoked at all (§0 Intent/Render separation principle).

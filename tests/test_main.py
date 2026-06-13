@@ -61,72 +61,66 @@ def _make_mock_bot() -> StructureBot:
 # ════════════════════════════════════════════════════════════════════════════════
 
 class TestSemicolonChaining:
+    # Post-collapse the dispatch seam is engine.dispatch → engine.handle_request (the
+    # single shared path; the GUI worker calls the same method). engine.handle_request is
+    # invoked as handle_request(part, presenter), so we assert on the first positional arg.
+    @staticmethod
+    def _parts(mock):
+        return [c.args[0] for c in mock.call_args_list]
+
     def test_semicolon_split_runs_both_commands(self):
-        """
-        "cmd1; cmd2" must call _handle_request twice — once per part.
-        """
         bot = _make_mock_bot()
-        bot._handle_request = MagicMock()
+        bot._ensure_engine()
+        bot.engine.handle_request = MagicMock()
 
         bot._dispatch_input("cmd1; cmd2")
 
-        assert bot._handle_request.call_count == 2
-        bot._handle_request.assert_any_call("cmd1")
-        bot._handle_request.assert_any_call("cmd2")
+        assert bot.engine.handle_request.call_count == 2
+        assert self._parts(bot.engine.handle_request) == ["cmd1", "cmd2"]
 
     def test_semicolon_split_skips_empty_parts(self):
-        """
-        "cmd1;  ; cmd2" must call _handle_request exactly twice —
-        the blank middle segment must not be passed to it.
-        """
         bot = _make_mock_bot()
-        bot._handle_request = MagicMock()
+        bot._ensure_engine()
+        bot.engine.handle_request = MagicMock()
 
         bot._dispatch_input("cmd1;  ; cmd2")
 
-        assert bot._handle_request.call_count == 2
-        called_args = [c.args[0] for c in bot._handle_request.call_args_list]
+        assert bot.engine.handle_request.call_count == 2
+        called_args = self._parts(bot.engine.handle_request)
         assert "" not in called_args
-        assert "cmd1" in called_args
-        assert "cmd2" in called_args
+        assert "cmd1" in called_args and "cmd2" in called_args
 
     def test_semicolon_split_preserves_order(self):
-        """
-        Commands must be run in the order they appear left-to-right.
-        """
         bot = _make_mock_bot()
-        bot._handle_request = MagicMock()
+        bot._ensure_engine()
+        bot.engine.handle_request = MagicMock()
 
         bot._dispatch_input("alpha; beta; gamma")
 
-        called_args = [c.args[0] for c in bot._handle_request.call_args_list]
-        assert called_args == ["alpha", "beta", "gamma"]
+        assert self._parts(bot.engine.handle_request) == ["alpha", "beta", "gamma"]
 
     def test_no_semicolon_calls_handle_request_once(self):
-        """
-        Plain input (no semicolon) must result in exactly one _handle_request call.
-        """
         bot = _make_mock_bot()
-        bot._handle_request = MagicMock()
+        bot._ensure_engine()
+        bot.engine.handle_request = MagicMock()
 
         bot._dispatch_input("suggest proline mutations to stabilise chain A")
 
-        bot._handle_request.assert_called_once_with(
+        assert bot.engine.handle_request.call_count == 1
+        assert self._parts(bot.engine.handle_request) == [
             "suggest proline mutations to stabilise chain A"
-        )
+        ]
 
     def test_active_site_command_short_circuits(self):
-        """
-        An active-site command must be handled by handle_active_site_command
-        and NOT reach _handle_request.
-        """
+        """An active-site command is handled by the fast-path and NOT translated."""
         bot = _make_mock_bot()
         bot.router.handle_active_site_command.return_value = "Active-site residues set: [25]."
-        bot._handle_request = MagicMock()
+        bot._ensure_engine()
+        bot.engine.handle_request = MagicMock()
 
         bot._dispatch_input("set active site residues 25")
 
-        bot._handle_request.assert_not_called()
+        bot.engine.handle_request.assert_not_called()
 
 
 # ════════════════════════════════════════════════════════════════════════════════

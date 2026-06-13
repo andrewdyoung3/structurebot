@@ -1169,7 +1169,7 @@ class TestIntegrationHandleRequest:
         # Patch make_llm_classify_fn where tool_router imports it
         classifier = MagicMock(return_value="view.hide_atoms")
         with patch("intent_registry.make_llm_classify_fn", return_value=classifier), \
-             patch("main.probe_chimerax_verbs"):
+             patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot(bridge)
             bot._handle_request("remove all spheres")
 
@@ -1195,7 +1195,7 @@ class TestIntegrationHandleRequest:
         # Classifier returns None → graceful miss
         classifier = MagicMock(return_value=None)
         with patch("intent_registry.make_llm_classify_fn", return_value=classifier), \
-             patch("main.probe_chimerax_verbs"):
+             patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot(bridge)
             bot._handle_request("switch to the wireframe rendering mode")
 
@@ -1213,7 +1213,7 @@ class TestIntegrationHandleRequest:
         (c) A non-representation phrase must bypass the noun-floor and reach
         translate() (the free-translation path).
         """
-        with patch("main.probe_chimerax_verbs"):
+        with patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot()
             bot._handle_request("fold the top design")
 
@@ -1238,7 +1238,7 @@ class TestIntegrationHandleRequest:
                 "clarification_needed": None, "confidence": "high",
             }
 
-        with patch("main.probe_chimerax_verbs"):
+        with patch("request_engine.probe_chimerax_verbs"):
             bot = self._make_bot(bridge, translate_side_effect=_mock_translate)
             bot._handle_request("make it glow with spheres everywhere")
 

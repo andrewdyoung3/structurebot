@@ -45,7 +45,7 @@ except ImportError:
     sys.exit(1)
 
 from chimerax_bridge import ChimeraXBridge
-from translator import CommandTranslator, RefusalError, is_usage_cap_error, probe_chimerax_verbs
+from translator import CommandTranslator
 from session_state import SessionState
 from tool_router import ToolRouter
 from presenter import ConsolePresenter
@@ -485,41 +485,13 @@ class StructureBot:
                 self._dispatch_input(user_input)
 
     def _dispatch_input(self, user_input: str) -> None:
-        """
-        Process one user input string (from REPL or script).
-
-        Handles in order:
-          1. Semicolon chaining — "cmd1; cmd2" runs both sequentially.
-          2. Active-site management commands (set/clear/show).
-          3. Sequence display fast-path (show designed sequences, etc.).
-          4. Full LLM-backed _handle_request pipeline.
-        """
-        # ── Semicolon chaining ─────────────────────────────────────────────────
-        if ";" in user_input:
-            parts = [p.strip() for p in user_input.split(";") if p.strip()]
-            for part in parts:
-                self._handle_request(part)
-            return
-
-        # ── Active-site management ─────────────────────────────────────────────
-        msg = self.router.handle_active_site_command(user_input)
-        if msg:
-            console.print(f"[ok]✓[/ok] {escape(msg)}")
-            return
-
-        # ── Sequence display fast-path ─────────────────────────────────────────
-        seq_msg = self.router.handle_sequence_display_command(user_input)
-        if seq_msg:
-            console.print(seq_msg)
-            return
-
-        # ── Live-selection fast-path (act on the current ChimeraX selection) ───
-        sel_msg = self.router.handle_selection_command(user_input)
-        if sel_msg:
-            console.print(sel_msg)
-            return
-
-        self._handle_request(user_input)
+        """Process one user input string (REPL or script): semicolon chaining + the
+        bypass-LLM fast-paths (active-site / sequence-display / live-selection) + the full
+        pipeline — all via the shared engine.dispatch, the SINGLE path both front-ends use
+        (the GUI worker calls the same method). Rendering goes through the presenter, so
+        the console output is unchanged (ConsolePresenter reproduces it verbatim)."""
+        self._ensure_engine()
+        self.engine.dispatch(user_input, self.presenter)
 
     # ── Script runner ─────────────────────────────────────────────────────────
 
@@ -575,10 +547,8 @@ class StructureBot:
             self.engine = RequestEngine(self)
 
     def _handle_request(self, user_input: str, is_retry: bool = False) -> None:
-        # Populate the verb-guard registry once per bridge connection (idempotent).
-        # Must run BEFORE translate() so Tier 2 of _validate_command_verbs fires.
-        if self.bridge:
-            probe_chimerax_verbs(self.bridge.run_command)
+        # Thin wrapper → the shared engine (the verb-guard probe now runs inside
+        # engine.handle_request, the single translate entry).
         self._ensure_engine()
         self.engine.handle_request(user_input, self.presenter, is_retry=is_retry)
 

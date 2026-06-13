@@ -37,7 +37,7 @@ from rich.markup import escape
 import config
 from chimerax_bridge import ChimeraXBridge
 from colabfold_bridge import ColabFoldBridge
-from translator import CommandTranslator, probe_chimerax_verbs
+from translator import CommandTranslator
 from session_state import SessionState
 from tool_router import ToolRouter
 from request_engine import RequestEngine
@@ -81,11 +81,8 @@ class _RequestWorker(QtCore.QRunnable):
     def run(self):
         self.tid = threading.get_ident()
         try:
-            try:
-                probe_chimerax_verbs(self._engine.bridge.run_command)
-            except Exception:
-                pass  # verb-guard probe is best-effort
             # dispatch = semicolon chaining + bypass-LLM fast-paths + handle_request
+            # (the verb-guard probe runs inside engine.handle_request).
             self._engine.dispatch(self._text, self._presenter)
         except KeyboardInterrupt:
             self.signals.failed.emit("cancelled")
