@@ -29,7 +29,6 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from translator import is_usage_cap_error
 
 
 # ── Windows-only keyboard polling (for the auto-proceed countdown) ──────────────
@@ -299,21 +298,12 @@ class ConsolePresenter(Presenter):
 
     def translation_error(self, exc: Exception) -> None:
         sys.stderr.write(f"[main] translation error: {type(exc).__name__}: {exc}\n")
-        if is_usage_cap_error(exc):
-            self._console.print(
-                f"[warn]⚠ Claude API usage limit reached: {escape(str(exc))}[/warn]"
-            )
-            self._console.print(
-                "[dim]Set TRANSLATOR_BACKEND=ollama to use the local model, or wait "
-                "for the limit to reset (see the date above).[/dim]"
-            )
-        else:
-            self._console.print(
-                f"[warn]⚠ Couldn't translate that request: {escape(str(exc))}[/warn]"
-            )
-            self._console.print(
-                "[dim]Returning to the prompt — try again, or rephrase it.[/dim]"
-            )
+        self._console.print(
+            f"[warn]⚠ Couldn't translate that request: {escape(str(exc))}[/warn]"
+        )
+        self._console.print(
+            "[dim]Is the local Ollama model reachable? Try again, or rephrase it.[/dim]"
+        )
 
     # ── status / long-running ─────────────────────────────────────────────────
     def status(self, label: str):

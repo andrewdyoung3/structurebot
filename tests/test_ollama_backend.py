@@ -13,14 +13,10 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import anthropic
-import httpx
-import requests as _requests
-
 import config
 import translator as T
 from translator import (
-    CommandTranslator, OllamaBackend, ClaudeBackend,
+    CommandTranslator, OllamaBackend,
     ensure_translator_unloaded, make_backend, TRANSLATION_JSON_SCHEMA,
 )
 from tool_router import ToolRouter, ToolStepResult
@@ -112,190 +108,9 @@ def test_guard_applies_to_ollama_output() -> None:
     _assert(any("Rewrote" in w for w in result["warnings"]), "rewrite surfaced as warning")
 
 
-# -- C. one-directional fallback routing ---------------------------------------
-
-def test_claude_error_falls_back_to_ollama() -> None:
-    print("\n=== C. fallback routing ===")
-    t = _translator()   # default claude backend
-    conn = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
-    with patch.object(t, "client") as mc, \
-         patch("requests.post", return_value=_ollama_resp(_VALID)) as mpost:
-        mc.messages.create.side_effect = conn
-        result = t.translate("color chain A red", _session())
-    _assert(mpost.called, "Claude connectivity error + fallback on → Ollama called")
-    _assert(result["commands"] == _VALID_SCOPED, "result came from Ollama (chain-scoped)")
-
-
-def test_claude_success_does_not_call_ollama() -> None:
-    t = _translator()
-    good = MagicMock(content=[MagicMock(text=json.dumps(_VALID))], stop_reason="end_turn")
-    with patch.object(t, "client") as mc, patch("requests.post") as mpost:
-        mc.messages.create.return_value = good
-        t.translate("color chain A red", _session())
-    _assert(not mpost.called, "Claude success → Ollama NEVER called")
-
-
-def test_fallback_disabled_reraises() -> None:
-    t = _translator()
-    conn = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
-    with patch.object(config, "TRANSLATOR_FALLBACK", False), \
-         patch.object(t, "client") as mc, patch("requests.post") as mpost:
-        mc.messages.create.side_effect = conn
-        raised = False
-        try:
-            t.translate("color chain A red", _session())
-        except anthropic.APIConnectionError:
-            raised = True
-    _assert(raised, "fallback OFF → Claude error propagates")
-    _assert(not mpost.called, "fallback OFF → Ollama NOT called")
-
-
-def test_forced_ollama_error_surfaces_claude_never_called() -> None:
-    t = _ollama_translator()
-    with patch.object(t, "client") as mc, \
-         patch("requests.post", side_effect=_requests.exceptions.ConnectionError("down")):
-        surfaced = False
-        try:
-            t.translate("color chain A red", _session())
-        except _requests.exceptions.ConnectionError:
-            surfaced = True
-    _assert(surfaced, "forced ollama + ollama down → error surfaces (benchmark honesty)")
-    _assert(not mc.messages.create.called, "forced ollama → Claude is NEVER called")
-
-
-def test_refusal_is_not_a_fallback_trigger() -> None:
-    """An empty/declined-but-successful Claude response (RefusalError) is NOT a
-    fallback trigger — it propagates as today."""
-    from translator import RefusalError
-    t = _translator()
-    empty = MagicMock(content=[], stop_reason="refusal")
-    with patch.object(t, "client") as mc, patch("requests.post") as mpost:
-        mc.messages.create.return_value = empty   # both attempts empty → RefusalError
-        raised = False
-        try:
-            t.translate("color chain A red", _session())
-        except RefusalError:
-            raised = True
-    _assert(raised, "RefusalError still raised (not swallowed by fallback)")
-    _assert(not mpost.called, "RefusalError does NOT fall back to Ollama")
-
-
-# -- C2. usage-cap (400) fallback ----------------------------------------------
-
-def _usage_cap_error() -> anthropic.BadRequestError:
-    """A Claude USAGE/SPEND-CAP rejection: HTTP 400 invalid_request_error whose
-    message reports a usage limit (NOT a 429 RateLimitError / 401 AuthError)."""
-    resp = httpx.Response(400, request=httpx.Request("POST", "http://x"))
-    msg = ("You have reached your specified API usage limits. "
-           "You will regain access on 2026-07-01 at 00:00 UTC.")
-    body = {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
-    return anthropic.BadRequestError(msg, response=resp, body=body)
-
-
-def _malformed_400() -> anthropic.BadRequestError:
-    """A genuinely malformed request — also a 400, must NOT be treated as a cap."""
-    resp = httpx.Response(400, request=httpx.Request("POST", "http://x"))
-    msg = "messages: at least one message is required"
-    body = {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
-    return anthropic.BadRequestError(msg, response=resp, body=body)
-
-
-def test_is_usage_cap_error_classification() -> None:
-    print("\n=== C2. usage-cap fallback ===")
-    _assert(T.is_usage_cap_error(_usage_cap_error()), "usage-cap 400 classified as a cap")
-    _assert(not T.is_usage_cap_error(_malformed_400()), "malformed 400 is NOT a cap")
-    _assert(not T.is_usage_cap_error(
-        anthropic.RateLimitError(
-            "rate", response=httpx.Response(429, request=httpx.Request("POST", "http://x")),
-            body=None)), "429 RateLimitError is NOT a cap")
-    _assert(not T.is_usage_cap_error(ValueError("nope")), "non-API error is NOT a cap")
-    # forced 'ollama' never falls back, so a cap can't reroute it
-    _assert(not _ollama_translator()._may_fall_back(), "forced ollama → _may_fall_back is False")
-    _assert(_translator()._may_fall_back(), "active claude + fallback on → _may_fall_back is True")
-
-
-def test_usage_cap_falls_back_to_ollama() -> None:
-    t = _translator()   # active = claude
-    with patch.object(t, "client") as mc, \
-         patch("requests.post", return_value=_ollama_resp(_VALID)) as mpost:
-        mc.messages.create.side_effect = _usage_cap_error()
-        result = t.translate("color chain A red", _session())
-    _assert(mpost.called, "usage-cap + fallback on → Ollama called")
-    _assert(result["commands"] == _VALID_SCOPED, "result came from Ollama (normal translation)")
-
-
-def test_usage_cap_fallback_disabled_reraises() -> None:
-    t = _translator()
-    with patch.object(config, "TRANSLATOR_FALLBACK", False), \
-         patch.object(t, "client") as mc, patch("requests.post") as mpost:
-        mc.messages.create.side_effect = _usage_cap_error()
-        raised = False
-        try:
-            t.translate("color chain A red", _session())
-        except anthropic.BadRequestError:
-            raised = True
-    _assert(raised, "usage-cap + fallback OFF → surfaces (no silent swallow)")
-    _assert(not mpost.called, "fallback OFF → Ollama NOT called")
-
-
-def test_non_usage_cap_400_does_not_fall_back() -> None:
-    t = _translator()
-    with patch.object(t, "client") as mc, patch("requests.post") as mpost:
-        mc.messages.create.side_effect = _malformed_400()
-        raised = False
-        try:
-            t.translate("color chain A red", _session())
-        except anthropic.BadRequestError:
-            raised = True
-    _assert(raised, "malformed 400 → surfaces as an error (not a cap)")
-    _assert(not mpost.called, "malformed 400 → does NOT reroute to Ollama")
-
-
-# -- C3. Claude usage-cap LATCH (Priority 0.4) ---------------------------------
-
-def test_usage_cap_latches_and_skips_claude_next_call() -> None:
-    print("\n=== C3. Claude cap latch ===")
-    t = _translator()   # active = claude
-    _assert(t._claude_capped is False, "latch starts unset on a fresh translator")
-    with patch.object(t, "client") as mc, \
-         patch("requests.post", return_value=_ollama_resp(_VALID)) as mpost:
-        mc.messages.create.side_effect = _usage_cap_error()
-        # First call: Claude attempted once → cap → latch + Ollama fallback
-        t.translate("color chain A red", _session())
-        first = mc.messages.create.call_count
-        _assert(first == 1, "first call attempts Claude exactly once")
-        _assert(t._claude_capped is True, "cap latches _claude_capped=True")
-        # Second call: Claude must be SKIPPED (no wasted capped round-trip)
-        t.translate("show as cartoon", _session())
-        _assert(mc.messages.create.call_count == first,
-                "after latch, Claude is NOT called again")
-    _assert(mpost.call_count >= 2, "both translations served by Ollama")
-
-
-def test_cap_does_not_latch_when_fallback_disabled() -> None:
-    t = _translator()
-    with patch.object(config, "TRANSLATOR_FALLBACK", False), \
-         patch.object(t, "client") as mc, patch("requests.post"):
-        mc.messages.create.side_effect = _usage_cap_error()
-        try:
-            t.translate("color chain A red", _session())
-        except anthropic.BadRequestError:
-            pass
-    _assert(t._claude_capped is False,
-            "cap surfaces (fallback off) → latch NOT set (Claude not silently disabled)")
-
-
-def test_transient_connection_error_does_not_latch() -> None:
-    """A transient connectivity error falls back per-call but must NOT latch — a
-    blip should not disable Claude for the whole session (only a usage cap does)."""
-    t = _translator()
-    conn = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
-    with patch.object(t, "client") as mc, \
-         patch("requests.post", return_value=_ollama_resp(_VALID)):
-        mc.messages.create.side_effect = conn
-        t.translate("color chain A red", _session())
-    _assert(t._claude_capped is False, "transient connection error does NOT latch")
-
+# -- C. (REMOVED) Claude fallback / usage-cap / latch routing — RETIRED:
+#      translation is LOCAL-ONLY (Ollama); there is no Claude backend to fall back
+#      from, no usage cap, no latch. See the local request/parse/guard tests above.
 
 # -- D. VRAM unload invariant --------------------------------------------------
 
@@ -341,13 +156,15 @@ def test_non_gpu_dispatch_does_not_unload() -> None:
 
 def test_config_and_factory() -> None:
     print("\n=== E. config + factory ===")
-    for k in ("TRANSLATOR_BACKEND", "TRANSLATOR_FALLBACK", "OLLAMA_BASE_URL",
-              "OLLAMA_MODEL", "OLLAMA_NUM_CTX", "OLLAMA_KEEP_ALIVE", "OLLAMA_TIMEOUT",
-              "TRANSLATOR_TOOL_NAMES"):
+    for k in ("OLLAMA_BASE_URL", "OLLAMA_MODEL", "OLLAMA_NUM_CTX",
+              "OLLAMA_KEEP_ALIVE", "OLLAMA_TIMEOUT", "TRANSLATOR_TOOL_NAMES"):
         _assert(hasattr(config, k), f"config.{k} present")
-    _assert(config.TRANSLATOR_BACKEND == "claude", "default backend UNCHANGED (claude)")
-    _assert(isinstance(make_backend("ollama"), OllamaBackend), "factory builds OllamaBackend")
-    _assert("ollama" in T._BACKENDS, "ollama registered in _BACKENDS")
+    _assert(not hasattr(config, "TRANSLATOR_BACKEND"),
+            "TRANSLATOR_BACKEND removed (translation is local-only)")
+    _assert(isinstance(make_backend("ollama"), OllamaBackend), "make_backend → OllamaBackend")
+    import pytest as _pt
+    with _pt.raises(RuntimeError):
+        make_backend("claude")   # the Claude arm is retired
 
 
 # -- F. enum-constrained tools + targeted few-shot -----------------------------
@@ -395,15 +212,6 @@ def main() -> int:
     print("=" * 60); print("tests/test_ollama_backend.py"); print("=" * 60)
     test_ollama_builds_constrained_request_and_parses()
     test_guard_applies_to_ollama_output()
-    test_claude_error_falls_back_to_ollama()
-    test_claude_success_does_not_call_ollama()
-    test_fallback_disabled_reraises()
-    test_forced_ollama_error_surfaces_claude_never_called()
-    test_refusal_is_not_a_fallback_trigger()
-    test_is_usage_cap_error_classification()
-    test_usage_cap_falls_back_to_ollama()
-    test_usage_cap_fallback_disabled_reraises()
-    test_non_usage_cap_400_does_not_fall_back()
     print("\n(ensure-unloaded tests need pytest's monkeypatch)")
     test_gpu_dispatch_fires_unload()
     test_non_gpu_dispatch_does_not_unload()

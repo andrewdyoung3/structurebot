@@ -1,4 +1,4 @@
-anthropic>=0.40.0
+# NL translation is LOCAL-ONLY (the local Ollama model) — no anthropic / Claude SDK.
 requests>=2.31.0
 rich>=13.7.0
 

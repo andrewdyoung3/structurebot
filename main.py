@@ -209,14 +209,7 @@ class StructureBot:
     def startup(self) -> None:
         console.print(Panel(BANNER, border_style="cyan", padding=(0, 2)))
 
-        # 1. Check ANTHROPIC_API_KEY
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            console.print(
-                "[err]✗ ANTHROPIC_API_KEY is not set.[/err]\n"
-                "  Add it to .env.local:  ANTHROPIC_API_KEY=sk-ant-...\n"
-                "  Or set it in your shell before running StructureBot."
-            )
-            sys.exit(1)
+        # Translation is local-only (Ollama) — no API key to check.
 
         # 2. Verify ChimeraX path
         cx_path = Path(self.bridge.chimerax_path or "")

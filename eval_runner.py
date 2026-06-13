@@ -612,7 +612,9 @@ def main(argv=None) -> Dict[str, Path]:
     ap = argparse.ArgumentParser(description="Run the model-independent 3-dimension translator benchmark.")
     ap.add_argument("--manifest", default="scripts/eval_corpus_manifest.json",
                     help="frozen corpus JSON")
-    ap.add_argument("--backends", default="claude,ollama", help="comma list (claude,ollama)")
+    ap.add_argument("--backends", default="ollama",
+                    help="comma list; only 'ollama' runs (the 'claude' arm is retired — "
+                         "translation is local-only; requesting it raises)")
     ap.add_argument("--runs", type=int, default=6,
                     help="TOTAL runs per backend; the cold run is discarded, so scored = runs-1 "
                          "(use 6 for 5 scored runs)")

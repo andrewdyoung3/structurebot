@@ -20,61 +20,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# ── Ensure venv site-packages takes priority over any global install ──────────
-#
-# On Windows, pip install --user drops packages into
-#   %APPDATA%\Python\PythonXYZ\site-packages
-# which may appear on sys.path *before* the venv's site-packages, causing the
-# wrong (user-installed, possibly outdated) copy of anthropic to be loaded.
-#
-# We locate the venv relative to this file and, if any AppData path precedes
-# the venv on sys.path, move the venv to position 0.  We also evict any
-# already-cached anthropic.* modules so the corrected path takes effect.
-
-def _ensure_venv_priority() -> None:
-    _project_root   = Path(__file__).resolve().parent
-    _venv_site_pkgs = _project_root / "venv" / "Lib" / "site-packages"
-    _appdata_marker = str(Path.home() / "AppData" / "Roaming" / "Python")
-
-    if not _venv_site_pkgs.is_dir():
-        return
-
-    _venv_idx = next(
-        (i for i, p in enumerate(sys.path)
-         if Path(p).resolve() == _venv_site_pkgs),
-        None,
-    )
-    _appdata_idxs = [
-        i for i, p in enumerate(sys.path)
-        if _appdata_marker.lower() in p.lower()
-    ]
-
-    _needs_fix = (
-        _venv_idx is None
-        or (_appdata_idxs and min(_appdata_idxs) < _venv_idx)
-    )
-
-    if _needs_fix:
-        _venv_str = str(_venv_site_pkgs)
-        if _venv_idx is not None:
-            sys.path.pop(_venv_idx)
-        sys.path.insert(0, _venv_str)
-
-        # Evict cached anthropic modules so re-import resolves against venv
-        for _mod in [m for m in list(sys.modules)
-                     if m == "anthropic" or m.startswith("anthropic.")]:
-            del sys.modules[_mod]
-
-_ensure_venv_priority()
-
-import anthropic
-
 import config
 from session_state import SessionState
 
-# ── Model ──────────────────────────────────────────────────────────────────────
-
-DEFAULT_MODEL: str = config.ANTHROPIC_MODEL
 
 
 class RefusalError(ValueError):
@@ -984,47 +932,6 @@ class TranslatorBackend:
         raise NotImplementedError
 
 
-class ClaudeBackend(TranslatorBackend):
-    """
-    Default backend — the Anthropic Claude API.  Wraps the current logic
-    verbatim, using the translator's shared system prompt
-    (``_build_system_blocks``) and primitives (``_pre_screen`` / ``_call_api`` /
-    ``_parse_response`` / ``_history`` / ``client``).
-    """
-    name = "claude"
-
-    def translate(self, translator: "CommandTranslator",
-                  user_input: str, session) -> Dict[str, Any]:
-        system_blocks = translator._build_system_blocks(session)
-
-        # Short-circuit for requests that bypass the API entirely.
-        pre = translator._pre_screen(user_input)
-        if pre is not None:
-            translator._history.append({"role": "user",      "content": user_input})
-            translator._history.append({"role": "assistant",  "content": "{}"})
-            return pre
-
-        translator._history.append({"role": "user", "content": user_input})
-        raw = translator._call_api(system_blocks)
-        translator._history.append({"role": "assistant", "content": raw})
-
-        result = translator._parse_response(raw)
-
-        # Retry once if JSON parsing failed.
-        if result.get("_parse_failed"):
-            retry_msg = (
-                "Your previous response was not valid JSON. "
-                "Respond with ONLY a JSON object matching the schema, no other text."
-            )
-            translator._history.append({"role": "user", "content": retry_msg})
-            raw2 = translator._call_api(system_blocks)
-            translator._history.append({"role": "assistant", "content": raw2})
-            result = translator._parse_response(raw2)
-            result.pop("_parse_failed", None)
-
-        return result
-
-
 # JSON schema for Ollama's structured output — EXACTLY the normalized 7-key
 # translation object (the shared schema; NOT a fork of the prompt text).
 # `tools_needed` items are ENUM-constrained to the real router registry
@@ -1061,10 +968,9 @@ _OLLAMA_MAY_BE_LOADED = False
 
 class OllamaBackend(TranslatorBackend):
     """
-    Local-LLM backend via Ollama (benchmark + fallback role; Claude stays the
-    default). Same interface and SAME normalized output as ClaudeBackend: reuses
-    the translator's shared prompt (`_build_system_blocks`) and normalization
-    (`_parse_response`) — no prompt fork.
+    The SOLE translation backend — the local Ollama model (translation is
+    LOCAL-ONLY by design; there is no Claude backend). Reuses the translator's
+    shared prompt (`_build_system_blocks`) and normalization (`_parse_response`).
 
     Output mechanism (locked): **schema-constrained JSON** via Ollama's native
     `/api/chat` `format` (NOT the model's tool-call template); `temperature=0`
@@ -1193,101 +1099,41 @@ def ensure_translator_unloaded() -> None:
         _OLLAMA_MAY_BE_LOADED = False
 
 
-# Claude API failures that justify a fallback (real transport/auth/quota issues,
-# NOT a successful-but-imperfect or refused response). APITimeoutError is a
-# subclass of APIConnectionError; AuthenticationError/RateLimitError of APIStatusError.
-_CLAUDE_FALLBACK_ERRORS = (
-    anthropic.APIConnectionError,
-    anthropic.AuthenticationError,
-    anthropic.RateLimitError,
-)
-
-
-def is_usage_cap_error(exc: BaseException) -> bool:
-    """True for a Claude API USAGE/SPEND-CAP rejection: a ``BadRequestError``
-    (HTTP 400, ``invalid_request_error``) whose message reports a usage limit
-    ("You have reached your specified API usage limits …").
-
-    NARROW on purpose. A usage-cap is a 400, not a 429 (`RateLimitError`) or 401
-    (`AuthenticationError`), so it matched none of `_CLAUDE_FALLBACK_ERRORS`. But a
-    genuinely malformed request is ALSO a 400 `BadRequestError` — it must NOT match
-    here (it has to surface, never silently reroute to Ollama). The discriminator is
-    the "usage limit" phrase in the message, narrowed by the `invalid_request_error`
-    error type when the SDK exposes the parsed body.
-    """
-    if not isinstance(exc, anthropic.BadRequestError):
-        return False
-    msg = (getattr(exc, "message", None) or str(exc) or "").lower()
-    if "usage limit" not in msg:
-        return False
-    etype = ""
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict):
-            etype = str(err.get("type", "")).lower()
-    # accept the cap when the type confirms it OR the SDK didn't expose a parsed body
-    return etype in ("", "invalid_request_error")
-
-
-_BACKENDS = {"claude": ClaudeBackend, "ollama": OllamaBackend}
-
-
-def make_backend(name: str) -> TranslatorBackend:
-    """
-    Return the translation backend for *name* (``config.TRANSLATOR_BACKEND``).
-    Only ``"claude"`` exists today; an unknown name falls back to it.
-    """
-    cls = _BACKENDS.get((name or "claude").strip().lower())
-    if cls is None:
-        sys.stderr.write(
-            f"[translator] unknown TRANSLATOR_BACKEND {name!r}; using 'claude'.\n")
-        cls = ClaudeBackend
-    return cls()
+def make_backend(name: str = "ollama") -> "TranslatorBackend":
+    """RETAINED for the (opt-in) eval/benchmark harness ONLY — the live translate path
+    uses OllamaBackend() directly (no selection, no runtime Claude-seeking). Translation
+    is LOCAL-ONLY: the "claude" arm is RETIRED and raises; any other name → Ollama."""
+    if (name or "").strip().lower() == "claude":
+        raise RuntimeError(
+            "The Claude translate backend is retired — StructureBot translation is "
+            "LOCAL-ONLY (Ollama). See §0."
+        )
+    return OllamaBackend()
 
 
 # ── Translator ─────────────────────────────────────────────────────────────────
 
 class CommandTranslator:
     """
-    Converts natural language into ChimeraX commands via a pluggable LLM backend
-    (default: the Anthropic Claude API — see TRANSLATOR_BACKEND / ClaudeBackend).
+    Converts natural language into ChimeraX commands via the LOCAL Ollama model.
+    Translation is LOCAL-ONLY by design — there is no Claude/Anthropic path, no
+    API key, no external network or server-side-state dependency (see §0). The
+    `api_key` parameter is accepted-and-ignored for back-compat with old callers.
 
     Conversation history is maintained across turns so follow-up requests
     ("now do the same for chain B") work without re-stating context.
     """
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model:   str = DEFAULT_MODEL,
-    ):
-        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        if not key:
-            raise ValueError(
-                "ANTHROPIC_API_KEY is not set.\n"
-                "  Add it to .env.local or set it in your shell."
-            )
-        self.client  = anthropic.Anthropic(api_key=key)
-        self.model   = model
+    def __init__(self, api_key: Optional[str] = None):  # api_key ignored (local-only)
         self._ref    = _load_command_reference()
         self._history: List[Dict[str, str]] = []
 
         # Pre-format the static block once; it never changes during a session.
         self._static_block: str = _STATIC_SYSTEM.format(command_reference=self._ref)
 
-        # Pluggable translation backend (default: Claude). The backend reuses the
-        # shared prompt/parsing on this translator; the Claude primitives
-        # (client / _call_api / _pre_screen / _static_block) stay here unchanged.
-        self._backend: TranslatorBackend = make_backend(
-            getattr(config, "TRANSLATOR_BACKEND", "claude")
-        )
-
-        # Per-session Claude usage-cap latch (Priority 0.4).  Once a usage/spend
-        # cap rejection is seen, every subsequent translate routes straight to
-        # Ollama — no more wasted capped Claude round-trips for the rest of the
-        # session.  Mirrors the intent classifier's _claude_capped latch.
-        self._claude_capped: bool = False
+        # The sole translate backend: the local Ollama model. No backend selection,
+        # no runtime Claude-seeking — there is nothing to choose.
+        self._backend: TranslatorBackend = OllamaBackend()
 
     # ── Public ─────────────────────────────────────────────────────────────────
 
@@ -1311,7 +1157,7 @@ class CommandTranslator:
           3. _validate_open_targets  — block unresolvable open targets (Bug 4a)
           4. _validate_command_verbs — reject unregistered leading verbs (Bug 4b)
         """
-        result   = self._translate_via_backend(user_input, session)
+        result   = self._backend.translate(self, user_input, session)
         cmds     = result.get("commands")     or []
         exps     = result.get("explanations") or []
         warnings = list(result.get("warnings") or [])
@@ -1338,58 +1184,6 @@ class CommandTranslator:
         result["explanations"] = exps
         result["warnings"]     = warnings
         return result
-
-    def _translate_via_backend(self, user_input: str, session) -> Dict[str, Any]:
-        """
-        Run the active backend, with the LOCKED one-directional fallback:
-
-        - active backend == "claude": on a REAL Claude API failure
-          (connection/timeout/auth/rate-limit) AND config.TRANSLATOR_FALLBACK,
-          fall back to the local Ollama backend. Any other error (e.g. a
-          RefusalError from an empty/declined-but-successful response) propagates
-          unchanged — never a fallback trigger.
-        - a Claude USAGE/SPEND-CAP rejection (a 400 BadRequestError, NOT a 429/401)
-          is also treated as a fallback trigger when active == claude; a genuinely
-          malformed 400 must SURFACE, never reroute (see is_usage_cap_error).
-        - active backend == "ollama" (forced/benchmark): NEVER falls back to
-          Claude; its error surfaces (benchmark honesty).
-        """
-        # Cap latch: once a usage cap was seen this session, skip Claude entirely
-        # and go straight to Ollama (no dangling user turn to pop — ClaudeBackend
-        # was never called this turn, so route directly without _fall_back_to_ollama).
-        if self._claude_capped and self._may_fall_back():
-            return make_backend("ollama").translate(self, user_input, session)
-
-        try:
-            return self._backend.translate(self, user_input, session)
-        except _CLAUDE_FALLBACK_ERRORS as exc:
-            if not self._may_fall_back():
-                raise
-            return self._fall_back_to_ollama(user_input, session, type(exc).__name__)
-        except anthropic.BadRequestError as exc:
-            # A usage/spend-cap rejection is a 400 (invalid_request_error), so it
-            # never matched _CLAUDE_FALLBACK_ERRORS. Fall back ONLY for the cap; any
-            # other 400 (a real malformed request) re-raises and surfaces.
-            if not (is_usage_cap_error(exc) and self._may_fall_back()):
-                raise
-            self._claude_capped = True   # latch — skip Claude for the rest of the session
-            return self._fall_back_to_ollama(user_input, session, "usage-limit cap")
-
-    def _may_fall_back(self) -> bool:
-        """The one-directional fallback is allowed only when the ACTIVE backend is
-        claude and TRANSLATOR_FALLBACK is on — a forced 'ollama' NEVER falls back."""
-        return (self._backend.name == "claude"
-                and getattr(config, "TRANSLATOR_FALLBACK", True))
-
-    def _fall_back_to_ollama(self, user_input: str, session, reason: str) -> Dict[str, Any]:
-        """Drop the dangling user turn ClaudeBackend appended before failing (so the
-        fallback doesn't double-append it) and re-run on the local Ollama backend."""
-        if self._history and self._history[-1].get("role") == "user":
-            self._history.pop()
-        sys.stderr.write(
-            f"[translator] Claude API failure ({reason}); "
-            "falling back to the local Ollama backend.\n")
-        return make_backend("ollama").translate(self, user_input, session)
 
     def _build_system_blocks(self, session: SessionState) -> list:
         """
@@ -1491,30 +1285,6 @@ class CommandTranslator:
             }
         return None
 
-    def _call_api(self, system_blocks: list) -> str:
-        # One automatic retry. An empty/declined response on a routine
-        # structural-biology request is usually transient/over-eager — re-issuing
-        # the IDENTICAL request typically succeeds — so we try twice before
-        # surfacing anything to the user. (Genuine content concerns refuse again.)
-        stop = "unknown"
-        for _attempt in range(2):
-            response = self.client.messages.create(
-                model      = self.model,
-                max_tokens = 2048,
-                system     = system_blocks,
-                messages   = self._history,
-            )
-            if response.content:
-                return response.content[0].text.strip()
-            stop = getattr(response, "stop_reason", "unknown")
-        # Both attempts came back empty — surface the REAL reason (the actual
-        # stop_reason), not a generic "safety filter" assumption.
-        raise RefusalError(
-            f"the model returned no content (stop_reason={stop!r}) after an "
-            "automatic retry. Routine structural-biology requests can hit a "
-            "transient/over-eager decline — try again or rephrase slightly."
-        )
-
     @staticmethod
     def _parse_response(raw: str) -> Dict[str, Any]:
         """
@@ -1598,6 +1368,6 @@ class CommandTranslator:
 
     def __repr__(self) -> str:
         return (
-            f"<CommandTranslator model={self.model!r} "
+            f"<CommandTranslator backend=ollama model={config.OLLAMA_MODEL!r} "
             f"history_turns={len(self._history) // 2}>"
         )

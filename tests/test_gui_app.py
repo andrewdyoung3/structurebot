@@ -205,15 +205,16 @@ def test_preflight_ollama_already_up(_app, monkeypatch):
     assert not w._services                                    # nothing spawned (already up)
 
 
-def test_preflight_ollama_model_missing_warns(_app, monkeypatch):
+def test_preflight_ollama_model_missing_is_blocking(_app, monkeypatch):
     class Resp:
         status_code = 200
         def json(self): return {"models": [{"name": "llama3:8b"}]}   # qwen3 absent
     monkeypatch.setattr(gui_app.requests, "get", lambda *a, **k: Resp())
     w = _preflight_fake()
     w._preflight_ollama()
-    warns = " ".join(str(c) for c in w.presenter.warn.call_args_list)
-    assert "not found" in warns and "pull" in warns
+    # Translation is local-only with NO fallback → a missing model is a BLOCKING error.
+    errs = " ".join(str(c) for c in w.presenter.error.call_args_list)
+    assert "REQUIRED" in errs and "missing" in errs and "pull" in errs
 
 
 def test_bridge_on_structure_opened_fires(_app, monkeypatch):
