@@ -127,31 +127,41 @@ class SequenceEditorController:
                 ids.append(m.group(1))
         return ids
 
+    def load_model(self, model_id: str) -> List[ChainSeq]:
+        """Read ONE model's macromolecule residues over REST and build/replace its
+        per-chain sequence grids in `self.chains` WITHOUT clearing the other models
+        (so a freshly-displayed model is *added* alongside existing tabs). Returns
+        that model's ChainSeqs. Reuses `parse_selection_text` + `chain_resnum_to_seqpos`
+        exactly like the all-models path."""
+        mid = str(model_id).lstrip("#").strip()
+        # exclude solvent/ligand/ions exactly like chimerax_bridge._model_chain_resnums
+        text = self._value(f"info residues #{mid} & ~solvent & ~ligand & ~ions")
+        refs = parse_selection_text(text, default_model=mid)
+        by_chain: Dict[str, Dict[int, str]] = {}
+        for (_model, chain, resnum, resname) in refs:
+            # first occurrence wins (insertion codes collapse to base number — the
+            # documented spine limitation; common non-1-start/gap cases preserved)
+            by_chain.setdefault(chain, {}).setdefault(resnum, resname)
+        out: List[ChainSeq] = []
+        for chain, rn_to_name in by_chain.items():
+            ordered_resnums = sorted(rn_to_name)
+            pos_map = chain_resnum_to_seqpos(ordered_resnums)
+            cells = [ResidueCell(mid, chain, rn, three_to_one(rn_to_name[rn]),
+                                 pos_map[rn]) for rn in ordered_resnums]
+            cs = ChainSeq(mid, chain, cells)
+            self.chains[(mid, chain)] = cs
+            out.append(cs)
+        return out
+
     def load_models(self) -> List[ChainSeq]:
         """Read every loaded model's macromolecule residues over REST and build the
-        per-chain sequence grid. Reuses `parse_selection_text` (identity parse) +
-        `chain_resnum_to_seqpos` (gap-aware numbering). Non-1-start / gapped chains
-        render correctly because positions come from the spine, not from assuming 1."""
+        per-chain sequence grid (the manual 'load all' path). Clears first, then
+        delegates per model to `load_model`. Non-1-start / gapped chains render
+        correctly because positions come from the spine, not from assuming 1."""
         self.chains.clear()
         out: List[ChainSeq] = []
         for mid in self.list_model_ids():
-            # exclude solvent/ligand/ions exactly like chimerax_bridge._model_chain_resnums
-            text = self._value(
-                f"info residues #{mid} & ~solvent & ~ligand & ~ions")
-            refs = parse_selection_text(text, default_model=mid)
-            by_chain: Dict[str, Dict[int, str]] = {}
-            for (_model, chain, resnum, resname) in refs:
-                # first occurrence wins (insertion codes collapse to base number — the
-                # documented spine limitation; common non-1-start/gap cases preserved)
-                by_chain.setdefault(chain, {}).setdefault(resnum, resname)
-            for chain, rn_to_name in by_chain.items():
-                ordered_resnums = sorted(rn_to_name)
-                pos_map = chain_resnum_to_seqpos(ordered_resnums)
-                cells = [ResidueCell(mid, chain, rn, three_to_one(rn_to_name[rn]),
-                                     pos_map[rn]) for rn in ordered_resnums]
-                cs = ChainSeq(mid, chain, cells)
-                self.chains[(mid, chain)] = cs
-                out.append(cs)
+            out.extend(self.load_model(mid))
         return out
 
     def get_chain(self, model: str, chain: str) -> Optional[ChainSeq]:

@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import requests
 
@@ -106,6 +106,11 @@ class ChimeraXBridge:
         self._command_queue: queue.Queue = queue.Queue()
         # Once-per-session guard for the lean window layout (Log/CLI/Toolbar hidden).
         self._lean_layout_applied: bool = False
+        # Optional fire-and-forget post-open hook: called with the REAL opened model id
+        # (digits, from _opened_model_id) after a successful structure open. The unified
+        # GUI sets this to capture ground-truth ids for tab focus; left None elsewhere
+        # (no-op). Never alters results, never aborts the open.
+        self.on_structure_opened: Optional[Callable[[str], None]] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -417,6 +422,13 @@ class ChimeraXBridge:
                 self._maybe_apply_presentation_on_open()
                 self._maybe_apply_lean_layout()
                 self._maybe_show_sequence_on_open(model_id)
+                # Fire-and-forget: hand the REAL opened model id to whoever registered
+                # (the unified GUI, for ground-truth tab focus). None elsewhere → no-op.
+                if self.on_structure_opened is not None:
+                    try:
+                        self.on_structure_opened(model_id)
+                    except Exception:
+                        pass
         return results
 
     # ── Post-open hooks ────────────────────────────────────────────────────────
