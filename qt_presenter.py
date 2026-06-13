@@ -30,7 +30,6 @@ from rich.table import Table
 from rich.theme import Theme
 
 from presenter import Presenter
-from translator import is_usage_cap_error
 
 # Same semantic theme as the console front-end (parity of meaning → colour).
 THEME = Theme({
@@ -185,13 +184,8 @@ class QtPresenter(Presenter):
                    "try the same request again, or rephrase it slightly.[/dim]")
 
     def translation_error(self, exc: Exception) -> None:
-        if is_usage_cap_error(exc):
-            self._emit(f"[warn]⚠ Claude API usage limit reached: {escape(str(exc))}[/warn]")
-            self._emit("[dim]Set TRANSLATOR_BACKEND=ollama to use the local model, or wait "
-                       "for the limit to reset.[/dim]")
-        else:
-            self._emit(f"[warn]⚠ Couldn't translate that request: {escape(str(exc))}[/warn]")
-            self._emit("[dim]Try again, or rephrase it.[/dim]")
+        self._emit(f"[warn]⚠ Couldn't translate that request: {escape(str(exc))}[/warn]")
+        self._emit("[dim]Is the local Ollama model reachable? Try again, or rephrase it.[/dim]")
 
     # ── status / long-running ─────────────────────────────────────────────────
     def status(self, label: str):

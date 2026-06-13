@@ -332,9 +332,10 @@ def print_rich(comparison: Dict[str, Any], model_label: str = "") -> None:
 
 def main() -> int:
     import argparse
-    ap = argparse.ArgumentParser(description="Translator backend benchmark (Claude vs Ollama).")
-    ap.add_argument("--backends", default="claude,ollama",
-                    help="comma list of registered backends to compare")
+    ap = argparse.ArgumentParser(description="Translator backend benchmark (LOCAL Ollama; "
+                                             "the Claude arm is retired — translation is local-only).")
+    ap.add_argument("--backends", default="ollama",
+                    help="comma list; only 'ollama' runs (the 'claude' arm is retired)")
     ap.add_argument("--runs", type=int, default=5,
                     help="runs per case (mean over N>=5 is the comparison bar)")
     ap.add_argument("--model", default=None, help="override OLLAMA_MODEL for this run")

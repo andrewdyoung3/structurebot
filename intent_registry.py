@@ -411,14 +411,14 @@ def make_llm_classify_fn(
     rules (backward compatible); a new op-class passes its own registry and task
     block (e.g. COLOR_REGISTRY + _COLOR_TASK_BLOCK).
 
-    Backend: tries the configured TRANSLATOR_BACKEND first; falls back to Ollama
-    on any failure (e.g. API cap).  The Ollama call uses `think: false` at the
-    TOP LEVEL of the request body — required for qwen3; NOT inside options{}.
+    Backend: the LOCAL Ollama model ONLY (classification is local-only, like
+    translation — no Claude path). The Ollama call uses `think: false` at the TOP
+    LEVEL of the request body — required for qwen3; NOT inside options{}.
+    (`backend_name` is accepted-and-ignored for back-compat with old callers.)
     """
     import config as _cfg
     _reg          = registry if registry is not None else VIEWER_REGISTRY
     _task         = task_block if task_block is not None else _VIEWER_TASK_BLOCK
-    _backend      = backend_name or getattr(_cfg, "TRANSLATOR_BACKEND", "ollama")
     _ollama_model = os.environ.get("OLLAMA_MODEL", getattr(_cfg, "OLLAMA_MODEL", "qwen3:8b"))
     _ollama_url   = (
         os.environ.get("OLLAMA_HOST")
@@ -462,30 +462,8 @@ def make_llm_classify_fn(
         )
         return _parse_resp(r.json().get("response", ""), all_labels)
 
-    # Latch: set to True on first Claude API failure — subsequent calls skip Claude
-    _claude_capped = [False]
-
     def classify(text: str, labels: List[str]) -> Optional[str]:
-        all_labels = list(labels) + ["uncovered", "none"]
-
-        if _backend == "claude" and not _claude_capped[0]:
-            try:
-                import anthropic
-                client = anthropic.Anthropic(
-                    api_key=os.environ.get("ANTHROPIC_API_KEY", "")
-                )
-                msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=30,
-                    messages=[{"role": "user", "content": _build_prompt(text, all_labels)}],
-                )
-                result = _parse_resp(msg.content[0].text or "", all_labels)
-                if result is not None:
-                    return result
-            except Exception:
-                _claude_capped[0] = True  # latch — skip Claude for this session
-
-        # Ollama — primary when backend=ollama, fallback when Claude failed/capped
+        # Local Ollama only — no Claude attempt, no API key, no network beyond localhost.
         try:
             return _call_ollama(text, labels)
         except Exception:

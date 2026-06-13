@@ -58,8 +58,18 @@ def _assert(cond: bool, name: str, msg: str = "") -> bool:
 
 
 def _make_translator() -> Translator:
-    """Return a Translator with a fake API key (no live calls)."""
-    return Translator(api_key="sk-ant-test-key-does-not-call-api")
+    """Return a local-only Translator (no live calls)."""
+    return Translator()
+
+
+def _stub_backend(t, json_str: str) -> None:
+    """Make t's backend return the given raw JSON via the shared _parse_response —
+    so translate()'s deterministic guards run backend-independently (no Claude/Ollama)."""
+    class _Stub:
+        name = "stub"
+        def translate(self, tr, user_input, session):
+            return tr._parse_response(json_str)
+    t._backend = _Stub()
 
 
 # -- A. _pre_screen() ----------------------------------------------------------
@@ -128,132 +138,24 @@ def test_translate_rfdiffusion_skips_api() -> None:
     session = MagicMock()
     session.get_context_summary.return_value = "No structures loaded."
 
-    # If the API were called, it would raise (fake key).
-    # We verify _call_api is NOT invoked.
-    with patch.object(t, "_call_api") as mock_api:
+    # The pre-screen short-circuits BEFORE any LLM call — verify the local Ollama
+    # request (requests.post) is never made.
+    with patch("requests.post") as mock_post:
         result = t.translate("design a binder for chain A", session)
 
-    mock_api.assert_not_called()
+    mock_post.assert_not_called()
     _assert("rfdiffusion" in result.get("tools_needed", []),
             "pre-screened result routes to rfdiffusion",
             f"got tools_needed={result.get('tools_needed')}")
 
 
-# -- B. _call_api() empty response guard ---------------------------------------
-
-def test_call_api_empty_content_raises_value_error() -> None:
-    print("\n=== B. _call_api() empty response guard ===")
-    t = _make_translator()
-
-    # Simulate an API response with an empty content list
-    mock_response = MagicMock()
-    mock_response.content = []
-    mock_response.stop_reason = "end_turn"
-
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = mock_response
-        try:
-            t._call_api([{"type": "text", "text": "system"}])
-            _fail("empty content raises ValueError", "no exception raised")
-        except ValueError as exc:
-            _assert("empty" in str(exc).lower() or "stop_reason" in str(exc),
-                    "ValueError message mentions empty response",
-                    f"got: {exc}")
-        except IndexError:
-            _fail("empty content raises ValueError",
-                  "got IndexError instead (guard not applied)")
-
-
-def test_call_api_non_empty_content_returns_text() -> None:
-    """Normal response returns stripped text without raising."""
-    t = _make_translator()
-
-    mock_response = MagicMock()
-    mock_response.content = [MagicMock(text="  hello world  ")]
-    mock_response.stop_reason = "end_turn"
-
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = mock_response
-        result = t._call_api([{"type": "text", "text": "system"}])
-
-    _assert(result == "hello world", "non-empty content returns stripped text",
-            f"got {result!r}")
-
-
-def test_call_api_stop_reason_in_error() -> None:
-    """stop_reason is included in the ValueError message."""
-    t = _make_translator()
-
-    mock_response = MagicMock()
-    mock_response.content = []
-    mock_response.stop_reason = "max_tokens"
-
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = mock_response
-        try:
-            t._call_api([])
-            _fail("stop_reason in error", "no exception raised")
-        except ValueError as exc:
-            _assert("max_tokens" in str(exc),
-                    "stop_reason='max_tokens' in error message",
-                    f"got: {exc}")
-
-
 # -- C. Over-eager refusal handling (false positives on benign design) ---------
-
-_BENIGN = "redesign the dimer interface residues to be hydrophilic, no cysteines"
 
 _VALID_JSON = (
     '{"commands": ["select #1/A"], "explanations": ["x"], "warnings": [], '
     '"clarification_needed": null, "confidence": "high", '
     '"tools_needed": ["proteinmpnn"], "tool_inputs": {}}'
 )
-
-
-def test_benign_design_request_not_flagged() -> None:
-    """
-    A benign protein-engineering request that gets ONE transient empty/declined
-    response must NOT be flagged: the automatic retry succeeds and a normal result
-    is returned (no RefusalError).
-    """
-    print("\n=== C. over-eager refusal handling ===")
-    t = _make_translator()
-    session = MagicMock()
-    session.get_context_summary.return_value = "No structures loaded."
-
-    empty = MagicMock(content=[], stop_reason="refusal")
-    good  = MagicMock(content=[MagicMock(text=_VALID_JSON)], stop_reason="end_turn")
-
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.side_effect = [empty, good]   # 1st empty, retry OK
-        result = t.translate(_BENIGN, session)
-
-    # the chain-scope guard scopes the bare `select #1/A` to the macromolecule
-    assert result.get("commands") == ["select (#1/A & ~ligand & ~solvent & ~ions)"], (
-        f"benign request should translate after retry, got {result!r}")
-    assert mock_client.messages.create.call_count == 2, "should retry exactly once"
-    _ok("benign design request not flagged (retry rescued it)")
-
-
-def test_call_api_retries_once_then_refuses() -> None:
-    """Two consecutive empty responses → RefusalError, after exactly 2 calls."""
-    t = _make_translator()
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = MagicMock(
-            content=[], stop_reason="refusal")
-        try:
-            t._call_api([{"type": "text", "text": "system"}])
-            _fail("retries then refuses", "no exception raised")
-            return
-        except RefusalError as exc:
-            _assert(mock_client.messages.create.call_count == 2,
-                    "retried exactly once before refusing",
-                    f"got {mock_client.messages.create.call_count} calls")
-            # Transparent: shows the REAL stop_reason, does NOT claim a safety filter.
-            _assert("stop_reason" in str(exc) and "refusal" in str(exc),
-                    "refusal message surfaces the real stop_reason", f"got: {exc}")
-            _assert("safety filter" not in str(exc).lower(),
-                    "refusal message does NOT assume a safety filter", f"got: {exc}")
 
 
 def test_system_prompt_frames_routine_design_as_legitimate() -> None:
@@ -347,11 +249,9 @@ def test_translate_rewrites_zone_end_to_end() -> None:
     t = _make_translator()
     session = MagicMock()
     session.get_context_summary.return_value = "1IL8 loaded as #1 (chains A, B)."
-    resp = MagicMock(content=[MagicMock(text=_ZONE_JSON)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = resp
-        result = t.translate(
-            "select the residues at the dimer interface on chain A", session)
+    _stub_backend(t, _ZONE_JSON)
+    result = t.translate(
+        "select the residues at the dimer interface on chain A", session)
     cmds = result.get("commands", [])
     _assert(cmds[0] == "select (#1/A & ~ligand & ~solvent & ~ions) & "
             "((#1/B & ~ligand & ~solvent & ~ions) :<4.5)",
@@ -411,10 +311,8 @@ def test_hide_chain_targets_representation() -> None:
         '"warnings": [], "clarification_needed": null, "confidence": "high", '
         '"tools_needed": ["chimerax"], "tool_inputs": {}}'
     )
-    resp = MagicMock(content=[MagicMock(text=hide_json)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = resp
-        result = t.translate("hide chain B", session)
+    _stub_backend(t, hide_json)
+    result = t.translate("hide chain B", session)
     cmds = result.get("commands", [])
     joined = " ".join(cmds).lower()
     _assert(cmds == ["hide (#1/B & ~ligand & ~solvent & ~ions) cartoon"],
@@ -426,15 +324,16 @@ def test_hide_chain_targets_representation() -> None:
 
 # -- E. Pluggable backend (Claude default; same normalized shape) --------------
 
-def test_default_backend_is_claude() -> None:
-    print("\n=== E. pluggable backend ===")
-    from translator import ClaudeBackend, TranslatorBackend
+def test_default_backend_is_ollama() -> None:
+    print("\n=== E. local-only backend ===")
+    from translator import OllamaBackend, TranslatorBackend
     t = _make_translator()
-    _assert(isinstance(t._backend, ClaudeBackend),
-            "default backend is ClaudeBackend", f"got {type(t._backend).__name__}")
+    _assert(isinstance(t._backend, OllamaBackend),
+            "the sole backend is OllamaBackend (local-only)", f"got {type(t._backend).__name__}")
     _assert(isinstance(t._backend, TranslatorBackend),
-            "ClaudeBackend implements the TranslatorBackend interface")
-    _assert(t._backend.name == "claude", "backend name is 'claude'")
+            "OllamaBackend implements the TranslatorBackend interface")
+    _assert(t._backend.name == "ollama", "backend name is 'ollama'")
+    _assert(getattr(t, "client", None) is None, "no Claude client (local-only)")
 
 
 def test_backend_translate_returns_normalized_shape() -> None:
@@ -443,17 +342,15 @@ def test_backend_translate_returns_normalized_shape() -> None:
     t = _make_translator()
     session = MagicMock()
     session.get_context_summary.return_value = "No structures loaded."
-    good = MagicMock(content=[MagicMock(text=_VALID_JSON)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = good
-        result = t.translate("color chain A red", session)
+    _stub_backend(t, _VALID_JSON)
+    result = t.translate("color chain A red", session)
     for key in ("commands", "explanations", "warnings", "clarification_needed",
                 "confidence", "tools_needed", "tool_inputs"):
         _assert(key in result, f"normalized result has '{key}'")
     _assert(result["commands"] == ["select (#1/A & ~ligand & ~solvent & ~ions)"],
             "backend produced the parsed commands (chain-scoped)", f"got {result.get('commands')}")
-    _assert(mock_client.messages.create.called,
-            "default backend used the Claude client")
+    _assert(type(t._backend).__name__ in ("OllamaBackend", "_Stub"),
+            "translate routed through the (local) backend")
 
 
 # -- F. Open-target validation guard (Bug 4a) ----------------------------------
@@ -524,10 +421,8 @@ def test_open_guard_end_to_end_in_translate() -> None:
         '"clarification_needed": null, "confidence": "high", '
         '"tools_needed": ["chimerax"], "tool_inputs": {}}'
     )
-    resp = MagicMock(content=[MagicMock(text=bad_json)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = resp
-        result = t.translate("open sequence", session)
+    _stub_backend(t, bad_json)
+    result = t.translate("open sequence", session)
     cmds = result.get("commands", [])
     _assert("open sequence" not in cmds,
             "blocked open not in commands", f"got {cmds}")
@@ -602,10 +497,8 @@ def test_verb_guard_end_to_end_in_translate() -> None:
         '"clarification_needed": null, "confidence": "high", '
         '"tools_needed": ["chimerax"], "tool_inputs": {}}'
     )
-    resp = MagicMock(content=[MagicMock(text=bad_json)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = resp
-        result = t.translate("find chain A", session)
+    _stub_backend(t, bad_json)
+    result = t.translate("find chain A", session)
     cmds = result.get("commands", [])
     _assert("find chain A" not in cmds,
             "hallucinated verb not in commands", f"got {cmds}")
@@ -683,10 +576,8 @@ def test_correction_blocked_by_guard_4a() -> None:
         '"warnings": [], "clarification_needed": null, "confidence": "medium", '
         '"tools_needed": ["chimerax"], "tool_inputs": {}}'
     )
-    resp = MagicMock(content=[MagicMock(text=same_bad_json)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = resp
-        fix = t.translate_error_fix("open design1.pdb", "No such file", session)
+    _stub_backend(t, same_bad_json)
+    fix = t.translate_error_fix("open design1.pdb", "No such file", session)
     # Guard 4a should have blocked open design1.pdb → commands empty
     _assert(not fix.get("commands"),
             "re-proposed invalid open blocked by guard 4a in correction", f"got {fix.get('commands')}")
@@ -702,10 +593,8 @@ def test_correction_blocked_by_guard_4b() -> None:
         '"warnings": [], "clarification_needed": null, "confidence": "low", '
         '"tools_needed": ["chimerax"], "tool_inputs": {}}'
     )
-    resp = MagicMock(content=[MagicMock(text=bad_fix_json)], stop_reason="end_turn")
-    with patch.object(t, "client") as mock_client:
-        mock_client.messages.create.return_value = resp
-        fix = t.translate_error_fix("find design1.pdb", "Unknown command: find", session)
+    _stub_backend(t, bad_fix_json)
+    fix = t.translate_error_fix("find design1.pdb", "Unknown command: find", session)
     _assert(not fix.get("commands"),
             "hallucinated verb in correction blocked by guard 4b", f"got {fix.get('commands')}")
 
@@ -725,13 +614,8 @@ def main() -> int:
     test_translate_rfdiffusion_skips_api()
 
     # B. _call_api() guard
-    test_call_api_empty_content_raises_value_error()
-    test_call_api_non_empty_content_returns_text()
-    test_call_api_stop_reason_in_error()
 
     # C. over-eager refusal handling
-    test_benign_design_request_not_flagged()
-    test_call_api_retries_once_then_refuses()
     test_system_prompt_frames_routine_design_as_legitimate()
 
     # D. zone-syntax guard + hide/show representation
@@ -747,7 +631,7 @@ def main() -> int:
     test_hide_chain_targets_representation()
 
     # E. pluggable backend
-    test_default_backend_is_claude()
+    test_default_backend_is_ollama()
     test_backend_translate_returns_normalized_shape()
 
     # F. open-target validation guard (Bug 4a)

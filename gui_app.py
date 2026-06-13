@@ -583,13 +583,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         """Worker-thread preflight: bring up ChimeraX + Ollama, render the ✓ checklist to
         the pane, offer session restore. Error-first — any dependency that won't come up
         is reported and the GUI stays usable."""
-        import os
         p = self.presenter
-        p.info("StructureBot — starting up…")
-        # API key: DEGRADE (don't hard-exit) — Claude is optional/capped; Ollama is local.
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            p.warn("⚠ ANTHROPIC_API_KEY not set — Claude unavailable; using local Ollama "
-                   "(set TRANSLATOR_BACKEND=ollama).")
+        p.info("StructureBot — starting up… (translation is LOCAL-ONLY via Ollama)")
+        # No API-key check — there is no Claude/Anthropic path.
         self._preflight_chimerax()
         self._preflight_ollama()
         self._preflight_accelerators()
@@ -697,10 +693,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 svc.start()
                 self._services.append(svc)
             except FileNotFoundError:
-                p.warn("⚠ `ollama` not on PATH — local translation unavailable (install Ollama).")
+                p.error("✗ REQUIRED: Ollama is not installed — translation is LOCAL-ONLY "
+                        "and has NO fallback. Install from https://ollama.com/download.")
                 return
             except Exception as exc:
-                p.warn(f"⚠ Couldn't start Ollama: {exc}")
+                p.error(f"✗ REQUIRED: couldn't start Ollama: {exc} — translation cannot run "
+                        "without it (no fallback).")
                 return
             deadline = time.time() + 30
             while time.time() < deadline:
@@ -709,7 +707,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     break
                 time.sleep(0.5)
             if t is None:
-                p.warn("⚠ Ollama did not become ready within 30 s.")
+                p.error("✗ REQUIRED: Ollama did not become ready within 30 s — translation "
+                        "cannot run without it (no fallback). Check `ollama serve`.")
                 return
             p.success(f"✓ Ollama serve is up ({where})")
         else:
@@ -720,7 +719,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if any(n == model or n.startswith(stem) for n in names):
             p.dim(f"  model {model} present")
         else:
-            p.warn(f"⚠ Ollama model {model} not found — run `ollama pull {model}`.")
+            p.error(f"✗ REQUIRED: Ollama model {model} is missing — translation cannot run "
+                    f"without it (no fallback). Run `ollama pull {model}`.")
             return
 
         # GPU-vs-CPU placement (B1) — the original bug class: "up" ≠ "on the GPU".

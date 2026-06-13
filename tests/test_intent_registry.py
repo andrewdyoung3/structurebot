@@ -729,8 +729,9 @@ class TestClassifierBackend:
         body = captured[0]
         assert body["options"]["num_predict"] >= 60
 
-    def test_classifier_falls_back_to_ollama_when_claude_raises(self):
-        """If the Claude path raises (e.g. API cap), Ollama is tried as fallback."""
+    def test_classifier_uses_ollama_only(self):
+        """Classification is LOCAL-ONLY — Ollama is called and there is no Claude
+        attempt (the `backend_name` arg is accepted-and-ignored)."""
         ollama_calls: list = []
 
         def fake_post(url, json=None, **kw):
@@ -739,16 +740,12 @@ class TestClassifierBackend:
             resp.json.return_value = {"response": "view.hide_atoms"}
             return resp
 
-        with patch("anthropic.Anthropic") as mock_anthropic, \
-             patch("requests.post", side_effect=fake_post):
-            mock_anthropic.return_value.messages.create.side_effect = RuntimeError(
-                "monthly usage limit reached"
-            )
-            fn = make_llm_classify_fn(backend_name="claude")
+        with patch("requests.post", side_effect=fake_post):
+            fn = make_llm_classify_fn(backend_name="claude")  # arg ignored — no Claude path
             labels = VIEWER_REGISTRY.list_intent_keys("view")
             result = fn("remove all spheres", labels)
 
-        assert ollama_calls, "Ollama fallback was never called after Claude failure"
+        assert ollama_calls, "Ollama was called (local-only classification)"
         assert result == "view.hide_atoms"
 
     def test_uncovered_response_yields_graceful_miss(self):

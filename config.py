@@ -134,13 +134,9 @@ CONFORMER_B_TRANSPARENCY: int = int(
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
-# claude-sonnet-4-6 is the current recommended model.
-# Upgrade to claude-opus-4-7 for the hardest multi-step reasoning tasks.
-ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-
-# NL→ChimeraX translation backend (pluggable). "claude" (Anthropic API, default)
-# or "ollama" (local model). Unknown values fall back to "claude".
-TRANSLATOR_BACKEND: str = os.environ.get("TRANSLATOR_BACKEND", "claude").strip().lower()
+# NL→ChimeraX translation is LOCAL-ONLY (the local Ollama model; see translator.py
+# and §0). There is no Claude/Anthropic backend, no API key, and no backend-selection
+# switch — TRANSLATOR_BACKEND / TRANSLATOR_FALLBACK / ANTHROPIC_MODEL were removed.
 
 # Canonical valid tool names — the EXACT (lowercase) literals the router
 # dispatches on (`tool_router._dispatch_tool`). Used to ENUM-constrain the Ollama
@@ -156,15 +152,6 @@ TRANSLATOR_TOOL_NAMES: list = [
     "validate_ddg", "validate_design",
 ]
 
-# One-directional fallback: when TRANSLATOR_BACKEND="claude" and the Claude API
-# fails with a REAL API-failure (connection-unreachable / timeout / auth /
-# rate-limit), fall back to the local Ollama backend. A successful-but-imperfect
-# Claude response is used as-is (never a fallback trigger). A forced
-# TRANSLATOR_BACKEND="ollama" NEVER falls back to Claude (benchmark honesty).
-TRANSLATOR_FALLBACK: bool = (
-    os.environ.get("TRANSLATOR_FALLBACK", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
 
 # ── Ollama local LLM backend (benchmark + fallback; see translator.OllamaBackend)
 OLLAMA_BASE_URL: str = os.environ.get(

@@ -220,29 +220,8 @@ class TestScriptRunner:
 # Translation-error backstop — the REPL must never crash on a backend error
 # ════════════════════════════════════════════════════════════════════════════════
 class TestTranslationErrorBackstop:
-    @staticmethod
-    def _cap_error():
-        import anthropic
-        import httpx
-        msg = ("You have reached your specified API usage limits. "
-               "You will regain access on 2026-07-01 at 00:00 UTC.")
-        return anthropic.BadRequestError(
-            msg, response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
-            body={"type": "error", "error": {"type": "invalid_request_error", "message": msg}})
-
-    def test_usage_cap_does_not_crash_repl(self):
-        """A Claude usage-cap BadRequestError out of translate() (e.g. fallback off)
-        is caught, surfaced cleanly, and does NOT propagate — the REPL survives."""
-        import main
-        bot = _make_mock_bot()
-        bot.translator.translate.side_effect = self._cap_error()
-
-        bot._handle_request("open 1hsg")          # must NOT raise
-
-        bot.router.route.assert_not_called()      # bailed before routing
-        printed = " ".join(str(c) for c in main.console.print.call_args_list).lower()
-        assert "usage limit" in printed, printed
-        assert "ollama" in printed                # actionable guidance shown
+    # (The Claude usage-cap test was removed — translation is local-only now; the
+    # generic backstop below covers "any translate() error is caught, not propagated.")
 
     def test_unexpected_error_does_not_crash_repl(self):
         """Any other unexpected translate() failure is also caught (clean message,
