@@ -183,8 +183,13 @@ def test_managed_service_stop_terminates(_app):
 
 
 def _preflight_fake(**attrs):
-    obj = types.SimpleNamespace(presenter=MagicMock(), _services=[], **attrs)
+    obj = types.SimpleNamespace(presenter=MagicMock(), _services=[],
+                                _OLLAMA_MIN_VERSION=W._OLLAMA_MIN_VERSION, **attrs)
     obj._preflight_ollama = types.MethodType(W._preflight_ollama, obj)
+    # stub the new I/O helpers so the wholesale _preflight_ollama test stays OFFLINE
+    # (the version subprocess + the GPU warm-load are tested directly elsewhere).
+    obj._ollama_cli_version = lambda: (None, "")
+    obj._ollama_gpu_status = lambda base: (None, "undetermined")
     return obj
 
 
@@ -298,3 +303,56 @@ def test_qt_presenter_markup_and_active_site(_app):
     import re as _re
     text = _re.sub(r"<[^>]+>", "", " ".join(out))
     assert "raw markup" in text and "set [25]" in text
+
+
+# ── Audit remediation: preflight GPU/CPU + version guardrails, intent_registry URL ──
+
+def test_ollama_gpu_status_detects_gpu(_app, monkeypatch):
+    monkeypatch.setattr(gui_app.requests, "post", lambda *a, **k: MagicMock())
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "qwen3:8b",
+                                          "size_vram": 5_000_000_000, "size": 6_000_000_000}]}
+    monkeypatch.setattr(gui_app.requests, "get", lambda *a, **k: resp)
+    status, detail = gui_app.StructureBotWindow._ollama_gpu_status(None, "http://x")
+    assert status == "gpu" and "VRAM" in detail
+
+
+def test_ollama_gpu_status_detects_cpu(_app, monkeypatch):
+    monkeypatch.setattr(gui_app.requests, "post", lambda *a, **k: MagicMock())
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "qwen3:8b", "size_vram": 0, "size": 6_000_000_000}]}
+    monkeypatch.setattr(gui_app.requests, "get", lambda *a, **k: resp)
+    status, _ = gui_app.StructureBotWindow._ollama_gpu_status(None, "http://x")
+    assert status == "cpu"                          # the original-bug class, now detected
+
+
+def test_ollama_version_below_blackwell_floor(_app, monkeypatch):
+    monkeypatch.setattr(gui_app.subprocess, "run",
+                        lambda *a, **k: MagicMock(stdout="ollama version is 0.24.0"))
+    ver, s = gui_app.StructureBotWindow._ollama_cli_version(None)
+    assert ver == (0, 24, 0) and s == "0.24.0"
+    assert ver < gui_app.StructureBotWindow._OLLAMA_MIN_VERSION   # would warn
+
+
+def test_ollama_version_at_floor_ok(_app, monkeypatch):
+    monkeypatch.setattr(gui_app.subprocess, "run",
+                        lambda *a, **k: MagicMock(stdout="ollama version is 0.30.8"))
+    ver, _ = gui_app.StructureBotWindow._ollama_cli_version(None)
+    assert ver >= gui_app.StructureBotWindow._OLLAMA_MIN_VERSION
+
+
+def test_intent_classifier_uses_config_base_url(_app, monkeypatch):
+    """make_llm_classify_fn falls back to config.OLLAMA_BASE_URL (not a bare hardcode)."""
+    import config, intent_registry
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://sentinel:9999")
+    cap = {}
+    def fake_post(url, json=None, timeout=None):
+        cap["url"] = url
+        r = MagicMock(); r.json.return_value = {"response": "none"}
+        return r
+    monkeypatch.setattr(intent_registry.requests if hasattr(intent_registry, "requests") else __import__("requests"),
+                        "post", fake_post)
+    fn = intent_registry.make_llm_classify_fn(backend_name="ollama")
+    fn("do something", ["view.cartoon_only"])
+    assert cap.get("url", "").startswith("http://sentinel:9999"), cap
