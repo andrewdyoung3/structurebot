@@ -418,12 +418,12 @@ def make_llm_classify_fn(
     import config as _cfg
     _reg          = registry if registry is not None else VIEWER_REGISTRY
     _task         = task_block if task_block is not None else _VIEWER_TASK_BLOCK
-    _backend      = backend_name or getattr(_cfg, "TRANSLATOR_BACKEND", "claude")
+    _backend      = backend_name or getattr(_cfg, "TRANSLATOR_BACKEND", "ollama")
     _ollama_model = os.environ.get("OLLAMA_MODEL", getattr(_cfg, "OLLAMA_MODEL", "qwen3:8b"))
     _ollama_url   = (
         os.environ.get("OLLAMA_HOST")
         or getattr(_cfg, "OLLAMA_HOST", None)
-        or "http://localhost:11434"
+        or getattr(_cfg, "OLLAMA_BASE_URL", "http://localhost:11434")
     ).rstrip("/")
 
     def _build_prompt(text: str, all_labels: List[str]) -> str:

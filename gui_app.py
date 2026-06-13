@@ -592,6 +592,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                    "(set TRANSLATOR_BACKEND=ollama).")
         self._preflight_chimerax()
         self._preflight_ollama()
+        self._preflight_accelerators()
         self._preflight_wsl()
         self._preflight_restore()
         p.dim("Startup complete.")
@@ -623,10 +624,58 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         else:
             p.warn(f"⚠ Ping failed: {ping['result'].get('error')}")
 
+    # Blackwell-safe Ollama floor: builds below this lack the sm_120 GPU fix and run on
+    # CPU silently (the 0.24.0 bug). Warn if the installed binary is older.
+    _OLLAMA_MIN_VERSION = (0, 30, 0)
+
+    def _ollama_cli_version(self):
+        """(version_tuple, raw_str) from `ollama --version`, or (None, '') if unknown."""
+        try:
+            out = subprocess.run(["ollama", "--version"], capture_output=True, text=True,
+                                  timeout=8,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+            if m:
+                return (tuple(int(g) for g in m.groups()), m.group(0))
+        except Exception:
+            pass
+        return (None, "")
+
+    def _ollama_gpu_status(self, base: str):
+        """Determine GPU vs CPU placement the REAL way (mirrors esm_bridge's
+        real-kernel check, not a bare ping): warm-load the model, then read /api/ps
+        `size_vram`. Returns ('gpu'|'cpu'|None, detail). None = couldn't determine."""
+        try:
+            requests.post(f"{base}/api/generate", json={
+                "model": config.OLLAMA_MODEL, "prompt": "ok", "stream": False,
+                "think": False, "options": {"num_predict": 1},
+            }, timeout=90)
+            r = requests.get(f"{base}/api/ps", timeout=5)
+            stem = config.OLLAMA_MODEL.split(":")[0]
+            for m in (r.json().get("models") or []):
+                if m.get("name") == config.OLLAMA_MODEL or m.get("name", "").startswith(stem):
+                    vram, total = m.get("size_vram", 0) or 0, m.get("size", 0) or 0
+                    if vram > 0:
+                        pct = int(100 * vram / total) if total else 100
+                        return ("gpu", f"{pct}% in VRAM")
+                    return ("cpu", "0% in VRAM")
+            return (None, "model not resident")
+        except Exception as exc:
+            return (None, f"{type(exc).__name__}")
+
     def _preflight_ollama(self) -> None:
         p = self.presenter
         base = config.OLLAMA_BASE_URL
         where = base.split("://", 1)[-1]      # host:port for the status lines
+
+        # Version floor (B2): a downgrade below 0.30.0 re-introduces the Blackwell/CPU bug.
+        ver_tuple, ver_str = self._ollama_cli_version()
+        if ver_tuple is not None and ver_tuple < self._OLLAMA_MIN_VERSION:
+            p.warn(f"⚠ Ollama {ver_str} is below the Blackwell-safe floor "
+                   f"{'.'.join(map(str, self._OLLAMA_MIN_VERSION))} — it may run on CPU. "
+                   "Update from https://ollama.com/download.")
+        elif ver_str:
+            p.dim(f"  Ollama {ver_str}")
 
         def tags():
             try:
@@ -672,6 +721,38 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             p.dim(f"  model {model} present")
         else:
             p.warn(f"⚠ Ollama model {model} not found — run `ollama pull {model}`.")
+            return
+
+        # GPU-vs-CPU placement (B1) — the original bug class: "up" ≠ "on the GPU".
+        # Determined the REAL way (warm-load + /api/ps size_vram), not a bare ping.
+        status, detail = self._ollama_gpu_status(base)
+        if status == "gpu":
+            p.success(f"✓ Ollama on GPU ({detail})")
+        elif status == "cpu":
+            p.warn("⚠ Ollama is up but running on CPU — GPU expected; translations will be "
+                   "slow. Check the GPU/driver and the Ollama version.")
+        else:
+            p.dim(f"  (Ollama GPU/CPU placement undetermined: {detail})")
+
+    def _preflight_accelerators(self) -> None:
+        """Surface the ML tools' GPU/CPU placement up front (B3), reusing the EXISTING
+        real-kernel checks — so a silent CPU fallback is visible, not buried in a log."""
+        p = self.presenter
+        try:
+            import esm_bridge
+            if esm_bridge._check_venv312_cuda():
+                p.success("✓ ESM / ESMFold / ThermoMPNN: GPU (venv312, cu128 sm_120)")
+            else:
+                p.warn("⚠ ESM / ESMFold / ThermoMPNN: CPU fallback (venv312 CUDA probe "
+                       "failed — GPU expected; inference will be slow)")
+        except Exception:
+            pass
+        try:
+            from rasp_bridge import RaSPBridge
+            if RaSPBridge().is_available():
+                p.dim("  RaSP: CPU (by design — the 2022 stack can't drive Blackwell; ~11 s/chain)")
+        except Exception:
+            pass
 
     def _preflight_wsl(self) -> None:
         p = self.presenter
