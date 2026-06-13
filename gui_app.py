@@ -85,7 +85,8 @@ class _RequestWorker(QtCore.QRunnable):
                 probe_chimerax_verbs(self._engine.bridge.run_command)
             except Exception:
                 pass  # verb-guard probe is best-effort
-            self._engine.handle_request(self._text, self._presenter)
+            # dispatch = semicolon chaining + bypass-LLM fast-paths + handle_request
+            self._engine.dispatch(self._text, self._presenter)
         except KeyboardInterrupt:
             self.signals.failed.emit("cancelled")
             return
@@ -122,10 +123,11 @@ class ManagedService:
     """A background process the app started (e.g. `ollama serve`): detached, windowless,
     its output logged. Tracked so teardown stops EXACTLY what the app started."""
 
-    def __init__(self, name: str, args: list, log_path):
+    def __init__(self, name: str, args: list, log_path, env: Optional[dict] = None):
         self.name = name
         self.args = args
         self.log_path = Path(log_path)
+        self.env = env                    # extra env vars merged over os.environ (or None)
         self.proc: Optional[subprocess.Popen] = None
         self._log = None
 
@@ -136,10 +138,14 @@ class ManagedService:
         except Exception:
             self._log = None
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        proc_env = None
+        if self.env:
+            import os as _os
+            proc_env = {**_os.environ, **self.env}
         self.proc = subprocess.Popen(
             self.args,
             stdout=self._log, stderr=(subprocess.STDOUT if self._log is not None else None),
-            creationflags=flags,
+            creationflags=flags, env=proc_env,
         )
         return self
 
@@ -183,6 +189,31 @@ class _PreflightWorker(QtCore.QRunnable):
         except Exception as exc:                       # error-first: never crash the pool
             self.win.presenter.error(f"Preflight error: {type(exc).__name__}: {exc}")
         self.signals.done.emit()
+
+
+class _HistoryLineEdit(QtWidgets.QLineEdit):
+    """Command input with ↑/↓ history recall (the console affordance a user relies on)."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self._hist: List[str] = []
+        self._idx = 0
+
+    def push(self, text: str) -> None:
+        if text and (not self._hist or self._hist[-1] != text):
+            self._hist.append(text)
+        self._idx = len(self._hist)
+
+    def keyPressEvent(self, e) -> None:
+        if e.key() == QtCore.Qt.Key_Up and self._hist:
+            self._idx = max(0, self._idx - 1)
+            self.setText(self._hist[self._idx])
+            return
+        if e.key() == QtCore.Qt.Key_Down and self._hist:
+            self._idx = min(len(self._hist), self._idx + 1)
+            self.setText(self._hist[self._idx] if self._idx < len(self._hist) else "")
+            return
+        super().keyPressEvent(e)
 
 
 # ── the window (== the engine host) ───────────────────────────────────────────────
@@ -238,7 +269,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
-        self.input = QtWidgets.QLineEdit()
+        self.output.append(render_html(
+            "[dim]Type a request, e.g. \"open 2HHB and show it as a cartoon\".  "
+            "↑/↓ recalls history.[/dim]"))
+        self.input = _HistoryLineEdit()
         self.input.setPlaceholderText("Ask StructureBot…  (e.g. \"open 1hsg and show it as a cartoon\")")
 
         bottom = QtWidgets.QWidget()
@@ -358,6 +392,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             return
         if self._in_flight:
             return
+        self.input.push(text)                  # ↑/↓ history recall
         self.input.clear()
         self.output.append(f"<pre style='margin:0;color:#7fd1ff'><b>&gt; {escape(text)}</b></pre>")
         self._start_request(text)
@@ -594,6 +629,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
     def _preflight_ollama(self) -> None:
         p = self.presenter
         base = config.OLLAMA_BASE_URL
+        where = base.split("://", 1)[-1]      # host:port for the status lines
 
         def tags():
             try:
@@ -605,8 +641,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         t = tags()
         if t is None:
             p.info("Ollama not running — starting `ollama serve` (windowless, logged)…")
+            # Bind the spawned serve to the configured host:port (so a non-default
+            # OLLAMA_BASE_URL is honoured), via OLLAMA_HOST.
+            host = base.split("://", 1)[-1]
             svc = ManagedService("ollama", ["ollama", "serve"],
-                                 config.LOG_DIR / "ollama_serve.log")
+                                 config.LOG_DIR / "ollama_serve.log",
+                                 env={"OLLAMA_HOST": host})
             try:
                 svc.start()
                 self._services.append(svc)
@@ -625,9 +665,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             if t is None:
                 p.warn("⚠ Ollama did not become ready within 30 s.")
                 return
-            p.success("✓ Ollama serve is up (port 11434)")
+            p.success(f"✓ Ollama serve is up ({where})")
         else:
-            p.success("✓ Connected to Ollama (port 11434)")
+            p.success(f"✓ Connected to Ollama ({where})")
         names = [m.get("name", "") for m in (t.get("models") or [])]
         model = config.OLLAMA_MODEL
         stem = model.split(":")[0]
@@ -686,6 +726,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     # ── teardown: stop exactly what the app started ───────────────────────────────
     def closeEvent(self, event) -> None:
+        # Persist the session (parity with the console's save-on-exit) so the next launch's
+        # restore prompt has something to restore.
+        try:
+            self.session.save("session.json")
+        except Exception:
+            pass
         # Ollama (a bundled daemon WE started) is stopped. ChimeraX is left running like
         # the console REPL — it is the user's structure viewer; killing it on window close
         # would discard their loaded models.

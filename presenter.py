@@ -115,6 +115,10 @@ class Presenter(ABC):
     def dim(self, text: str) -> None: ...
     @abstractmethod
     def blank(self) -> None: ...
+    @abstractmethod
+    def markup(self, text: str) -> None: ...          # render a raw Rich-markup string
+    @abstractmethod
+    def active_site_ok(self, msg: str) -> None: ...    # the dispatch active-site ✓ line
 
     # structured render
     @abstractmethod
@@ -187,6 +191,14 @@ class ConsolePresenter(Presenter):
 
     def blank(self) -> None:
         self._console.print()
+
+    def markup(self, text: str) -> None:
+        # raw Rich markup built by the router (sequence/selection fast-paths) — printed
+        # verbatim, exactly as the console _dispatch_input does.
+        self._console.print(text)
+
+    def active_site_ok(self, msg: str) -> None:
+        self._console.print(f"[ok]✓[/ok] {escape(msg)}")
 
     # ── structured render ───────────────────────────────────────────────────────
     def show_commands(self, commands: List[str], explanations: List[str], confidence: str) -> None:

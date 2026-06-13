@@ -100,6 +100,13 @@ class QtPresenter(Presenter):
     def blank(self) -> None:
         self._sig.append_html.emit("")
 
+    def markup(self, text: str) -> None:
+        # raw Rich markup (router sequence/selection fast-paths) → HTML in the pane
+        self._sig.append_html.emit(render_html(text))
+
+    def active_site_ok(self, msg: str) -> None:
+        self._emit(f"[ok]✓[/ok] {escape(msg)}")
+
     # ── structured (same Rich renderables as ConsolePresenter) ────────────────────
     def show_commands(self, commands: List[str], explanations: List[str], confidence: str) -> None:
         conf_color = {"high": "green", "medium": "yellow", "low": "red"}.get(confidence, "white")

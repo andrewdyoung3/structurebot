@@ -50,6 +50,31 @@ class RequestEngine:
     def session(self):
         return self._host.session
 
+    # ── input dispatch (pre-LLM glue, shared by front-ends) ─────────────────────
+    def dispatch(self, user_input: str, presenter) -> None:
+        """Front-end input glue: semicolon chaining + the bypass-LLM fast-paths
+        (active-site / sequence-display / live-selection), then the full handle_request
+        pipeline. Mirrors the console REPL's _dispatch_input so a GUI submit gets the
+        SAME pre-LLM behaviour. (The console keeps its own _dispatch_input for now; this
+        is the shared form the closeout can collapse onto.)"""
+        if ";" in user_input:
+            for part in [p.strip() for p in user_input.split(";") if p.strip()]:
+                self.handle_request(part, presenter)
+            return
+        msg = self.router.handle_active_site_command(user_input)
+        if msg:
+            presenter.active_site_ok(msg)
+            return
+        seq_msg = self.router.handle_sequence_display_command(user_input)
+        if seq_msg:
+            presenter.markup(seq_msg)
+            return
+        sel_msg = self.router.handle_selection_command(user_input)
+        if sel_msg:
+            presenter.markup(sel_msg)
+            return
+        self.handle_request(user_input, presenter)
+
     # ── the request pipeline ──────────────────────────────────────────────────
     def handle_request(self, user_input: str, presenter, is_retry: bool = False) -> None:
         # 1. Pre-translate interception: covered intent categories bypass translation.

@@ -241,3 +241,60 @@ def test_opened_mid_focus_falls_back_to_guess(_app):
     w.show_model = lambda mid: shown.append(mid)
     W._on_request_done(w)
     assert shown == ["1"]                                     # fallback when bridge saw no open
+
+
+# ── Stage 4: engine.dispatch (semicolon + fast-paths) shared with the GUI ─────────
+
+def test_dispatch_semicolon_splits_into_requests(_app):
+    eng = RequestEngine(MagicMock())
+    calls = []
+    eng.handle_request = lambda text, pres: calls.append(text)
+    eng.dispatch("open 1hsg; cartoon #1 ;  ; color #1 red", MagicMock())
+    assert calls == ["open 1hsg", "cartoon #1", "color #1 red"]   # blanks skipped, order kept
+
+
+def test_dispatch_active_site_fast_path_short_circuits(_app):
+    host = MagicMock()
+    host.router.handle_active_site_command.return_value = "Active-site residues set: [25]."
+    eng = RequestEngine(host)
+    eng.handle_request = lambda *a: (_ for _ in ()).throw(AssertionError("must not reach LLM"))
+    pres = MagicMock()
+    eng.dispatch("set active site residues 25", pres)
+    pres.active_site_ok.assert_called_once_with("Active-site residues set: [25].")
+
+
+def test_dispatch_sequence_and_selection_fast_paths(_app):
+    host = MagicMock()
+    host.router.handle_active_site_command.return_value = None
+    host.router.handle_sequence_display_command.return_value = "[bold]Sequences[/bold]"
+    eng = RequestEngine(host)
+    called = []
+    eng.handle_request = lambda *a: called.append(1)
+    pres = MagicMock()
+    eng.dispatch("show designed sequences", pres)
+    pres.markup.assert_called_once_with("[bold]Sequences[/bold]")
+    assert not called
+
+
+def test_dispatch_falls_through_to_handle_request(_app):
+    host = MagicMock()
+    host.router.handle_active_site_command.return_value = None
+    host.router.handle_sequence_display_command.return_value = None
+    host.router.handle_selection_command.return_value = None
+    eng = RequestEngine(host)
+    got = []
+    eng.handle_request = lambda text, pres: got.append(text)
+    eng.dispatch("suggest stabilising mutations", MagicMock())
+    assert got == ["suggest stabilising mutations"]
+
+
+def test_qt_presenter_markup_and_active_site(_app):
+    sig = PresenterSignals()
+    out = []
+    sig.append_html.connect(lambda h: out.append(h))
+    pres = QtPresenter(sig)
+    pres.markup("[bold]raw markup[/bold]")
+    pres.active_site_ok("set [25]")
+    import re as _re
+    text = _re.sub(r"<[^>]+>", "", " ".join(out))
+    assert "raw markup" in text and "set [25]" in text

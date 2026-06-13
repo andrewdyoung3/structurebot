@@ -916,8 +916,25 @@ def main() -> None:
                         metavar="FILE",
                         help="Path to a text file of commands to run sequentially "
                              "(one per line; blank lines and # comments skipped)")
+    parser.add_argument("--console",          action="store_true",
+                        help="Run the console REPL (the parity oracle / debug fallback) "
+                             "instead of the default GUI")
     parser.set_defaults(auto_proceed=True)
     args = parser.parse_args()
+
+    # The GUI is the default front-end; --console (and --script) use the console REPL.
+    # Both drive the SAME RequestEngine; the console stays the parity oracle + fallback.
+    if not (args.console or args.script):
+        from PySide6 import QtWidgets
+        from gui_app import StructureBotWindow
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+        win = StructureBotWindow(
+            port               = args.port,
+            auto_proceed       = args.auto_proceed,
+            auto_proceed_delay = config.AUTO_PROCEED_DELAY,
+        )
+        win.show()
+        sys.exit(app.exec())
 
     bot = StructureBot(
         chimerax_path     = args.chimerax,
