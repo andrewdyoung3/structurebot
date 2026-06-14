@@ -196,6 +196,10 @@ class SessionState:
         self.session_start   = datetime.now().isoformat(timespec="seconds")
         self.working_dir     = working_dir or os.getcwd()
         self.structures:     Dict[str, Dict[str, Any]] = {}  # model_id → info
+        # Variant-Design Workbench: model_id → DesignSession.to_dict() (template T
+        # per unique chain + ordered variants). Persisted; backward-compatible
+        # (an old session.json without this key restores to {}).
+        self.design_sessions: Dict[str, Dict[str, Any]] = {}
         self.named_selections: Dict[str, str] = {}
         self.applied_styles: List[str] = []
         self.command_history: List[Dict[str, Any]] = []
@@ -534,6 +538,15 @@ class SessionState:
         """Return ProteinMPNN results for a model, or None."""
         entry = self.proteinmpnn_results.get(str(model_id))
         return entry.get("data") if entry else None
+
+    # ── Variant-Design Workbench ───────────────────────────────────────────────
+    def add_design_session(self, model_id: str, design_dict: Dict[str, Any]) -> None:
+        """Store/replace the Workbench DesignSession (as a dict) for a model."""
+        self.design_sessions[str(model_id)] = design_dict
+
+    def get_design_session(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Return the Workbench DesignSession dict for a model, or None."""
+        return self.design_sessions.get(str(model_id))
 
     # ── Disulfide candidate tracking ──────────────────────────────────────────
 
@@ -938,6 +951,7 @@ class SessionState:
             "session_start":        self.session_start,
             "working_dir":          self.working_dir,
             "structures":           self.structures,
+            "design_sessions":      self.design_sessions,
             "named_selections":     self.named_selections,
             "applied_styles":       self.applied_styles,
             "command_history":      self.command_history,
@@ -975,6 +989,7 @@ class SessionState:
         state.session_start       = data.get("session_start", state.session_start)
         state.working_dir         = data.get("working_dir",   state.working_dir)
         state.structures          = data.get("structures",    {})
+        state.design_sessions     = data.get("design_sessions", {})   # backward-compat default
         state.named_selections    = data.get("named_selections", {})
         state.applied_styles      = data.get("applied_styles", [])
         state.command_history     = data.get("command_history", [])
@@ -1097,6 +1112,7 @@ class SessionState:
         """
         return copy.deepcopy({
             "structures":            self.structures,
+            "design_sessions":       self.design_sessions,
             "named_selections":      self.named_selections,
             "applied_styles":        self.applied_styles,
             "command_history":       self.command_history,
@@ -1129,6 +1145,7 @@ class SessionState:
         Restore all mutable state fields from a snapshot produced by snapshot().
         """
         self.structures            = copy.deepcopy(snap.get("structures",            {}))
+        self.design_sessions       = copy.deepcopy(snap.get("design_sessions",       {}))
         self.named_selections      = copy.deepcopy(snap.get("named_selections",      {}))
         self.applied_styles        = copy.deepcopy(snap.get("applied_styles",        []))
         self.command_history       = copy.deepcopy(snap.get("command_history",       []))

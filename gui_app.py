@@ -44,6 +44,7 @@ from request_engine import RequestEngine
 from qt_presenter import QtPresenter, PresenterSignals, render_html, CANCEL
 from seq_editor.controller import SequenceEditorController
 from seq_editor.view import _ChainGrid
+from variant_workbench import VariantWorkbenchPanel
 
 
 def _async_raise(tid: int, exctype=KeyboardInterrupt) -> None:
@@ -231,6 +232,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
         # sequence-tab controller shares the same ChimeraX bridge
         self.controller = SequenceEditorController(self.bridge.run_command, ColabFoldBridge().predict)
+        # Variant-Design Workbench (Stage 1) — a new panel over the SAME controller +
+        # session; populated on structure open (coexists with the chain-grid tabs).
+        self.workbench = VariantWorkbenchPanel(self.controller, session=self.session)
 
         # presenter + engine (the SAME engine the console drives)
         self._sig = PresenterSignals()
@@ -264,6 +268,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.resize(1000, 720)
 
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self.workbench, "Variant Workbench")   # Stage-1 panel (first tab)
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(
@@ -456,6 +461,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         mid = str(model_id).lstrip("#").strip()
         if not mid:
             return
+        # Populate the Variant Workbench (template T per unique chain) for this model.
+        # Error-first inside load_model — never blocks the chain-grid path below.
+        try:
+            self.workbench.load_model(mid)
+        except Exception as exc:
+            self.presenter.warn(f"Workbench load #{mid} failed: {exc}")
         if any(k[0] == mid for k in self._grids):
             self._focus_model(mid)
             return
