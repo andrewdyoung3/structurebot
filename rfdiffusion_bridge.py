@@ -300,11 +300,31 @@ class RFdiffusionBridge:
                 return True
             return False
 
-        # (3) No Windows clone -> probe the isolated WSL2 env.
+        # (3) No Windows clone -> probe the isolated WSL2 env. RESOLVE + STORE the
+        #     actual script path here (root OR scripts/) so _build_command uses the
+        #     SAME validated path — availability and execution agree by construction
+        #     (the bug was two independent resolutions: the probe accepted root-OR-
+        #     scripts/ while the builder hardcoded root, so a scripts/-only clone
+        #     passed availability but failed the run).
         if self._wsl.is_available() and self._wsl.check_rfdiffusion(self._wsl_dir):
-            self._backend = "wsl_clone"
-            return True
+            wsl_script = self._resolve_wsl_script()
+            if wsl_script:
+                self._script  = wsl_script   # a WSL path str (passthrough at dispatch)
+                self._backend = "wsl_clone"
+                return True
         return False
+
+    def _resolve_wsl_script(self) -> Optional[str]:
+        """The actual run_inference.py path in the WSL clone — repo root OR
+        scripts/ (the official v1 layout), validated by a WSL test. Mirrors
+        _find_script for the win_clone route. Returns None if neither exists."""
+        for cand in (f"{self._wsl_dir}/run_inference.py",
+                     f"{self._wsl_dir}/scripts/run_inference.py"):
+            r = self._wsl.run_command(
+                f"test -f {shlex.quote(cand)} && echo FOUND", timeout=20)
+            if r.get("ok") and "FOUND" in (r.get("stdout", "") or ""):
+                return cand
+        return None
 
     @staticmethod
     def _find_script(root: Path) -> Optional[Path]:
@@ -700,7 +720,11 @@ class RFdiffusionBridge:
           diffuser.T / ppi.hotspot_res / contigmap.contigs / diffuser.partial_T
           inference.symmetry (with --config-name symmetry)
         """
-        script = str(self._script) if self._script else f"{self._wsl_dir}/run_inference.py"
+        # SINGLE SOURCE OF TRUTH: the exact path _check_available validated + stored
+        # (win_clone → Windows Path translated to /mnt/c at dispatch; wsl_clone →
+        # WSL path str, passthrough). No independent root fallback here — that is
+        # what let availability and execution diverge.
+        script = str(self._script)
         cmd = [RFDIFFUSION_PYTHON, script]
 
         if mode == "binder":
