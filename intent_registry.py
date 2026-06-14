@@ -178,6 +178,11 @@ class IntentRegistry:
             # "align the chains by chain order".  Once gated, resolve_alias picks
             # the specific scheme.
             return _color_category_floor(text.lower())
+        if category == "design":
+            # Design-intent op-class: a goal-DIRECTED redesign only (redesign verb +
+            # objective cue). Bare "redesign chain A" never enters; "suggest
+            # mutations to improve solubility" (no redesign verb) never enters.
+            return _design_goal_category_floor(text.lower())
         low = text.lower()
         triggers = _CATEGORY_TRIGGERS.get(category, ())
         return any(t in low for t in triggers)
@@ -848,3 +853,97 @@ COLOR_REGISTRY.register(IntentDef(
     aliases     = (),   # resolved via extract_named_color() in _run_color, not alias
     render_fn   = lambda spec: [],  # overridden in _run_color (needs the color value)
 ))
+
+
+# ── DESIGN-INTENT op-class (goal → tool-invocation PROFILE) ──────────────────────
+# The THIRD op-class. Same §0 intent/render discipline as viewer/color — the LLM
+# returns a canonical goal LABEL from a closed set; a deterministic registry owns
+# the realisation — but the render codomain is a tool-invocation PROFILE
+# (tool + scope + params + ranking), NOT a ChimeraX command string. Resolution
+# REUSES IntentRegistry (alias → make_llm_classify_fn(registry=, task_block=) →
+# miss); each IntentDef's render_fn is a deliberate no-op (the "render" output is
+# DESIGN_PROFILES[name]). Stage-1 vocab = "solubility" only; "oligomerization"
+# slots in at FIX 4 as one more DesignGoalDef + DesignProfile (tool=
+# "interface_ddg_scan", ranking=("ddg_bind",), fold_guard="stability_ensemble").
+
+
+@dataclass(frozen=True)
+class DesignProfile:
+    """The render codomain of a design goal — pure data the handler executes."""
+    goal:        str
+    tool:        str                  # dispatch key: "proteinmpnn" (FIX 4: "interface_ddg_scan")
+    designable:  str                  # "solvent_exposed" | "whole_chain" | "interface"
+    bias:        Optional[str]        # "soluble" → ProteinMPNN hydrophilic bias
+    omit:        Tuple[str, ...]      # ("C",) → omit cysteine
+    ranking:     Tuple[str, ...]      # ("camsol", "esmfold") — NOT log-likelihood
+    fold_guard:  Optional[str]        # None (Stage 1) | "stability_ensemble" (FIX 4)
+    description: str
+
+
+DESIGN_GOAL_REGISTRY = IntentRegistry()
+
+DESIGN_GOAL_REGISTRY.register(IntentDef(
+    name        = "design.solubility",
+    category    = "design",
+    description = ("redesign solvent-exposed positions to improve solubility / "
+                  "reduce aggregation"),
+    aliases     = (
+        "redesign for solubility", "redesign for improved solubility",
+        "redesign to be more soluble", "redesign to improve solubility",
+        "redesign to be soluble", "more soluble redesign", "soluble redesign",
+        "solubility redesign", "redesign to reduce aggregation",
+        "redesign to be less aggregation-prone", "redesign for reduced aggregation",
+        "design for solubility", "redesign the surface for solubility",
+    ),
+    render_fn   = lambda spec: [],   # no-op: render output is DESIGN_PROFILES[name]
+))
+
+DESIGN_PROFILES: Dict[str, DesignProfile] = {
+    "design.solubility": DesignProfile(
+        goal        = "solubility",
+        tool        = "proteinmpnn",
+        designable  = "solvent_exposed",
+        bias        = "soluble",
+        omit        = ("C",),
+        ranking     = ("camsol", "esmfold"),
+        fold_guard  = None,
+        description = ("ProteinMPNN on solvent-exposed positions (buried core "
+                      "fixed), soluble bias, Cys omitted; ranked by CamSol + "
+                      "ESMFold fold-check."),
+    ),
+}
+
+
+# A goal-DIRECTED redesign trips the floor (so it reaches resolution); bare
+# "redesign chain A" (no objective) does NOT enter the op-class. Deliberately
+# BROADER than solubility (thermostab/stability/affinity/oligomer cues) so a
+# NON-solubility goal still ENTERS and is then resolved to MISS — the
+# over-attraction guard lives in resolution, not the floor.
+_DESIGN_REDESIGN_VERB_RE = re.compile(r"\bre-?design(?:s|ed|ing)?\b", re.IGNORECASE)
+_DESIGN_GOAL_OBJECTIVE_RE = re.compile(
+    r"solub|soluble|aggregat|hydrophil"
+    r"|thermo|thermal|stabil|stable|melting|rigid"
+    r"|affinit|oligomer|dimeri|trimeri|tetrameri|interface",
+    re.IGNORECASE,
+)
+
+
+def _design_goal_category_floor(low: str) -> bool:
+    """Conservative gate: a REDESIGN verb AND a goal-objective cue. Bare redesign
+    never enters; "suggest mutations to improve solubility" (no redesign verb)
+    never enters (stays mutation_scan); a non-solubility objective enters and is
+    handed back at resolution."""
+    return bool(_DESIGN_REDESIGN_VERB_RE.search(low)
+                and _DESIGN_GOAL_OBJECTIVE_RE.search(low))
+
+
+_DESIGN_TASK_BLOCK = (
+    "Which protein-DESIGN GOAL does this redesign request target?\n"
+    "Goals:\n"
+    "  design.solubility — improve SOLUBILITY / reduce AGGREGATION (surface "
+    "polarity & charge of exposed residues).\n"
+    "Reply with ONLY the exact key string, nothing else.\n"
+    "Use 'none' if the redesign targets a DIFFERENT goal (e.g. thermostability, "
+    "rigidity, binding affinity, oligomerization) or no recognizable goal. Do NOT "
+    "force-fit an unrelated goal onto design.solubility."
+)

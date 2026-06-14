@@ -108,6 +108,9 @@ _repr_classify_fn = None
 # Color classifier — created once so the _claude_capped latch persists across calls
 _color_classify_fn = None
 
+# Design-goal classifier — created once (LLM tier for the design-intent op-class)
+_design_classify_fn = None
+
 
 class ToolRouter:
     """
@@ -153,6 +156,7 @@ class ToolRouter:
         "conformer_comparison":  "🔄",
         "representation":        "🖼️",
         "color":                 "🎨",
+        "design_goal":           "🧪",
     }
 
     # Conformer-comparison intent keywords.  Specific enough to avoid false
@@ -1137,6 +1141,7 @@ class ToolRouter:
         _repr_key    = None
         _color_intent = False  # color op-class override (set below)
         _color_key    = None
+        _design_intent = False  # design-intent op-class override (set below)
 
         # ── Viewer representation intent override (FIRST — highest priority) ────
         # Fires before ALL analysis-tool overrides because representation is
@@ -1190,6 +1195,37 @@ class ToolRouter:
                 }
                 _color_intent = True
                 _claimed      = True
+
+        # ── Design-intent op-class override (goal → tool-invocation profile) ────
+        # SINGLE SOURCE OF TRUTH for a goal-directed redesign. Fires only on the
+        # conservative design floor (redesign verb + goal objective) so bare
+        # "redesign chain A" never enters and "suggest mutations to improve
+        # solubility" (no redesign verb) stays mutation_scan. Claims so the later
+        # proteinmpnn/mutation_scan routing cannot also fire (supersede, not
+        # double-route). Alias resolved up front; the LLM tier + profile lookup +
+        # the over-attraction MISS-handback run in _run_design_goal.
+        if user_input and not _claimed:
+            from intent_registry import DESIGN_GOAL_REGISTRY as _dreg
+            if _dreg.detect_category_phrase(user_input, "design"):
+                # Strip an intervening target ("redesign CHAIN A for solubility") so
+                # the contiguous alias lands deterministically (else the LLM tier).
+                _design_goal_key = _dreg.resolve_alias(
+                    self._strip_target_for_alias(user_input))   # None → LLM in execute
+                _chain = "A"
+                for _inp in list(tool_inputs.values()):
+                    if isinstance(_inp, dict) and _inp.get("chain"):
+                        _chain = _inp["chain"]; break
+                tools_needed = ["design_goal"]
+                tool_inputs  = {
+                    "design_goal": {
+                        "_user_input": user_input,
+                        "intent_key":  _design_goal_key,
+                        "model_id":    self._primary_model_id(),
+                        "chain":       _chain,
+                    }
+                }
+                _design_intent = True
+                _claimed       = True
 
         # ── Validate-design meta-tool override ─────────────────────────────────
         # Checked FIRST: "validate design" appears in _MPNN_ESMFOLD_KEYWORDS too,
@@ -1548,6 +1584,12 @@ class ToolRouter:
             result["commands"]     = []
             result["explanations"] = []
 
+        # Design-intent: the op-class owns the whole redesign; drop any translator
+        # commands so nothing runs alongside the profile-driven ProteinMPNN.
+        if _design_intent:
+            result["commands"]     = []
+            result["explanations"] = []
+
         # Bio-assembly: clear any translator-emitted commands (e.g. a re-open) —
         # the sym command is issued from within _run_bio_assembly, not from the
         # commands list; a spurious re-open would duplicate the AU model.
@@ -1625,6 +1667,15 @@ class ToolRouter:
                 desc = defn.description if defn else key
                 return f"Color: {desc} (deterministic render)"
             return "Color (resolving intent…)"
+        if tool == "design_goal":
+            inp = tool_inputs.get("design_goal", {})
+            key = inp.get("intent_key")
+            if key:
+                from intent_registry import DESIGN_PROFILES
+                prof = DESIGN_PROFILES.get(key)
+                return (f"Design goal: {prof.description}" if prof
+                        else f"Design goal: {key}")
+            return "Design goal (resolving goal…)"
         if tool == "bio_assembly":
             inp   = tool_inputs.get("bio_assembly", {})
             mid   = inp.get("model_id") or self._primary_model_id()
@@ -1968,6 +2019,8 @@ class ToolRouter:
                 return self._run_representation(inputs, user_input=user_input)
             if tool == "color":
                 return self._run_color(inputs, user_input=user_input)
+            if tool == "design_goal":
+                return self._run_design_goal(inputs, user_input=user_input)
             if tool == "bio_assembly":
                 return self._run_bio_assembly(inputs, user_input=user_input)
             if tool == "interface_stabilization":
@@ -2791,6 +2844,164 @@ class ToolRouter:
         except Exception:
             return []
 
+    def _run_design_goal(
+        self,
+        inputs:     Dict[str, Any],
+        user_input: str = "",
+    ) -> ToolStepResult:
+        """
+        Design-intent op-class handler (the SINGLE source of truth for goal→profile).
+
+        Resolution: alias (route) → LLM classifier → MISS. On MISS — including a
+        non-solubility goal the classifier must NOT force-fit (the over-attraction
+        guard) — hands back to the plain `_run_proteinmpnn` path; never errors,
+        never widens. On a resolved goal: realises the profile (solvent-exposed
+        designable set, soluble bias, Cys omitted), runs ProteinMPNN with FULLY
+        RESOLVED inputs (`_resolved_profile` makes the whole-chain path unreachable),
+        then RANKS by CamSol (cross-sequence scalar) + an ESMFold fold-check —
+        never MPNN log-likelihood.
+        """
+        from intent_registry import (
+            DESIGN_GOAL_REGISTRY, DESIGN_PROFILES, make_llm_classify_fn,
+            _DESIGN_TASK_BLOCK,
+        )
+        from camsol_bridge import camsol_solubility_score
+        import config as _cfg
+
+        user_input = user_input or inputs.get("_user_input", "")
+        intent_key = inputs.get("intent_key")        # alias-resolved in route(), or None
+        model_id   = str(inputs.get("model_id") or self._first_model_id())
+        chain_id   = inputs.get("chain") or inputs.get("chain_id") or "A"
+        resolution = "alias"
+
+        # Tier (b): LLM classifier when the alias missed. The over-attraction guard
+        # is HERE — a different goal ("thermostable") must come back None, not be
+        # rubber-stamped to the only offered label.
+        if intent_key is None:
+            global _design_classify_fn
+            if _design_classify_fn is None:
+                _design_classify_fn = make_llm_classify_fn(
+                    registry=DESIGN_GOAL_REGISTRY, task_block=_DESIGN_TASK_BLOCK)
+            classify = _design_classify_fn
+            intent_key, resolution = DESIGN_GOAL_REGISTRY.resolve(
+                self._strip_target_for_alias(user_input),
+                llm_classify_fn=lambda t, ls: classify(t, ls))
+
+        # Tier (c): MISS → hand back to the plain redesign path (never widen/error).
+        profile = DESIGN_PROFILES.get(intent_key) if intent_key else None
+        if profile is None:
+            return self._run_proteinmpnn({
+                "model_id": model_id, "chain_id": chain_id,
+                "_user_input": user_input,
+            })
+
+        pdb_path = self._ensure_pdb_file(model_id)
+        if not pdb_path:
+            return ToolStepResult(
+                tool="design_goal", success=False,
+                error=("Design-goal redesign needs a local PDB file and none could "
+                       "be resolved for the loaded model."))
+
+        # ── Designable set per the profile ─────────────────────────────────────
+        design_positions: Optional[List[int]] = None
+        if profile.designable == "solvent_exposed":
+            cav = self._get_cavity_bridge()
+            exposed = cav.solvent_exposed_residues(
+                pdb_path, chain_id,
+                sasa_threshold=_cfg.DESIGN_EXPOSED_SASA_THRESHOLD)
+            if not exposed:
+                return ToolStepResult(
+                    tool="design_goal", success=False,
+                    error=(f"Could not determine solvent-exposed positions for "
+                           f"chain {chain_id} (SASA unavailable). Refusing rather "
+                           f"than redesigning the whole chain."))
+            design_positions = exposed
+
+        # ── Fully-resolved ProteinMPNN inputs (profile → params) ───────────────
+        mpnn_inputs: Dict[str, Any] = {
+            "model_id":          model_id,
+            "chain_id":          chain_id,
+            "pdb_path":          pdb_path,
+            "design_positions":  design_positions,
+            "_resolved_profile": intent_key,
+        }
+        if profile.bias == "soluble":
+            mpnn_inputs["bias_toward"] = "soluble"   # → _HYDROPHILIC_AAS bias
+        if profile.omit:
+            mpnn_inputs["exclude_amino_acids"] = list(profile.omit)
+
+        result = self._run_proteinmpnn(mpnn_inputs)
+        if not result.success:
+            return result
+
+        # ── Ranking: CamSol scalar (comparable) + ESMFold fold-check ───────────
+        data    = result.data or {}
+        designs = data.get("sequences") or []
+        wt_seq  = data.get("wildtype_sequence") or ""
+        wt_camsol = camsol_solubility_score(wt_seq) if wt_seq else None
+
+        for d in designs:
+            seq = d.get("sequence", "")
+            d["camsol"] = camsol_solubility_score(seq) if seq else None
+            d["camsol_gain"] = (
+                None if (d["camsol"] is None or wt_camsol is None)
+                else round(d["camsol"] - wt_camsol, 3))
+        designs.sort(
+            key=lambda d: d["camsol"] if d.get("camsol") is not None else float("-inf"),
+            reverse=True)
+
+        # ESMFold fold-guard on the top-K only (GPU/venv312 cost); graceful if down.
+        folded = 0
+        for d in designs[: int(_cfg.DESIGN_FOLD_CHECK_TOP_K)]:
+            try:
+                pred = self._get_esmfold_bridge().predict(d.get("sequence", ""))
+                mp = pred.get("mean_plddt") if isinstance(pred, dict) else None
+            except Exception:
+                mp = None
+            d["mean_plddt"] = mp
+            if mp is not None:
+                folded += 1
+                if mp < float(_cfg.DESIGN_FOLD_PLDDT_FLOOR):
+                    d["fold_flag"] = (
+                        f"low pLDDT {mp:.0f} (<{_cfg.DESIGN_FOLD_PLDDT_FLOOR:.0f}) "
+                        f"— possible misfolder")
+        fold_note = "" if folded else " (ESMFold unavailable — ranked by CamSol only)"
+
+        data["sequences"]     = designs
+        data["ranking"]       = "camsol+esmfold"
+        data["wt_camsol"]     = wt_camsol
+        data["design_profile"] = intent_key
+
+        # ── Transparency: state the profile applied ────────────────────────────
+        n_exp    = len(design_positions or [])
+        chain_len = len(wt_seq) if wt_seq else None
+        n_fixed  = (chain_len - n_exp) if chain_len is not None else None
+        top      = designs[0] if designs else None
+        lines = [
+            f"[Design profile: solubility — {resolution}-resolved]",
+            (f"Designed {n_exp} solvent-exposed position(s)"
+             + (f", held {n_fixed} buried/core fixed" if n_fixed is not None else "")
+             + f" on chain {chain_id}; soluble bias on, Cys omitted."),
+            (f"Ranked by CamSol{' + ESMFold' if folded else ''}{fold_note}."
+             + (f" WT CamSol baseline = {wt_camsol:+.2f}." if wt_camsol is not None else "")),
+        ]
+        if top is not None and top.get("camsol") is not None:
+            lines.append(
+                f"Top design CamSol = {top['camsol']:+.2f}"
+                + (f" (gain {top['camsol_gain']:+.2f} vs WT)"
+                   if top.get("camsol_gain") is not None else "")
+                + (f", mean pLDDT {top['mean_plddt']:.0f}"
+                   if top.get("mean_plddt") is not None else ""))
+
+        return ToolStepResult(
+            tool             = "design_goal",
+            success          = True,
+            data             = data,
+            viz_commands     = result.viz_commands,
+            viz_explanations = result.viz_explanations,
+            summary          = "\n".join(lines) + "\n\n" + (result.summary or ""),
+        )
+
     def _run_proteinmpnn(self, inputs: Dict[str, Any]) -> ToolStepResult:
         """
         Run ProteinMPNN fixed-backbone sequence redesign.
@@ -2855,8 +3066,16 @@ class ToolRouter:
         # "design only the selection/interface" flag, an interface/selection
         # design_mode, an explicit position list, or a named partner chain all
         # mean "do NOT redesign the whole chain".
+        # `_resolved_profile` (set by _run_design_goal) means a design-intent
+        # op-class already resolved the FULL scope+params — treat as scoped so the
+        # under-scoped whole-chain+bias path is STRUCTURALLY unreachable for a
+        # resolved goal, keyed on PROFILE PRESENCE not design_positions content
+        # (defense in depth; the goal handler already refuses on an empty exposed
+        # set, so an empty set never reaches here).
+        resolved_profile = bool(inputs.get("_resolved_profile"))
         scoped = bool(
-            design_positions
+            resolved_profile
+            or design_positions
             or partner_chain
             or inputs.get("use_selection")
             or inputs.get("design_only_interface")
