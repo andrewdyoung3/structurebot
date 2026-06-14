@@ -3768,6 +3768,29 @@ class ToolRouter:
         )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
+        # ── Voter visibility (B2): an EXPECTED voter that silently produced nothing
+        # is the insidious case ("thought I had 4 axes, got 3"). LOUD for
+        # capability-passed-then-empty (the formerly-silent drop, with the reason);
+        # a QUIET one-liner for capability-absent (axis count stays visible);
+        # SILENT for a deliberately-disabled voter (no note recorded). Normal runs
+        # add nothing.
+        _vn        = getattr(scanner, "voter_notes", [])
+        _loud      = [n for n in _vn if n.get("state") == "empty"]
+        _quiet     = [n for n in _vn if n.get("state") == "unavailable"]
+        _vlines: List[str] = []
+        for _n in _loud:
+            _r = _n.get("reason") or "produced no output"
+            _vlines.append(
+                f"⚠  {_n['voter']} was available but produced no scores — dropped "
+                f"from the ensemble for this run (reason: {_r}). The ranking below "
+                f"uses the remaining voters.")
+        if _quiet:
+            _names = ", ".join(_n["voter"] for _n in _quiet)
+            _vlines.append(
+                f"· {_names} not available this run — the ensemble used the "
+                f"remaining axes.")
+        _vheader = ("\n".join(_vlines) + "\n\n") if _vlines else ""
+
         if not results:
             excluded_note = ""
             if protected_residues:
@@ -3779,8 +3802,10 @@ class ToolRouter:
                 tool      = "mutation_scan",
                 success   = True,
                 data      = {"candidates": [], "count": 0,
-                             "excluded_count": len(protected_residues)},
-                summary   = f"Mutation scan complete — no candidates met the criteria.{excluded_note}",
+                             "excluded_count": len(protected_residues),
+                             "voter_notes": _vn},
+                summary   = (_vheader + f"Mutation scan complete — no candidates met "
+                             f"the criteria.{excluded_note}"),
                 elapsed_ms = elapsed_ms,
             )
 
@@ -3810,7 +3835,7 @@ class ToolRouter:
             f"solubility delta={top['solubility_delta']:+.2f})"
         )
 
-        detailed_summary = scanner._generate_summary(results)
+        detailed_summary = _vheader + scanner._generate_summary(results)
 
         return ToolStepResult(
             tool             = "mutation_scan",
@@ -3821,6 +3846,7 @@ class ToolRouter:
                 "top":           top,
                 "excluded_count": len(protected_residues),
                 "analysis_mode": analysis_mode,
+                "voter_notes":   _vn,
             },
             viz_commands     = viz_cmds,
             viz_explanations = viz_exps,

@@ -61,6 +61,9 @@ class RaSPBridge:
         self._cache  = Path(getattr(_cfg, "RASP_CACHE_DIR", "cache/rasp"))
         from wsl_bridge import WSLBridge
         self._wsl = WSLBridge(distribution=self._distro)
+        # Reason the last score_mutations() returned no scores (e.g. alignment
+        # divergence) — surfaced by the scanner's voter-visibility (B2).
+        self.last_skip_reason: Optional[str] = None
 
     # ── Availability ──────────────────────────────────────────────────────────
 
@@ -108,7 +111,14 @@ class RaSPBridge:
     ) -> Tuple[Dict[str, float], Dict[str, str]]:
         """Per-candidate RaSP ddG → ({key: ddg}, {key: 'rasp'}).  ({}, {}) when
         unavailable/failed/diverged (the caller leaves ddg=None / not_computed)."""
-        _log = progress or (lambda *_: None)
+        self.last_skip_reason = None
+
+        def _log(m: str) -> None:
+            self.last_skip_reason = m.strip()
+            if progress:
+                try: progress(m)
+                except Exception: pass
+
         if not candidates:
             return {}, {}
         if not self.is_available():

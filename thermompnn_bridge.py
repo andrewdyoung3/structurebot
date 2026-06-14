@@ -73,6 +73,10 @@ class ThermoMPNNBridge:
         self._python = _cfg.THERMOMPNN_PYTHON
         self._model  = _cfg.THERMOMPNN_MODEL
         self._sign   = int(getattr(_cfg, "THERMOMPNN_DDG_SIGN", 1))
+        # The reason the last score_mutations() returned no scores (e.g. residue-
+        # mapping divergence) — surfaced by the scanner's voter-visibility (B2) so
+        # an available-but-empty voter is an ACTIONABLE warning, not a silent drop.
+        self.last_skip_reason: Optional[str] = None
 
     # ── Availability ──────────────────────────────────────────────────────────
 
@@ -161,7 +165,13 @@ class ThermoMPNNBridge:
         Unavailable / failed / unmapped → ({}, {}) or partial; callers mark the
         missing ones not_computed.  Never raises, never fakes a value.
         """
+        self.last_skip_reason = None
+
         def _log(m: str) -> None:
+            # capture the most recent message as the candidate skip-reason; the
+            # scanner reads it ONLY when the result is empty, so a success-path
+            # progress line is never surfaced as a "reason".
+            self.last_skip_reason = m.strip()
             if progress:
                 try: progress(m)
                 except Exception: pass
