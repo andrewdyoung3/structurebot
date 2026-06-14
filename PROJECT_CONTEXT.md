@@ -1078,13 +1078,19 @@ point + 12 controller tests); live-verified. Growth-arc items above remain DEFER
 
 ### Main venv (`venv/`, Python 3.14)
 
-| Package | Version constraint | Purpose |
+**Manifests (pinned, the reproducible source of truth):** `requirements.txt` = core runtime; `requirements-dev.txt` (`-r requirements.txt` + pytest) = the documented way to run the suite; `requirements-esm.txt` = the OPTIONAL `+cpu` torch/ESM extra. **No `anthropic`** (translation is LOCAL-ONLY). A bare `pip install -r requirements.txt` on a fresh venv reproduces an import-complete app; `requirements-dev.txt` reproduces the green gated suite — verified against a clean clone (see §13, 2026-06-14 repro-manifest).
+
+| Package | Pin (`requirements.txt`) | Purpose |
 |---------|-------------------|---------|
-| `requests` | `>=2.31.0` | DynaMut2 API, RCSB API, ChimeraX REST, ESM Atlas fallback |
-| `rich` | `>=13.7.0` | Console REPL, tables, panels |
-| `biopython` | [verify] | PDB parsing in disulfide/proline/cavity/salt-bridge/structural_utils |
-| `freesasa` | [verify] | SASA computation in salt_bridge_bridge.py (optional — degrades gracefully) |
-| `torch` | **`2.12.0+cpu`** | CPU-only — the in-process ESM fallback (`esm_bridge`, lazy import). **Must stay `+cpu`**: a `+cu126`/non-cu128 build can't run sm_120 and returns a false `is_available()`. GPU ESM is the venv312 subprocess. |
+| `requests` | `==2.34.2` | DynaMut2 API, RCSB API, ChimeraX REST, ESM Atlas fallback |
+| `rich` | `==15.0.0` | Console REPL, tables, panels |
+| `PySide6` | `==6.11.1` | The default GUI front-end (`python main.py`); abi3/cp310 wheel runs on 3.14 |
+| `numpy` | `==2.4.6` | Kabsch/RMSD, conformer comparison, deviation maps |
+| `biopython` | `==1.87` | `Bio.PDB` parsing + the residue-identity spine (`structural_utils`, `residue_mapping`); fast-tier ddG voters hard-depend on it |
+| `freesasa` | `==2.2.1` | SASA for glycan/solvent accessibility (falls back to `Bio.PDB` ShrakeRupley if absent) |
+| `openpyxl` | `==3.1.5` | stability/ddG `.xlsx` export |
+| `pytest` (+`pytest-timeout`) | `==9.0.3` (`requirements-dev.txt`) | Test runner — NOT a runtime dep; lives in the dev manifest |
+| `torch` | `==2.12.0+cpu` (`requirements-esm.txt`, OPTIONAL) | CPU-only in-process ESM fallback (`esm_bridge`, lazy import). **`+cpu` ONLY** (installed via the `download.pytorch.org/whl/cpu` index): a `+cu126`/non-cu128 build can't run sm_120 and returns a false `is_available()` — the silent-CPU trap. GPU ESM is the venv312 subprocess. The gated suite needs no torch. |
 
 ### venv312 (`venv312/`, Python 3.12)
 

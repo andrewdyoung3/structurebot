@@ -1,69 +1,45 @@
-# NL translation is LOCAL-ONLY (the local Ollama model) — no anthropic / Claude SDK.
-requests>=2.31.0
-rich>=13.7.0
+# StructureBot — CORE runtime dependencies
+# Install:  pip install -r requirements.txt
+#
+# Pinned to the known-working dev-venv versions (Python 3.10+; verified on 3.14).
+# NL translation is LOCAL-ONLY (the local Ollama model) — there is deliberately NO
+# anthropic / Claude SDK here, and there must not be one.
+#
+# This file is the reproducible source of truth: every package the app imports at
+# runtime is listed below. Test-only and optional GPU/ESM extras live in their own
+# files (see the bottom of this file).
 
-# Standalone Sequence Editor GUI (seq_editor/ — the project's first GUI surface).
-# PySide6 ships abi3/cp310 wheels that install + run on the Python 3.14 main venv
-# (verified 6.11.1). LGPL. Only needed to LAUNCH the editor; the rest of the app and
-# the controller unit tests don't import it.
-PySide6>=6.6
+# ── Console UI + HTTP ──────────────────────────────────────────────────────────
+requests==2.34.2
+rich==15.0.0
 
-# ── Computational biology tools (optional) ────────────────────────────────────
-#
-# ESM-2 protein language model (evolutionary conservation scoring)
-# Install ONE of the following:
-#
-#   Option A — Meta's official fair-esm package:
-#     pip install fair-esm
-#
-#   Note: fair-esm may have compatibility issues with Python 3.14+.
-#   If you get import errors, use Option B instead.
-#
-#   Option B — HuggingFace transformers (fallback):
-#     pip install transformers torch
-#
-# Either package will be detected automatically by esm_bridge.py.
-# The ESM-2 model (~30 MB) is downloaded on first use and cached locally.
-#
-# CamSol solubility scoring uses only the Python standard library —
-# no additional packages required.
+# ── GUI (the default front-end: python main.py) ────────────────────────────────
+# PySide6 ships abi3/cp310 wheels that install + run on Python 3.14 (verified 6.11.1).
+PySide6==6.11.1
 
-# ── CUDA / GPU acceleration ────────────────────────────────────────────────────
-#
-# For NVIDIA GPUs (ESM-2 inference acceleration):
-#
-#   RTX 5070 Ti (Blackwell, sm_120) — requires CUDA 13.0:
-#     pip install torch==2.12.0+cu130 --index-url https://download.pytorch.org/whl/cu130
-#   NOTE: cu130 DLLs may be blocked by Windows Application Control policies.
-#   If blocked, PyTorch will gracefully fall back to CPU.
-#
-#   Ada Lovelace / Ampere (RTX 40xx, 30xx) — use cu126:
-#     pip install torch==2.12.0+cu126 --index-url https://download.pytorch.org/whl/cu126
-#
-# ESM-2 bridge auto-probes CUDA with a test tensor op and falls back to CPU
-# if hardware/driver mismatch is detected (see _probe_cuda_device in esm_bridge.py).
-# CPU inference: ~27 ms/residue (fair-esm small model).
+# ── Structural biology (imported by the app, not just tests) ────────────────────
+# numpy      — Kabsch/RMSD, conformer comparison, deviation maps
+# biopython  — Bio.PDB parsing + the residue-identity spine (structural_utils,
+#              residue_mapping); the fast-tier ddG voters hard-depend on it
+# freesasa   — SASA for glycan/solvent accessibility (falls back to Bio.PDB
+#              ShrakeRupley if absent, but it is a first-class path)
+# openpyxl   — stability/ddG .xlsx export
+numpy==2.4.6
+biopython==1.87
+freesasa==2.2.1
+openpyxl==3.1.5
 
-# ── Assembly analysis ──────────────────────────────────────────────────────────
+# ── Test/dev tooling ───────────────────────────────────────────────────────────
+# Running the suite (pytest) is NOT a runtime dependency — it lives in:
+#     pip install -r requirements-dev.txt
 #
-# assembly_analyser.py uses:
-#   - requests  (already required above) — for RCSB assembly API queries
-#   - re, typing — Python standard library
+# ── Optional: in-process ESM-2 fallback (CPU) ──────────────────────────────────
+# The GPU ESM/ESMFold/ThermoMPNN path runs in the separate venv312 (cu128, sm_120)
+# via subprocess — it is NOT installed here. The main venv only needs torch for the
+# in-process CPU fallback in esm_bridge, and ONLY the +cpu build (a CUDA wheel here
+# is the cu126/sm_120 "looks-connected-but-runs-CPU" trap). It is OPTIONAL:
+#     pip install -r requirements-esm.txt
 #
-# No additional packages needed for monomer/multimer mode or interface detection.
-# ChimeraX REST bridge is used for interface detection in multimer mode.
-
-# ── ProteinMPNN / LigandMPNN (optional, for sequence redesign) ────────────────
-#
-# NOT pip-installable.  Clone and configure:
-#
-#   git clone https://github.com/dauparas/ProteinMPNN
-#   # Add to .env.local:
-#   PROTEINMPNN_DIR=C:/path/to/ProteinMPNN
-#
-# OR for ligand-aware design (handles small-molecule binding sites):
-#   git clone https://github.com/dauparas/LigandMPNN
-#   PROTEINMPNN_DIR=C:/path/to/LigandMPNN
-#
-# ProteinMPNN: Dauparas et al. (2022) Science 378:49-56
-# LigandMPNN:  Dauparas et al. (2023) biorxiv 2023.12.22
+# ── Optional, not pip-installable: ProteinMPNN / LigandMPNN ─────────────────────
+#   git clone https://github.com/dauparas/ProteinMPNN   (or LigandMPNN)
+#   then set PROTEINMPNN_DIR in .env.local  (see .env.example)

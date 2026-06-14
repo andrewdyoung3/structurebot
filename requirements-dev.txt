@@ -1,0 +1,13 @@
+# StructureBot — DEV / TEST dependencies
+# Install:  pip install -r requirements-dev.txt   (pulls in the core runtime too)
+#
+# This is the documented way to run the test suite:
+#     pip install -r requirements-dev.txt
+#     pytest -q          # gated suite; live PyRosetta/ColabFold benchmarks self-skip
+-r requirements.txt
+
+pytest==9.0.3
+# pytest-timeout is only consumed by the live PyRosetta/ColabFold benchmark tests
+# (@pytest.mark.timeout / --timeout=…); those skip without their live envs, so it is
+# not needed for the gated suite, but is pinned here so the benchmark invocations work.
+pytest-timeout==2.4.0

@@ -1,0 +1,15 @@
+# StructureBot — OPTIONAL in-process ESM-2 CPU fallback
+# Install:  pip install -r requirements-esm.txt
+#
+# Only needed if you want esm_bridge's IN-PROCESS ESM-2 fallback to run on this
+# (main) venv. The primary GPU ESM/ESMFold/ThermoMPNN path lives in the separate
+# venv312 (cu128, sm_120) and is driven by subprocess — it does NOT use these.
+#
+# CRITICAL — CPU build ONLY. The +cpu index is mandatory: a default `pip install
+# torch` on a Blackwell box pulls a CUDA wheel that reports is_available()==True but
+# was built <= sm_90, i.e. the silent "looks-connected-but-runs-CPU" cu126/sm_120
+# trap. Pinning +cpu via the cpu index avoids it entirely. The gated test suite does
+# NOT require torch at all (the ESM path is subprocess-mocked).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.0+cpu
+fair-esm==2.0.0
