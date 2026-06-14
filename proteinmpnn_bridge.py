@@ -441,7 +441,29 @@ class ProteinMPNNBridge:
         self._dir:       Optional[Path] = Path(_PROTEINMPNN_DIR) if _PROTEINMPNN_DIR else None
         self._backend:   Optional[str] = None   # "proteinmpnn" | "ligandmpnn"
         self._script:    Optional[Path] = None
+        self._python:    str = _PYTHON_EXE      # venv312 interpreter (overridable)
         self._available: bool = self._check_available()
+
+    def is_available(self) -> bool:
+        """True iff installed (files present) AND the venv312 import chain RUNS.
+
+        Tier 1 = `self._available` (file presence, set in __init__). Tier 2 = a
+        cached venv312 import-chain probe — the cavity-class capability check: a
+        True flag must mean "can run", not "the interpreter FILE exists". The
+        graceful-degrade contract is unchanged; this only reports absence
+        correctly. Probe is imports-only (no model load), cached, graceful.
+        """
+        if not self._available or not self._dir:
+            return False
+        from dep_probe import local_import_probe
+        imports = ["import numpy", "import torch", "import torch.nn"]
+        if self._backend == "proteinmpnn":
+            imports.append("import protein_mpnn_utils")
+        return local_import_probe(
+            self._python, imports, path_dirs=[str(self._dir)],
+            timeout=int(getattr(_cfg, "PROTEINMPNN_PROBE_TIMEOUT", 60)),
+            cache_key=("proteinmpnn", self._python, str(self._dir)),
+        )
 
     def _check_available(self) -> bool:
         """

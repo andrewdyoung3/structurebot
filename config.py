@@ -406,6 +406,8 @@ PROTEINMPNN_DIR: str = os.environ.get(
     "PROTEINMPNN_DIR",
     str(Path(__file__).parent / "ProteinMPNN"),
 )
+# is_available() capability probe: venv312 import-chain check timeout (cached).
+PROTEINMPNN_PROBE_TIMEOUT: int = int(os.environ.get("PROTEINMPNN_PROBE_TIMEOUT", "60"))
 
 # Persistent cache for ProteinMPNN designs. The bridge runs in a deleted
 # tempfile.TemporaryDirectory(), and the interactive session is only saved on a
@@ -473,6 +475,9 @@ RASP_DIR: str = os.environ.get("RASP_DIR", "/home/andre/RaSP_repo")
 # WSL2 interpreter for RaSP inference (the dedicated rasp_env venv).
 RASP_PYTHON: str = os.environ.get("RASP_PYTHON", "/home/andre/rasp_env/bin/python")
 RASP_WSL_DISTRO: str = os.environ.get("RASP_WSL_DISTRO", "Ubuntu-24.04")
+# is_available() WSL import-chain capability probe timeout (cached, definitive-only).
+RASP_PROBE_TIMEOUT: int = int(os.environ.get("RASP_PROBE_TIMEOUT", "60"))
+RFDIFFUSION_PROBE_TIMEOUT: int = int(os.environ.get("RFDIFFUSION_PROBE_TIMEOUT", "90"))
 # Enable the fast-tier RaSP voter.  "auto" = use it if WSL + rasp_env are present,
 # else skip gracefully.  "false"/"0" disables (scan == pre-RaSP, byte-for-byte).
 RASP_ENABLE: str = os.environ.get("RASP_ENABLE", "auto").strip().lower()
