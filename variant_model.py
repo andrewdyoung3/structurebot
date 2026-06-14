@@ -115,12 +115,20 @@ class ChainDesign:
         self.variants.append(v)
         return v
 
-    def edit_variant(self, variant_id: str, col: int, new_aa: str) -> None:
+    def edit_variant(self, variant_id: str, col: int, new_aa: str,
+                     *, source: Optional[str] = None,
+                     note: Optional[Dict[str, Any]] = None) -> None:
         """Substitute one residue in a variant at a column, lossless against T: sets the
         variant cell's aa and re-derives the Mutation list vs the template. Editing back
         to the template residue REVERTS (drops the mutation). Raises on unknown variant /
         out-of-range column / non-standard aa / gap column (no substituting a gap in S2).
-        The template is NEVER touched (T is immutable — the design baseline)."""
+        The template is NEVER touched (T is immutable — the design baseline).
+
+        *source* tags the resulting Mutation (e.g. "accepted_suggestion" when cherry-
+        picked from a mutation_scanner candidate — honest provenance distinct from the
+        variant's own source); defaults to the variant's source. *note* (e.g. the scan
+        `combined_score` + recommendation) is recorded in `provenance["accepted"]` keyed
+        by resnum, and cleared on revert so it never outlives its mutation."""
         v = self.get_variant(variant_id)
         if v is None:
             raise KeyError(f"variant not found: {variant_id!r}")
@@ -135,9 +143,16 @@ class ChainDesign:
             raise ValueError(f"not a standard amino acid: {new_aa!r}")
         cell.aa = aa
         v.mutations = [m for m in v.mutations if m.resnum != tmpl.resnum]
+        # drop any stale accepted-suggestion note for this position (revert OR re-pick)
+        accepted = v.provenance.get("accepted")
+        if isinstance(accepted, list):
+            v.provenance["accepted"] = [a for a in accepted if a.get("resnum") != tmpl.resnum]
         if tmpl.aa is not None and aa != tmpl.aa:
             v.mutations.append(Mutation(resnum=tmpl.resnum, from_aa=tmpl.aa,
-                                        to_aa=aa, source=v.source))
+                                        to_aa=aa, source=source or v.source))
+            if note:
+                v.provenance.setdefault("accepted", []).append(
+                    {"resnum": tmpl.resnum, "to_aa": aa, **note})
         v.mutations.sort(key=lambda m: m.resnum)
 
 
@@ -286,6 +301,7 @@ def import_mpnn_designs(design: ChainDesign, mpnn_result: Dict[str, Any],
     Stage 1 ships this shape (tested) but does not wire it into the UI (Stage 3).
     """
     tmpl = design.template_cells
+    fasta_path = mpnn_result.get("fasta_path")     # run identity for cross-import dedupe
     out: List[Variant] = []
     for k, d in enumerate(mpnn_result.get("sequences", []) or []):
         seq = str(d.get("sequence", ""))
@@ -297,9 +313,65 @@ def import_mpnn_designs(design: ChainDesign, mpnn_result: Dict[str, Any],
             if tc.aa is not None and aa != tc.aa and tc.resnum is not None:
                 muts.append(Mutation(resnum=tc.resnum, from_aa=tc.aa, to_aa=aa,
                                      source="proteinmpnn"))
+        prov: Dict[str, Any] = {"mpnn_run": run_id, "design_k": k}
+        if fasta_path:
+            prov["fasta_path"] = fasta_path
         out.append(Variant(
             id=next_id_fn(), parent="T", source="proteinmpnn",
-            provenance={"mpnn_run": run_id, "design_k": k},
-            cells=cells, mutations=muts,
+            provenance=prov, cells=cells, mutations=muts,
         ))
     return out
+
+
+# ── Stage 3a: consume cached tool results (batch import dedupe + inline suggestions) ─
+
+def filter_new_mpnn_variants(existing: List[Variant], candidates: List[Variant]) -> List[Variant]:
+    """Drop candidate MPNN variants already imported — identity = (fasta_path, design_k)
+    from provenance — so re-clicking Import is idempotent (no duplicate rows). Candidates
+    with no fasta_path (uncached run) are always kept (can't prove a prior import)."""
+    seen = {(v.provenance.get("fasta_path"), v.provenance.get("design_k"))
+            for v in existing if v.source == "proteinmpnn"}
+    out: List[Variant] = []
+    for v in candidates:
+        key = (v.provenance.get("fasta_path"), v.provenance.get("design_k"))
+        if key[0] is not None and key in seen:
+            continue
+        out.append(v)
+        seen.add(key)
+    return out
+
+
+def group_scan_suggestions(scan_results, chains, template_cells) -> Dict[int, List[Dict[str, Any]]]:
+    """Group mutation_scanner candidates into per-COLUMN ranked suggestion lists for the
+    inline Suggest track. Filters to *chains* (the unique-chain tab's member chains — so a
+    scan run on ONE homo-oligomer copy lands in that copy's collapsed tab), maps each
+    candidate's AUTHOR resnum → template column, and sorts each column's list by
+    combined_score (desc). SPARSE BY CONSTRUCTION: only columns the scan actually covered
+    appear — a scoped scan yields a sparse track, never implying a suggestion where none
+    was computed. Pure / testable."""
+    chains = {str(c) for c in chains}
+    resnum_to_col = {c.resnum: c.col for c in template_cells if c.resnum is not None}
+    by_col: Dict[int, List[Dict[str, Any]]] = {}
+    for cand in (scan_results or []):
+        if str(cand.get("chain", "")) not in chains:
+            continue
+        resnum = cand.get("resnum", cand.get("position"))
+        col = resnum_to_col.get(resnum)
+        if col is None:                            # candidate resnum not in the template
+            continue
+        by_col.setdefault(col, []).append(cand)
+    for col in by_col:
+        by_col[col].sort(key=lambda c: c.get("combined_score", 0.0), reverse=True)
+    return by_col
+
+
+# combined_score → hex for the Suggest track cell (mirrors mutation_scanner's gradient
+# bands: blue strong / cyan good / yellow marginal / orange-red not-recommended).
+def suggestion_color(score: float) -> str:
+    if score >= 1.5:
+        return "#2a6fdb"      # strong
+    if score >= 0.5:
+        return "#3ec0c9"      # good (cyan)
+    if score >= 0.0:
+        return "#e8c33a"      # marginal (yellow)
+    return "#e2663b"          # not recommended (orange-red)

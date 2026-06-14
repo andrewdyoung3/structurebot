@@ -34,11 +34,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from color_modes import all_modes, get_mode
 from seq_library import build_numbering_header_content
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
-                           build_color_commands, build_design_session, column_tracks)
+                           build_color_commands, build_design_session, column_tracks,
+                           filter_new_mpnn_variants, group_scan_suggestions,
+                           import_mpnn_designs, suggestion_color)
 
 _COLS = 30                                  # residues per wrapped block
+_SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
-_ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… or None)
+_ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
 _AA_ROLE = QtCore.Qt.UserRole + 2           # cell → residue 1-letter ("-"/None for non-seq)
 _EDITED_ROLE = QtCore.Qt.UserRole + 3       # cell → bool (variant cell differs from T)
 _AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
@@ -93,14 +96,16 @@ class _ColorWorker(QtCore.QRunnable):
 
 class _ChainDesignTab(QtWidgets.QScrollArea):
     """Wrapped CLC-style view of one ChainDesign. Rows per block: Ruler, T, each
-    variant, Consensus, Conservation. Tracks the ACTIVE row (drives 3D coloring) and
-    the current color mode. A cell click emits (row_id, template-column)."""
+    variant, [Suggest], Consensus, Conservation. Tracks the ACTIVE row (drives 3D
+    coloring) and the current color mode. A cell click emits (row_id, template-column);
+    a click on the sparse inline Suggest track emits (_SUGGEST_ROW, col)."""
 
     cellClicked2 = QtCore.Signal(object, int)   # (row_id: str|None, template col 0-based)
 
-    def __init__(self, design: ChainDesign):
+    def __init__(self, design: ChainDesign, suggestions: Optional[Dict[int, List[dict]]] = None):
         super().__init__()
         self.design = design
+        self.suggestions: Dict[int, List[dict]] = dict(suggestions or {})  # col -> ranked cands
         self.active_row_id: str = "T"               # T drives 3D coloring by default
         self._mode = get_mode("none")               # current color mode (OFF by default)
         self._blocks: List[QtWidgets.QTableWidget] = []
@@ -123,13 +128,21 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         consensus, conservation = column_tracks(design)
         cons_pct = ["·▁▂▃▄▅▆▇█"[min(8, int(c * 8))] for c in conservation]
 
-        # row identity, in table-row order: ruler, T, variants…, consensus, conservation
-        self._row_ids = [None, "T"] + [vv.id for vv in design.variants] + [None, None]
+        # The inline Suggest track appears ONLY when a scan produced candidates for this
+        # chain (sparse by construction — never implies a suggestion where none was run).
+        has_sugg = bool(self.suggestions)
+        sugg_label = ["Suggest"] if has_sugg else []
+        sugg_rid   = [_SUGGEST_ROW] if has_sugg else []
+
+        # row identity, in table-row order: ruler, T, variants…, [Suggest], consensus, conservation
+        self._row_ids = [None, "T"] + [vv.id for vv in design.variants] + sugg_rid + [None, None]
         labels = ["#", f"T ({design.rep_chain})"] \
-            + [vv.id for vv in design.variants] + ["Consensus", "Conservation"]
+            + [vv.id for vv in design.variants] + sugg_label + ["Consensus", "Conservation"]
         tmpl_aa = [c.aa or "-" for c in design.template_cells]
         var_aa = {vv.id: ([c.aa or "-" for c in vv.cells] if len(vv.cells) == n
                           else ["-"] * n) for vv in design.variants}
+        n_var = len(design.variants)
+        sugg_row = (2 + n_var) if has_sugg else -1     # table-row index of the Suggest track
 
         for start in range(0, max(1, n), _COLS):
             end = min(start + _COLS, n)
@@ -147,6 +160,8 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                     aa = var_aa[vv.id][gcol]
                     edited = (aa != "-" and aa != tmpl_aa[gcol])
                     self._put(block, 2 + vi, lc, aa, gcol, vv.id, aa, edited=edited)
+                if has_sugg:
+                    self._put_suggest(block, sugg_row, lc, gcol)
                 self._put(block, len(labels) - 2, lc, consensus[gcol], gcol, None, None, faint=True)
                 self._put(block, len(labels) - 1, lc, cons_pct[gcol], gcol, None, None, faint=True)
             block.resizeColumnsToContents()
@@ -171,6 +186,29 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         if edited:
             f = it.font(); f.setBold(True); it.setFont(f)      # edit visible under any mode
         it.setBackground(self._default_bg(row_id, edited))
+        block.setItem(row, col, it)
+
+    def _put_suggest(self, block, row, col, gcol):
+        """One inline Suggest-track cell: the top-ranked candidate's residue colored by
+        combined_score (sparse — blank where the scan produced nothing for this column)."""
+        cands = self.suggestions.get(gcol)
+        if cands:
+            top = cands[0]
+            it = QtWidgets.QTableWidgetItem(str(top.get("to_aa", "?")))
+            it.setData(_ROW_ROLE, _SUGGEST_ROW)
+            it.setBackground(QtGui.QBrush(QtGui.QColor(
+                suggestion_color(top.get("combined_score", 0.0)))))
+            f = it.font(); f.setBold(True); it.setFont(f)
+            it.setToolTip("\n".join(
+                f"{c.get('from_aa','?')}{c.get('resnum','?')}{c.get('to_aa','?')}  "
+                f"score {c.get('combined_score', 0.0):+.2f}"
+                + (f"  ·  {c.get('recommendation','')}" if c.get("recommendation") else "")
+                for c in cands))
+        else:
+            it = QtWidgets.QTableWidgetItem("")              # sparse: nothing here
+            it.setData(_ROW_ROLE, None)                      # not clickable
+        it.setTextAlignment(QtCore.Qt.AlignCenter)
+        it.setData(_RESNUM_ROLE, gcol)
         block.setItem(row, col, it)
 
     @staticmethod
@@ -198,7 +236,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                     if it is None:
                         continue
                     row_id = it.data(_ROW_ROLE)
-                    if row_id is None:                          # non-sequence row
+                    if row_id is None or row_id == _SUGGEST_ROW:   # non-sequence / score-colored
                         continue
                     if not active:
                         it.setBackground(self._default_bg(row_id, bool(it.data(_EDITED_ROLE))))
@@ -233,14 +271,19 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         return v.cells if v is not None else self.design.template_cells
 
     def _mark_active_header(self) -> None:
-        labels = ["#", f"T ({self.design.rep_chain})"] \
-            + [vv.id for vv in self.design.variants] + ["Consensus", "Conservation"]
+        # base labels by row id (mirrors _build's layout, incl. the optional Suggest row)
+        base_by_rid = {None: "", "T": f"T ({self.design.rep_chain})",
+                       _SUGGEST_ROW: "Suggest"}
+        for vv in self.design.variants:
+            base_by_rid[vv.id] = vv.id
+        tails = ["#", "Consensus", "Conservation"]   # the three None-id rows, in order
         for block in self._blocks:
-            for r, base in enumerate(labels):
-                rid = self._row_ids[r] if r < len(self._row_ids) else None
-                txt = ("► " + base) if (rid is not None and rid == self.active_row_id) else base
-                hdr = QtWidgets.QTableWidgetItem(txt)
-                if rid is not None and rid == self.active_row_id:
+            ti = iter(tails)
+            for r, rid in enumerate(self._row_ids):
+                base = base_by_rid.get(rid, "") if rid is not None else next(ti)
+                active = rid is not None and rid == self.active_row_id
+                hdr = QtWidgets.QTableWidgetItem(("► " + base) if active else base)
+                if active:
                     f = hdr.font(); f.setBold(True); hdr.setFont(f)
                 block.setVerticalHeaderItem(r, hdr)
 
@@ -251,6 +294,12 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         if old is not None:
             old.deleteLater()
         self._build()
+
+    def set_suggestions(self, suggestions: Dict[int, List[dict]]) -> None:
+        """Replace the inline Suggest-track data (per-column ranked candidates) and
+        re-lay. Empty → the track disappears (sparse / honest by absence)."""
+        self.suggestions = dict(suggestions or {})
+        self.rebuild()
 
     def _on_cell(self, row, col):
         it = self.sender().item(row, col)
@@ -296,6 +345,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._apply_btn.clicked.connect(self._apply_substitution)
         bar.addWidget(self._apply_btn)
         bar.addSpacing(12)
+        # Stage 3a: pull the latest cached tool results into the panel (import = capture).
+        self._import_btn = QtWidgets.QPushButton("Import MPNN designs")
+        self._import_btn.clicked.connect(self._import_mpnn)
+        bar.addWidget(self._import_btn)
+        self._sugg_btn = QtWidgets.QPushButton("Load scan suggestions")
+        self._sugg_btn.clicked.connect(self._load_suggestions)
+        bar.addWidget(self._sugg_btn)
+        bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
@@ -334,7 +391,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not self._design:
             return
         for _ukey, cd in self._design.chains.items():
-            tab = _ChainDesignTab(cd)
+            tab = _ChainDesignTab(cd, self._suggestions_for(cd))
             tab.cellClicked2.connect(lambda rid, col, t=tab: self._on_cell(t, rid, col))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
@@ -406,8 +463,160 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._apply_color_to(tab)
         self._push_3d_color(tab)
 
+    # ── Stage 3a: consume cached tool results (batch import + inline cherry-pick) ────
+    def _suggestions_for(self, cd: ChainDesign) -> Dict[int, List[dict]]:
+        """Per-column ranked scan suggestions for *cd* from the cached scan result,
+        filtered to cd's member chains (a scan on ONE homo-oligomer copy lands in the
+        collapsed unique-chain tab). {} when no scan is cached → no Suggest track."""
+        if self._session is None or self._design is None:
+            return {}
+        try:
+            scan = self._session.get_scan_result(self._design.model_id)
+        except Exception:
+            scan = None
+        if not scan:
+            return {}
+        chains = {c for _m, c in cd.members} | {cd.rep_chain}
+        return group_scan_suggestions(scan, chains, cd.template_cells)
+
+    def _chaindesign_for_chain(self, chain: Optional[str]) -> Optional[ChainDesign]:
+        """The unique-chain ChainDesign that owns *chain* (rep or any member copy);
+        the first design when chain is None (uncified result). None if no match."""
+        if self._design is None:
+            return None
+        for cd in self._design.chains.values():
+            chains = {c for _m, c in cd.members} | {cd.rep_chain}
+            if chain is None or chain in chains:
+                return cd
+        return None
+
+    def _focus_tab_for_design(self, cd: ChainDesign) -> Optional[_ChainDesignTab]:
+        for i in range(self._tabs.count()):
+            w = self._tabs.widget(i)
+            if isinstance(w, _ChainDesignTab) and w.design is cd:
+                self._tabs.setCurrentIndex(i)
+                return w
+        return None
+
+    def _import_mpnn(self) -> None:
+        if self._session is None or self._design is None:
+            self._status.setText("No session/structure — nothing to import.")
+            return
+        try:
+            mpnn = self._session.get_proteinmpnn_result(self._design.model_id)
+        except Exception:
+            mpnn = None
+        if not mpnn or not mpnn.get("sequences"):
+            self._status.setText("No cached ProteinMPNN designs. Run e.g. 'redesign chain A "
+                                 "with ProteinMPNN' first, then Import.")
+            return
+        chain = str(mpnn.get("chain", "")) or None
+        cd = self._chaindesign_for_chain(chain)
+        if cd is None:
+            self._status.setText(f"ProteinMPNN designs are for chain {chain}, which isn't a "
+                                 f"loaded unique chain.")
+            return
+        run_id = len({v.provenance.get("fasta_path") for v in cd.variants
+                      if v.source == "proteinmpnn" and v.provenance.get("fasta_path")})
+        # build with throwaway ids, dedupe, then assign real monotonic ids to survivors
+        # only (so re-importing the same cache wastes no V-numbers)
+        _tmp = iter(range(10 ** 9))
+        candidates = import_mpnn_designs(cd, mpnn, run_id, lambda: f"__tmp{next(_tmp)}")
+        new = filter_new_mpnn_variants(cd.variants, candidates)
+        if not new:
+            n_seq = len(mpnn.get("sequences", []))
+            if not candidates:
+                self._status.setText(f"None of the {n_seq} MPNN design(s) align to the "
+                                     f"template length for chain {cd.rep_chain} — skipped.")
+            else:
+                self._status.setText("These MPNN designs are already imported "
+                                     "(no duplicate rows added).")
+            return
+        for vrow in new:
+            vrow.id = self._design.new_variant_id()
+        cd.variants.extend(new)
+        tab = self._focus_tab_for_design(cd)
+        if tab is not None:
+            tab.rebuild()
+            self._apply_color_to(tab)
+        self._persist()
+        self._status.setText(f"Imported {len(new)} ProteinMPNN design(s) for chain "
+                             f"{cd.rep_chain} as variant rows (run {run_id}).")
+
+    def _load_suggestions(self) -> None:
+        if self._design is None:
+            return
+        total = 0
+        for i in range(self._tabs.count()):
+            tab = self._tabs.widget(i)
+            if isinstance(tab, _ChainDesignTab):
+                sugg = self._suggestions_for(tab.design)
+                tab.set_suggestions(sugg)
+                total += len(sugg)
+        cur = self._cur_tab()
+        if cur is not None:
+            self._apply_color_to(cur)
+        if total == 0:
+            self._status.setText("No scan suggestions cached. Run a mutation scan (e.g. "
+                                 "'scan chain A for stabilizing mutations') first.")
+        else:
+            self._status.setText(f"Loaded scan suggestions at {total} position(s). Add/select "
+                                 f"a variant row, then click a Suggest cell to cherry-pick.")
+
+    def _show_suggestion_menu(self, tab: _ChainDesignTab, col: int) -> None:
+        cands = tab.suggestions.get(col) or []
+        if not cands:
+            return
+        menu = QtWidgets.QMenu(self)
+        head = menu.addAction(f"Suggestions @ residue {tab.design.resnum_for_col(col)} "
+                              f"(into {tab.active_row_id}):")
+        head.setEnabled(False)
+        menu.addSeparator()
+        acts: Dict[QtGui.QAction, dict] = {}
+        for c in cands:
+            label = (f"{c.get('from_aa','?')}→{c.get('to_aa','?')}   "
+                     f"score {c.get('combined_score', 0.0):+.2f}"
+                     + (f"   · {c.get('recommendation','')}" if c.get("recommendation") else ""))
+            acts[menu.addAction(label)] = c
+        chosen = menu.exec(QtGui.QCursor.pos())
+        if chosen in acts:
+            self._accept_suggestion(tab, col, acts[chosen])
+
+    def _accept_suggestion(self, tab: _ChainDesignTab, col: int, cand: dict) -> None:
+        """Cherry-pick a scanner candidate into the ACTIVE variant (provenance
+        accepted_suggestion + the scan score). Applies to all copies; recolors panel+3D."""
+        if tab.active_row_id == "T" or tab.design.get_variant(tab.active_row_id) is None:
+            self._status.setText("Add or select a VARIANT row first, then accept a suggestion "
+                                 "(T is the immutable template).")
+            return
+        vid = tab.active_row_id
+        to_aa = str(cand.get("to_aa", ""))
+        note = {"combined_score": cand.get("combined_score"),
+                "recommendation": cand.get("recommendation"),
+                "from_tool": "mutation_scanner"}
+        try:
+            tab.design.edit_variant(vid, col, to_aa, source="accepted_suggestion", note=note)
+        except Exception as exc:
+            self._status.setText(f"Accept failed: {type(exc).__name__}: {exc}")
+            return
+        tab.rebuild()
+        tab.set_active_row(vid)
+        self._edit_target = (vid, col)
+        self._apply_color_to(tab)
+        self._push_3d_color(tab)
+        self._persist()
+        resnum = tab.design.resnum_for_col(col)
+        self._status.setText(
+            f"Accepted {cand.get('from_aa','?')}{resnum}{to_aa} into {vid} "
+            f"(score {cand.get('combined_score', 0.0):+.2f}, accepted_suggestion). "
+            f"Applies to all copies; 3D recolored.")
+
     # ── cell click: 3D-select the column; set active row / edit target ──────────────
     def _on_cell(self, tab: _ChainDesignTab, row_id, col: int) -> None:
+        if row_id == _SUGGEST_ROW:                         # inline cherry-pick affordance
+            self._select_column(tab.design, col)           # show where it is in 3D
+            self._show_suggestion_menu(tab, col)
+            return
         self._select_column(tab.design, col)               # column→3D select (all copies)
         if row_id == "T":
             tab.set_active_row("T")

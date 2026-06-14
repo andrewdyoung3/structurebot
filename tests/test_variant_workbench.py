@@ -155,3 +155,101 @@ class TestStage2:
         p.load_model("1")
         tab = p._cur_tab()
         assert p.color_commands_for(tab) == []   # OFF mode is non-destructive
+
+
+class TestStage3aImport:
+    def _sess(self, mpnn=None, scan=None):
+        s = MagicMock()
+        s.get_proteinmpnn_result.return_value = mpnn
+        s.get_scan_result.return_value = scan
+        return s
+
+    def test_import_mpnn_makes_rows_with_provenance(self, _app):
+        mpnn = {"chain": "A", "wildtype_sequence": "MKV", "fasta_path": "r.fa",
+                "sequences": [{"sequence": "MAV"}, {"sequence": "MKL"}]}
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=self._sess(mpnn=mpnn))
+        p.load_model("1")
+        p._import_mpnn()
+        cd = p._cur_tab().design
+        assert len(cd.variants) == 2
+        assert all(v.source == "proteinmpnn" for v in cd.variants)
+        assert cd.variants[0].provenance["fasta_path"] == "r.fa"
+
+    def test_reimport_is_idempotent(self, _app):
+        mpnn = {"chain": "A", "fasta_path": "r.fa",
+                "sequences": [{"sequence": "MAV"}]}
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=self._sess(mpnn=mpnn))
+        p.load_model("1")
+        p._import_mpnn(); p._import_mpnn()                 # twice
+        assert len(p._cur_tab().design.variants) == 1     # no duplicate row
+
+    def test_import_targets_the_mpnn_chain(self, _app):
+        mpnn = {"chain": "B", "fasta_path": "r.fa", "sequences": [{"sequence": "WYF"}]}
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "WYF")],
+                      session=self._sess(mpnn=mpnn))
+        p.load_model("1")
+        p._import_mpnn()
+        # the design owning chain B got the row; chain A's did not
+        by_chain = {cd.rep_chain: cd for cd in p._design.chains.values()}
+        assert len(by_chain["B"].variants) == 1 and len(by_chain["A"].variants) == 0
+
+    def test_length_mismatch_skipped_with_status(self, _app):
+        mpnn = {"chain": "A", "fasta_path": "r.fa", "sequences": [{"sequence": "MKVQQ"}]}
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=self._sess(mpnn=mpnn))
+        p.load_model("1")
+        p._import_mpnn()
+        assert len(p._cur_tab().design.variants) == 0
+        assert "align" in p._status.text().lower()
+
+
+class TestStage3aSuggestions:
+    def _scan(self, chain="A"):
+        # candidates at resnums 2 and 3 (chain A); resnum 1 has NONE → sparse track
+        return [
+            {"chain": chain, "resnum": 2, "position": 2, "from_aa": "K", "to_aa": "A",
+             "combined_score": 0.6, "recommendation": "good"},
+            {"chain": chain, "resnum": 2, "position": 2, "from_aa": "K", "to_aa": "D",
+             "combined_score": 1.7, "recommendation": "strong"},
+            {"chain": chain, "resnum": 3, "position": 3, "from_aa": "V", "to_aa": "L",
+             "combined_score": -0.3, "recommendation": "marginal"},
+        ]
+
+    def test_load_suggestions_is_sparse(self, _app):
+        s = MagicMock(); s.get_scan_result.return_value = self._scan()
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=s)
+        p.load_model("1")
+        p._load_suggestions()
+        tab = p._cur_tab()
+        assert set(tab.suggestions) == {1, 2}      # cols for resnums 2,3; resnum 1 (col0) absent
+        assert [c["to_aa"] for c in tab.suggestions[1]] == ["D", "A"]   # sorted desc
+
+    def test_accept_into_active_variant_with_provenance(self, _app):
+        s = MagicMock(); s.get_scan_result.return_value = self._scan()
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=s)
+        p.load_model("1")
+        p._load_suggestions()
+        tab = p._cur_tab()
+        p._add_variant()                            # V1 becomes the active row
+        vid = tab.design.variants[0].id
+        top = tab.suggestions[1][0]                 # K2D, score 1.7
+        p._accept_suggestion(tab, 1, top)
+        v = tab.design.get_variant(vid)
+        assert v.cells[1].aa == "D"
+        assert v.mutations[0].source == "accepted_suggestion"
+        assert v.provenance["accepted"][0]["combined_score"] == 1.7
+
+    def test_accept_without_variant_is_guarded(self, _app):
+        s = MagicMock(); s.get_scan_result.return_value = self._scan()
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=s)
+        p.load_model("1")
+        p._load_suggestions()
+        tab = p._cur_tab()                          # active row defaults to T
+        p._accept_suggestion(tab, 1, tab.suggestions[1][0])
+        assert tab.design.variants == []           # nothing edited
+        assert "variant" in p._status.text().lower()
+
+    def test_no_scan_no_suggest_track(self, _app):
+        s = MagicMock(); s.get_scan_result.return_value = None
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=s)
+        p.load_model("1")
+        assert p._cur_tab().suggestions == {}

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from variant_model import (
     AlignedCell, Mutation, Variant, ChainDesign, DesignSession,
     build_design_session, import_mpnn_designs, column_tracks, build_color_commands,
+    filter_new_mpnn_variants, group_scan_suggestions, suggestion_color,
 )
 from seq_editor.controller import ResidueCell, ChainSeq
 
@@ -169,6 +170,90 @@ class TestColorCommands:
         cells = [AlignedCell(0, 1, "K"), AlignedCell(1, None, None), AlignedCell(2, 3, "K")]
         cmds = build_color_commands(cells, [("1", "A")], self._green)
         assert cmds == ["color #1/A #ffffff", "color #1/A:1,3 #00ff00"]
+
+
+class TestAcceptSuggestionProvenance:
+    def _cd(self):
+        cd = next(iter(build_design_session(
+            [_chainseq("1", "A", "MKV")], "1").chains.values()))
+        cd.add_variant("V1")
+        return cd
+
+    def test_source_override_and_note_recorded(self):
+        cd = self._cd()
+        cd.edit_variant("V1", 1, "A", source="accepted_suggestion",
+                        note={"combined_score": 1.23, "recommendation": "good"})
+        v = cd.get_variant("V1")
+        assert v.mutations[0].source == "accepted_suggestion"     # not the variant's "manual"
+        acc = v.provenance["accepted"]
+        assert acc == [{"resnum": 2, "to_aa": "A", "combined_score": 1.23,
+                        "recommendation": "good"}]
+
+    def test_revert_clears_accepted_note(self):
+        cd = self._cd()
+        cd.edit_variant("V1", 1, "A", source="accepted_suggestion", note={"combined_score": 1.0})
+        cd.edit_variant("V1", 1, "K")                              # back to T → revert
+        v = cd.get_variant("V1")
+        assert v.mutations == [] and v.provenance.get("accepted", []) == []
+
+    def test_default_source_is_variant_source(self):
+        cd = self._cd()
+        cd.edit_variant("V1", 1, "A")                             # no override
+        assert cd.get_variant("V1").mutations[0].source == "manual"
+
+
+class TestMpnnDedup:
+    def test_fasta_path_in_provenance(self):
+        cd = ChainDesign("k", "1", "A", [("1", "A")],
+                         [AlignedCell(0, 1, "M"), AlignedCell(1, 2, "K")])
+        mpnn = {"sequences": [{"sequence": "MA"}], "fasta_path": "cache/run.fa"}
+        v = import_mpnn_designs(cd, mpnn, 0, iter(["V1"]).__next__)[0]
+        assert v.provenance["fasta_path"] == "cache/run.fa"
+
+    def test_filter_drops_already_imported(self):
+        existing = [Variant("V1", "T", "proteinmpnn",
+                            provenance={"fasta_path": "r.fa", "design_k": 0})]
+        cands = [Variant("Vx", "T", "proteinmpnn", provenance={"fasta_path": "r.fa", "design_k": 0}),
+                 Variant("Vy", "T", "proteinmpnn", provenance={"fasta_path": "r.fa", "design_k": 1})]
+        new = filter_new_mpnn_variants(existing, cands)
+        assert [v.provenance["design_k"] for v in new] == [1]      # k=0 deduped, k=1 kept
+
+    def test_no_fasta_path_always_kept(self):
+        cands = [Variant("Vx", "T", "proteinmpnn", provenance={"design_k": 0})]
+        assert len(filter_new_mpnn_variants([], cands)) == 1
+
+
+class TestScanSuggestions:
+    def _cells(self):
+        return [AlignedCell(0, 10, "M"), AlignedCell(1, 11, "K"), AlignedCell(2, 12, "V")]
+
+    def _cand(self, chain, resnum, to_aa, score):
+        return {"chain": chain, "resnum": resnum, "position": resnum,
+                "from_aa": "K", "to_aa": to_aa, "combined_score": score}
+
+    def test_groups_by_col_sorted_and_sparse(self):
+        scan = [self._cand("A", 11, "A", 0.5), self._cand("A", 11, "D", 1.8),
+                self._cand("A", 12, "L", -0.2)]
+        sugg = group_scan_suggestions(scan, {"A"}, self._cells())
+        # only scored columns appear (col 0 / resnum 10 absent → sparse)
+        assert set(sugg) == {1, 2}
+        assert [c["to_aa"] for c in sugg[1]] == ["D", "A"]        # sorted by score desc
+        assert 0 not in sugg
+
+    def test_filters_to_member_chains(self):
+        scan = [self._cand("A", 11, "A", 1.0), self._cand("B", 11, "W", 2.0)]
+        sugg = group_scan_suggestions(scan, {"A"}, self._cells())   # only chain A
+        assert [c["to_aa"] for c in sugg[1]] == ["A"]
+
+    def test_candidate_resnum_not_in_template_skipped(self):
+        sugg = group_scan_suggestions([self._cand("A", 999, "A", 1.0)], {"A"}, self._cells())
+        assert sugg == {}
+
+    def test_suggestion_color_bands(self):
+        assert suggestion_color(2.0) == "#2a6fdb"     # strong
+        assert suggestion_color(0.8) == "#3ec0c9"     # good
+        assert suggestion_color(0.2) == "#e8c33a"     # marginal
+        assert suggestion_color(-1.0) == "#e2663b"    # not recommended
 
 
 class TestPersistenceRoundtrip:
