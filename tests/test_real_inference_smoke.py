@@ -86,13 +86,16 @@ def test_esm_real_inference():
     assert res.success and res.data, "ESM-2 produced no conservation scores"
 
 
-# NOTE — RFdiffusion has NO gated B3 inference smoke here, deliberately:
-#   - its capability flag (import chain in rfdiffusion_env) IS live-verified (Unit B);
-#   - a real backbone was verified by the 2026-06-12 activation smoke (raw CLI);
-#   - but analyze() exposes no unconditional/monomer mode (only binder /
-#     motif_scaffold / symmetric / partial_diffusion), and a live `symmetric` run
-#     this turn hit a run_inference.py PATH-RESOLUTION error (the execution path
-#     BEYOND the import chain — `can't open …/RFdiffusion/run_inference.py`). That
-#     is a separate finding tracked in §9; shipping a gated test that fails on
-#     opt-in would be worse than none. Status: guarded (capability flag + 06-12
-#     activation smoke); B3 inference-smoke deferred pending the run-path fix.
+@_gate
+def test_rfdiffusion_real_inference():
+    # MUST go through the bridge analyze() DISPATCH (not the raw CLI) — the 06-12
+    # smoke verified only the engine; the dispatch (script-path resolution) was the
+    # broken, never-exercised path. symmetric is the no-PDB analyze() mode; T≥15 is
+    # an RFdiffusion model constraint. Asserts a real backbone via the production path.
+    from rfdiffusion_bridge import RFdiffusionBridge
+    b = RFdiffusionBridge()
+    assert b.is_available(), "RFdiffusion capability flag False — env not ready"
+    res = b.analyze({"mode": "symmetric", "symmetry": "c2", "contigs": "60-60",
+                     "num_designs": 1, "num_steps": 15})
+    assert res.success and res.data.get("pdb_paths"), \
+        f"RFdiffusion analyze() produced no backbone: {(res.error or '')[:160]}"
