@@ -682,6 +682,72 @@ class TestRunRepresentation:
         assert "bridge" in result.error.lower()
 
 
+# ── 13b. _run_representation TARGET scoping (the op-class widening fix) ─────────
+
+class TestRepresentationTargetScoping:
+    """_run_representation used to ALWAYS render against the whole model (`#N`),
+    silently widening every targeted request ("show the ligand as sticks" re-styled
+    the entire structure). It now uses the shared resolver: chain / ligand / residue
+    targets scope; finer targets DEFER to the translator's command (never widen)."""
+
+    def setup_method(self):
+        import tool_router
+        tool_router._repr_classify_fn = None
+
+    def _router(self) -> ToolRouter:
+        mb = MagicMock()
+        mb.run_command.return_value = {"value": "", "error": None}
+        ms = MagicMock()
+        ms.structures = {"1": {"name": "1hsg"}}
+        ms.get_structure.return_value = {"name": "1hsg"}
+        return ToolRouter(bridge=mb, session=ms)
+
+    def test_ligand_scoped_not_whole_model(self):
+        result = self._router()._run_representation(
+            {"_user_input": "show the ligand as sticks", "intent_key": "view.sticks"})
+        assert result.success is True
+        assert all("#1 & ligand" in c for c in result.data["commands"]), \
+            result.data["commands"]
+        assert not any(c == "style #1 stick" for c in result.data["commands"])
+
+    def test_chain_scoped_excludes_ligand(self):
+        result = self._router()._run_representation(
+            {"_user_input": "show chain A as cartoon",
+             "intent_key": "view.cartoon_only"})
+        assert all("(#1/A & ~ligand & ~solvent & ~ions)" in c
+                   for c in result.data["commands"]), result.data["commands"]
+        assert result.data["chain"] == "A"
+
+    def test_residue_range_in_chain_scoped(self):
+        result = self._router()._run_representation(
+            {"_user_input": "show residues 80-90 in chain A as sticks",
+             "intent_key": "view.sticks"})
+        assert all("#1/A:80-90" in c for c in result.data["commands"]), \
+            result.data["commands"]
+
+    def test_whole_model_when_no_target(self):
+        result = self._router()._run_representation(
+            {"_user_input": "show as cartoon", "intent_key": "view.cartoon_only"})
+        assert all("#1" in c and "/" not in c and "&" not in c
+                   for c in result.data["commands"]), result.data["commands"]
+
+    def test_finer_target_defers_to_translator(self):
+        result = self._router()._run_representation(
+            {"_user_input": "show residues within 5 of the ligand as sticks",
+             "intent_key": "view.sticks",
+             "_translator_commands": ["style :LIG :<5 stick"]})
+        assert result.success is True
+        assert result.data["resolution"] == "deferred"
+        assert result.data["commands"] == ["style :LIG :<5 stick"]
+
+    def test_finer_target_without_fallback_refuses(self):
+        result = self._router()._run_representation(
+            {"_user_input": "show the binding pocket as sticks",
+             "intent_key": "view.sticks", "_translator_commands": []})
+        assert result.success is False
+        assert "finer selection" in result.error.lower()
+
+
 # ── 14. Classifier backend — Ollama path, think flag, fallback ────────────────
 
 class TestClassifierBackend:

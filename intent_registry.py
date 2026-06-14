@@ -679,16 +679,17 @@ VIEWER_REGISTRY.register(IntentDef(
 _COLOR_VERB_RE = re.compile(r"\b(?:re)?colou?r(?:s|ed|ing)?\b", re.IGNORECASE)
 _RAINBOW_RE    = re.compile(r"\brainbow\b", re.IGNORECASE)
 
-# Sub-chain selection qualifiers the color op-class CANNOT render (it only targets
-# a whole chain or the whole model).  When any of these is present the phrase is
-# NOT gated to the op-class — it falls through to guarded free-translation, which
-# can build the residue/region selection.  This keeps the op-class to the simple
-# cases ("color chain A red", "color by chain", "rainbow") and prevents capturing
-# compound requests like "color the proline residues" / "color the binding pocket".
+# Sub-chain selection qualifiers the color op-class CANNOT render.  When any is
+# present the phrase is NOT gated to the op-class — it falls through to guarded
+# free-translation (or, once gated, the resolver's DEFER path).  Residue selection
+# BY NUMBER ("residues 50-60", "residue 75") is deliberately NOT listed: the shared
+# op-class resolver renders those as a `:N-M` spec, so they gate in and scope
+# deterministically.  Residue selection by TYPE/property/region ("proline
+# residues", "hydrophobic", "the binding pocket") stays here — still inexpressible.
+# `\bresidues?\b(?!\s+\d)` blocks a bare "residues" mention but lets a residue
+# NUMBER ("residues 50…") through to the resolver.
 _COLOR_COMPLEX_RE = re.compile(
-    r"\bresidues?\b"
-    r"|\b\d+\s*[-–]\s*\d+\b"                       # a residue-number range (20-30)
-    r"|:\s*\d"                                      # an explicit residue spec (:25)
+    r"\bresidues?\b(?!\s+\d)"
     r"|\b(?:pocket|site|interface|loop|helix|helices|sheet|strand|domain|motif"
     r"|patch|cleft|groove|terminus|termini|backbone|side\s?chain|sidechains?"
     r"|core|active|binding)\b"                      # named regions

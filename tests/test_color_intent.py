@@ -193,8 +193,17 @@ class TestCategoryFloor:
     def test_floor_binding_pocket_not_gated(self):
         assert _color_category_floor("color the binding pocket residues on chain a") is False
 
-    def test_floor_resnum_range_not_gated(self):
-        assert _color_category_floor("color residues 20-30 red") is False
+    def test_floor_resnum_range_gates(self):
+        # Residue-number ranges ARE now gated: the shared op-class resolver renders
+        # them as a `:N-M` spec (it no longer falls through to free-translation,
+        # whose residue specs were unreliable). Residue TYPES still don't gate
+        # (test_floor_proline_residues_not_gated).
+        assert _color_category_floor("color residues 20-30 red") is True
+        assert _color_category_floor("color residue 75 blue") is True
+
+    def test_floor_bare_residues_word_not_gated(self):
+        # a bare "residues" with no number is still inexpressible → must not gate
+        assert _color_category_floor("color the surface residues red") is False
 
     def test_floor_active_site_not_gated(self):
         assert _color_category_floor("color the active site blue") is False
@@ -420,7 +429,166 @@ class TestChainScopeGuard:
         assert result.data["chain"] is None
 
 
-# ── 9. LLM classifier — color registry ─────────────────────────────────────────
+# ── 9. Keyword-selector targets — the op-class ligand regression ────────────────
+
+class TestKeywordSelectorTarget:
+    """
+    "colour the ligand white" must scope to the bound ligand, NOT the whole model.
+    The op-class migration's target parser only understood `chain X` / `/X`, so a
+    ligand/solvent/ions request fell through to the whole-model `#N` spec and painted
+    the ENTIRE structure (verified live on 1HSG: protein chains were coloured too).
+    """
+
+    def setup_method(self):
+        import tool_router
+        tool_router._color_classify_fn = None
+
+    def test_solid_ligand_color_scoped_to_ligand(self):
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({"_user_input": "colour the ligand white",
+                                    "intent_key": None})
+        assert result.success is True
+        assert result.data["color_name"] == "white"
+        assert result.data["commands"] == ["color #1 & ligand white"], \
+            result.data["commands"]
+        # the whole-model (bleeding) form must NOT be emitted
+        assert "color #1 white" not in result.data["commands"]
+
+    def test_scheme_ligand_color_scoped_to_ligand(self):
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({"_user_input": "color the ligand by element",
+                                    "intent_key": "color.by_element"})
+        assert result.data["commands"] == ["color #1 & ligand byelement"], \
+            result.data["commands"]
+
+    def test_solvent_target_scoped(self):
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({"_user_input": "color the solvent blue",
+                                    "intent_key": None})
+        assert result.data["commands"] == ["color #1 & solvent blue"], \
+            result.data["commands"]
+
+    def test_ions_target_scoped(self):
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({"_user_input": "color the ions yellow",
+                                    "intent_key": None})
+        assert result.data["commands"] == ["color #1 & ions yellow"], \
+            result.data["commands"]
+
+    def test_explicit_chain_wins_over_ligand_word(self):
+        # an explicit chain ref is more specific than the bare "ligand" keyword
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({"_user_input": "color chain A red",
+                                    "intent_key": None})
+        assert result.data["commands"] == \
+            ["color (#1/A & ~ligand & ~solvent & ~ions) red"], result.data["commands"]
+
+
+# ── 9b. Shared op-class target resolver (color + representation agree) ──────────
+
+class TestOpclassTargetResolver:
+    """The single resolver both op-class handlers use. SAFETY INVARIANT: it renders
+    only targets it can express (whole / chain / keyword / residue-number); any
+    finer target (zone / pocket / interface / selection) returns defer=True so the
+    caller runs the translator's command rather than a widened whole-model one."""
+
+    def _r(self):
+        return _make_router()
+
+    def test_no_target_is_whole_model(self):
+        t = self._r()._resolve_opclass_target("color by chain", "1")
+        assert t == {"spec": "#1", "chain": None, "keyword": None,
+                     "target_desc": "whole model", "defer": False}
+
+    def test_explicit_whole_phrasing(self):
+        for p in ("color the whole model red", "give each chain a shade",
+                  "color everything blue"):
+            assert self._r()._resolve_opclass_target(p, "1")["spec"] == "#1"
+
+    def test_chain_target(self):
+        t = self._r()._resolve_opclass_target("color chain A red", "1")
+        assert t["spec"] == "#1/A" and t["chain"] == "A" and t["defer"] is False
+
+    def test_keyword_targets(self):
+        for word, kw in (("the ligand", "ligand"), ("the solvent", "solvent"),
+                         ("water", "solvent"), ("the ions", "ions")):
+            t = self._r()._resolve_opclass_target(f"color {word} white", "1")
+            assert t["spec"] == f"#1 & {kw}", (word, t)
+
+    def test_residue_range_expressed(self):
+        for p in ("color residues 50-60 red", "color residues 50 to 60 red"):
+            t = self._r()._resolve_opclass_target(p, "1")
+            assert t["spec"] == "#1:50-60" and t["defer"] is False, (p, t)
+
+    def test_residue_range_in_chain(self):
+        t = self._r()._resolve_opclass_target(
+            "show residues 80-90 in chain A as sticks", "1")
+        assert t["spec"] == "#1/A:80-90" and t["chain"] == "A"
+
+    def test_residue_single_and_list(self):
+        assert self._r()._resolve_opclass_target("color residue 75 blue", "1")["spec"] \
+            == "#1:75"
+        assert self._r()._resolve_opclass_target(
+            "color residues 10,20,30 green", "1")["spec"] == "#1:10,20,30"
+
+    def test_finer_targets_defer(self):
+        # zone / pocket / interface / selection: cannot express → DEFER (never #1)
+        for p in ("color residues within 5 of the ligand green",
+                  "color the binding pocket blue", "color the active site red",
+                  "color the interface yellow", "color the selection cyan"):
+            t = self._r()._resolve_opclass_target(p, "1")
+            assert t["defer"] is True and t["spec"] is None, (p, t)
+
+    def test_within_zone_defers_even_with_ligand_word(self):
+        # the ligand keyword must NOT win when the real target is RELATIVE to it
+        t = self._r()._resolve_opclass_target(
+            "color residues within 5 angstroms of the ligand green", "1")
+        assert t["defer"] is True
+
+
+# ── 9c. Residue-range + DEFER through _run_color ────────────────────────────────
+
+class TestColorResidueAndDefer:
+
+    def setup_method(self):
+        import tool_router
+        tool_router._color_classify_fn = None
+
+    def test_residue_range_renders_scoped_spec(self):
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({"_user_input": "color residues 50 to 60 red",
+                                    "intent_key": None})
+        assert result.success is True
+        assert result.data["commands"] == ["color #1:50-60 red"], \
+            result.data["commands"]
+        assert "color #1 red" not in result.data["commands"]   # never widened
+
+    def test_defer_runs_translator_command_not_whole_model(self):
+        # a binding-pocket request the resolver can't express runs the translator's
+        # already-scoped command, NEVER a regenerated `color #1 …`.
+        router = _router_with_bridge([_cx_ok("")])
+        result = router._run_color({
+            "_user_input": "color the binding pocket blue",
+            "intent_key": None,
+            "_translator_commands": ["color :MK1 :<4.0 blue"],
+        })
+        assert result.success is True
+        assert result.data["resolution"] == "deferred"
+        assert result.data["commands"] == ["color :MK1 :<4.0 blue"]
+
+    def test_defer_without_fallback_refuses_not_widens(self):
+        # no translator command to fall back to → REFUSE (never silently widen)
+        router = _router_with_bridge([])
+        result = router._run_color({
+            "_user_input": "color the binding pocket blue",
+            "intent_key": None,
+            "_translator_commands": [],
+        })
+        assert result.success is False
+        assert "finer selection" in result.error.lower()
+
+
+# ── 10. LLM classifier — color registry ────────────────────────────────────────
 
 class TestColorClassifier:
 
