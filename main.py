@@ -223,32 +223,40 @@ class StructureBot:
         else:
             console.print(f"[info]ChimeraX:[/info] [dim]{cx_path}[/dim]")
 
-        # 3. Start or connect
+        # 3. Start or connect. ensure_visible_gui() rejects a leftover *windowless*
+        # ChimeraX (REST-reachable but with no GUI window — a zombie from a prior
+        # session): models would open into an invisible viewer. It relaunches a
+        # fresh visible window in that case.
         with console.status("[cyan]Connecting to ChimeraX REST server…[/cyan]"):
             already = self.bridge.is_running()
-
-        if already:
-            console.print(
-                f"[ok]✓[/ok] Connected to ChimeraX at "
-                f"http://{config.REST_HOST}:{self.bridge.port}/"
-            )
-        else:
+        if not already:
             console.print("[warn]ChimeraX REST server not found — launching ChimeraX…[/warn]")
             console.print("[dim]  (may take 20–40 s for ChimeraX to initialise)[/dim]")
-            try:
-                with console.status("[cyan]Starting ChimeraX…[/cyan]"):
-                    self.bridge.start(timeout=60)
+        try:
+            with console.status("[cyan]Starting ChimeraX…[/cyan]"):
+                outcome = self.bridge.ensure_visible_gui(timeout=60)
+            if outcome == "connected":
+                console.print(
+                    f"[ok]✓[/ok] Connected to ChimeraX at "
+                    f"http://{config.REST_HOST}:{self.bridge.port}/"
+                )
+            elif outcome == "relaunched":
+                console.print(
+                    "[warn]⚠ A windowless ChimeraX was holding the port — relaunched a "
+                    f"fresh visible window (REST on port {self.bridge.port}).[/warn]"
+                )
+            else:  # "started"
                 console.print(
                     f"[ok]✓[/ok] ChimeraX started — REST server on port {self.bridge.port}."
                 )
-            except Exception as exc:
-                console.print(f"[err]✗ Failed to start ChimeraX: {exc}[/err]")
-                console.print(
-                    "\n[dim]Manual fix: open ChimeraX and run in its command bar:\n"
-                    "  remotecontrol rest start port 60001\n"
-                    "Then re-run StructureBot.[/dim]"
-                )
-                sys.exit(1)
+        except Exception as exc:
+            console.print(f"[err]✗ Failed to start ChimeraX: {exc}[/err]")
+            console.print(
+                "\n[dim]Manual fix: open ChimeraX and run in its command bar:\n"
+                "  remotecontrol rest start port 60001\n"
+                "Then re-run StructureBot.[/dim]"
+            )
+            sys.exit(1)
 
         # 4. Ping
         ping = self.bridge.ping()

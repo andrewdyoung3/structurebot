@@ -78,6 +78,46 @@ def test_run_command_success_path_does_not_reconnect():
     reconnect.assert_not_called()
 
 
+def test_ensure_visible_gui_reuses_running_visible_chimerax():
+    """REST reachable + a visible ChimeraX window → reuse it ('connected'), no relaunch."""
+    bridge = _bridge()
+    with patch.object(bridge, "is_running", MagicMock(return_value=True)), \
+         patch.object(bridge, "_visible_chimerax_window_exists",
+                      MagicMock(return_value=True)), \
+         patch.object(bridge, "start", MagicMock()) as start, \
+         patch.object(bridge, "_kill_all_chimerax", MagicMock()) as kill:
+        assert bridge.ensure_visible_gui() == "connected"
+    start.assert_not_called()
+    kill.assert_not_called()
+
+
+def test_ensure_visible_gui_starts_when_nothing_running():
+    """No REST server → launch fresh ('started')."""
+    bridge = _bridge()
+    with patch.object(bridge, "is_running", MagicMock(return_value=False)), \
+         patch.object(bridge, "start", MagicMock(return_value=True)) as start, \
+         patch.object(bridge, "_kill_all_chimerax", MagicMock()) as kill:
+        assert bridge.ensure_visible_gui() == "started"
+    start.assert_called_once()
+    kill.assert_not_called()
+
+
+def test_ensure_visible_gui_replaces_windowless_zombie():
+    """REST reachable but NO visible window → kill the zombie and relaunch a fresh
+    visible instance ('relaunched'). is_running() returns False after the kill so the
+    drop-wait loop exits immediately."""
+    bridge = _bridge()
+    running = MagicMock(side_effect=[True, False])   # before kill: up; after kill: gone
+    with patch.object(bridge, "is_running", running), \
+         patch.object(bridge, "_visible_chimerax_window_exists",
+                      MagicMock(return_value=False)), \
+         patch.object(bridge, "_kill_all_chimerax", MagicMock()) as kill, \
+         patch.object(bridge, "start", MagicMock(return_value=True)) as start:
+        assert bridge.ensure_visible_gui() == "relaunched"
+    kill.assert_called_once()
+    start.assert_called_once()
+
+
 def test_run_commands_recovers_mid_list_via_reconnect():
     """
     run_commands benefits from the same reconnect: a mid-list connection drop

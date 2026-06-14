@@ -170,6 +170,99 @@ class ChimeraXBridge:
             "Try increasing the timeout or check that ChimeraX starts cleanly."
         )
 
+    def ensure_visible_gui(self, timeout: int = STARTUP_TIMEOUT) -> str:
+        """
+        Guarantee a ChimeraX with a *visible* GUI window is up and reachable on
+        self.port, then return how that was achieved:
+
+            "connected"  — a visible ChimeraX was already running; reused as-is
+            "started"    — nothing was running; launched a fresh ChimeraX
+            "relaunched" — a leftover *windowless* ChimeraX (REST-reachable but with
+                           no GUI window — e.g. a zombie from a prior session that
+                           StructureBot deliberately left running) was squatting the
+                           port; it is killed and a fresh visible instance launched
+
+        This is stricter than start(), which reuses ANY reachable REST server.
+        Reusing a windowless instance is exactly the failure the user hits: models
+        open into an invisible viewer and "nothing appears". Raises on launch
+        failure (same contract as start()).
+        """
+        if self.is_running():
+            if self._visible_chimerax_window_exists():
+                return "connected"
+            # A windowless leftover is holding the port. Replace it: nothing visible
+            # is being discarded (the precondition is "no visible ChimeraX window").
+            self._kill_all_chimerax()
+            deadline = time.time() + 10
+            while time.time() < deadline and self.is_running():
+                time.sleep(0.3)
+            self.start(timeout=timeout)
+            return "relaunched"
+        self.start(timeout=timeout)
+        return "started"
+
+    @staticmethod
+    def _visible_chimerax_window_exists() -> bool:
+        """
+        True if some ChimeraX process owns a visible top-level window (Windows).
+
+        On non-Windows platforms, or if the probe fails for any reason, returns
+        True (assume a usable GUI — never block startup on a best-effort check).
+        """
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+            found: List[int] = []
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                handle = kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+                if handle:
+                    try:
+                        buf = ctypes.create_unicode_buffer(32768)
+                        size = wintypes.DWORD(len(buf))
+                        if kernel32.QueryFullProcessImageNameW(
+                                handle, 0, buf, ctypes.byref(size)):
+                            if buf.value.lower().endswith("chimerax.exe"):
+                                found.append(pid.value)
+                    finally:
+                        kernel32.CloseHandle(handle)
+                return not found      # stop enumerating once a match is found
+
+            user32.EnumWindows(_cb, 0)
+            return bool(found)
+        except Exception:
+            return True
+
+    def _kill_all_chimerax(self) -> None:
+        """
+        Force-kill every ChimeraX process (Windows). Only called once we have
+        confirmed NO visible ChimeraX window exists, so nothing the user can see
+        is discarded. Best-effort; never raises.
+        """
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "ChimeraX.exe"],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                pass
+        self._process = None
+
     def stop(self, graceful: bool = True) -> None:
         """
         Stop the ChimeraX process.  Sends 'quit' via REST first if graceful=True.

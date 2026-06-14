@@ -601,18 +601,26 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                    "'remotecontrol rest start port 60001'.")
             return
         p.dim(f"ChimeraX: {cx}")
-        if self.bridge.is_running():
-            p.success(f"✓ Connected to ChimeraX on port {self.bridge.port}")
-        else:
+        # ensure_visible_gui() rejects a leftover *windowless* ChimeraX (REST-reachable
+        # but with no GUI window — a zombie from a prior session): models would open into
+        # an invisible viewer and "nothing appears". It relaunches a fresh visible window.
+        if not self.bridge.is_running():
             p.info("ChimeraX REST not found — launching ChimeraX… (may take 20–40 s)")
-            try:
-                self.bridge.start(timeout=60)
+        try:
+            outcome = self.bridge.ensure_visible_gui(timeout=60)
+            if outcome == "connected":
+                p.success(f"✓ Connected to ChimeraX on port {self.bridge.port}")
+            elif outcome == "relaunched":
+                self._started_chimerax = True
+                p.warn("⚠ A windowless ChimeraX was holding the port — relaunched a "
+                       f"fresh visible window (REST on port {self.bridge.port}).")
+            else:  # "started"
                 self._started_chimerax = True
                 p.success(f"✓ ChimeraX started — REST on port {self.bridge.port}")
-            except Exception as exc:
-                p.error(f"✗ Failed to start ChimeraX: {exc}")
-                p.dim("Manual fix: open ChimeraX → 'remotecontrol rest start port 60001'.")
-                return
+        except Exception as exc:
+            p.error(f"✗ Failed to start ChimeraX: {exc}")
+            p.dim("Manual fix: open ChimeraX → 'remotecontrol rest start port 60001'.")
+            return
         ping = self.bridge.ping()
         if ping.get("ok"):
             ver = (ping["result"].get("value") or "")[:40].strip()

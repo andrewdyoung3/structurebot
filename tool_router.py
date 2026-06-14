@@ -1147,12 +1147,21 @@ class ToolRouter:
         if user_input:
             from intent_registry import VIEWER_REGISTRY as _vreg
             if _vreg.detect_category_phrase(user_input):
-                _repr_key    = _vreg.resolve_alias(user_input)  # None → LLM in execute
+                # Strip the target so an intervening target ("show the ligand as
+                # sticks") doesn't break the contiguous alias match → deterministic
+                # intent_key, no flaky LLM tier.
+                _repr_key    = _vreg.resolve_alias(
+                    self._strip_target_for_alias(user_input))  # None → LLM in execute
                 tools_needed = ["representation"]
                 tool_inputs  = {
                     "representation": {
                         "_user_input": user_input,
                         "intent_key":  _repr_key,
+                        # Preserved for the resolver's DEFER path: a finer target
+                        # (residue range / zone / pocket) runs these scoped commands
+                        # instead of a regenerated whole-model render.
+                        "_translator_commands": list(
+                            translator_result.get("commands") or []),
                     }
                 }
                 _repr_intent = True
@@ -1167,12 +1176,16 @@ class ToolRouter:
         if user_input and not _claimed:
             from intent_registry import COLOR_REGISTRY as _creg
             if _creg.detect_category_phrase(user_input, "color"):
-                _color_key   = _creg.resolve_alias(user_input)  # None → LLM/solid in execute
+                _color_key   = _creg.resolve_alias(
+                    self._strip_target_for_alias(user_input))  # None → LLM/solid in execute
                 tools_needed = ["color"]
                 tool_inputs  = {
                     "color": {
                         "_user_input": user_input,
                         "intent_key":  _color_key,
+                        # Preserved for the resolver's DEFER path (see representation).
+                        "_translator_commands": list(
+                            translator_result.get("commands") or []),
                     }
                 }
                 _color_intent = True
@@ -6859,6 +6872,193 @@ class ToolRouter:
         except Exception:
             return []
 
+    # ── Shared op-class target resolver (single source of truth) ───────────────
+    # The op-class handlers (_run_color / _run_representation) rebuild a command
+    # from the user's English via the intent/render registry, so both MUST agree on
+    # WHAT the command applies to. This one resolver is that agreement — neither
+    # handler reimplements target parsing.
+    #
+    # SAFETY INVARIANT (the regression class this closes): an op-class handler must
+    # NEVER silently broaden scope. It renders a deterministic command ONLY for a
+    # target it can fully express — the whole model, a chain, or a
+    # ligand/solvent/ions keyword selector. For any FINER target (residue
+    # ranges/zones, a binding/active site, an interface, a live selection) it
+    # DEFERS: the caller runs the translator's already-scoped command instead of a
+    # regenerated whole-model one. Widening (ligand → whole model) is thereby made
+    # structurally impossible, not merely unlikely.
+
+    # Markers of a target finer than a bare chain/keyword. Presence of ANY forces a
+    # defer — even when a chain/keyword is also present, because the real target is
+    # then relative/narrower ("residues 50-60 in chain A", "within 5 Å of the
+    # ligand"). Deliberately EXCLUDES secondary-structure words (helix/strand/loop)
+    # so "color by secondary structure" still routes to the registry scheme.
+    _OPCLASS_FINER_TARGET_RE = re.compile(
+        r"""\bresidues?\b | \bresid\b | \bresno\b
+          | :\s*\d
+          | \b\d+\s*(?:-|–|to|thru|through)\s*\d+\b
+          | \bwithin\b | \bnear\b | \bnearby\b | \bzone\b
+          | \bpocket\b | \bbinding\s+site\b | \bactive\s+site\b
+          | \binterface\b
+          | \bselection\b | \bselected\b
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    def _resolve_opclass_target(
+        self, user_input: str, model_id: str,
+    ) -> Dict[str, Any]:
+        """Resolve the target an op-class (color/representation) command applies to.
+
+        Returns a dict:
+          {"spec": str|None, "chain": str|None, "keyword": str|None,
+           "target_desc": str, "defer": bool}
+
+        defer=False → render deterministically against ``spec`` (whole model /
+                      ``#N/CHAIN`` / ``#N & <keyword>``). Chain specs are scoped to
+                      exclude ligand/solvent/ions by the shared chain-scope guard at
+                      the call site.
+        defer=True  → ``spec`` is None; the target is finer than this resolver can
+                      express. The caller MUST run the translator's command instead
+                      of regenerating a whole-model one (the safety invariant).
+
+        Precedence: a finer-target marker → DEFER (wins over chain/keyword, since
+        the marker means the real target is narrower); else explicit chain ref;
+        else ligand/solvent/ions keyword; else the whole model.
+        """
+        ui  = user_input or ""
+        mid = str(model_id)
+
+        # 1. Explicit residue selection (range / list / single), optionally
+        #    chain-qualified → an EXPRESSIBLE `:N` / `:N-M` / `:n,m` spec. Done
+        #    BEFORE the finer-target defer so a residue range renders
+        #    deterministically (the translator's residue specs are unreliable —
+        #    `/50-60` instead of `:50-60`) while zones/pockets still defer.
+        res_chain = None
+        cm = re.search(r"\bchain\s+([A-Za-z0-9])\b", ui, re.I) \
+            or re.search(r"(?<![A-Za-z0-9])/([A-Za-z0-9])(?![A-Za-z0-9:])", ui)
+        if cm:
+            res_chain = cm.group(1).upper()
+        rng    = re.search(r"\bresidues?\s+(\d+)\s*(?:-|–|to|through|thru)\s*(\d+)\b",
+                           ui, re.I)
+        rlist  = re.search(r"\bresidues?\s+(\d+(?:\s*,\s*\d+)+)", ui, re.I)
+        rone   = re.search(r"\bresidues?\s+(\d+)\b", ui, re.I)
+        res_frag = None
+        if rng:
+            res_frag = f":{rng.group(1)}-{rng.group(2)}"
+        elif rlist:
+            res_frag = ":" + re.sub(r"\s+", "", rlist.group(1))
+        elif rone:
+            res_frag = f":{rone.group(1)}"
+        if res_frag:
+            chain_part = f"/{res_chain}" if res_chain else ""
+            desc = (f"residues {res_frag[1:]}"
+                    + (f" in chain {res_chain}" if res_chain else ""))
+            return {"spec": f"#{mid}{chain_part}{res_frag}", "chain": res_chain,
+                    "keyword": None, "target_desc": desc, "defer": False}
+
+        # 2. A finer-than-chain target marker we can't express (distance zone,
+        #    binding/active site, interface, live selection) → DEFER (highest
+        #    remaining precedence). A bare chain/keyword in the same phrase would
+        #    WIDEN it ("within 5 Å of the ligand" is NOT the whole ligand), so never
+        #    render in this case.
+        if self._OPCLASS_FINER_TARGET_RE.search(ui):
+            return {"spec": None, "chain": None, "keyword": None,
+                    "target_desc": "a finer selection", "defer": True}
+
+        # 3. Explicit whole-model phrasing — an intended, explicit broadening.
+        if re.search(r"\b(?:each|every|all|both|per)\s+chains?\b"
+                     r"|\bwhole\s+(?:model|structure|thing)\b|\beverything\b",
+                     ui, re.I):
+            return {"spec": f"#{mid}", "chain": None, "keyword": None,
+                    "target_desc": "whole model", "defer": False}
+
+        # 4. Explicit chain ref ("chain A" / "/A"), but NOT residue-qualified
+        #    (a `/A:50` is handled as a residue selection in step 1).
+        m = re.search(r"\bchain\s+([A-Za-z0-9])\b", ui, re.I)
+        if not m:
+            m = re.search(r"(?<![A-Za-z0-9])/([A-Za-z0-9])(?![A-Za-z0-9:])", ui)
+        if m:
+            chain = m.group(1).upper()
+            return {"spec": f"#{mid}/{chain}", "chain": chain, "keyword": None,
+                    "target_desc": f"chain {chain}", "defer": False}
+
+        # 5. Keyword selectors (ligand / solvent|water / ions) — disjoint from the
+        #    protein chains; the bare ChimeraX keyword, scoped to this model.
+        keyword = None
+        if re.search(r"\bligands?\b", ui, re.I):
+            keyword = "ligand"
+        elif re.search(r"\b(?:solvent|waters?)\b", ui, re.I):
+            keyword = "solvent"
+        elif re.search(r"\bions?\b", ui, re.I):
+            keyword = "ions"
+        if keyword:
+            return {"spec": f"#{mid} & {keyword}", "chain": None,
+                    "keyword": keyword, "target_desc": f"the {keyword}",
+                    "defer": False}
+
+        # 6. No target named → the whole model (the common "color by chain" /
+        #    "show as cartoon" case).
+        return {"spec": f"#{mid}", "chain": None, "keyword": None,
+                "target_desc": "whole model", "defer": False}
+
+    # Target phrases removed before ALIAS / scheme matching only. A target sitting
+    # between the verb and the representation/scheme noun ("show THE LIGAND as
+    # sticks", "show CHAIN A as cartoon") breaks the registry's contiguous-phrase
+    # alias match, dropping the request to the flaky LLM tier. The target and the
+    # color are resolved separately from the ORIGINAL text (_resolve_opclass_target
+    # / extract_named_color), so removing the target here is safe and only helps the
+    # alias land deterministically.
+    _TARGET_PHRASE_RE = re.compile(
+        r"\bthe\s+ligands?\b|\bligands?\b|\bthe\s+solvent\b|\bsolvent\b|\bwaters?\b"
+        r"|\bions?\b|\bchain\s+[A-Za-z0-9]\b|(?<![A-Za-z0-9])/[A-Za-z0-9]\b",
+        re.IGNORECASE,
+    )
+
+    def _strip_target_for_alias(self, user_input: str) -> str:
+        """Remove a target phrase so the verb+noun alias core matches (see
+        _TARGET_PHRASE_RE). Used ONLY for alias/scheme resolution."""
+        stripped = self._TARGET_PHRASE_RE.sub(" ", user_input or "")
+        return re.sub(r"\s{2,}", " ", stripped).strip()
+
+    def _execute_deferred_opclass(
+        self, tool: str, commands: List[str],
+    ) -> ToolStepResult:
+        """Safety-invariant defer path: the op-class resolver could not express the
+        target, so run the translator's already-scoped command(s) verbatim rather
+        than a regenerated whole-model command. Never widens scope. If there is no
+        translator command to fall back to, REFUSE (never silently widen)."""
+        if self.bridge is None:
+            return ToolStepResult(tool=tool, success=False,
+                                  error="ChimeraX bridge unavailable.")
+        if not commands:
+            return ToolStepResult(
+                tool=tool, success=False,
+                error=(
+                    f"This {tool} request targets a finer selection (e.g. a residue "
+                    "range, a distance zone, or a binding pocket) that the "
+                    "deterministic resolver can't express, and no fallback command "
+                    "was available. Rephrase with a chain (e.g. 'chain A') or "
+                    "'the ligand', or name the residues explicitly."),
+            )
+        executed: List[str] = []
+        for cmd in commands:
+            r = self.bridge.run_command(cmd)
+            if r.get("error"):
+                return ToolStepResult(
+                    tool=tool, success=False,
+                    error=(f"Command failed (deferred to the translator's scoped "
+                           f"command): {cmd!r} → {r['error']}"),
+                )
+            executed.append(cmd)
+        return ToolStepResult(
+            tool=tool, success=True,
+            summary=(f"Applied {tool} to a finer target via the translator's scoped "
+                     f"command(s) — op-class resolver deferred (NOT whole-model)\n"
+                     f"Commands: {'; '.join(executed)}"),
+            viz_commands=[], viz_explanations=[],
+            data={"resolution": "deferred", "commands": executed},
+        )
+
     def _run_representation(
         self,
         inputs:     Dict[str, Any],
@@ -6876,12 +7076,23 @@ class ToolRouter:
         via post-command probe.  viz_commands=[] (already run); summary carries result.
         """
         from intent_registry import VIEWER_REGISTRY, make_llm_classify_fn
+        from translator import _scope_chain_refs_to_macromolecule
 
         user_input = user_input or inputs.get("_user_input", "")
         intent_key = inputs.get("intent_key")   # pre-resolved by route() alias match
         model_id   = str(inputs.get("model_id") or self._primary_model_id())
-        spec       = f"#{model_id}"
         resolution = "alias"
+
+        # Target resolution via the shared op-class resolver. DEFER (run the
+        # translator's already-scoped command) for any target finer than a chain /
+        # ligand keyword, so "show the ligand as sticks" never re-styles the WHOLE
+        # model (the op-class widening regression). Undo carries no target marker,
+        # so it resolves to the whole-model spec and is unaffected.
+        tgt = self._resolve_opclass_target(user_input, model_id)
+        if tgt["defer"]:
+            return self._execute_deferred_opclass(
+                "representation", inputs.get("_translator_commands") or [])
+        spec = tgt["spec"]
 
         # Tier (b): LLM constrained classifier — fires when alias match missed
         if intent_key is None:
@@ -6890,8 +7101,10 @@ class ToolRouter:
                 _repr_classify_fn = make_llm_classify_fn()
             classify = _repr_classify_fn
             labels   = VIEWER_REGISTRY.list_intent_keys("view")
+            # Resolve on the target-stripped text so the alias core lands and the
+            # LLM sees the bare representation phrase, not the target.
             intent_key, resolution = VIEWER_REGISTRY.resolve(
-                user_input,
+                self._strip_target_for_alias(user_input),
                 llm_classify_fn=lambda t, ls: classify(t, ls),
             )
 
@@ -6943,6 +7156,12 @@ class ToolRouter:
         commands = VIEWER_REGISTRY.render(intent_key, spec)
         defn     = VIEWER_REGISTRY.get_defn(intent_key)
 
+        # Chain-scope guard: a chain rep ("show chain A as cartoon") excludes
+        # ligand/solvent/ions so it never bleeds onto them — matching the color
+        # path and the translator. Whole-model `#N` and keyword `#N & ligand`
+        # specs carry no bare chain ref and pass through unchanged.
+        commands, _scope_notes = _scope_chain_refs_to_macromolecule(commands)
+
         if self.bridge is None:
             return ToolStepResult(
                 tool="representation", success=False,
@@ -6981,7 +7200,8 @@ class ToolRouter:
             tool    = "representation",
             success = True,
             summary = (
-                f"Applied {desc} ({resolution}-resolved){verify_note}\n"
+                f"Applied {desc} to {tgt['target_desc']} "
+                f"({resolution}-resolved){verify_note}\n"
                 f"Commands: {cmd_str}"
             ),
             viz_commands     = [],   # already executed above
@@ -6989,6 +7209,7 @@ class ToolRouter:
             data = {
                 "intent_key": intent_key,
                 "spec":       spec,
+                "chain":      tgt["chain"],
                 "resolution": resolution,
                 "commands":   executed,
             },
@@ -7025,21 +7246,17 @@ class ToolRouter:
         model_id   = str(inputs.get("model_id") or self._primary_model_id())
         resolution = "alias"
 
-        # Parse the target: an explicit chain ("chain A" / "/A") scopes to that
-        # chain; otherwise the whole model.  "each/every/all/both/per chain(s)"
-        # means the WHOLE model (and guards against the article "a" being read as
-        # chain A in "give each chain a separate shade").
-        chain = None
-        _ui = user_input or ""
-        if re.search(r"\b(?:each|every|all|both|per)\s+chains?\b", _ui, re.I):
-            chain = None
-        else:
-            m = re.search(r"\bchain\s+([A-Za-z0-9])\b", _ui, re.I)
-            if not m:
-                m = re.search(r"(?<![A-Za-z0-9])/([A-Za-z0-9])\b", _ui)
-            if m:
-                chain = m.group(1).upper()
-        spec = f"#{model_id}/{chain}" if chain else f"#{model_id}"
+        # Target resolution via the shared op-class resolver (the SAME one
+        # _run_representation uses). DEFER (run the translator's already-scoped
+        # command) for any target finer than a chain / ligand keyword, so
+        # "colour the ligand white" never paints the whole model (the regression
+        # this whole op-class audit closes).
+        tgt    = self._resolve_opclass_target(user_input, model_id)
+        if tgt["defer"]:
+            return self._execute_deferred_opclass(
+                "color", inputs.get("_translator_commands") or [])
+        spec   = tgt["spec"]
+        chain  = tgt["chain"]
 
         # color.solid carries a parsed color value (no alias tier).
         color_name = None
@@ -7057,8 +7274,11 @@ class ToolRouter:
                     )
                 classify = _color_classify_fn
                 labels   = COLOR_REGISTRY.list_intent_keys("color")
+                # Scheme resolution on the target-stripped text (target + color are
+                # parsed separately from the original), so "color the ligand by
+                # element" still resolves the by-element scheme.
                 intent_key, resolution = COLOR_REGISTRY.resolve(
-                    user_input,
+                    self._strip_target_for_alias(user_input),
                     llm_classify_fn=lambda t, ls: classify(t, ls),
                 )
                 # LLM picked color.solid but no named color present → ask which.
@@ -7117,7 +7337,7 @@ class ToolRouter:
         desc    = defn.description if defn else intent_key
         if intent_key == "color.solid":
             desc = f"solid color {color_name}"
-        target  = f"chain {chain}" if chain else "whole model"
+        target  = tgt["target_desc"]
         cmd_str = "; ".join(executed)
         return ToolStepResult(
             tool    = "color",
