@@ -27,7 +27,7 @@ select gets chatty.
 """
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -102,7 +102,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         super().__init__()
         self.design = design
         self.active_row_id: str = "T"               # T drives 3D coloring by default
-        self._color_for: Optional[Callable[[Optional[str]], Optional[str]]] = None
+        self._mode = get_mode("none")               # current color mode (OFF by default)
         self._blocks: List[QtWidgets.QTableWidget] = []
         self._row_ids: List[Optional[str]] = []     # by table row index
         self.setWidgetResizable(True)
@@ -157,8 +157,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         v.addStretch(1)
         self.setWidget(inner)
         self._mark_active_header()
-        if self._color_for is not None:
-            self.set_color_mode(self._color_for)
+        self.set_color_mode(self._mode)            # re-apply the active mode after a rebuild
 
     def _put(self, block, row, col, text, gcol, row_id, aa, *, edited=False, faint=False):
         it = QtWidgets.QTableWidgetItem(text)
@@ -183,11 +182,15 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         return QtGui.QBrush()                                    # clear
 
     # ── color mode: repaint sequence rows (T + variants) by each cell's aa ──────────
-    def set_color_mode(self, color_for: Optional[Callable[[Optional[str]], Optional[str]]]) -> None:
-        """Paint cell backgrounds via *color_for* (color_modes; the SAME fn that drives
-        the 3D), or restore defaults when it yields no color. Sequence rows only —
-        ruler/consensus/conservation keep their faint styling."""
-        self._color_for = color_for
+    def set_color_mode(self, mode) -> None:
+        """Paint sequence-row cell backgrounds via *mode* (a color_modes.ColorMode — the
+        SAME registry that drives the 3D). Under an ACTIVE mode every sequence cell shows
+        the mode color, or WHITE for a no-opinion/gap residue, exactly mirroring the 3D
+        (reset-to-white + colored runs) so the panel↔3D sync invariant holds for EVERY
+        residue. Under the OFF mode ('none') the row defaults return (T tint / edit
+        highlight). Ruler/consensus/conservation keep their faint styling regardless."""
+        self._mode = mode
+        active = mode.fn is not None
         for block in self._blocks:
             for r in range(block.rowCount()):
                 for c in range(block.columnCount()):
@@ -197,12 +200,12 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                     row_id = it.data(_ROW_ROLE)
                     if row_id is None:                          # non-sequence row
                         continue
-                    aa = it.data(_AA_ROLE)
-                    hexc = color_for(aa) if (color_for and aa not in (None, "-")) else None
-                    if hexc:
-                        it.setBackground(QtGui.QBrush(QtGui.QColor(hexc)))
-                    else:
+                    if not active:
                         it.setBackground(self._default_bg(row_id, bool(it.data(_EDITED_ROLE))))
+                        continue
+                    aa = it.data(_AA_ROLE)
+                    hexc = mode.color_for(aa) if aa not in (None, "-") else None
+                    it.setBackground(QtGui.QBrush(QtGui.QColor(hexc) if hexc else _RESET_BG))
 
     def color_hex_at(self, row_id: str, col: int) -> Optional[str]:
         """The painted background hex of (row_id, template col) — for the sync-invariant
@@ -421,7 +424,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     # ── coloring helpers ───────────────────────────────────────────────────────────
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
-        tab.set_color_mode(get_mode(self._mode_key).color_for)
+        tab.set_color_mode(get_mode(self._mode_key))
 
     def _push_3d_color(self, tab: _ChainDesignTab) -> None:
         """Recolor the 3D by the tab's ACTIVE row across all copies. No-op for the OFF

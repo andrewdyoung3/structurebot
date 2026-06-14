@@ -139,6 +139,17 @@ class TestStage2:
         # active row is the edited variant → resnum 3 colored red on BOTH copies
         assert f"color #1/A:3 {red}" in cmds and f"color #1/B:3 {red}" in cmds
 
+    def test_neutral_cell_is_white_under_active_mode(self, _app):
+        # the sync invariant must hold for NO-OPINION residues too: under an active mode
+        # a neutral cell is white (#ffffff) — exactly the 3D reset — not the T row tint.
+        p, _ = _panel([_chainseq("1", "A", "MKV")])     # M is neutral under charge
+        p.load_model("1")
+        tab = p._cur_tab()
+        _set_mode(p, "charge")
+        assert tab.color_hex_at("T", 0) == "#ffffff"
+        _set_mode(p, "none")                            # OFF → row default (T tint) returns
+        assert tab.color_hex_at("T", 0) == "#eef4ff"
+
     def test_none_mode_pushes_no_3d(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV")])
         p.load_model("1")
