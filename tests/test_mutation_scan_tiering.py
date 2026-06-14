@@ -159,6 +159,45 @@ class TestScopeScanner:
         assert results, "scope must bypass the CamSol/ESM pre-filter"
 
 
+class TestSpecificMutationScoring:
+    """Stage 4a: score a variant's EXACT mutations (score_mutations={resnum: to_aa}) —
+    emit one candidate per resnum with the GIVEN to_aa, not generated candidate AAs."""
+
+    def test_score_mutations_emits_exact_subs(self):
+        scanner = _scanner_with_scores("ACDEFGHIKLMNPQR")
+        with patch.object(scanner, "_run_rosetta_batch"):
+            results = scanner.scan(
+                pdb_path=_fake_pdb(), chain_id="A", sequence="ACDEFGHIKLMNPQR",
+                score_mutations={3: "W", 5: "Y"}, run_rosetta=False,
+            )
+        assert {(r["resnum"], r["to_aa"]) for r in results} == {(3, "W"), (5, "Y")}
+
+    def test_score_mutations_allows_pro(self):
+        # the user designed this — the Pro/Cys substitution rule is bypassed
+        scanner = _scanner_with_scores("ACDEFGHIKLMNPQR")
+        with patch.object(scanner, "_run_rosetta_batch"):
+            results = scanner.scan(
+                pdb_path=_fake_pdb(), chain_id="A", sequence="ACDEFGHIKLMNPQR",
+                score_mutations={4: "P"}, run_rosetta=False,
+            )
+        assert {(r["resnum"], r["to_aa"]) for r in results} == {(4, "P")}
+
+    def test_score_mutations_via_router_threads_through(self):
+        # the spine path: tool_inputs.score_mutations → _run_mutation_scan → scan()
+        router = _make_router()
+        with patch.object(router, "_fetch_sequence", return_value="ACDEFGHIKLMNPQR"), \
+             patch.object(router, "_ensure_pdb_file", return_value=_fake_pdb()), \
+             patch("mutation_scanner.MutationScanner._get_or_run_camsol",
+                   return_value={i: 0.0 for i in range(1, 16)}), \
+             patch("mutation_scanner.MutationScanner._get_or_run_esm",
+                   return_value={i: 0.5 for i in range(1, 16)}):
+            step = router._run_mutation_scan(
+                {"model_id": "1", "chain": "A",
+                 "score_mutations": {3: "W", 5: "Y"}}, user_input="")
+        cands = (step.data or {}).get("candidates", [])
+        assert {(c["resnum"], c["to_aa"]) for c in cands} == {(3, "W"), (5, "Y")}
+
+
 # ── 3. Default (fast) tier ─────────────────────────────────────────────────────
 
 class TestDefaultTier:

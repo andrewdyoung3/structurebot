@@ -79,6 +79,31 @@ def _aromatic(aa: str) -> Optional[str]:
     return "#9b59b6" if aa in {"F", "W", "Y"} else None   # purple
 
 
+# ── result-backed scales (Stage 4): per-residue VALUE → hex (not aa-keyed) ──────────
+# These differ from the modes above: they color by a per-residue computed VALUE (ddG,
+# pLDDT, deviation) rather than residue identity, so they live as value→hex scales used
+# by the panel cells AND the 3D push for a variant that has results. Kept here so the two
+# surfaces share one source (the S2 sync invariant, extended to result modes).
+_DDG_NEUTRAL = 1.0          # |ddG| within ~1 kcal/mol ≈ method noise → white
+_DDG_SAT     = 2.5          # saturates to full blue/red beyond ±2.5 kcal/mol
+_DDG_BLUE = (42, 111, 219)  # stabilizing (ddG < 0)
+_DDG_RED  = (226, 59, 59)   # destabilizing (ddG > 0)
+
+
+def ddg_color(ddg: Optional[float]) -> Optional[str]:
+    """Diverging blue–white–red for a SIGNED ddG (system convention: positive =
+    destabilizing). None → no data (renders as reset). Inside the neutral band
+    (|ddG| ≤ 1 kcal/mol ≈ method noise) → white; magnitude saturates the hue by ±2.5."""
+    if ddg is None:
+        return None
+    if abs(ddg) <= _DDG_NEUTRAL:
+        return "#ffffff"
+    t = min(1.0, (abs(ddg) - _DDG_NEUTRAL) / (_DDG_SAT - _DDG_NEUTRAL))
+    end = _DDG_RED if ddg > 0 else _DDG_BLUE
+    rgb = tuple(_WHITE[i] + t * (end[i] - _WHITE[i]) for i in range(3))
+    return _hex(rgb)
+
+
 @dataclass(frozen=True)
 class ColorMode:
     key:   str                              # stable id

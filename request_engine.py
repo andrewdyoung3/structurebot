@@ -156,6 +156,7 @@ class RequestEngine:
         user_input: str,
         presenter,
         is_retry:   bool = False,
+        on_result=None,
     ) -> None:
         """The post-build request spine, shared by BOTH front-end paths: the NL path
         (handle_request, after translate/interception) and the panel tool-launch path
@@ -163,6 +164,12 @@ class RequestEngine:
         execute → tools → viz → auto-fix → state/log. ONE spine — never a parallel
         invocation: the confirm-gate, the mutation-scan tiering/estimate, and the real
         capability-flagged tool subprocess all fire here regardless of who built *result*.
+
+        *on_result* (optional): a callback invoked with the FULLY-EXECUTED `result` dict
+        once the pipeline completes — the seam by which the Workbench captures a tool's
+        own output (e.g. a variant stability scan) into the variant's ResultSlots WITHOUT
+        relying on the shared session cache. Not called on an early return (cancel /
+        clarification miss / nothing to run) — there is no executed result to hand back.
         """
         # 2. Route (augment with tool pipeline info; no execution yet)
         result = self.router.route(result, user_input=user_input)
@@ -465,6 +472,10 @@ class RequestEngine:
         self._host._log_exchange(user_input, all_commands, success, error_msg,
                                  tool_steps=_tool_steps if _tool_steps else None)
 
+        # Hand the executed result to the caller (Workbench result-capture seam).
+        if on_result is not None:
+            on_result(result)
+
     # ── panel tool-launch entry (build a result dict, enter the shared spine) ─────
     def handle_tool_request(
         self,
@@ -473,6 +484,7 @@ class RequestEngine:
         user_input:  str,
         presenter,
         confidence:  str = "high",
+        on_result=None,
     ) -> None:
         """Launch a tool FROM the GUI panel through the SAME spine as the NL path.
 
@@ -494,7 +506,7 @@ class RequestEngine:
             "tools_needed":         [tool],
             "tool_inputs":          {tool: dict(tool_inputs or {})},
         }
-        self._run_pipeline(result, user_input, presenter)
+        self._run_pipeline(result, user_input, presenter, on_result=on_result)
 
     # ── command execution (presenter-rendered) ──────────────────────────────────
     def execute_commands(

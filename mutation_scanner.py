@@ -332,6 +332,7 @@ class MutationScanner:
         run_thermompnn:     bool = True,
         run_rasp:           bool = True,
         run_dynamut2:       bool = True,
+        score_mutations:    Optional[Dict[int, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Run the full CamSol → ESM → Rosetta pipeline.
@@ -358,6 +359,14 @@ class MutationScanner:
                              named position is scanned; default None = whole chain
                              (current behaviour).  A non-None-but-empty scope means
                              the request resolved to nothing → returns [].
+        score_mutations    : {author_resnum: to_aa} — score EXACTLY these specific
+                             substitutions (a Variant's own mutations), one candidate
+                             per resnum with the GIVEN to_aa, instead of generating
+                             candidate AAs.  Bypasses the CamSol/ESM pre-filter AND the
+                             Pro/Cys substitution rules (the user designed these), and
+                             implies the scope (its resnums).  Used by the Workbench
+                             "Test stability" action — an honest verdict on THIS design,
+                             not a re-suggestion.  None = normal candidate generation.
         run_rosetta        : when True (deep tier) run the Rosetta ddG voter; when
                              False (fast/default triage tier) skip it entirely (no
                              WSL2/PyRosetta spawned), report ddG as "not computed",
@@ -456,6 +465,12 @@ class MutationScanner:
         # positions and raise the candidate cap so every scoped position is covered
         # (a scope of 16 positions must not be truncated by the default cap of 20).
         _include_set: Optional[set] = None
+        # Specific-mutation scoring (Workbench "Test stability"): the resnums to score
+        # ARE the keys of score_mutations; normalize to {resnum: TO_AA}.
+        _specific: Optional[Dict[int, str]] = None
+        if score_mutations:
+            _specific = {int(rn): str(aa).strip().upper() for rn, aa in score_mutations.items()}
+            include_positions = list(_specific.keys()) if include_positions is None else include_positions
         if include_positions is not None:
             _include_set = {int(p) for p in include_positions}
             if not _include_set:
@@ -478,6 +493,7 @@ class MutationScanner:
             chain_id           = chain_id,
             interface_residues = _interface_protected,
             include_positions  = _include_set,
+            specific_mutations = _specific,
         )
 
         if not raw_candidates:
@@ -910,6 +926,7 @@ class MutationScanner:
         chain_id:          Optional[str],
         interface_residues: Optional[set] = None,
         include_positions: Optional[set] = None,
+        specific_mutations: Optional[Dict[int, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Build the list of (position, from_aa, to_aa, estimated_camsol_delta) dicts
@@ -958,8 +975,17 @@ class MutationScanner:
 
             is_proximal = resnum in proximal_set
 
-            # Generate substitution candidates for this position
-            subs = self._substitution_candidates(from_aa, cands_per_pos)
+            # Specific-mutation scoring: emit EXACTLY the given to_aa for this resnum
+            # (the variant's own substitution) — no candidate generation, no Pro/Cys
+            # rule, no self-substitution filter beyond a sanity check.
+            if specific_mutations is not None:
+                to_aa = specific_mutations.get(resnum)
+                if not to_aa or to_aa == from_aa:
+                    continue
+                subs = [(to_aa, _estimate_camsol_delta(from_aa, to_aa))]
+            else:
+                # Generate substitution candidates for this position
+                subs = self._substitution_candidates(from_aa, cands_per_pos)
             for to_aa, camsol_delta in subs:
                 candidates.append({
                     "position":              pos,        # SEQUENCE index (CamSol/ESM)

@@ -290,6 +290,45 @@ def build_color_commands(cells: List[AlignedCell],
     return cmds
 
 
+def build_color_commands_by_resnum(resnums: List[int],
+                                   value_for: Callable[[int], Optional[str]],
+                                   members: List[Tuple[str, str]],
+                                   reset: str = "#ffffff") -> List[str]:
+    """Stage 4 result-mode analog of `build_color_commands`, keyed by per-residue VALUE
+    instead of residue identity. *resnums* is the author-resnum order to paint (the active
+    row's non-gap resnums); *value_for(resnum)* returns a hex (e.g. `color_modes.ddg_color`
+    applied to that residue's ddG) or None (no data → reset). Emits one `color #M/C {reset}`
+    baseline per (model, chain) copy, then run-grouped `color #M/C:<resnums> <hex>` for
+    residues whose value differs from the reset. Pure / testable; same run-compaction +
+    all-copies guarantee as `build_color_commands`."""
+    colored: List[Tuple[int, str]] = []
+    for rn in resnums:
+        if rn is None:
+            continue
+        colored.append((rn, value_for(rn) or reset))
+
+    runs: List[Tuple[str, List[int]]] = []
+    for resnum, hexc in colored:
+        if runs and runs[-1][0] == hexc:
+            runs[-1][1].append(resnum)
+        else:
+            runs.append((hexc, [resnum]))
+
+    cmds: List[str] = []
+    for (model, chain) in members:
+        spec0 = f"#{model}/{chain}"
+        cmds.append(f"color {spec0} {reset}")
+        for hexc, resnos in runs:
+            if hexc == reset:
+                continue
+            if len(resnos) > 1 and resnos == list(range(resnos[0], resnos[-1] + 1)):
+                rng = f"{resnos[0]}-{resnos[-1]}"
+            else:
+                rng = ",".join(str(r) for r in resnos)
+            cmds.append(f"color {spec0}:{rng} {hexc}")
+    return cmds
+
+
 def import_mpnn_designs(design: ChainDesign, mpnn_result: Dict[str, Any],
                         run_id: int, next_id_fn) -> List[Variant]:
     """PRE-SHAPE (a): turn one ProteinMPNN run's designs into parallel variant rows
@@ -363,6 +402,48 @@ def group_scan_suggestions(scan_results, chains, template_cells) -> Dict[int, Li
     for col in by_col:
         by_col[col].sort(key=lambda c: c.get("combined_score", 0.0), reverse=True)
     return by_col
+
+
+# ── Stage 4a: reduce a stability scan (scored for a variant's EXACT mutations) ──────
+
+def candidate_ddg(c: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Best-available per-mutation ddG from a scan candidate + its source axis: deep
+    Rosetta first (the calibrated physics axis), else ThermoMPNN (ML), else RaSP (proxy).
+    Returns (ddg, source) — (None, "not_computed") when no axis scored it."""
+    for key, src in (("ddg", "rosetta"), ("thermompnn_ddg", "thermompnn"),
+                     ("rasp_ddg", "rasp")):
+        v = c.get(key)
+        if isinstance(v, (int, float)):
+            return float(v), src
+    return None, "not_computed"
+
+
+def stability_summary(candidates: List[Dict[str, Any]],
+                      mutations: List["Mutation"]) -> Dict[str, Any]:
+    """Reduce scan candidates (run for a variant's EXACT mutations) to a per-variant
+    stability result for ResultSlots.stability: a per-resnum ddG map (for the diverging
+    result color mode), one row per scored mutation (the expandable detail), and the
+    summed ddG (the badge). Matches each candidate against the variant's own (resnum,
+    to_aa) so only the designed substitutions are attributed. Pure / testable."""
+    want = {(m.resnum, m.to_aa) for m in mutations}
+    per_resnum: Dict[int, Optional[float]] = {}
+    rows: List[Dict[str, Any]] = []
+    for c in candidates or []:
+        rn, to_aa = c.get("resnum"), c.get("to_aa")
+        if (rn, to_aa) not in want:
+            continue
+        ddg, src = candidate_ddg(c)
+        per_resnum[rn] = ddg
+        rows.append({"resnum": rn, "from_aa": c.get("from_aa"), "to_aa": to_aa,
+                     "ddg": ddg, "ddg_source": src,
+                     "combined_score": c.get("combined_score"),
+                     "recommendation": c.get("recommendation")})
+    rows.sort(key=lambda r: r["resnum"])
+    vals = [r["ddg"] for r in rows if r["ddg"] is not None]
+    return {"per_resnum": per_resnum, "rows": rows,
+            "sum_ddg": round(sum(vals), 2) if vals else None,
+            "n_scored": len(rows),
+            "tier": "deep" if any(r["ddg_source"] == "rosetta" for r in rows) else "fast"}
 
 
 # combined_score → hex for the Suggest track cell (mirrors mutation_scanner's gradient

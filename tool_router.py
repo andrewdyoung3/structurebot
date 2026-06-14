@@ -3698,6 +3698,12 @@ class ToolRouter:
         run_rosetta    = bool(inputs.get("run_rosetta", False))
         shortlist_k    = inputs.get("rosetta_shortlist_k")   # None = full coverage
         ddg_basis      = inputs.get("ddg_basis") or "symmetric"
+        # Workbench "Test stability": score a variant's EXACT mutations {resnum: to_aa}
+        # (not candidate generation). Implies the scope, so an empty score set ≠ a
+        # whole-chain fallback — it's caught by the scope guard below.
+        score_mutations = inputs.get("score_mutations")      # None | {resnum: to_aa}
+        if score_mutations:
+            scan_positions = [int(r) for r in score_mutations]
 
         # A scope that was requested but resolved to nothing → ERROR, no full-chain
         # fallback (mirrors the ProteinMPNN restricted-design convention).
@@ -3773,6 +3779,7 @@ class ToolRouter:
             run_rosetta        = run_rosetta,
             rosetta_shortlist_k = shortlist_k,
             ddg_basis          = ddg_basis,
+            score_mutations    = score_mutations,
         )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
