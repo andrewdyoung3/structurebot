@@ -100,7 +100,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
     coloring) and the current color mode. A cell click emits (row_id, template-column);
     a click on the sparse inline Suggest track emits (_SUGGEST_ROW, col)."""
 
-    cellClicked2 = QtCore.Signal(object, int)   # (row_id: str|None, template col 0-based)
+    cellClicked2 = QtCore.Signal(object, int, bool)   # (row_id, template col, ctrl-held)
 
     def __init__(self, design: ChainDesign, suggestions: Optional[Dict[int, List[dict]]] = None):
         super().__init__()
@@ -307,7 +307,11 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             return
         gcol = it.data(_RESNUM_ROLE)
         if gcol is not None:
-            self.cellClicked2.emit(it.data(_ROW_ROLE), int(gcol))
+            # Ctrl(+Cmd)-click is the DISTINCT scan-set gesture; a plain click keeps its
+            # S2 meaning (edit target / active row). Disambiguated here at the source.
+            mods = QtWidgets.QApplication.keyboardModifiers()
+            ctrl = bool(mods & (QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier))
+            self.cellClicked2.emit(it.data(_ROW_ROLE), int(gcol), ctrl)
 
 
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
@@ -370,13 +374,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # Stage 3b: launch tools FROM the panel through the engine spine (confirm-gate +
         # real subprocess). Scope = the scan set (clicked columns); empty → whole chain.
         self._scan_btn = QtWidgets.QPushButton("Scan…")
-        self._scan_btn.setToolTip("Mutation-scan the selected positions (or the whole "
-                                  "chain if none are selected) through the tool spine.")
+        self._scan_btn.setToolTip("Mutation-scan the scan set (Ctrl+click residues to build "
+                                  "it; whole chain if empty) through the tool spine.")
         self._scan_btn.clicked.connect(self._on_scan_clicked)
         bar.addWidget(self._scan_btn)
         self._mpnn_run_btn = QtWidgets.QPushButton("Run ProteinMPNN…")
-        self._mpnn_run_btn.setToolTip("Redesign the chain (selected positions, or whole "
-                                      "chain) with ProteinMPNN through the tool spine.")
+        self._mpnn_run_btn.setToolTip("Redesign the chain (the scan set via Ctrl+click, or "
+                                      "whole chain) with ProteinMPNN through the tool spine.")
         self._mpnn_run_btn.clicked.connect(self._on_mpnn_clicked)
         bar.addWidget(self._mpnn_run_btn)
         self._scan_set_lbl = QtWidgets.QLabel("scan set: 0")
@@ -428,7 +432,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         for _ukey, cd in self._design.chains.items():
             tab = _ChainDesignTab(cd, self._suggestions_for(cd))
-            tab.cellClicked2.connect(lambda rid, col, t=tab: self._on_cell(t, rid, col))
+            tab.cellClicked2.connect(
+                lambda rid, col, ctrl, t=tab: self._on_cell(t, rid, col, to_scan=ctrl))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
         self._status.setText(
@@ -649,19 +654,29 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"(score {cand.get('combined_score', 0.0):+.2f}, accepted_suggestion). "
             f"Applies to all copies; 3D recolored.")
 
-    # ── cell click: 3D-select the column; set active row / edit target ──────────────
-    def _on_cell(self, tab: _ChainDesignTab, row_id, col: int) -> None:
+    # ── cell click: plain = S2 edit-target; Ctrl+click = scan-set (distinct gesture) ──
+    def _on_cell(self, tab: _ChainDesignTab, row_id, col: int, to_scan: bool = False) -> None:
         if row_id == _SUGGEST_ROW:                         # inline cherry-pick affordance
             self._select_column(tab.design, col)           # show where it is in 3D
             self._show_suggestion_menu(tab, col)
             return
-        # Stage 3b: a residue/column click TOGGLES the position in the scan set (the
-        # deterministic scan scope), then 3D-selects the whole set across all copies so
-        # the 3D mirrors exactly what "Scan…" / "Run ProteinMPNN…" will cover.
-        if tab.design.resnum_for_col(col) is not None:
+        # Stage 3b — DISTINCT gesture: Ctrl(+Cmd)-click TOGGLES the position in the scan
+        # set (the deterministic scan scope) and 3D-selects the whole set across copies.
+        # It does NOT touch the edit target / active row, so a plain click keeps its full
+        # S2 meaning below.
+        if to_scan:
+            if tab.design.resnum_for_col(col) is None:     # gap column → not scannable
+                return
             self._scan_cols.symmetric_difference_update({col})
-        self._update_scan_label()
-        self._select_scan_set(tab.design)                  # scan set → 3D (all copies)
+            self._update_scan_label()
+            self._select_scan_set(tab.design)              # scan set → 3D (all copies)
+            n = len(self._scan_set_resnums(tab.design))
+            self._status.setText(f"Scan set: {n} site(s). Ctrl+click to toggle; "
+                                 f"Scan…/Run ProteinMPNN… cover these (or the whole chain if empty).")
+            return
+        # Plain click — UNCHANGED S2 behavior: select just this column in 3D and set the
+        # active row / (variant) edit target.
+        self._select_column(tab.design, col)               # column→3D select (all copies)
         if row_id == "T":
             tab.set_active_row("T")
             self._edit_target = None
@@ -672,7 +687,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             resnum = tab.design.resnum_for_col(col)
             wt = tab.design.template_cells[col].aa if 0 <= col < len(tab.design.template_cells) else "?"
             self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
-                                 f"Pick an aa and Apply.")
+                                 f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
             self._push_3d_color(tab)
 
     # ── coloring helpers ───────────────────────────────────────────────────────────

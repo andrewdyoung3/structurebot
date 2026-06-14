@@ -261,16 +261,32 @@ class TestStage3bLaunch:
     it into engine.handle_tool_request — the SAME spine). Asserted directly, like the
     select/color command surfaces; the dialog/emit handlers are thin wrappers over these."""
 
-    def test_scan_set_toggle_via_click(self, _app):
+    def test_ctrlclick_toggles_scan_set(self, _app):
+        # Ctrl+click (to_scan=True) is the DISTINCT scan-set gesture.
         p, _ = _panel([_chainseq("1", "A", "MKVLA")])
         p.load_model("1")
         tab = p._cur_tab()
-        p._on_cell(tab, "T", 0)
-        p._on_cell(tab, "T", 2)
+        p._on_cell(tab, "T", 0, to_scan=True)
+        p._on_cell(tab, "T", 2, to_scan=True)
         assert p._scan_cols == {0, 2}
-        p._on_cell(tab, "T", 0)                     # second click toggles it back off
+        p._on_cell(tab, "T", 0, to_scan=True)       # second ctrl+click toggles it back off
         assert p._scan_cols == {2}
         assert p._scan_set_lbl.text() == "scan set: 1"
+
+    def test_plain_click_is_s2_edit_target_not_scan_set(self, _app):
+        # The disambiguation: a PLAIN click keeps its full S2 meaning (active row + edit
+        # target) and must NOT touch the scan set — editing stays as easy as in S2.
+        p, _ = _panel([_chainseq("1", "A", "MKV")])
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._add_variant()                            # V1 active
+        vid = tab.design.variants[0].id
+        p._on_cell(tab, vid, 1)                     # plain click on a variant cell
+        assert p._edit_target == (vid, 1)          # S2 edit target set
+        assert p._scan_cols == set()               # scan set untouched
+        # and a plain click never grows the scan set even after several clicks
+        p._on_cell(tab, vid, 0); p._on_cell(tab, "T", 2)
+        assert p._scan_cols == set()
 
     def test_scan_spec_empty_set_is_whole_chain(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV")])
@@ -285,7 +301,7 @@ class TestStage3bLaunch:
         p, _ = _panel([_chainseq("1", "A", "MKV", start=10)])
         p.load_model("1")
         tab = p._cur_tab()
-        p._on_cell(tab, "T", 0); p._on_cell(tab, "T", 2)   # resnums 10, 12
+        p._on_cell(tab, "T", 0, to_scan=True); p._on_cell(tab, "T", 2, to_scan=True)   # resnums 10, 12
         spec = p.scan_launch_spec(deep=True)
         assert spec["tool_inputs"]["scan_positions"] == [10, 12]
         assert spec["tool_inputs"]["run_rosetta"] is True
@@ -298,7 +314,7 @@ class TestStage3bLaunch:
         # the Stage-3b live-verify caught: "N selected position(s)" zeroed the scope.)
         p, _ = _panel([_chainseq("1", "A", "MKV", start=10)])
         p.load_model("1")
-        tab = p._cur_tab(); p._on_cell(tab, "T", 0)
+        tab = p._cur_tab(); p._on_cell(tab, "T", 0, to_scan=True)
         for deep in (True, False):
             ui = p.scan_launch_spec(deep=deep)["user_input"].lower()
             for tok in ("rosetta", "rosie", "proline", "glyco", "exhaustive",
@@ -315,7 +331,7 @@ class TestStage3bLaunch:
         p, _ = _panel([_chainseq("1", "A", "MKV", start=5)])
         p.load_model("1")
         tab = p._cur_tab()
-        p._on_cell(tab, "T", 1)                     # resnum 6
+        p._on_cell(tab, "T", 1, to_scan=True)       # resnum 6
         d = p.mpnn_launch_spec(soluble=False)
         assert d["tool"] == "proteinmpnn" and d["refresh"] == "mpnn"
         assert d["tool_inputs"]["chain_id"] == "A"
@@ -333,7 +349,7 @@ class TestStage3bLaunch:
     def test_clear_scan_set(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV")])
         p.load_model("1")
-        p._on_cell(p._cur_tab(), "T", 0)
+        p._on_cell(p._cur_tab(), "T", 0, to_scan=True)
         assert p._scan_cols
         p._clear_scan_set()
         assert p._scan_cols == set() and p._scan_set_lbl.text() == "scan set: 0"
@@ -341,7 +357,7 @@ class TestStage3bLaunch:
     def test_tab_change_resets_scan_set(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "WYF")])
         p.load_model("1")
-        p._on_cell(p._cur_tab(), "T", 0)
+        p._on_cell(p._cur_tab(), "T", 0, to_scan=True)
         assert p._scan_cols
         p._tabs.setCurrentIndex(1)                  # fires _on_tab_changed
         assert p._scan_cols == set()
@@ -358,5 +374,5 @@ class TestStage3bLaunch:
         # swap in a single-cell gap design (resnum_for_col(0) is None) — the toggle path
         # reads tab.design.resnum_for_col, so a gap column must not enter the scan set.
         tab.design = ChainDesign("k", "1", "A", [("1", "A")], [AlignedCell(0, None, None)])
-        p._on_cell(tab, None, 0)
+        p._on_cell(tab, None, 0, to_scan=True)
         assert p._scan_cols == set()
