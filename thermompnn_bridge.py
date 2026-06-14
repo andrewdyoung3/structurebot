@@ -45,6 +45,15 @@ _CREATE_NO_WINDOW: int = (
     subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # type: ignore[attr-defined]
 )
 
+# Per-session cache for the venv312 import-chain capability probe, keyed by
+# (interpreter, dir) so a config change re-probes. Spawned at most once per key.
+_IMPORT_PROBE_CACHE: Dict[Tuple[str, str], bool] = {}
+
+
+def _reset_import_probe_cache() -> None:
+    """Clear the capability-probe cache (tests; or after a venv312 change)."""
+    _IMPORT_PROBE_CACHE.clear()
+
 # The residue-identity primitives now live in the shared `residue_mapping` module
 # so every fast-tier voter (ThermoMPNN, RaSP, …) reuses the IDENTICAL spine +
 # WT-anchored alignment.  Re-exported here for backward-compatible imports.
@@ -68,15 +77,65 @@ class ThermoMPNNBridge:
     # ── Availability ──────────────────────────────────────────────────────────
 
     def is_available(self) -> bool:
-        """True iff enabled AND a valid install (script + model + interpreter)."""
+        """True iff enabled AND a valid install AND the venv312 import chain RUNS.
+
+        Two tiers — the second is the cavity-class fix (a True flag must mean
+        "can run", not "files exist"):
+          (1) cheap presence: script + model + interpreter files exist;
+          (2) CAPABILITY: spawn the venv312 interpreter and confirm the import
+              chain `custom_inference.py` needs actually resolves WHERE IT RUNS
+              (torch/omegaconf/Bio.PDB + the tool's own modules). A venv312 whose
+              torch/deps silently broke has the interpreter FILE present (tier 1
+              passes) but cannot import — tier 2 catches that, where a same-process
+              check (wrong environment) would not. Cached per session; graceful
+              (probe failure → correctly False → clean skip, never a crash).
+        """
         enable = getattr(_cfg, "THERMOMPNN_ENABLE", "auto")
         if str(enable).lower() in ("false", "0", "off", "no"):
             return False
         if not self._dir:
             return False
         script = self._dir / "analysis" / "custom_inference.py"
-        return (script.is_file() and Path(self._model).is_file()
-                and Path(self._python).is_file())
+        if not (script.is_file() and Path(self._model).is_file()
+                and Path(self._python).is_file()):
+            return False
+        return self._venv312_import_chain_ok()
+
+    def _venv312_import_chain_ok(self) -> bool:
+        """Tier-2 capability probe: does `custom_inference.py`'s import chain
+        resolve in the venv312 SUBPROCESS (where inference runs)? Imports only —
+        NOT a model load / inference. Cached per (interpreter, dir). A definitive
+        result (probe ran to completion) is cached; a probe-infrastructure failure
+        (spawn error / timeout) returns False WITHOUT caching, so a transient error
+        never masquerades permanently as 'capability absent'."""
+        key = (str(self._python), str(self._dir))
+        if key in _IMPORT_PROBE_CACHE:
+            return _IMPORT_PROBE_CACHE[key]
+        analysis = self._dir / "analysis"
+        # Replicate custom_inference.py's sys.path: its own dir (analysis/) + the
+        # repo root (it does sys.path.append(dirname(ABPATH))).
+        probe = (
+            "import sys; sys.path[:0] = [r'{ana}', r'{root}']\n"
+            "import torch, pandas, omegaconf\n"
+            "from Bio.PDB import PDBParser\n"
+            "import datasets, train_thermompnn, protein_mpnn_utils\n"
+            "import thermompnn_benchmarking, SSM\n"
+            "print('THERMOMPNN_IMPORT_OK')\n"
+        ).format(ana=str(analysis), root=str(self._dir))
+        try:
+            r = subprocess.run(
+                [self._python, "-c", probe],
+                capture_output=True, text=True,
+                timeout=int(getattr(_cfg, "THERMOMPNN_PROBE_TIMEOUT", 60)),
+                stdin=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception:
+            # spawn failure / timeout — not a definitive capability verdict; do NOT
+            # cache, skip this run gracefully (the voter renormalizes as today).
+            return False
+        ok = (r.returncode == 0) and ("THERMOMPNN_IMPORT_OK" in (r.stdout or ""))
+        _IMPORT_PROBE_CACHE[key] = ok
+        return ok
 
     def status(self) -> str:
         if str(getattr(_cfg, "THERMOMPNN_ENABLE", "auto")).lower() in ("false", "0"):

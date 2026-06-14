@@ -252,3 +252,71 @@ class TestEndToEndUnfriendly:
                       include_positions=[3, 4, 5], run_rosetta=False, run_thermompnn=False, run_rasp=False)
         assert sorted({r["resnum"] for r in res}) == [3, 4, 5]
         assert all(r["position"] == r["seqindex"] for r in res)   # coincide when 1-based
+
+
+# ── Capability flag (Unit B) — is_available() probes the venv312 import chain ─────
+# Locks the live-verified behavior: a True flag means "can run", not "files exist".
+# All hermetic (subprocess + file checks mocked) so it runs in CI without venv312.
+
+import subprocess as _subprocess
+import thermompnn_bridge as _tb
+
+
+def _ok_proc():
+    from subprocess import CompletedProcess
+    return CompletedProcess(args=[], returncode=0, stdout="THERMOMPNN_IMPORT_OK\n", stderr="")
+
+
+def _fail_proc():
+    from subprocess import CompletedProcess
+    return CompletedProcess(args=[], returncode=1, stdout="", stderr="ModuleNotFoundError: torch")
+
+
+class TestCapabilityFlag:
+    def setup_method(self):
+        _tb._reset_import_probe_cache()
+
+    def _present_install(self, monkeypatch):
+        """Make tier-1 (file presence) pass so tier-2 (the probe) is reached."""
+        monkeypatch.setattr(_tb.Path, "is_file", lambda self: True)
+        monkeypatch.setattr(config, "THERMOMPNN_ENABLE", "auto", raising=False)
+
+    def test_capability_true_when_import_chain_ok(self, monkeypatch):
+        self._present_install(monkeypatch)
+        with patch.object(_tb.subprocess, "run", return_value=_ok_proc()):
+            assert _tb.ThermoMPNNBridge().is_available() is True
+
+    def test_file_presence_passes_but_capability_fails(self, monkeypatch):
+        # the cavity analog: interpreter/files EXIST, import chain is broken → False
+        self._present_install(monkeypatch)
+        with patch.object(_tb.subprocess, "run", return_value=_fail_proc()):
+            assert _tb.ThermoMPNNBridge().is_available() is False
+
+    def test_tier1_short_circuits_without_spawning(self, monkeypatch):
+        # missing files → False at tier 1, the probe is NEVER spawned
+        monkeypatch.setattr(_tb.Path, "is_file", lambda self: False)
+        with patch.object(_tb.subprocess, "run",
+                          side_effect=AssertionError("must not spawn at tier 1")) as m:
+            assert _tb.ThermoMPNNBridge().is_available() is False
+
+    def test_probe_cached_no_respawn(self, monkeypatch):
+        self._present_install(monkeypatch)
+        b = _tb.ThermoMPNNBridge()
+        with patch.object(_tb.subprocess, "run", return_value=_ok_proc()) as m:
+            assert b.is_available() is True
+            assert b.is_available() is True
+            assert m.call_count == 1, "capability probe must be cached (one spawn)"
+
+    def test_probe_error_graceful_and_not_cached(self, monkeypatch):
+        self._present_install(monkeypatch)
+        b = _tb.ThermoMPNNBridge()
+        with patch.object(_tb.subprocess, "run", side_effect=TimeoutError("boom")):
+            assert b.is_available() is False          # graceful, no crash
+        key = (str(b._python), str(b._dir))
+        assert key not in _tb._IMPORT_PROBE_CACHE, "transient error must NOT be cached"
+
+    def test_disabled_returns_false_without_spawn(self, monkeypatch):
+        monkeypatch.setattr(config, "THERMOMPNN_ENABLE", "false", raising=False)
+        with patch.object(_tb.subprocess, "run",
+                          side_effect=AssertionError("must not spawn when disabled")):
+            assert _tb.ThermoMPNNBridge().is_available() is False

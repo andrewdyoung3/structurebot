@@ -442,6 +442,9 @@ THERMOMPNN_MODEL: str = os.environ.get(
 # Enable the fast-tier ThermoMPNN voter.  "auto" = use it if THERMOMPNN_DIR is a
 # valid install, else skip gracefully.  "false"/"0" disables (scan == pre-ThermoMPNN).
 THERMOMPNN_ENABLE: str = os.environ.get("THERMOMPNN_ENABLE", "auto").strip().lower()
+# is_available() capability probe: how long to wait for the cheap venv312 import-chain
+# check (imports only, no model load). Cached per session; spawned at most once.
+THERMOMPNN_PROBE_TIMEOUT: int = int(os.environ.get("THERMOMPNN_PROBE_TIMEOUT", "60"))
 # Sign normalisation: ThermoMPNN trains on NEGATED Megascale ddG (datasets.py:161),
 # Megascale positive = stabilising → ThermoMPNN predicts negative = stabilising,
 # which ALREADY matches the system convention (positive = destabilising).  So the
