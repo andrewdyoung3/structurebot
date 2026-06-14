@@ -68,7 +68,7 @@ For any operation class where the set of valid outputs is known and finite, the 
 
 **Error detection hardening:** `_ERROR_PREFIXES` in `chimerax_bridge.py` now includes `"Expected"` to catch `"Expected a collection of one of 'atoms', 'bonds'…"` — previously these were silently passed as success. Any response matching an error prefix is `FAILED`, not `✓`.
 
-**Current scope:** viewer representation intents (cartoon/spacefill/sticks/ball-and-stick/surface/hide-atoms/hide-cartoon/hide-surface/show-atoms/undo-representation). Operation-class migration (color, selection, etc.) is the documented next phase — see §9.
+**Current scope:** the viewer-representation AND color op-classes are both LANDED (representation: cartoon/spacefill/sticks/ball-and-stick/surface/hide-atoms/hide-cartoon/hide-surface/show-atoms/undo-representation; color: by-chain/by-element/by-heteroatom/rainbow/by-attribute/solid), both on the shared op-class target resolver (`_resolve_opclass_target` — see the Investigation & Audit Discipline subsection above). The remaining op-class migration (selection, etc.) is the documented next phase — see §9.
 
 ---
 
