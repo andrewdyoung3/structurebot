@@ -20,8 +20,22 @@ def _row(pdbid, variant, score):
     return {"pdbid": pdbid, "chainid": "A", "variant": variant, "score": str(score)}
 
 
+# The real-data tests below need the external RaSP_repo Ssym CSVs (an upstream clone
+# + download, NOT committed to this repo). On a fresh clone they are absent → SKIP,
+# mirroring the live PyRosetta/ColabFold benchmark skips — a machine-dependent test
+# must skip, never hard-fail. The synthetic-data gate tests further down build their
+# own rows and always run.
+_SSYM_CSV = (Path(__file__).resolve().parent.parent
+             / "RaSP_repo" / "data" / "test" / "Ssym_dir" / "ddG_experimental" / "ddg.csv")
+_needs_ssym_data = pytest.mark.skipif(
+    not _SSYM_CSV.is_file(),
+    reason=f"external Ssym data absent ({_SSYM_CSV}); clone+download RaSP_repo to run",
+)
+
+
 # ── real data ────────────────────────────────────────────────────────────────────
 
+@_needs_ssym_data
 def test_real_ssym_builds_and_flags_renumbering():
     pairs = sm.build_ssym_pairs()
     assert len(pairs) == 352
@@ -38,6 +52,7 @@ def test_real_ssym_builds_and_flags_renumbering():
         assert abs(f["exp_ddg"] + r["exp_ddg"]) < 1e-6
 
 
+@_needs_ssym_data
 def test_pair_schema_is_link_ready():
     pairs = sm.build_ssym_pairs()
     p = pairs[0]
@@ -50,6 +65,7 @@ def test_pair_schema_is_link_ready():
     assert p["fwd"]["provenance"]["dynamut2"] == "training"
 
 
+@_needs_ssym_data
 def test_flatten_two_mutations_per_pair():
     pairs = sm.build_ssym_pairs()
     muts = sm.ssym_pair_mutations(pairs)

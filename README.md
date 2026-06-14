@@ -31,9 +31,9 @@ python main.py --no-auto-proceed # always confirm before executing
 
 | Requirement | Notes |
 |---|---|
-| Python 3.10+ (venv at `.\venv`) | `pip install -r requirements.txt` |
+| Python 3.10+ (venv at `.\venv`) | `pip install -r requirements.txt` (app) · `pip install -r requirements-dev.txt` (to run the test suite) |
 | UCSF ChimeraX 1.x | Install at default path or set `CHIMERAX_PATH` |
-| Anthropic API key | Already in `.env.local` |
+| Ollama + `qwen3:8b` | Translation is LOCAL-ONLY — `ollama pull qwen3:8b` (Ollama ≥ 0.30.0). No API key. |
 | Port 60001 free | REST server default |
 
 ---
