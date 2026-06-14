@@ -289,6 +289,15 @@ class MutationScanner:
                 print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
         self._progress = progress_callback or _safe_print
+        # Per-scan voter-visibility (B2): {voter, state, reason} where state is
+        # "ok" | "disabled" (silent) | "unavailable" (quiet note) | "empty" (LOUD:
+        # capability-passed then produced nothing — the formerly-silent drop). The
+        # discriminator between "unavailable" and "empty" is the now-reliable
+        # is_available() capability flag (Unit B).
+        self.voter_notes: List[Dict[str, Any]] = []
+
+    def _note_voter(self, voter: str, state: str, reason: Optional[str] = None) -> None:
+        self.voter_notes.append({"voter": voter, "state": state, "reason": reason})
 
     # ── Identity spine ──────────────────────────────────────────────────────────
 
@@ -382,6 +391,7 @@ class MutationScanner:
         # candidate that passes the CamSol/ESM thresholds).  An explicit int still
         # caps generation if a caller wants it.  (Rosetta cost is governed by the
         # opt-in deep tier + shortlist, NOT by truncating the evaluated set.)
+        self.voter_notes = []                # reset per scan (voter-visibility, B2)
         max_candidates     = filt.get("max_candidates", None)
         cands_per_pos      = filt.get("candidates_per_pos",  3)
         protected          = set(filt.get("binding_site_residues", []))
@@ -1083,12 +1093,17 @@ class MutationScanner:
         fast tier renormalises over CamSol+ESM exactly as before (no crash, no fake).
         """
         if not enabled or not pdb_path or not Path(pdb_path).is_file():
-            return {}, {}
+            return {}, {}        # not requested / no structure → silent (no note)
         try:
             from thermompnn_bridge import ThermoMPNNBridge
             bridge = ThermoMPNNBridge()
+            status = bridge.status()
+            if status.lower().startswith("disabled"):
+                return {}, {}    # deliberately disabled → SILENT (config choice)
             if not bridge.is_available():
-                self._progress(f"  ThermoMPNN: {bridge.status()} — fast tier without it.")
+                # capability-absent (the reliable Unit-B flag) → QUIET note
+                self._progress(f"  ThermoMPNN: {status} — fast tier without it.")
+                self._note_voter("ThermoMPNN", "unavailable", status)
                 return {}, {}
             # ThermoMPNN keys by AUTHOR resnum (its WT-anchored map returns resnum);
             # pass resnum so the candidate keys match.
@@ -1100,13 +1115,23 @@ class MutationScanner:
             self._progress(
                 f"  ThermoMPNN: scoring {len(cands)} candidate(s) (fast-tier stability voter)…"
             )
-            return bridge.score_mutations(
+            ddg, src = bridge.score_mutations(
                 pdb_path, chain_id or "A", cands, progress=self._progress
             )
+            if not ddg:
+                # available + ran, produced NOTHING → the formerly-silent drop → LOUD
+                self._note_voter("ThermoMPNN", "empty",
+                                 getattr(bridge, "last_skip_reason", None))
+            else:
+                self._note_voter("ThermoMPNN", "ok")
+            return ddg, src
         except Exception as exc:
+            # available (passed status/capability) then threw → a real anomaly → LOUD
             self._progress(
                 f"  ThermoMPNN unavailable ({type(exc).__name__}) — fast tier without it."
             )
+            self._note_voter("ThermoMPNN", "empty",
+                             f"{type(exc).__name__}: {str(exc)[:100]}")
             return {}, {}
 
     def _run_rasp(
@@ -1124,12 +1149,16 @@ class MutationScanner:
         tier renormalises over the present axes exactly as before (no crash, no fake).
         """
         if not enabled or not pdb_path or not Path(pdb_path).is_file():
-            return {}, {}
+            return {}, {}        # not requested / no structure → silent (no note)
         try:
             from rasp_bridge import RaSPBridge
             bridge = RaSPBridge()
+            status = bridge.status()
+            if status.lower().startswith("disabled"):
+                return {}, {}    # deliberately disabled → SILENT (config choice)
             if not bridge.is_available():
-                self._progress(f"  RaSP: {bridge.status()} — fast tier without it.")
+                self._progress(f"  RaSP: {status} — fast tier without it.")
+                self._note_voter("RaSP", "unavailable", status)   # QUIET
                 return {}, {}
             # RaSP keys by AUTHOR resnum (its WT-anchored map returns resnum); pass
             # resnum so the candidate keys match.
@@ -1141,13 +1170,20 @@ class MutationScanner:
             self._progress(
                 f"  RaSP: scoring {len(cands)} candidate(s) (fast-tier physics proxy)…"
             )
-            return bridge.score_mutations(
+            ddg, src = bridge.score_mutations(
                 pdb_path, chain_id or "A", cands, progress=self._progress
             )
+            if not ddg:
+                self._note_voter("RaSP", "empty",
+                                 getattr(bridge, "last_skip_reason", None))   # LOUD
+            else:
+                self._note_voter("RaSP", "ok")
+            return ddg, src
         except Exception as exc:
             self._progress(
                 f"  RaSP unavailable ({type(exc).__name__}) — fast tier without it."
             )
+            self._note_voter("RaSP", "empty", f"{type(exc).__name__}: {str(exc)[:100]}")
             return {}, {}
 
     def _run_dynamut2(
@@ -1205,6 +1241,11 @@ class MutationScanner:
                     f"  DynaMut2 unavailable ({(result.error or '')[:80]}) — "
                     "dynamics not_computed; deep run continues."
                 )
+                # API (no local capability flag): a no-response is transient, NOT a
+                # "passed-capability-then-empty" anomaly → QUIET (not loud), per the
+                # don't-nag-on-a-flaky-API rule.
+                self._note_voter("DynaMut2", "unavailable",
+                                 (result.error or "remote API unavailable")[:100])
                 return {}, {}
             scores = result.data.get("ddg_scores", {})      # keyed f"{wt}{resnum}{mut}", system sign
             # EXCLUDE empirical fallbacks — a BLOSUM/B-factor estimate is NOT a
@@ -1226,6 +1267,8 @@ class MutationScanner:
                 f"  DynaMut2 unavailable ({type(exc).__name__}) — dynamics not_computed; "
                 "deep run continues."
             )
+            self._note_voter("DynaMut2", "unavailable",
+                             f"{type(exc).__name__}: {str(exc)[:100]}")
             return {}, {}
 
     @staticmethod
