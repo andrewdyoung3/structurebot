@@ -70,14 +70,24 @@ class RaSPBridge:
         ck = (self._distro, self._python, self._dir)
         if ck in _AVAIL_CACHE:
             return _AVAIL_CACHE[ck]
-        ok = False
-        if self._wsl.is_available():
-            # rasp_env python + RaSP repo both present in WSL
-            chk = (f"test -x {shlex.quote(self._python)} && "
-                   f"test -d {shlex.quote(self._dir)} && echo RASP_OK")
-            r = self._wsl.run_command(chk, timeout=30)
-            ok = bool(r.get("ok")) and "RASP_OK" in r.get("stdout", "")
-        _AVAIL_CACHE[ck] = ok
+        if not self._wsl.is_available():
+            return False   # WSL down — transient, do NOT cache
+        # Tier 1: the RaSP repo dir is present in WSL.
+        d = self._wsl.run_command(
+            f"test -d {shlex.quote(self._dir)} && echo RASP_DIR_OK", timeout=30)
+        if not (bool(d.get("ok")) and "RASP_DIR_OK" in (d.get("stdout", "") or "")):
+            return False   # absent/inconclusive — do NOT cache (could be transient)
+        # Tier 2 (CAPABILITY, upgrades the old `test -x python` presence check):
+        # confirm the rasp_env import chain RUNS in WSL — a True flag must mean
+        # "the env can import torch/numpy", not "the interpreter file exists" (the
+        # cavity class). dep_probe caches only a DEFINITIVE verdict.
+        from dep_probe import wsl_import_probe
+        ok = wsl_import_probe(
+            self._wsl, self._python, ["import numpy", "import torch"],
+            timeout=int(getattr(_cfg, "RASP_PROBE_TIMEOUT", 60)),
+            cache_key=("rasp", self._distro, self._python, self._dir))
+        if ok:
+            _AVAIL_CACHE[ck] = True   # cache only definitive success; False re-checks
         return ok
 
     def status(self) -> str:

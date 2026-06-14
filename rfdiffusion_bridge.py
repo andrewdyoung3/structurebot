@@ -317,8 +317,24 @@ class RFdiffusionBridge:
     # ── Availability (public, ColabFold parity) ─────────────────────────────────
 
     def is_available(self) -> bool:
-        """True if RFdiffusion is runnable by either route (Windows clone or WSL env)."""
-        return self._available
+        """True iff installed (route detected) AND the WSL rfdiffusion_env import
+        chain RUNS.
+
+        Tier 1 = `self._available` (route detection: Windows clone fs-check OR WSL
+        env probe). Tier 2 = a cached WSL import probe (torch + dgl in
+        RFDIFFUSION_PYTHON) — the cavity-class capability check: the Windows-clone
+        route's fs-check confirms FILES exist but not that the WSL env can import
+        (dgl/sm_120 is the real break risk). dep_probe caches a DEFINITIVE verdict;
+        WSL-down / spawn error → False without caching. Run path is unaffected (it
+        does not gate on this).
+        """
+        if not self._available:
+            return False
+        from dep_probe import wsl_import_probe
+        return wsl_import_probe(
+            self._wsl, RFDIFFUSION_PYTHON, ["import torch", "import dgl"],
+            timeout=int(getattr(_cfg, "RFDIFFUSION_PROBE_TIMEOUT", 90)),
+            cache_key=("rfdiffusion", RFDIFFUSION_PYTHON, self._wsl_dir))
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
