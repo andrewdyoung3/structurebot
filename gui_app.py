@@ -94,6 +94,36 @@ class _RequestWorker(QtCore.QRunnable):
         self.signals.done.emit()
 
 
+class _ToolRequestWorker(QtCore.QRunnable):
+    """Stage 3b: runs one engine.handle_tool_request off the UI thread — a tool LAUNCH
+    from the Variant Workbench (build a result dict → the SAME spine as the NL path). The
+    confirm-gate/tiering prompts block THIS thread via the QtPresenter; Cancel injects
+    KeyboardInterrupt here exactly like the NL worker."""
+
+    def __init__(self, engine, spec, presenter):
+        super().__init__()
+        self._engine, self._spec, self._presenter = engine, spec, presenter
+        self.signals = _RequestSignals()
+        self.tid: Optional[int] = None
+
+    @QtCore.Slot()
+    def run(self):
+        self.tid = threading.get_ident()
+        try:
+            s = self._spec
+            self._engine.handle_tool_request(
+                s["tool"], s.get("tool_inputs") or {}, s.get("user_input", ""),
+                self._presenter, confidence=s.get("confidence", "high"),
+            )
+        except KeyboardInterrupt:
+            self.signals.failed.emit("cancelled")
+            return
+        except Exception as exc:                       # error-first: never crash the pool
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.signals.done.emit()
+
+
 class _LoadModelSignals(QtCore.QObject):
     done = QtCore.Signal(str, list)
     failed = QtCore.Signal(str)
@@ -300,6 +330,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._sig.set_busy.connect(self._on_busy)
         self._sig.ask.connect(self._on_ask)
         self.input.returnPressed.connect(self._on_submit)
+        # Stage 3b: the Workbench requests a tool launch → run it on the engine spine.
+        self.workbench.launchRequested.connect(self._on_tool_launch)
 
     # ── presenter signal slots (UI thread) ───────────────────────────────────────
     @QtCore.Slot(str)
@@ -411,6 +443,43 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         w.signals.failed.connect(self._on_request_failed)
         self._worker = w
         self._pool.start(w)
+
+    # ── Stage 3b: tool launch from the Variant Workbench ──────────────────────────
+    @QtCore.Slot(dict)
+    def _on_tool_launch(self, spec: dict) -> None:
+        """Run a Workbench-built tool spec through the engine spine on a worker thread.
+        On completion, fire the S3a consume path so the result auto-renders in the panel
+        (the bridges cache into the session; the panel reads it back)."""
+        if self._in_flight:
+            self.presenter.warn("A request is already running — wait for it to finish.")
+            return
+        self.output.append(render_html(
+            f"<pre style='margin:0;color:#7fd1ff'><b>&gt; {escape(spec.get('user_input',''))}</b></pre>"))
+        self._in_flight = True
+        self._pending_focus = []
+        self._opened_mids = []
+        self.presenter.cancelled = False
+        self.input.setEnabled(False)
+        self.cancel_action.setEnabled(True)
+        refresh = spec.get("refresh")
+        w = _ToolRequestWorker(self.engine, spec, self.presenter)
+        w.signals.done.connect(lambda r=refresh: self._on_tool_done(r))
+        w.signals.failed.connect(self._on_request_failed)
+        self._worker = w
+        self._pool.start(w)
+
+    @QtCore.Slot()
+    def _on_tool_done(self, refresh) -> None:
+        # The tool's results are cached in the session by the bridge; render them via the
+        # SAME S3a consume path the manual buttons use (no parallel rendering code).
+        try:
+            if refresh == "mpnn":
+                self.workbench._import_mpnn()
+            elif refresh == "scan":
+                self.workbench._load_suggestions()
+        except Exception as exc:
+            self.presenter.warn(f"Workbench refresh failed: {exc}")
+        self._finish_request()
 
     @QtCore.Slot()
     def _on_request_done(self) -> None:

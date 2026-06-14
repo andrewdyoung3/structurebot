@@ -107,6 +107,48 @@ def test_engine_drives_qt_presenter(_app):
     host.bridge.run_commands.assert_called_with(["color #1 red"])
 
 
+# ── Stage 3b: handle_tool_request enters the SAME spine (no translate, real route/execute) ──
+
+def test_handle_tool_request_enters_the_spine(_app):
+    sig = PresenterSignals()
+    out = []
+    sig.append_html.connect(lambda h: out.append(h))
+    sig.ask.connect(lambda kind, payload, q: q.put("proceed"))   # the confirm-gate → proceed
+    pres = QtPresenter(sig)
+
+    host = MagicMock()
+    routed = {"commands": [], "explanations": [], "warnings": ["Deep tier — approximate runtime ~2 h"],
+              "confidence": "low", "clarification_needed": None,
+              "tools_needed": ["mutation_scan"], "has_extra_tools": True,
+              "tool_inputs": {"mutation_scan": {"model_id": "1", "chain": "A",
+                                                "scan_positions": [10, 25], "run_rosetta": True}}}
+    host.router.route.return_value = routed
+    executed = dict(routed)
+    executed.update({"tool_step_results": [], "all_viz_commands": [], "all_viz_explanations": [],
+                     "tool_summaries": {}, "pipeline_success": True, "pipeline_error": None})
+    host.router.execute.return_value = executed
+
+    eng = RequestEngine(host)
+    eng.handle_tool_request(
+        "mutation_scan",
+        {"model_id": "1", "chain": "A", "scan_positions": [10, 25], "run_rosetta": True},
+        "[Workbench] mutation scan on chain A — 2 selected position(s), deep tier",
+        pres, confidence="low")
+
+    # It built a routed-shaped dict and entered route() → execute() (the real spine) —
+    # never a parallel invocation, and translate() (the LLM) was never touched.
+    built = host.router.route.call_args.args[0]
+    assert built["tools_needed"] == ["mutation_scan"]
+    assert built["tool_inputs"]["mutation_scan"]["run_rosetta"] is True
+    assert built["confidence"] == "low"
+    host.router.execute.assert_called_once()
+    host.translator.translate.assert_not_called()
+    # the deep-tier estimate reached the pane before the gate
+    import re as _re
+    text = _re.sub(r"<[^>]+>", "", " ".join(out))
+    assert "approximate runtime" in text.lower()
+
+
 # ── host hooks: open -> session add + record for focus; show_model -> tab ─────────
 
 import types  # noqa: E402

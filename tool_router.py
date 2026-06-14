@@ -838,8 +838,12 @@ class ToolRouter:
             inp["scan_positions"] = positions   # may be [] → _run_mutation_scan errors
 
         # (b) Tier + options
+        # `deep` and the scan scope may arrive PRE-SET in `inp` (the panel tool-launch
+        # path builds the result dict deterministically — no text to parse), OR be parsed
+        # from user_input (the NL/typed path). Honor the pre-set first so the estimate +
+        # confirm-gate below fire identically for both; the text path is unchanged.
         import config as _cfg
-        deep      = bool(self._TIER_ROSETTA_RE.search(user_input))
+        deep      = bool(inp.get("run_rosetta")) or bool(self._TIER_ROSETTA_RE.search(user_input))
         thorough  = bool(self._THOROUGHNESS_RE.search(user_input))
         shortlist = bool(self._SHORTLIST_RE.search(user_input))
         asym      = bool(self._ASYMMETRIC_RE.search(user_input))
@@ -855,15 +859,19 @@ class ToolRouter:
         #   n_mut  — ACTUAL full-grid Rosetta calls = positions × candidates_per_pos
         #   n_res  — FULL pose residues (all chains; drives per-mutation cost)
         if deep or thorough:
+            _preset_scope = inp.get("scan_positions")
             if scope_requested and positions:
                 n_pos: Optional[int] = len(positions)
+            elif _preset_scope:                 # panel-supplied scope (no text to parse)
+                n_pos = len(_preset_scope)
             else:
                 _seq  = self._fetch_sequence(model_id, chain) or ""
                 n_pos = len(_seq) or None
             cands = int(inp.get("candidates_per_pos") or self._DEFAULT_CANDS_PER_POS)
+            _scoped = scope_requested or bool(_preset_scope)
             if n_pos:
                 n_mut = n_pos * cands
-                if not scope_requested:        # whole-chain scan is capped
+                if not _scoped:                # whole-chain scan is capped
                     n_mut = min(n_mut, self._DEFAULT_MAX_CANDIDATES)
             else:
                 n_mut = None
