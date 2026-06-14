@@ -21,10 +21,14 @@ those keyed by unique-chain. Persisted via session_state (JSON-friendly dicts).
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Source provenance for a single substitution (Stage 2+ populate manual/suggested).
 MutationSource = str  # "manual" | "proteinmpnn" | "mutation_scanner" | "accepted_suggestion"
+
+# Standard-20 codes a substitution may pick (canonical biological constant; mirrors
+# seq_editor.controller.VALID_AA but kept local so the pure model has no Qt/spine pull).
+_STD_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
 
 @dataclass
@@ -93,6 +97,48 @@ class ChainDesign:
         if 0 <= col < len(self.template_cells):
             return self.template_cells[col].resnum
         return None
+
+    # ── Stage 2: variant creation + manual edit (pure; mirrors ChainSeq overlay) ────
+    def get_variant(self, variant_id: str) -> Optional["Variant"]:
+        for v in self.variants:
+            if v.id == variant_id:
+                return v
+        return None
+
+    def add_variant(self, variant_id: str, *, parent: str = "T",
+                    source: MutationSource = "manual") -> "Variant":
+        """Create a new variant row as an aligned COPY of the template column axis (no
+        mutations yet) and append it. The cells are fresh AlignedCells (never alias the
+        template's), so editing one variant can't bleed into T or its siblings."""
+        cells = [AlignedCell(col=c.col, resnum=c.resnum, aa=c.aa) for c in self.template_cells]
+        v = Variant(id=variant_id, parent=parent, source=source, cells=cells)
+        self.variants.append(v)
+        return v
+
+    def edit_variant(self, variant_id: str, col: int, new_aa: str) -> None:
+        """Substitute one residue in a variant at a column, lossless against T: sets the
+        variant cell's aa and re-derives the Mutation list vs the template. Editing back
+        to the template residue REVERTS (drops the mutation). Raises on unknown variant /
+        out-of-range column / non-standard aa / gap column (no substituting a gap in S2).
+        The template is NEVER touched (T is immutable — the design baseline)."""
+        v = self.get_variant(variant_id)
+        if v is None:
+            raise KeyError(f"variant not found: {variant_id!r}")
+        if not (0 <= col < len(self.template_cells)) or col >= len(v.cells):
+            raise ValueError(f"column out of range: {col}")
+        tmpl = self.template_cells[col]
+        cell = v.cells[col]
+        if tmpl.is_gap or cell.is_gap or tmpl.resnum is None:
+            raise ValueError("cannot substitute a gap column")
+        aa = (new_aa or "").strip().upper()
+        if aa not in _STD_AA:
+            raise ValueError(f"not a standard amino acid: {new_aa!r}")
+        cell.aa = aa
+        v.mutations = [m for m in v.mutations if m.resnum != tmpl.resnum]
+        if tmpl.aa is not None and aa != tmpl.aa:
+            v.mutations.append(Mutation(resnum=tmpl.resnum, from_aa=tmpl.aa,
+                                        to_aa=aa, source=v.source))
+        v.mutations.sort(key=lambda m: m.resnum)
 
 
 @dataclass
@@ -180,6 +226,53 @@ def column_tracks(design: "ChainDesign") -> Tuple[List[str], List[float]]:
         consensus.append(top)
         conservation.append(round(topn / len(colvals), 3))
     return consensus, conservation
+
+
+def build_color_commands(cells: List[AlignedCell],
+                         members: List[Tuple[str, str]],
+                         color_for: Callable[[Optional[str]], Optional[str]],
+                         reset: str = "#ffffff") -> List[str]:
+    """Compact ChimeraX `color` commands that paint a sequence-PROPERTY view onto the
+    shared backbone (Stage 2 preview — color-by-identity, no rotamers rebuilt).
+
+    *cells* are the ACTIVE row's AlignedCells (template OR a variant — substitution-only,
+    so resnums map 1:1 onto the real atoms). For each (model, chain) in *members* (every
+    homo-oligomer copy): emit one `color #M/C {reset}` baseline, then run-grouped
+    `color #M/C:<resnums> <hex>` for residues whose color differs from the reset —
+    mirroring `camsol_bridge._build_viz_commands`'s consecutive-run compaction. Gap cells
+    and residues with no color opinion (color_for→None) fall through to the reset, so they
+    cost no command. `color_for` is the SAME fn the panel paints with (color_modes), which
+    is what pins panel-cell color == 3D-residue color (the sync invariant). Pure/testable.
+    """
+    # color per non-gap residue (resnum, hex) in axis order
+    colored: List[Tuple[int, str]] = []
+    for c in cells:
+        if c.is_gap or c.resnum is None:
+            continue
+        hexc = color_for(c.aa) or reset
+        colored.append((c.resnum, hexc))
+
+    # group consecutive same-color residues into runs (in axis order)
+    runs: List[Tuple[str, List[int]]] = []
+    for resnum, hexc in colored:
+        if runs and runs[-1][0] == hexc:
+            runs[-1][1].append(resnum)
+        else:
+            runs.append((hexc, [resnum]))
+
+    cmds: List[str] = []
+    for (model, chain) in members:
+        spec0 = f"#{model}/{chain}"
+        cmds.append(f"color {spec0} {reset}")          # baseline (covers all reset-color residues)
+        for hexc, resnos in runs:
+            if hexc == reset:
+                continue                                # already the baseline color
+            if len(resnos) > 1 and resnos == list(range(resnos[0], resnos[-1] + 1)):
+                rng = f"{resnos[0]}-{resnos[-1]}"
+            else:
+                rng = ",".join(str(r) for r in resnos)
+            cmds.append(f"color {spec0}:{rng} {hexc}")
+    return cmds
 
 
 def import_mpnn_designs(design: ChainDesign, mpnn_result: Dict[str, Any],

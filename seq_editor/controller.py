@@ -192,6 +192,27 @@ class SequenceEditorController:
             return {"value": None, "error": f"{type(exc).__name__}: {exc}"}
         return r if isinstance(r, dict) else {"value": r, "error": None}
 
+    def run_commands(self, commands: List[str]) -> dict:
+        """Run raw ChimeraX commands over REST in order (the Workbench 3D color push —
+        same trusted-tool-viz path as select: it goes direct to the bridge, not through
+        the free-translation emission guard). ERROR-FIRST: never raises; returns
+        {"value": last, "error": first_error|None}."""
+        err: Optional[str] = None
+        last = None
+        for cmd in commands:
+            try:
+                r = self._run(cmd)
+            except Exception as exc:
+                err = err or f"{type(exc).__name__}: {exc}"
+                continue
+            if isinstance(r, dict):
+                last = r.get("value")
+                if r.get("error") and err is None:
+                    err = r.get("error")
+            else:
+                last = r
+        return {"value": last, "error": err}
+
     def select_in_3d(self, model: str, chain: str, resnums: List[int]):
         """Push a selection to ChimeraX. No-op (returns None) on empty resnum list.
 

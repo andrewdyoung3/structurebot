@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from variant_model import (
     AlignedCell, Mutation, Variant, ChainDesign, DesignSession,
-    build_design_session, import_mpnn_designs, column_tracks,
+    build_design_session, import_mpnn_designs, column_tracks, build_color_commands,
 )
 from seq_editor.controller import ResidueCell, ChainSeq
 
@@ -95,6 +95,80 @@ class TestTracks:
         cons, csv = column_tracks(cd)
         assert cons[0] == "M" and csv[0] == 1.0          # col0 all M
         assert csv[1] == 0.5                              # col1 K vs A → 50%
+
+
+class TestVariantCreateEdit:
+    def _cd(self, seq="MKV", start=1):
+        return next(iter(build_design_session(
+            [_chainseq("1", "A", seq, start=start)], "1").chains.values()))
+
+    def test_add_variant_is_aligned_copy_of_template(self):
+        cd = self._cd()
+        v = cd.add_variant("V1")
+        assert [c.aa for c in v.cells] == list("MKV")
+        assert [c.resnum for c in v.cells] == [1, 2, 3]
+        assert v.mutations == [] and cd.variants == [v]
+        # fresh cells — editing the variant must not bleed into the template
+        v.cells[0].aa = "A"
+        assert cd.template_cells[0].aa == "M"
+
+    def test_edit_variant_sets_aa_and_tracks_mutation(self):
+        cd = self._cd()
+        cd.add_variant("V1")
+        cd.edit_variant("V1", 1, "A")          # K2A
+        v = cd.get_variant("V1")
+        assert v.cells[1].aa == "A"
+        assert [(m.resnum, m.from_aa, m.to_aa) for m in v.mutations] == [(2, "K", "A")]
+
+    def test_edit_back_to_template_reverts(self):
+        cd = self._cd()
+        cd.add_variant("V1")
+        cd.edit_variant("V1", 1, "A")
+        cd.edit_variant("V1", 1, "K")          # back to T
+        v = cd.get_variant("V1")
+        assert v.cells[1].aa == "K" and v.mutations == []
+
+    def test_edit_uses_template_resnum_offset(self):
+        cd = self._cd(start=50)
+        cd.add_variant("V1")
+        cd.edit_variant("V1", 2, "L")          # col 2 → resnum 52
+        assert cd.get_variant("V1").mutations[0].resnum == 52
+
+    def test_edit_rejects_bad_inputs(self):
+        cd = self._cd()
+        cd.add_variant("V1")
+        with pytest.raises(ValueError):
+            cd.edit_variant("V1", 1, "Z")      # non-standard aa
+        with pytest.raises(ValueError):
+            cd.edit_variant("V1", 99, "A")     # out-of-range column
+        with pytest.raises(KeyError):
+            cd.edit_variant("Vx", 1, "A")      # unknown variant
+
+
+class TestColorCommands:
+    def _green(self, aa):                       # a trivial mode: K→green, else None
+        return "#00ff00" if aa == "K" else None
+
+    def test_runs_grouped_and_reset_first_all_copies(self):
+        cells = [AlignedCell(0, 1, "M"), AlignedCell(1, 2, "K"),
+                 AlignedCell(2, 3, "K"), AlignedCell(3, 4, "V")]
+        cmds = build_color_commands(cells, [("1", "A"), ("1", "B")], self._green)
+        assert cmds == [
+            "color #1/A #ffffff", "color #1/A:2-3 #00ff00",
+            "color #1/B #ffffff", "color #1/B:2-3 #00ff00",
+        ]
+
+    def test_noncontiguous_resnums_use_comma_list(self):
+        cells = [AlignedCell(0, 2, "K"), AlignedCell(1, 3, "V"), AlignedCell(2, 5, "K")]
+        cmds = build_color_commands(cells, [("1", "A")], self._green)
+        assert cmds == ["color #1/A #ffffff", "color #1/A:2 #00ff00", "color #1/A:5 #00ff00"]
+
+    def test_gap_cells_skipped(self):
+        # the gap cell contributes no command; the two K's (same color) merge into one
+        # comma-list run (1 and 3 are non-contiguous once the gap is dropped).
+        cells = [AlignedCell(0, 1, "K"), AlignedCell(1, None, None), AlignedCell(2, 3, "K")]
+        cmds = build_color_commands(cells, [("1", "A")], self._green)
+        assert cmds == ["color #1/A #ffffff", "color #1/A:1,3 #00ff00"]
 
 
 class TestPersistenceRoundtrip:
