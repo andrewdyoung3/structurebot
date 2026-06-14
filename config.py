@@ -132,6 +132,28 @@ CONFORMER_B_TRANSPARENCY: int = int(
     os.environ.get("CONFORMER_B_TRANSPARENCY", "50")
 )
 
+# ── Design-intent profiles (op-class: goal → tool + params + ranking) ────────────
+# "redesign for solubility" → ProteinMPNN on the SOLVENT-EXPOSED positions only
+# (buried core fixed), soluble bias, Cys omitted; ranked by CamSol (+ ESMFold).
+#
+# Exposure gate: per-residue absolute SASA (Å², BioPython ShrakeRupley via
+# cavity_bridge). NOTE this is an EXPOSURE cut, deliberately HIGHER than cavity's
+# ~20 Å² BURIAL cutoff — at 20 it would grab partially-buried rim positions whose
+# mutation to charge can still destabilise. Tunable without a rebuild; if the 1HSG
+# live-verify still looks permissive, raise it or move to relative SASA (RSA).
+DESIGN_EXPOSED_SASA_THRESHOLD: float = float(
+    os.environ.get("DESIGN_EXPOSED_SASA_THRESHOLD", "40")
+)
+# Fold guard for ranking: ESMFold mean-pLDDT floor below which a design is flagged
+# as a likely misfolder, and how many top-CamSol designs to fold-check (ESMFold is
+# the GPU/venv312 cost, so only the shortlist is folded).
+DESIGN_FOLD_PLDDT_FLOOR: float = float(
+    os.environ.get("DESIGN_FOLD_PLDDT_FLOOR", "70")
+)
+DESIGN_FOLD_CHECK_TOP_K: int = int(
+    os.environ.get("DESIGN_FOLD_CHECK_TOP_K", "3")
+)
+
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
 # NL→ChimeraX translation is LOCAL-ONLY (the local Ollama model; see translator.py

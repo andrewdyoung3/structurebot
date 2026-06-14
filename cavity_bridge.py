@@ -39,7 +39,14 @@ except ImportError:
 
 try:
     from Bio.PDB import PDBIO as _PDBIO
-    from Bio.PDB.ShrakeRupley import ShrakeRupley as _ShrakeRupley
+    try:
+        # BioPython >= 1.79 ships ShrakeRupley in Bio.PDB.SASA. The old
+        # `Bio.PDB.ShrakeRupley` path never existed on shipped versions, so the
+        # prior import silently disabled ALL SASA (cavity detection + the
+        # solubility exposed-selector) — caught by the design-goal live-verify.
+        from Bio.PDB.SASA import ShrakeRupley as _ShrakeRupley
+    except ImportError:
+        from Bio.PDB.ShrakeRupley import ShrakeRupley as _ShrakeRupley  # legacy fallback
     _BIOPYTHON_SASA_OK = True
 except ImportError:
     _PDBIO = None          # type: ignore[assignment]
@@ -571,6 +578,35 @@ class CavityBridge:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def solvent_exposed_residues(
+        self,
+        pdb_path:       str,
+        chain_id:       str,
+        sasa_threshold: float = 40.0,
+    ) -> List[int]:
+        """
+        Author residue numbers on *chain_id* that are SOLVENT-EXPOSED — per-residue
+        absolute SASA ≥ *sasa_threshold* (Å²). The inverse of the burial test in
+        ``find_cavities``; reuses the same ``_sasa_for_chains`` ShrakeRupley path.
+
+        SASA is computed on the SELECTED CHAIN ONLY, so for a monomer redesign the
+        exposure reflects the isolated chain (not buried by partners). Returns []
+        on any failure (no BioPython, parse error) — callers must treat [] as
+        "could not determine" and refuse, NEVER fall back to the whole chain.
+
+        NOTE: absolute Å² is residue-size biased (a large exposed residue and a
+        small partially-buried one can read similar). The threshold is the lever; a
+        future refinement is relative SASA (RSA). See DESIGN_EXPOSED_SASA_THRESHOLD.
+        """
+        structure = self._load_structure(pdb_path)
+        if structure is None:
+            return []
+        sasa_map = self._sasa_for_chains(structure, pdb_path, [chain_id])
+        return sorted(
+            resno for (ch, resno), area in sasa_map.items()
+            if ch == chain_id and area >= sasa_threshold
+        )
 
     def _load_structure(self, pdb_path: str):
         if not _BIOPYTHON_OK:

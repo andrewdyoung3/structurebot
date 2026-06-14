@@ -92,17 +92,14 @@ _WINDOW_SIZE   = 9
 
 # ── Core algorithm ─────────────────────────────────────────────────────────────
 
-def camsol_score(sequence: str, window: int = _WINDOW_SIZE) -> List[float]:
-    """
-    Compute the CamSol per-residue solubility profile for *sequence*.
-
-    Returns a list of floats (z-scores, one per residue) where:
-      positive → more soluble than the sequence average
-      negative → aggregation-prone relative to the sequence average
-    """
+def _camsol_raw(sequence: str, window: int = _WINDOW_SIZE) -> List[float]:
+    """Per-residue UN-normalized CamSol window score (CHARGE_WEIGHT·|charge| −
+    hydrophobicity, averaged over the window). Higher = more soluble. This is the
+    raw, cross-sequence-COMPARABLE quantity; ``camsol_score`` z-normalizes it
+    per-sequence for the colour profile (see ``camsol_solubility_score`` for the
+    comparable scalar)."""
     n    = len(sequence)
     half = window // 2
-
     raw: List[float] = []
     for i in range(n):
         total = 0.0
@@ -115,6 +112,35 @@ def camsol_score(sequence: str, window: int = _WINDOW_SIZE) -> List[float]:
             total  += _CHARGE_WEIGHT * charge - hydro
             count  += 1
         raw.append(total / count if count else 0.0)
+    return raw
+
+
+def camsol_solubility_score(sequence: str, window: int = _WINDOW_SIZE) -> float:
+    """Absolute, cross-sequence-COMPARABLE intrinsic-solubility scalar = the mean of
+    the un-normalized CamSol window score. Higher = more soluble.
+
+    Use this to RANK redesigns against each other and the wild type. NOT
+    ``mean(camsol_score(...))`` — that is per-sequence z-normalized (mean ≈ 0 for
+    EVERY sequence), so it cannot compare two sequences; it exists only for the
+    per-residue colour profile.
+    """
+    seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", sequence.upper())
+    raw = _camsol_raw(seq, window)
+    return sum(raw) / len(raw) if raw else 0.0
+
+
+def camsol_score(sequence: str, window: int = _WINDOW_SIZE) -> List[float]:
+    """
+    Compute the CamSol per-residue solubility profile for *sequence*.
+
+    Returns a list of floats (z-scores, one per residue) where:
+      positive → more soluble than the sequence average
+      negative → aggregation-prone relative to the sequence average
+
+    NOTE: these are per-sequence z-scores (for colouring ONE structure). To compare
+    solubility BETWEEN sequences (ranking designs), use ``camsol_solubility_score``.
+    """
+    raw = _camsol_raw(sequence, window)
 
     if not raw:
         return raw

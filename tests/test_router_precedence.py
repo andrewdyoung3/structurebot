@@ -100,12 +100,14 @@ def test_precedence_higher_wins(prompt, trans, higher, lower, has_mpnn):
 #  (prompt, translator_tools, must_be_present, must_be_absent)
 # ════════════════════════════════════════════════════════════════════════════════
 DISTRACTORS = [
-    # solubility/aggregation wording must NOT pull a real proteinmpnn redesign
-    # into camsol/mutation_scan (the collision the new eval corpus forbids).
+    # a goal-directed REDESIGN for solubility now routes through the design-intent
+    # op-class (single source of truth: goal→profile→ProteinMPNN on exposed
+    # positions), superseding the bare proteinmpnn keyword path — and must still
+    # never be pulled into camsol/mutation_scan.
     ("Redesign chain A to improve its solubility with no cysteines.",
-     ["proteinmpnn"], "proteinmpnn", "mutation_scan"),
+     ["proteinmpnn"], "design_goal", "mutation_scan"),
     ("Redesign chain A to reduce aggregation.",
-     ["proteinmpnn"], "proteinmpnn", "mutation_scan"),
+     ["proteinmpnn"], "design_goal", "mutation_scan"),
     # a passing "proline" mention in a pure viz command must not route proline
     ("Color the proline residues on chain A red.",
      ["chimerax"], "chimerax", "proline"),
