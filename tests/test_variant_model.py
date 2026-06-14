@@ -18,8 +18,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from variant_model import (
     AlignedCell, Mutation, Variant, ChainDesign, DesignSession,
     build_design_session, import_mpnn_designs, column_tracks, build_color_commands,
+    build_color_commands_by_resnum, candidate_ddg, stability_summary,
     filter_new_mpnn_variants, group_scan_suggestions, suggestion_color,
 )
+from color_modes import ddg_color
 from seq_editor.controller import ResidueCell, ChainSeq
 
 
@@ -170,6 +172,56 @@ class TestColorCommands:
         cells = [AlignedCell(0, 1, "K"), AlignedCell(1, None, None), AlignedCell(2, 3, "K")]
         cmds = build_color_commands(cells, [("1", "A")], self._green)
         assert cmds == ["color #1/A #ffffff", "color #1/A:1,3 #00ff00"]
+
+
+class TestStage4aStability:
+    def test_candidate_ddg_prefers_rosetta_then_thermompnn_then_rasp(self):
+        assert candidate_ddg({"ddg": 1.0, "thermompnn_ddg": 2.0}) == (1.0, "rosetta")
+        assert candidate_ddg({"ddg": None, "thermompnn_ddg": 2.0}) == (2.0, "thermompnn")
+        assert candidate_ddg({"rasp_ddg": -0.5}) == (-0.5, "rasp")
+        assert candidate_ddg({}) == (None, "not_computed")
+
+    def test_stability_summary_matches_variant_mutations_only(self):
+        muts = [Mutation(10, "I", "R"), Mutation(25, "K", "A")]
+        candidates = [
+            {"resnum": 10, "from_aa": "I", "to_aa": "R", "ddg": 1.8, "combined_score": -0.2},
+            {"resnum": 25, "from_aa": "K", "to_aa": "A", "thermompnn_ddg": -0.4},
+            {"resnum": 10, "from_aa": "I", "to_aa": "K", "ddg": 0.1},   # NOT this variant's pick
+        ]
+        s = stability_summary(candidates, muts)
+        assert s["per_resnum"] == {10: 1.8, 25: -0.4}    # only the variant's exact subs
+        assert s["sum_ddg"] == 1.4
+        assert s["n_scored"] == 2
+        assert s["tier"] == "deep"                       # a Rosetta ddg was present
+        assert [r["resnum"] for r in s["rows"]] == [10, 25]
+        assert s["rows"][1]["ddg_source"] == "thermompnn"
+
+    def test_stability_summary_fast_tier_when_no_rosetta(self):
+        s = stability_summary([{"resnum": 5, "to_aa": "D", "thermompnn_ddg": 0.3}],
+                              [Mutation(5, "A", "D")])
+        assert s["tier"] == "fast" and s["per_resnum"] == {5: 0.3}
+
+
+class TestStage4aColor:
+    def test_ddg_color_diverging_neutral_band(self):
+        assert ddg_color(None) is None
+        assert ddg_color(0.0) == "#ffffff"
+        assert ddg_color(0.8) == "#ffffff"               # within ±1 neutral band
+        red, blue = ddg_color(3.0), ddg_color(-3.0)
+        r_red = int(red[1:3], 16); b_red = int(red[5:7], 16)
+        r_blue = int(blue[1:3], 16); b_blue = int(blue[5:7], 16)
+        assert r_red > b_red and b_blue > r_blue         # destabilizing red, stabilizing blue
+
+    def test_build_color_commands_by_resnum_runs_all_copies(self):
+        ddg = {10: 3.0, 11: 3.0, 25: -3.0}
+        value_for = lambda rn: ddg_color(ddg.get(rn))
+        cmds = build_color_commands_by_resnum([10, 11, 25], value_for,
+                                              [("1", "A"), ("1", "B")])
+        # baseline per copy, a merged run for 10-11 (same hex), a separate 25
+        assert cmds[0] == "color #1/A #ffffff"
+        assert "color #1/A:10-11 " + ddg_color(3.0) in cmds
+        assert "color #1/A:25 " + ddg_color(-3.0) in cmds
+        assert "color #1/B #ffffff" in cmds and "color #1/B:25 " + ddg_color(-3.0) in cmds
 
 
 class TestAcceptSuggestionProvenance:

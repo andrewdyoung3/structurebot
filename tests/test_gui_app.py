@@ -149,6 +149,34 @@ def test_handle_tool_request_enters_the_spine(_app):
     assert "approximate runtime" in text.lower()
 
 
+def test_handle_tool_request_on_result_seam(_app):
+    # S4a: the executed result is handed to on_result (the variant ResultSlots capture).
+    sig = PresenterSignals()
+    sig.ask.connect(lambda kind, payload, q: q.put("proceed"))
+    pres = QtPresenter(sig)
+
+    host = MagicMock()
+    routed = {"commands": [], "explanations": [], "warnings": [], "confidence": "high",
+              "clarification_needed": None, "tools_needed": ["mutation_scan"],
+              "has_extra_tools": True, "tool_inputs": {"mutation_scan": {"model_id": "1"}}}
+    host.router.route.return_value = routed
+    executed = dict(routed)
+    executed.update({"tool_step_results": [{"tool": "mutation_scan",
+                     "data": {"candidates": [{"resnum": 1, "to_aa": "W", "ddg": 2.0}]}}],
+                     "all_viz_commands": [], "all_viz_explanations": [], "tool_summaries": {},
+                     "pipeline_success": True, "pipeline_error": None})
+    host.router.execute.return_value = executed
+
+    captured = []
+    RequestEngine(host).handle_tool_request(
+        "mutation_scan", {"model_id": "1", "score_mutations": {1: "W"}},
+        "[Workbench] stability", pres, on_result=captured.append)
+
+    assert len(captured) == 1
+    cands = captured[0]["tool_step_results"][0]["data"]["candidates"]
+    assert cands[0]["resnum"] == 1 and cands[0]["ddg"] == 2.0
+
+
 # ── host hooks: open -> session add + record for focus; show_model -> tab ─────────
 
 import types  # noqa: E402

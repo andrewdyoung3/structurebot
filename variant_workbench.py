@@ -31,15 +31,17 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import all_modes, get_mode
+from color_modes import all_modes, ddg_color, get_mode
 from seq_library import build_numbering_header_content
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
-                           build_color_commands, build_design_session, column_tracks,
+                           build_color_commands, build_color_commands_by_resnum,
+                           build_design_session, column_tracks,
                            filter_new_mpnn_variants, group_scan_suggestions,
-                           import_mpnn_designs, suggestion_color)
+                           import_mpnn_designs, stability_summary, suggestion_color)
 
 _COLS = 30                                  # residues per wrapped block
 _SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
+_RESULT_DDG_MODE = "result:ddg"             # S4a result-backed color mode (per-residue ddG)
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
 _AA_ROLE = QtCore.Qt.UserRole + 2           # cell → residue 1-letter ("-"/None for non-seq)
@@ -101,6 +103,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
     a click on the sparse inline Suggest track emits (_SUGGEST_ROW, col)."""
 
     cellClicked2 = QtCore.Signal(object, int, bool)   # (row_id, template col, ctrl-held)
+    rowHeaderClicked = QtCore.Signal(object)          # row_id (variant header click → detail)
 
     def __init__(self, design: ChainDesign, suggestions: Optional[Dict[int, List[dict]]] = None):
         super().__init__()
@@ -108,6 +111,8 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         self.suggestions: Dict[int, List[dict]] = dict(suggestions or {})  # col -> ranked cands
         self.active_row_id: str = "T"               # T drives 3D coloring by default
         self._mode = get_mode("none")               # current color mode (OFF by default)
+        self.badges: Dict[str, str] = {}            # vid -> inline result badge (S4a)
+        self._result_coloring: Optional[Tuple[str, Dict[int, str]]] = None  # (row_id, resnum->hex)
         self._blocks: List[QtWidgets.QTableWidget] = []
         self._row_ids: List[Optional[str]] = []     # by table row index
         self.setWidgetResizable(True)
@@ -137,7 +142,8 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         # row identity, in table-row order: ruler, T, variants…, [Suggest], consensus, conservation
         self._row_ids = [None, "T"] + [vv.id for vv in design.variants] + sugg_rid + [None, None]
         labels = ["#", f"T ({design.rep_chain})"] \
-            + [vv.id for vv in design.variants] + sugg_label + ["Consensus", "Conservation"]
+            + [self._variant_label(vv.id) for vv in design.variants] \
+            + sugg_label + ["Consensus", "Conservation"]
         tmpl_aa = [c.aa or "-" for c in design.template_cells]
         var_aa = {vv.id: ([c.aa or "-" for c in vv.cells] if len(vv.cells) == n
                           else ["-"] * n) for vv in design.variants}
@@ -167,12 +173,26 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             block.resizeColumnsToContents()
             block.resizeRowsToContents()
             block.cellClicked.connect(self._on_cell)
+            block.verticalHeader().sectionClicked.connect(
+                lambda section, b=block: self._on_header(b, section))
             self._blocks.append(block)
             v.addWidget(block)
         v.addStretch(1)
         self.setWidget(inner)
         self._mark_active_header()
         self.set_color_mode(self._mode)            # re-apply the active mode after a rebuild
+
+    def _variant_label(self, vid: str) -> str:
+        """Variant row header: the id plus its inline result badge (S4a), if any."""
+        badge = self.badges.get(vid)
+        return f"{vid}  {badge}" if badge else vid
+
+    def _on_header(self, block, section: int) -> None:
+        """A click on a row's vertical header → request the expandable result detail
+        (variant rows only)."""
+        rid = self._row_ids[section] if 0 <= section < len(self._row_ids) else None
+        if rid not in (None, "T", _SUGGEST_ROW):
+            self.rowHeaderClicked.emit(rid)
 
     def _put(self, block, row, col, text, gcol, row_id, aa, *, edited=False, faint=False):
         it = QtWidgets.QTableWidgetItem(text)
@@ -228,6 +248,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         residue. Under the OFF mode ('none') the row defaults return (T tint / edit
         highlight). Ruler/consensus/conservation keep their faint styling regardless."""
         self._mode = mode
+        self._result_coloring = None                # leaving any result-mode coloring
         active = mode.fn is not None
         for block in self._blocks:
             for r in range(block.rowCount()):
@@ -243,6 +264,28 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                         continue
                     aa = it.data(_AA_ROLE)
                     hexc = mode.color_for(aa) if aa not in (None, "-") else None
+                    it.setBackground(QtGui.QBrush(QtGui.QColor(hexc) if hexc else _RESET_BG))
+
+    # ── result color mode (S4a): paint ONE row by per-residue computed value ─────────
+    def set_result_coloring(self, active_row_id: str, resnum_to_hex: Dict[int, str]) -> None:
+        """Paint the ACTIVE row's cells by a per-RESNUM result value (e.g. ddG via
+        color_modes.ddg_color); every other sequence cell renders the white reset — so the
+        result mode mirrors the 3D (which recolors only the active row's residues). Records
+        the coloring so rebuild() can re-apply it. The aa-modes are untouched (this is the
+        result-mode path; the panel chooses which to call)."""
+        self._mode = get_mode("none")
+        self._result_coloring = (active_row_id, dict(resnum_to_hex))
+        for block in self._blocks:
+            for r in range(block.rowCount()):
+                for c in range(block.columnCount()):
+                    it = block.item(r, c)
+                    if it is None:
+                        continue
+                    row_id = it.data(_ROW_ROLE)
+                    if row_id is None or row_id == _SUGGEST_ROW:
+                        continue
+                    rn = self.design.resnum_for_col(it.data(_RESNUM_ROLE))
+                    hexc = resnum_to_hex.get(rn) if row_id == active_row_id else None
                     it.setBackground(QtGui.QBrush(QtGui.QColor(hexc) if hexc else _RESET_BG))
 
     def color_hex_at(self, row_id: str, col: int) -> Optional[str]:
@@ -275,7 +318,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         base_by_rid = {None: "", "T": f"T ({self.design.rep_chain})",
                        _SUGGEST_ROW: "Suggest"}
         for vv in self.design.variants:
-            base_by_rid[vv.id] = vv.id
+            base_by_rid[vv.id] = self._variant_label(vv.id)
         tails = ["#", "Consensus", "Conservation"]   # the three None-id rows, in order
         for block in self._blocks:
             ti = iter(tails)
@@ -345,6 +388,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._edit_target: Optional[Tuple[str, int]] = None   # (variant_id, col)
         self._scan_cols: set = set()        # template columns chosen as the scan scope
         self._mode_key = "none"
+        self._scan_cache_snapshot = None    # (model_id, prior scan cache) for stability runs
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -391,10 +435,25 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._clear_scan_btn.clicked.connect(self._clear_scan_set)
         bar.addWidget(self._clear_scan_btn)
         bar.addSpacing(12)
+        # Stage 4a: per-variant action buttons (act on the ACTIVE variant row).
+        # Stability runs the 4-axis voter on the variant's EXACT mutations through the
+        # engine spine (deep → confirm-gate); solubility is the pure CamSol scalar (instant).
+        self._stab_btn = QtWidgets.QPushButton("Test stability")
+        self._stab_btn.setToolTip("Score the ACTIVE variant's exact mutations (4-axis ddG "
+                                  "voter) through the tool spine. Deep adds Rosetta (gated).")
+        self._stab_btn.clicked.connect(self._on_test_stability)
+        bar.addWidget(self._stab_btn)
+        self._sol_btn = QtWidgets.QPushButton("Test solubility")
+        self._sol_btn.setToolTip("CamSol intrinsic-solubility of the ACTIVE variant vs the "
+                                 "template (instant, local).")
+        self._sol_btn.clicked.connect(self._on_test_solubility)
+        bar.addWidget(self._sol_btn)
+        bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
             self._mode_combo.addItem(m.label, m.key)
+        self._mode_combo.addItem("ddG (result)", _RESULT_DDG_MODE)   # S4a result-backed mode
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
         bar.addStretch(1)
@@ -432,8 +491,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         for _ukey, cd in self._design.chains.items():
             tab = _ChainDesignTab(cd, self._suggestions_for(cd))
+            tab.badges = {v.id: self._badge_for(v) for v in cd.variants if self._badge_for(v)}
             tab.cellClicked2.connect(
                 lambda rid, col, ctrl, t=tab: self._on_cell(t, rid, col, to_scan=ctrl))
+            tab.rowHeaderClicked.connect(lambda rid, t=tab: self._on_result_detail(t, rid))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
         self._status.setText(
@@ -691,16 +752,25 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._push_3d_color(tab)
 
     # ── coloring helpers ───────────────────────────────────────────────────────────
+    def _active_ddg_map(self, tab: _ChainDesignTab) -> Dict[int, float]:
+        """{resnum: ddg} for the active variant's stability result (empty if none/T)."""
+        v = tab.design.get_variant(tab.active_row_id)
+        if v is None or not v.results.stability:
+            return {}
+        return {int(rn): d for rn, d in (v.results.stability.get("per_resnum") or {}).items()
+                if d is not None}
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
-        tab.set_color_mode(get_mode(self._mode_key))
+        if self._mode_key == _RESULT_DDG_MODE:
+            hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
+            tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
+        else:
+            tab.set_color_mode(get_mode(self._mode_key))
 
     def _push_3d_color(self, tab: _ChainDesignTab) -> None:
         """Recolor the 3D by the tab's ACTIVE row across all copies. No-op for the OFF
         mode (non-destructive: we do not know the pre-overlay coloring to restore)."""
-        mode = get_mode(self._mode_key)
-        if mode.fn is None:                                 # "none" → leave 3D untouched
-            return
-        cmds = build_color_commands(tab.active_row_cells(), tab.design.members, mode.color_for)
+        cmds = self.color_commands_for(tab)
         if not cmds:
             return
         w = _ColorWorker(self._c, cmds)
@@ -849,8 +919,210 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if spec is not None:
             self.launchRequested.emit(spec)
 
+    # ── Stage 4a: per-variant action buttons (act on the ACTIVE variant) ────────────
+    def _active_variant(self, tab: _ChainDesignTab):
+        """The active row as a Variant, or None when the active row is T / not a variant."""
+        return None if tab is None else tab.design.get_variant(tab.active_row_id)
+
+    def stability_launch_spec(self, deep: bool) -> Optional[dict]:
+        """Deterministic mutation_scan spec that scores the ACTIVE variant's EXACT
+        mutations (score_mutations={resnum: to_aa}) through the 4-axis voter. deep=True →
+        Rosetta (confidence='low' → confirm-gate). None when no active variant / no
+        mutations to score."""
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None or self._design is None or not v.mutations:
+            return None
+        score_mutations = {m.resnum: m.to_aa for m in v.mutations}
+        ti: Dict[str, object] = {"model_id": self._design.model_id, "chain": tab.design.rep_chain,
+                                 "score_mutations": score_mutations,
+                                 # scope the deep-tier estimate to the scored positions
+                                 "scan_positions": sorted(score_mutations)}
+        if deep:
+            ti["run_rosetta"] = True
+        tier = "deep" if deep else "fast"
+        return {
+            "tool":        "mutation_scan",
+            "tool_inputs": ti,
+            # trigger-free label (scope/tier come from ti); names the variant for the log.
+            "user_input":  f"[Workbench] stability of {v.id} on chain {tab.design.rep_chain} "
+                           f"— {len(score_mutations)} mutation(s), {tier} tier",
+            "confidence":  "low" if deep else "high",
+            "refresh":     "stability",
+            "_variant_id": v.id,
+        }
+
+    def _on_test_stability(self) -> None:
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None:
+            self._status.setText("Select a VARIANT row first (T is the template — nothing to test).")
+            return
+        if not v.mutations:
+            self._status.setText(f"{tab.active_row_id} has no mutations vs T — nothing to score.")
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Test stability")
+        box.setText(f"Score {v.id}: {len(v.mutations)} mutation(s) "
+                    f"({', '.join(f'{m.from_aa}{m.resnum}{m.to_aa}' for m in v.mutations[:6])}"
+                    f"{'…' if len(v.mutations) > 6 else ''})")
+        box.setInformativeText("Fast = CamSol+ESM+ThermoMPNN+RaSP (seconds). Deep adds Rosetta "
+                               "ddG — the spine shows a runtime estimate and asks before launching.")
+        fast = box.addButton("Fast", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        deep = box.addButton("Deep (+Rosetta)", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() not in (fast, deep):
+            return
+        spec = self.stability_launch_spec(deep=box.clickedButton() is deep)
+        if spec is not None:
+            # snapshot the shared scan cache so a stability run (which the scanner caches
+            # model-keyed) does not clobber the S3a Suggest-track cache; restored on apply.
+            self._scan_cache_snapshot = (self._design.model_id,
+                                         self._read_scan_cache(self._design.model_id))
+            self.launchRequested.emit(spec)
+
+    def _read_scan_cache(self, model_id):
+        if self._session is None:
+            return None
+        try:
+            return self._session.get_scan_result(model_id)
+        except Exception:
+            return None
+
+    def apply_stability_result(self, variant_id: str, result: dict) -> None:
+        """Consume the executed mutation_scan result (from the engine on_result seam) into
+        the named variant's ResultSlots.stability, restore the S3a scan cache, then
+        re-render badges + (if the ddG mode is active) recolor. Called on the UI thread."""
+        cd_v = self._find_variant(variant_id)
+        if cd_v is None:
+            return
+        cd, v = cd_v
+        candidates = self._candidates_from_result(result)
+        v.results.stability = stability_summary(candidates, v.mutations)
+        # restore the suggestion-scan cache the stability run overwrote
+        snap = getattr(self, "_scan_cache_snapshot", None)
+        if snap is not None and self._session is not None:
+            mid, prior = snap
+            try:
+                if prior is None:
+                    self._session.scan_results.pop(str(mid), None)
+                else:
+                    self._session.add_scan_result(str(mid), prior)
+            except Exception:
+                pass
+            self._scan_cache_snapshot = None
+        self._persist()
+        self._rerender_results(cd, v)
+        s = v.results.stability
+        self._status.setText(
+            f"{v.id} stability ({s.get('tier')}): ΣddG "
+            f"{('%+.2f' % s['sum_ddg']) if s.get('sum_ddg') is not None else 'n/a'} "
+            f"over {s.get('n_scored', 0)} mutation(s). Click the {v.id} row header for detail; "
+            f"pick the 'ddG (result)' color mode to map it.")
+
+    @staticmethod
+    def _candidates_from_result(result: dict) -> List[dict]:
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "mutation_scan":
+                return (step.get("data") or {}).get("candidates", []) or []
+        return []
+
+    def _on_test_solubility(self) -> None:
+        """Pure CamSol intrinsic-solubility scalar for the active variant vs the template —
+        instant/local, no spine launch, no gate."""
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None:
+            self._status.setText("Select a VARIANT row first (T is the template baseline).")
+            return
+        from camsol_bridge import camsol_solubility_score
+        wt_seq  = "".join(c.aa for c in tab.design.template_cells if c.aa)
+        var_seq = v.sequence
+        wt  = camsol_solubility_score(wt_seq)
+        var = camsol_solubility_score(var_seq)
+        v.results.solubility = {"variant": round(var, 3), "wt": round(wt, 3),
+                                "delta": round(var - wt, 3)}
+        self._persist()
+        self._rerender_results(tab.design, v)
+        self._status.setText(f"{v.id} solubility {var:+.2f} (Δ {var - wt:+.2f} vs T) — "
+                             f"{'more' if var > wt else 'less'} soluble than the template.")
+
+    # ── result badges + expandable detail ───────────────────────────────────────────
+    @staticmethod
+    def _badge_for(v) -> str:
+        """Compact inline badge for a variant's results (empty when none)."""
+        parts: List[str] = []
+        stab = v.results.stability
+        if stab and stab.get("sum_ddg") is not None:
+            d = stab["sum_ddg"]
+            parts.append(f"ddG {d:+.1f}{'▲' if d > 0 else '▼'}")
+        sol = v.results.solubility
+        if sol and sol.get("delta") is not None:
+            d = sol["delta"]
+            parts.append(f"sol {d:+.2f}{'▲' if d > 0 else '▼'}")
+        return " · ".join(parts)
+
+    def _find_variant(self, variant_id: str):
+        if self._design is None:
+            return None
+        for cd in self._design.chains.values():
+            v = cd.get_variant(variant_id)
+            if v is not None:
+                return cd, v
+        return None
+
+    def _rerender_results(self, cd: ChainDesign, v) -> None:
+        """Refresh a variant's badge in its tab and re-apply coloring (ddG mode reflects
+        a fresh stability result on all copies)."""
+        tab = self._focus_tab_for_design(cd)
+        if tab is None:
+            return
+        badge = self._badge_for(v)
+        if badge:
+            tab.badges[v.id] = badge
+        else:
+            tab.badges.pop(v.id, None)
+        tab._mark_active_header()                # repaint header labels (badge text)
+        self._apply_color_to(tab)
+        if self._mode_key == _RESULT_DDG_MODE:
+            self._push_3d_color(tab)
+
+    def _on_result_detail(self, tab: _ChainDesignTab, variant_id: str) -> None:
+        """Expandable detail: a popup of the variant's per-mutation ddG + solubility."""
+        v = tab.design.get_variant(variant_id)
+        if v is None:
+            return
+        lines: List[str] = []
+        stab = v.results.stability
+        if stab and stab.get("rows"):
+            lines.append(f"Stability ({stab.get('tier')} tier) — ΣddG "
+                         f"{('%+.2f' % stab['sum_ddg']) if stab.get('sum_ddg') is not None else 'n/a'}:")
+            for r in stab["rows"]:
+                dd = r.get("ddg")
+                lines.append(f"  {r['from_aa']}{r['resnum']}{r['to_aa']}: "
+                             f"ddG {('%+.2f' % dd) if dd is not None else 'n/c'} "
+                             f"[{r.get('ddg_source','?')}]")
+        sol = v.results.solubility
+        if sol:
+            lines.append(f"Solubility: {sol.get('variant'):+.2f} "
+                         f"(Δ {sol.get('delta'):+.2f} vs T)")
+        if not lines:
+            lines = [f"{variant_id}: no results yet. Use Test stability / Test solubility."]
+        QtWidgets.QMessageBox.information(self, f"{variant_id} results", "\n".join(lines))
+
     # exposed for tests / live-verify: the exact color commands the active row pushes
     def color_commands_for(self, tab: _ChainDesignTab):
+        """The exact 3D color commands the active row pushes under the current mode —
+        single source for the 3D push, the live-verify, and tests. Empty for OFF/no-data."""
+        if self._mode_key == _RESULT_DDG_MODE:
+            ddg_map = self._active_ddg_map(tab)
+            if not ddg_map:
+                return []                                # no stability result → nothing to paint
+            resnums = [c.resnum for c in tab.active_row_cells()
+                       if not c.is_gap and c.resnum is not None]
+            return build_color_commands_by_resnum(
+                resnums, lambda rn: ddg_color(ddg_map.get(rn)), tab.design.members)
         mode = get_mode(self._mode_key)
         if mode.fn is None:
             return []

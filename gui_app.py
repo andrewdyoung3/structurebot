@@ -100,9 +100,10 @@ class _ToolRequestWorker(QtCore.QRunnable):
     confirm-gate/tiering prompts block THIS thread via the QtPresenter; Cancel injects
     KeyboardInterrupt here exactly like the NL worker."""
 
-    def __init__(self, engine, spec, presenter):
+    def __init__(self, engine, spec, presenter, on_result=None):
         super().__init__()
         self._engine, self._spec, self._presenter = engine, spec, presenter
+        self._on_result = on_result
         self.signals = _RequestSignals()
         self.tid: Optional[int] = None
 
@@ -114,6 +115,7 @@ class _ToolRequestWorker(QtCore.QRunnable):
             self._engine.handle_tool_request(
                 s["tool"], s.get("tool_inputs") or {}, s.get("user_input", ""),
                 self._presenter, confidence=s.get("confidence", "high"),
+                on_result=self._on_result,
             )
         except KeyboardInterrupt:
             self.signals.failed.emit("cancelled")
@@ -462,14 +464,23 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.input.setEnabled(False)
         self.cancel_action.setEnabled(True)
         refresh = spec.get("refresh")
-        w = _ToolRequestWorker(self.engine, spec, self.presenter)
-        w.signals.done.connect(lambda r=refresh: self._on_tool_done(r))
+        variant_id = spec.get("_variant_id")
+        on_result = None
+        if refresh == "stability":
+            # S4a: capture the EXECUTED result off the engine seam (not the shared session
+            # cache) so it lands in the variant's ResultSlots. Runs on the worker thread;
+            # consumed on the UI thread in _on_tool_done.
+            self._captured_result = None
+            def on_result(result):
+                self._captured_result = result
+        w = _ToolRequestWorker(self.engine, spec, self.presenter, on_result=on_result)
+        w.signals.done.connect(lambda r=refresh, vid=variant_id: self._on_tool_done(r, vid))
         w.signals.failed.connect(self._on_request_failed)
         self._worker = w
         self._pool.start(w)
 
     @QtCore.Slot()
-    def _on_tool_done(self, refresh) -> None:
+    def _on_tool_done(self, refresh, variant_id=None) -> None:
         # The tool's results are cached in the session by the bridge; render them via the
         # SAME S3a consume path the manual buttons use (no parallel rendering code).
         try:
@@ -477,8 +488,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 self.workbench._import_mpnn()
             elif refresh == "scan":
                 self.workbench._load_suggestions()
+            elif refresh == "stability":
+                result = getattr(self, "_captured_result", None)
+                if result is not None and variant_id:
+                    self.workbench.apply_stability_result(variant_id, result)
+                else:
+                    self.presenter.dim("Stability run cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
+        self._captured_result = None
         self._finish_request()
 
     @QtCore.Slot()

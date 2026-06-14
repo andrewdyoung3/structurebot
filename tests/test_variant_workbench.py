@@ -22,9 +22,9 @@ pytest.importorskip("PySide6")
 from PySide6 import QtWidgets
 
 from seq_editor.controller import ResidueCell, ChainSeq
-from variant_workbench import VariantWorkbenchPanel
+from variant_workbench import VariantWorkbenchPanel, _RESULT_DDG_MODE
 from variant_model import ChainDesign, AlignedCell
-from color_modes import get_mode
+from color_modes import get_mode, ddg_color
 
 
 @pytest.fixture(scope="module")
@@ -376,3 +376,84 @@ class TestStage3bLaunch:
         tab.design = ChainDesign("k", "1", "A", [("1", "A")], [AlignedCell(0, None, None)])
         p._on_cell(tab, None, 0, to_scan=True)
         assert p._scan_cols == set()
+
+
+class TestStage4a:
+    """Per-variant action buttons → ResultSlots → badges + the per-residue ddG result
+    color mode. Pure surfaces asserted directly (the launch spec, the result-apply, the
+    color commands); QMessageBox dialogs are thin wrappers not exercised here."""
+
+    def _variant_panel(self):
+        # one variant (V1) with a single mutation M1W on chain A
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
+                      session=MagicMock())
+        p.load_model("1")
+        p._add_variant()                            # V1 is active
+        tab = p._cur_tab()
+        vid = tab.design.variants[0].id
+        tab.design.edit_variant(vid, 0, "W")        # resnum 1: M→W
+        return p, tab, vid
+
+    def test_stability_spec_scores_exact_mutations(self, _app):
+        p, tab, vid = self._variant_panel()
+        spec = p.stability_launch_spec(deep=False)
+        assert spec["tool"] == "mutation_scan" and spec["refresh"] == "stability"
+        assert spec["_variant_id"] == vid
+        assert spec["tool_inputs"]["score_mutations"] == {1: "W"}
+        assert "run_rosetta" not in spec["tool_inputs"] and spec["confidence"] == "high"
+
+    def test_stability_spec_deep_gates(self, _app):
+        p, tab, vid = self._variant_panel()
+        spec = p.stability_launch_spec(deep=True)
+        assert spec["tool_inputs"]["run_rosetta"] is True
+        assert spec["confidence"] == "low"          # deep → confirm-gate, no auto-proceed
+
+    def test_stability_spec_none_for_template_or_no_mutations(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
+        p.load_model("1")
+        assert p.stability_launch_spec(deep=False) is None      # active row is T
+        p._add_variant()                            # V1 active but no mutations yet
+        assert p.stability_launch_spec(deep=False) is None
+
+    def test_stability_label_has_no_trigger_tokens(self, _app):
+        p, tab, vid = self._variant_panel()
+        ui = p.stability_launch_spec(deep=True)["user_input"].lower()
+        for tok in ("rosetta", "rosie", "selected", "selection", "highlighted",
+                    "exhaustive", "comprehensive"):
+            assert tok not in ui
+
+    def test_apply_stability_result_fills_slots_and_badge(self, _app):
+        p, tab, vid = self._variant_panel()
+        result = {"tool_step_results": [{"tool": "mutation_scan", "data": {"candidates": [
+            {"resnum": 1, "from_aa": "M", "to_aa": "W", "ddg": 2.0, "combined_score": -0.1}]}}]}
+        p._scan_cache_snapshot = ("1", None)        # as set by _on_test_stability
+        p.apply_stability_result(vid, result)
+        v = tab.design.get_variant(vid)
+        assert v.results.stability["per_resnum"] == {1: 2.0}
+        assert v.results.stability["sum_ddg"] == 2.0
+        assert "ddG +2.0" in tab.badges[vid]        # inline badge rendered
+
+    def test_solubility_pure_compute_fills_slot(self, _app):
+        p, tab, vid = self._variant_panel()
+        p._on_test_solubility()
+        v = tab.design.get_variant(vid)
+        assert set(v.results.solubility) == {"variant", "wt", "delta"}
+        assert v.results.solubility["delta"] == round(
+            v.results.solubility["variant"] - v.results.solubility["wt"], 3)
+        assert "sol" in tab.badges[vid]
+
+    def test_result_ddg_color_mode_paints_active_variant_all_copies(self, _app):
+        p, tab, vid = self._variant_panel()
+        result = {"tool_step_results": [{"tool": "mutation_scan", "data": {"candidates": [
+            {"resnum": 1, "from_aa": "M", "to_aa": "W", "ddg": 3.0}]}}]}
+        p._scan_cache_snapshot = ("1", None)
+        p.apply_stability_result(vid, result)
+        p._mode_key = _RESULT_DDG_MODE
+        cmds = p.color_commands_for(tab)            # active row is V1 (has the result)
+        red = ddg_color(3.0)
+        assert f"color #1/A:1 {red}" in cmds and f"color #1/B:1 {red}" in cmds  # all copies
+
+    def test_result_ddg_mode_no_result_is_empty(self, _app):
+        p, tab, vid = self._variant_panel()         # V1 has no stability result yet
+        p._mode_key = _RESULT_DDG_MODE
+        assert p.color_commands_for(tab) == []
