@@ -313,11 +313,24 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 
 class VariantWorkbenchPanel(QtWidgets.QWidget):
-    """Stage-2 Workbench panel. `controller` = a seq_editor.SequenceEditorController
+    """Stage-3b Workbench panel. `controller` = a seq_editor.SequenceEditorController
     (shares the ChimeraX bridge). `load_model(model_id)` reads the structure, builds the
     DesignSession, renders the tabs, persists it. Toolbar: add variant, substitute
-    (combo+Apply), color mode. Column-click selects in 3D (all copies); a color mode
-    paints the panel AND recolors the 3D by the active row (T or a selected variant)."""
+    (combo+Apply), color mode, AND the Stage-3b tool LAUNCH buttons ("Run ProteinMPNN…",
+    "Scan…"). Column-click toggles the position into the SCAN SET (the deterministic scan
+    scope) and selects the whole set in 3D (all copies); a color mode paints the panel AND
+    recolors the 3D by the active row.
+
+    Stage-3b launches go through the SAME engine spine as the NL path: a click builds a
+    deterministic launch spec and emits `launchRequested(spec)`; the window runs it on a
+    worker thread via `engine.handle_tool_request` (so the mutation-scan confirm-gate/
+    tiering fires and the real subprocess runs), then calls the S3a consume path
+    (`_import_mpnn` / `_load_suggestions`) so results auto-render. The panel never launches
+    a tool itself — it has no engine; it only describes the request."""
+
+    # Stage 3b: panel → window. Payload = {tool, tool_inputs, user_input, confidence,
+    # refresh}. The window turns it into engine.handle_tool_request on the worker thread.
+    launchRequested = QtCore.Signal(dict)
 
     def __init__(self, controller, session=None, pool=None):
         super().__init__()
@@ -326,6 +339,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._pool = pool or QtCore.QThreadPool.globalInstance()
         self._design: Optional[DesignSession] = None
         self._edit_target: Optional[Tuple[str, int]] = None   # (variant_id, col)
+        self._scan_cols: set = set()        # template columns chosen as the scan scope
         self._mode_key = "none"
 
         lay = QtWidgets.QVBoxLayout(self)
@@ -352,6 +366,26 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._sugg_btn = QtWidgets.QPushButton("Load scan suggestions")
         self._sugg_btn.clicked.connect(self._load_suggestions)
         bar.addWidget(self._sugg_btn)
+        bar.addSpacing(12)
+        # Stage 3b: launch tools FROM the panel through the engine spine (confirm-gate +
+        # real subprocess). Scope = the scan set (clicked columns); empty → whole chain.
+        self._scan_btn = QtWidgets.QPushButton("Scan…")
+        self._scan_btn.setToolTip("Mutation-scan the selected positions (or the whole "
+                                  "chain if none are selected) through the tool spine.")
+        self._scan_btn.clicked.connect(self._on_scan_clicked)
+        bar.addWidget(self._scan_btn)
+        self._mpnn_run_btn = QtWidgets.QPushButton("Run ProteinMPNN…")
+        self._mpnn_run_btn.setToolTip("Redesign the chain (selected positions, or whole "
+                                      "chain) with ProteinMPNN through the tool spine.")
+        self._mpnn_run_btn.clicked.connect(self._on_mpnn_clicked)
+        bar.addWidget(self._mpnn_run_btn)
+        self._scan_set_lbl = QtWidgets.QLabel("scan set: 0")
+        self._scan_set_lbl.setStyleSheet("color:#888;")
+        bar.addWidget(self._scan_set_lbl)
+        self._clear_scan_btn = QtWidgets.QPushButton("Clear")
+        self._clear_scan_btn.setToolTip("Clear the scan set.")
+        self._clear_scan_btn.clicked.connect(self._clear_scan_set)
+        bar.addWidget(self._clear_scan_btn)
         bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
@@ -383,6 +417,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         self._design = build_design_session(chain_seqs, str(model_id))
         self._edit_target = None
+        self._scan_cols.clear()
+        self._update_scan_label()
         self._render()
         self._persist()
 
@@ -460,6 +496,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if tab is None:
             return
         self._edit_target = None
+        self._scan_cols.clear()                # cols index this tab's template; reset
+        self._update_scan_label()
         self._apply_color_to(tab)
         self._push_3d_color(tab)
 
@@ -617,7 +655,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._select_column(tab.design, col)           # show where it is in 3D
             self._show_suggestion_menu(tab, col)
             return
-        self._select_column(tab.design, col)               # column→3D select (all copies)
+        # Stage 3b: a residue/column click TOGGLES the position in the scan set (the
+        # deterministic scan scope), then 3D-selects the whole set across all copies so
+        # the 3D mirrors exactly what "Scan…" / "Run ProteinMPNN…" will cover.
+        if tab.design.resnum_for_col(col) is not None:
+            self._scan_cols.symmetric_difference_update({col})
+        self._update_scan_label()
+        self._select_scan_set(tab.design)                  # scan set → 3D (all copies)
         if row_id == "T":
             tab.set_active_row("T")
             self._edit_target = None
@@ -657,12 +701,138 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         w.signals.failed.connect(lambda e: self._status.setText(f"Workbench select failed: {e}"))
         self._pool.start(w)
 
+    def _select_scan_set(self, design: ChainDesign) -> None:
+        """3D-select every column in the scan set across all copies (off the UI thread).
+        Empty set → a bare `select` clears the ChimeraX selection."""
+        specs: List[Tuple[str, str, List[int]]] = []
+        for col in sorted(self._scan_cols):
+            specs.extend(self.select_specs_for_column(design, col))
+        w = _MultiSelectWorker(self._c, specs)
+        w.signals.failed.connect(lambda e: self._status.setText(f"Workbench select failed: {e}"))
+        self._pool.start(w)
+
+    def _update_scan_label(self) -> None:
+        self._scan_set_lbl.setText(f"scan set: {len(self._scan_cols)}")
+
+    def _clear_scan_set(self) -> None:
+        self._scan_cols.clear()
+        self._update_scan_label()
+        tab = self._cur_tab()
+        if tab is not None:
+            self._select_scan_set(tab.design)              # clears the 3D selection
+        self._status.setText("Scan set cleared — Scan…/Run ProteinMPNN… now cover the whole chain.")
+
     # exposed for tests / live-verify: the exact specs a column click dispatches
     def select_specs_for_column(self, design: ChainDesign, col: int):
         resnum = design.resnum_for_col(col)
         if resnum is None:
             return []
         return [(m, c, [resnum]) for (m, c) in design.members]
+
+    # ── Stage 3b: build a deterministic launch spec; emit it for the window to run ───
+    def _scan_set_resnums(self, design: ChainDesign) -> List[int]:
+        """The scan set as sorted author resnums (gap columns dropped)."""
+        nums = {design.resnum_for_col(c) for c in self._scan_cols}
+        return sorted(n for n in nums if n is not None)
+
+    def scan_launch_spec(self, deep: bool) -> Optional[dict]:
+        """Deterministic mutation_scan launch spec for the current tab + scan set.
+        deep=True → opt-in Rosetta tier (run_rosetta pre-set; the spine surfaces the
+        runtime estimate + confirm-gate, confidence='low' so it never auto-proceeds).
+        Empty scan set → whole-chain scan. None when no structure is loaded."""
+        tab = self._cur_tab()
+        if tab is None or self._design is None:
+            return None
+        cd      = tab.design
+        resnums = self._scan_set_resnums(cd)
+        ti: Dict[str, object] = {"model_id": self._design.model_id, "chain": cd.rep_chain}
+        if resnums:
+            ti["scan_positions"] = resnums
+        if deep:
+            ti["run_rosetta"] = True
+        scope = f"{len(resnums)} site(s)" if resnums else "the whole chain"
+        tier  = "deep" if deep else "fast"
+        return {
+            "tool":        "mutation_scan",
+            "tool_inputs": ti,
+            # The label is cosmetic — tier/scope come from `ti`, which route()'s tiering
+            # honors. It MUST stay free of any token the spine would parse: no
+            # "selected"/"selection"/"highlighted" (live-selection scope), no
+            # "rosetta"/"rosie" (deep), no thoroughness/shortlist words, and no
+            # "residue(s)/position(s) <digits>" (explicit-scope parse). "site(s)" is safe.
+            "user_input":  f"[Workbench] mutation scan on chain {cd.rep_chain} — "
+                           f"{scope}, {tier} tier",
+            "confidence":  "low" if deep else "high",
+            "refresh":     "scan",
+        }
+
+    def mpnn_launch_spec(self, soluble: bool) -> Optional[dict]:
+        """Deterministic ProteinMPNN launch spec for the current tab + scan set.
+        soluble=True → soft hydrophilic bias (the solubility design profile);
+        empty scan set → whole-chain redesign. None when no structure is loaded."""
+        tab = self._cur_tab()
+        if tab is None or self._design is None:
+            return None
+        cd      = tab.design
+        resnums = self._scan_set_resnums(cd)
+        ti: Dict[str, object] = {"model_id": self._design.model_id, "chain_id": cd.rep_chain}
+        if resnums:
+            ti["design_positions"] = resnums
+        if soluble:
+            ti["bias_toward"] = "soluble"
+        scope   = f"{len(resnums)} site(s)" if resnums else "the whole chain"
+        profile = "solubility-biased" if soluble else "default"
+        return {
+            "tool":        "proteinmpnn",
+            "tool_inputs": ti,
+            # trigger-free label (see scan_launch_spec) — scope comes from `ti`.
+            "user_input":  f"[Workbench] ProteinMPNN redesign of chain {cd.rep_chain} — "
+                           f"{scope}, {profile}",
+            "confidence":  "high",
+            "refresh":     "mpnn",
+        }
+
+    def _on_scan_clicked(self) -> None:
+        if self._cur_tab() is None or self._design is None:
+            self._status.setText("Load a structure first.")
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Mutation scan")
+        n = len(self._scan_set_resnums(self._cur_tab().design))
+        box.setText(f"Scan {n} selected position(s)" if n else "Scan the whole chain")
+        box.setInformativeText("Fast = CamSol + ESM (seconds). Deep adds Rosetta ddG — "
+                               "the spine shows a runtime estimate and asks before launching.")
+        fast = box.addButton("Fast", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        deep = box.addButton("Deep (+Rosetta)", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (fast, deep):
+            return
+        spec = self.scan_launch_spec(deep=clicked is deep)
+        if spec is not None:
+            self.launchRequested.emit(spec)
+
+    def _on_mpnn_clicked(self) -> None:
+        if self._cur_tab() is None or self._design is None:
+            self._status.setText("Load a structure first.")
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Run ProteinMPNN")
+        n = len(self._scan_set_resnums(self._cur_tab().design))
+        box.setText(f"Redesign {n} selected position(s)" if n else "Redesign the whole chain")
+        box.setInformativeText("Default = unconstrained ProteinMPNN. Solubility biases the "
+                               "design toward polar/charged residues.")
+        default = box.addButton("Default", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        sol     = box.addButton("Solubility", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (default, sol):
+            return
+        spec = self.mpnn_launch_spec(soluble=clicked is sol)
+        if spec is not None:
+            self.launchRequested.emit(spec)
 
     # exposed for tests / live-verify: the exact color commands the active row pushes
     def color_commands_for(self, tab: _ChainDesignTab):

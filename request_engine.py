@@ -146,6 +146,24 @@ class RequestEngine:
                 presenter.translation_error(exc)
                 return
 
+        # 2..11 — run the shared spine (route → confirm → execute → tools → state).
+        self._run_pipeline(result, user_input, presenter, is_retry)
+
+    # ── the shared post-build spine ─────────────────────────────────────────────
+    def _run_pipeline(
+        self,
+        result:     dict,
+        user_input: str,
+        presenter,
+        is_retry:   bool = False,
+    ) -> None:
+        """The post-build request spine, shared by BOTH front-end paths: the NL path
+        (handle_request, after translate/interception) and the panel tool-launch path
+        (handle_tool_request). Steps: route → clarification/tiering → preview → confirm →
+        execute → tools → viz → auto-fix → state/log. ONE spine — never a parallel
+        invocation: the confirm-gate, the mutation-scan tiering/estimate, and the real
+        capability-flagged tool subprocess all fire here regardless of who built *result*.
+        """
         # 2. Route (augment with tool pipeline info; no execution yet)
         result = self.router.route(result, user_input=user_input)
 
@@ -446,6 +464,37 @@ class RequestEngine:
 
         self._host._log_exchange(user_input, all_commands, success, error_msg,
                                  tool_steps=_tool_steps if _tool_steps else None)
+
+    # ── panel tool-launch entry (build a result dict, enter the shared spine) ─────
+    def handle_tool_request(
+        self,
+        tool:        str,
+        tool_inputs: dict,
+        user_input:  str,
+        presenter,
+        confidence:  str = "high",
+    ) -> None:
+        """Launch a tool FROM the GUI panel through the SAME spine as the NL path.
+
+        This is the deterministic analog of the color/representation pre-translate
+        interception in handle_request: the caller already KNOWS the tool + inputs, so it
+        builds a routed-shaped result dict and enters `_run_pipeline` directly — no
+        translate(), no LLM, no parallel invocation. route()'s mutation-scan tiering
+        (estimate + confirm-gate) and execute()'s real capability-flagged subprocess fire
+        unchanged; a deep tier passes confidence="low" so the GUI confirm requires an
+        explicit click (never a silent auto-proceed). Results are cached in the session by
+        the bridges themselves, so the panel's S3a consume path renders them on completion.
+        """
+        result = {
+            "commands":             [],
+            "explanations":         [],
+            "warnings":             [],
+            "clarification_needed": None,
+            "confidence":           confidence,
+            "tools_needed":         [tool],
+            "tool_inputs":          {tool: dict(tool_inputs or {})},
+        }
+        self._run_pipeline(result, user_input, presenter)
 
     # ── command execution (presenter-rendered) ──────────────────────────────────
     def execute_commands(

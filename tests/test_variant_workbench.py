@@ -8,6 +8,7 @@ real ChimeraX), gap columns select nothing, and load persists the DesignSession.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -253,3 +254,109 @@ class TestStage3aSuggestions:
         p, _ = _panel([_chainseq("1", "A", "MKV")], session=s)
         p.load_model("1")
         assert p._cur_tab().suggestions == {}
+
+
+class TestStage3bLaunch:
+    """The deterministic launch-spec surface the panel emits to the window (which turns
+    it into engine.handle_tool_request — the SAME spine). Asserted directly, like the
+    select/color command surfaces; the dialog/emit handlers are thin wrappers over these."""
+
+    def test_scan_set_toggle_via_click(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKVLA")])
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._on_cell(tab, "T", 0)
+        p._on_cell(tab, "T", 2)
+        assert p._scan_cols == {0, 2}
+        p._on_cell(tab, "T", 0)                     # second click toggles it back off
+        assert p._scan_cols == {2}
+        assert p._scan_set_lbl.text() == "scan set: 1"
+
+    def test_scan_spec_empty_set_is_whole_chain(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")])
+        p.load_model("1")
+        spec = p.scan_launch_spec(deep=False)
+        assert spec["tool"] == "mutation_scan"
+        assert "scan_positions" not in spec["tool_inputs"]
+        assert "run_rosetta" not in spec["tool_inputs"]
+        assert spec["confidence"] == "high" and spec["refresh"] == "scan"
+
+    def test_scan_spec_deep_presets_rosetta_and_low_confidence(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV", start=10)])
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._on_cell(tab, "T", 0); p._on_cell(tab, "T", 2)   # resnums 10, 12
+        spec = p.scan_launch_spec(deep=True)
+        assert spec["tool_inputs"]["scan_positions"] == [10, 12]
+        assert spec["tool_inputs"]["run_rosetta"] is True
+        assert spec["confidence"] == "low"          # deep → explicit confirm, no auto-proceed
+
+    def test_scan_spec_user_input_carries_no_text_triggers(self, _app):
+        # The tier/scope come from tool_inputs; the label must NOT smuggle a token the
+        # spine's tiering would parse — incl. "selected"/"selection"/"highlighted", which
+        # would hijack the scope to the (empty) live ChimeraX selection. (This is the bug
+        # the Stage-3b live-verify caught: "N selected position(s)" zeroed the scope.)
+        p, _ = _panel([_chainseq("1", "A", "MKV", start=10)])
+        p.load_model("1")
+        tab = p._cur_tab(); p._on_cell(tab, "T", 0)
+        for deep in (True, False):
+            ui = p.scan_launch_spec(deep=deep)["user_input"].lower()
+            for tok in ("rosetta", "rosie", "proline", "glyco", "exhaustive",
+                        "comprehensive", "deep-dive", "deep dive", "gold-standard",
+                        "shortlist", "asymmetric", "selected", "selection", "highlighted"):
+                assert tok not in ui, f"label leaked trigger {tok!r}: {ui!r}"
+            # no "residue(s)/position(s) <digits>" explicit-scope pattern either
+            assert not re.search(r"(residues?|positions?)\s+\d", ui)
+        m_ui = p.mpnn_launch_spec(soluble=True)["user_input"].lower()
+        for tok in ("selected", "selection", "highlighted"):
+            assert tok not in m_ui
+
+    def test_mpnn_spec_default_and_soluble(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV", start=5)])
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._on_cell(tab, "T", 1)                     # resnum 6
+        d = p.mpnn_launch_spec(soluble=False)
+        assert d["tool"] == "proteinmpnn" and d["refresh"] == "mpnn"
+        assert d["tool_inputs"]["chain_id"] == "A"
+        assert d["tool_inputs"]["design_positions"] == [6]
+        assert "bias_toward" not in d["tool_inputs"]
+        s = p.mpnn_launch_spec(soluble=True)
+        assert s["tool_inputs"]["bias_toward"] == "soluble"
+
+    def test_mpnn_spec_empty_set_whole_chain(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")])
+        p.load_model("1")
+        d = p.mpnn_launch_spec(soluble=False)
+        assert "design_positions" not in d["tool_inputs"]
+
+    def test_clear_scan_set(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")])
+        p.load_model("1")
+        p._on_cell(p._cur_tab(), "T", 0)
+        assert p._scan_cols
+        p._clear_scan_set()
+        assert p._scan_cols == set() and p._scan_set_lbl.text() == "scan set: 0"
+
+    def test_tab_change_resets_scan_set(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "WYF")])
+        p.load_model("1")
+        p._on_cell(p._cur_tab(), "T", 0)
+        assert p._scan_cols
+        p._tabs.setCurrentIndex(1)                  # fires _on_tab_changed
+        assert p._scan_cols == set()
+
+    def test_launch_spec_none_without_structure(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")])  # load_model NOT called
+        assert p.scan_launch_spec(deep=False) is None
+        assert p.mpnn_launch_spec(soluble=False) is None
+
+    def test_gap_column_not_added_to_scan_set(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MK")])
+        p.load_model("1")
+        tab = p._cur_tab()
+        # swap in a single-cell gap design (resnum_for_col(0) is None) — the toggle path
+        # reads tab.design.resnum_for_col, so a gap column must not enter the scan set.
+        tab.design = ChainDesign("k", "1", "A", [("1", "A")], [AlignedCell(0, None, None)])
+        p._on_cell(tab, None, 0)
+        assert p._scan_cols == set()

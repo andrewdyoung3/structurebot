@@ -238,6 +238,53 @@ class TestTierChoiceSurface:
 
 # ── 6. Estimate ────────────────────────────────────────────────────────────────
 
+class TestPresetTierScope:
+    """Stage 3b: the panel tool-launch path builds the result dict deterministically
+    (no text to parse), so route()'s tiering must honor a PRE-SET run_rosetta /
+    scan_positions — and still surface the deep estimate / confirm-gate.  The text path
+    is unchanged (a neutral prompt with no preset stays fast)."""
+
+    def _preset_route(self, router, *, run_rosetta=False, scan_positions=None,
+                      prompt="[Workbench] mutation scan on chain A", pose_res=574):
+        stub = _ms_stub()
+        mi = stub["tool_inputs"]["mutation_scan"]
+        if run_rosetta:
+            mi["run_rosetta"] = True
+        if scan_positions is not None:
+            mi["scan_positions"] = scan_positions
+        with patch.object(router, "_fetch_sequence", return_value="A" * 141), \
+             patch.object(router, "_pose_residue_count", return_value=pose_res):
+            return router.route(stub, user_input=prompt)
+
+    def test_preset_run_rosetta_honored_without_text(self):
+        # The panel prompt names no "rosetta"/"rosie"; the pre-set flag drives deep.
+        r = self._preset_route(_make_router(), run_rosetta=True,
+                               scan_positions=[10, 25, 50])
+        assert r["tool_inputs"]["mutation_scan"]["run_rosetta"] is True
+
+    def test_preset_deep_estimate_reads_preset_scope(self):
+        # 3 preset positions × 3 subs = 9 mutations; n_pos must read the preset scope,
+        # not the whole-chain length, and the scoped count is NOT whole-chain-capped.
+        r = self._preset_route(_make_router(), run_rosetta=True,
+                               scan_positions=[10, 25, 50], pose_res=574)
+        warns = " ".join(r.get("warnings", []))
+        assert "approximate runtime" in warns.lower()
+        assert "9 mutation" in warns
+        assert "3 position" in warns
+        assert "574-residue" in warns
+
+    def test_preset_scope_survives_neutral_prompt(self):
+        r = self._preset_route(_make_router(), scan_positions=[7, 8, 9])
+        assert r["tool_inputs"]["mutation_scan"]["scan_positions"] == [7, 8, 9]
+
+    def test_neutral_prompt_without_preset_stays_fast(self):
+        # Backward-compat: no preset + neutral text → fast tier, no estimate, no choice.
+        r = self._preset_route(_make_router())
+        assert r["tool_inputs"]["mutation_scan"]["run_rosetta"] is False
+        assert not r.get("_tier_choice")
+        assert not any("approximate runtime" in w.lower() for w in r.get("warnings", []))
+
+
 class TestEstimate:
 
     def test_deep_scoped_emits_estimate(self):
