@@ -3,8 +3,12 @@ tests/test_cavity_bridge.py
 ----------------------------
 Unit tests for CavityBridge.
 
-Uses synthetic data and minimal PDB stubs.
-No real PDB file or network access required.
+Most tests use synthetic data / minimal PDB stubs and MOCK SASA. That mocking is
+exactly how a dead `Bio.PDB.ShrakeRupley` import (the SASA path returned {} → 0
+cavities for every structure) survived 20 green tests for 17 days (dfd8d9c
+2026-05-28 → 7e36f87 2026-06-14). TestRealSASAPath below is the antidote: it
+exercises the REAL Bio.PDB.SASA path against a committed tiny real protein
+(crambin, hermetic — no network) so the import cannot silently die again.
 """
 
 from __future__ import annotations
@@ -20,7 +24,48 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cavity_bridge import CavityBridge, _SC_VOLUME, _VOLUME_MUTATIONS
+from cavity_bridge import CavityBridge, _SC_VOLUME, _VOLUME_MUTATIONS, _BIOPYTHON_SASA_OK
+
+
+_CRAMBIN_PDB = Path(__file__).parent / "fixtures" / "1crn.pdb"
+
+
+class TestRealSASAPath:
+    """NON-mocked end-to-end SASA: would have caught the dead ShrakeRupley import.
+
+    Crambin (1CRN, 46 residues, classic hydrophobic core) is committed as a tiny
+    hermetic fixture — no network, no mock. Asserts both the import is alive AND
+    the real path produces buried residues / a cavity.
+    """
+
+    def test_biopython_sasa_import_is_alive(self):
+        # the single assertion that directly catches a dead SASA import
+        assert _BIOPYTHON_SASA_OK is True, (
+            "Bio.PDB.SASA import is dead — cavity detection silently returns 0 "
+            "cavities for every structure (the dfd8d9c→7e36f87 regression class)")
+
+    def test_real_sasa_computes_buried_residues(self):
+        assert _CRAMBIN_PDB.is_file(), f"missing fixture {_CRAMBIN_PDB}"
+        cav = CavityBridge()
+        st = cav._load_structure(str(_CRAMBIN_PDB))
+        assert st is not None
+        sasa = cav._sasa_for_chains(st, str(_CRAMBIN_PDB), ["A"])
+        assert len(sasa) > 0, "real ShrakeRupley produced an EMPTY map (dead path)"
+        buried = [r for (ch, r), a in sasa.items() if a < 20.0]
+        assert len(buried) >= 1, "crambin must have a buried core (it has 7 at <20 Å²)"
+
+    def test_real_find_cavities_nonzero(self):
+        cav = CavityBridge()
+        cavs = cav.find_cavities(str(_CRAMBIN_PDB), chains=["A"])
+        assert isinstance(cavs, list)
+        assert len(cavs) >= 1, "crambin's hydrophobic core must yield >= 1 cavity live"
+        assert cavs[0]["n_residues"] >= 1
+
+    def test_real_solvent_exposed_residues_nonzero(self):
+        # the design-goal exposed-selector on the real path (not the dead {} → [])
+        cav = CavityBridge()
+        exposed = cav.solvent_exposed_residues(str(_CRAMBIN_PDB), "A", sasa_threshold=40.0)
+        assert len(exposed) >= 1, "crambin must have solvent-exposed residues live"
 
 
 @pytest.fixture

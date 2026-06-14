@@ -8,6 +8,9 @@ venv310/
 __pycache__/
 *.pyc
 *.pdb
+# committed hermetic test fixtures (e.g. crambin 1crn.pdb) — keep tracked
+!tests/fixtures/
+!tests/fixtures/*.pdb
 *.jsonl
 .env.local
 .env
