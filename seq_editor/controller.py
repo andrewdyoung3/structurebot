@@ -174,6 +174,24 @@ class SequenceEditorController:
         spec = ",".join(str(r) for r in resnums)
         return f"select #{model}/{chain}:{spec}"
 
+    def select_residues_multi(self, specs: List[Tuple[str, str, List[int]]]):
+        """Select residues across MULTIPLE (model, chain) copies in ONE `select`
+        command, so all homo-oligomer copies highlight together (the Workbench
+        column-click → 3D path). *specs* = [(model, chain, [resnums]), …]. No-op
+        (None) when nothing resolves. ERROR-FIRST: never raises."""
+        parts: List[str] = []
+        for model, chain, resnums in specs:
+            if resnums:
+                parts.append(f"#{model}/{chain}:" + ",".join(str(r) for r in resnums))
+        if not parts:
+            return None
+        cmd = "select " + " ".join(parts)
+        try:
+            r = self._run(cmd)
+        except Exception as exc:
+            return {"value": None, "error": f"{type(exc).__name__}: {exc}"}
+        return r if isinstance(r, dict) else {"value": r, "error": None}
+
     def select_in_3d(self, model: str, chain: str, resnums: List[int]):
         """Push a selection to ChimeraX. No-op (returns None) on empty resnum list.
 
