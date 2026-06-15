@@ -446,6 +446,42 @@ def stability_summary(candidates: List[Dict[str, Any]],
             "tier": "deep" if any(r["ddg_source"] == "rosetta" for r in rows) else "fast"}
 
 
+# ── Stage 4b: reduce a fold result (engine-agnostic) for ResultSlots.fold ───────────
+
+def fold_summary(step_data: Dict[str, Any],
+                 author_resnums: List[int],
+                 reference_model_id: Optional[str] = None) -> Dict[str, Any]:
+    """Reduce a fold tool's step data into the NORMALIZED, engine-agnostic fold contract
+    that the workbench viz / pLDDT color mode / per-model toggles all read — so a later
+    engine (Boltz) populates the SAME slot without changing any consumer.
+
+    The engine numbers its per-residue pLDDT 1..N over the ungapped folded sequence;
+    *author_resnums* (the variant's ordered ungapped author resnums) maps it back to the
+    design's numbering for the panel color mode. The predicted model's OWN 3D colouring is
+    numbering-agnostic (ChimeraX `palette alphafold` over the B-factor), so it needs no map.
+    Pure / testable. Boltz later adds 'iptm' + per-chain pLDDT additively."""
+    d = step_data or {}
+    raw = d.get("plddt") or {}
+    plddt: Dict[int, float] = {}
+    for i, rn in enumerate(author_resnums, start=1):
+        val = raw.get(i, raw.get(str(i)))
+        if val is not None and rn is not None:
+            plddt[int(rn)] = float(val)
+    mid = d.get("new_model_id", d.get("model_id"))
+    ref = reference_model_id if reference_model_id is not None else d.get("reference_model_id")
+    return {
+        "engine":             d.get("engine", "esmfold"),
+        "model_id":           str(mid) if mid is not None else None,
+        "mean_plddt":         d.get("mean_plddt"),
+        "plddt":              plddt,                       # author-resnum-keyed
+        "reference_model_id": str(ref) if ref is not None else None,
+        "rmsd":               d.get("rmsd"),               # matchmaker RMSD (None if uncaptured)
+        "source":             d.get("source"),             # LOCAL-ONLY provenance
+        "length":             d.get("length"),
+        "chain":              d.get("chain", "A"),
+    }
+
+
 # combined_score → hex for the Suggest track cell (mirrors mutation_scanner's gradient
 # bands: blue strong / cyan good / yellow marginal / orange-red not-recommended).
 def suggestion_color(score: float) -> str:

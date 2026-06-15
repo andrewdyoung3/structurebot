@@ -31,17 +31,20 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import all_modes, ddg_color, get_mode
+from color_modes import all_modes, ddg_color, get_mode, plddt_color
 from seq_library import build_numbering_header_content
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
                            build_design_session, column_tracks,
                            filter_new_mpnn_variants, group_scan_suggestions,
-                           import_mpnn_designs, stability_summary, suggestion_color)
+                           fold_summary, import_mpnn_designs, stability_summary,
+                           suggestion_color)
 
 _COLS = 30                                  # residues per wrapped block
 _SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
 _RESULT_DDG_MODE = "result:ddg"             # S4a result-backed color mode (per-residue ddG)
+_RESULT_PLDDT_MODE = "result:plddt"         # S4b result-backed color mode (per-residue pLDDT)
+_FOLD_ENGINES = ("esmfold", "boltz")        # S4b engine picker order (Boltz lands its own stage)
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
 _AA_ROLE = QtCore.Qt.UserRole + 2           # cell → residue 1-letter ("-"/None for non-seq)
@@ -448,12 +451,25 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "template (instant, local).")
         self._sol_btn.clicked.connect(self._on_test_solubility)
         bar.addWidget(self._sol_btn)
+        # Stage 4b: fold the ACTIVE variant through an engine (user picks; ESMFold local),
+        # opening a real pLDDT-coloured model matchmaker-overlaid on the template. Gated.
+        self._fold_btn = QtWidgets.QPushButton("Fold…")
+        self._fold_btn.setToolTip("Fold the ACTIVE variant (you pick the engine; ESMFold runs "
+                                  "LOCAL-ONLY) → a pLDDT-coloured model overlaid on the template.")
+        self._fold_btn.clicked.connect(self._on_fold_clicked)
+        bar.addWidget(self._fold_btn)
+        self._fold_vis_btn = QtWidgets.QPushButton("Hide folds")
+        self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
+        self._fold_vis_btn.setCheckable(True)
+        self._fold_vis_btn.toggled.connect(self._on_fold_visibility_toggled)
+        bar.addWidget(self._fold_vis_btn)
         bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
             self._mode_combo.addItem(m.label, m.key)
         self._mode_combo.addItem("ddG (result)", _RESULT_DDG_MODE)   # S4a result-backed mode
+        self._mode_combo.addItem("pLDDT (result)", _RESULT_PLDDT_MODE)  # S4b fold confidence
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
         bar.addStretch(1)
@@ -760,17 +776,29 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         return {int(rn): d for rn, d in (v.results.stability.get("per_resnum") or {}).items()
                 if d is not None}
 
+    def _active_plddt_map(self, tab: _ChainDesignTab) -> Dict[int, float]:
+        """{author_resnum: pLDDT} for the active variant's fold result (empty if none/T)."""
+        v = tab.design.get_variant(tab.active_row_id)
+        if v is None or not v.results.fold:
+            return {}
+        return {int(rn): float(p) for rn, p in (v.results.fold.get("plddt") or {}).items()
+                if p is not None}
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
         if self._mode_key == _RESULT_DDG_MODE:
             hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
+            tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
+        elif self._mode_key == _RESULT_PLDDT_MODE:
+            hexmap = {rn: plddt_color(p) for rn, p in self._active_plddt_map(tab).items()}
             tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
         else:
             tab.set_color_mode(get_mode(self._mode_key))
 
     def _push_3d_color(self, tab: _ChainDesignTab) -> None:
-        """Recolor the 3D by the tab's ACTIVE row across all copies. No-op for the OFF
-        mode (non-destructive: we do not know the pre-overlay coloring to restore)."""
-        cmds = self.color_commands_for(tab)
+        """Recolor the 3D by the tab's ACTIVE row across all copies AND make predicted fold
+        models follow the active row (per-model visibility). No-op for the OFF mode with no
+        folds (non-destructive: we do not know the pre-overlay coloring to restore)."""
+        cmds = self.fold_visibility_commands(tab) + self.color_commands_for(tab)
         if not cmds:
             return
         w = _ColorWorker(self._c, cmds)
@@ -1048,6 +1076,145 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status.setText(f"{v.id} solubility {var:+.2f} (Δ {var - wt:+.2f} vs T) — "
                              f"{'more' if var > wt else 'less'} soluble than the template.")
 
+    # ── Stage 4b: fold the active variant through an engine (user picks) ─────────────
+    def _fold_engine_availability(self) -> Dict[str, bool]:
+        """Capability flag (B2 3-state): which fold engines can run NOW. ESMFold = the
+        local venv312 worker is installed; Boltz = not wired until its own stage. Engines
+        are SHOWN enabled-or-disabled in the picker, never silently dropped."""
+        esm = False
+        try:
+            from esmfold_bridge import ESMFoldBridge
+            esm = ESMFoldBridge().local_available()
+        except Exception:
+            esm = False
+        return {"esmfold": esm, "boltz": False}
+
+    def fold_launch_spec(self, engine: str) -> Optional[dict]:
+        """Deterministic fold spec for the ACTIVE variant through *engine*: fold its exact
+        sequence LOCAL-ONLY, open the model, pLDDT-colour it, matchmaker onto the template.
+        confidence='low' → the spine's confirm-gate (a fold is non-trivial compute). None
+        when there is no active variant. The SAME spec shape a later engine reuses."""
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None or self._design is None:
+            return None
+        ti: Dict[str, object] = {
+            "model_id":   self._design.model_id,
+            "chain":      tab.design.rep_chain,
+            "sequence":   v.sequence,             # the VARIANT sequence (its mutations)
+            "engine":     engine,
+            "open_model": True,
+            "local_only": True,                   # LOCAL-ONLY: no remote Atlas/MSA server
+            "compare_to": self._design.model_id,  # matchmaker onto the loaded template
+        }
+        return {
+            "tool":        engine,                # esmfold|boltz → route() dispatch
+            "tool_inputs": ti,
+            "user_input":  f"[Workbench] fold {v.id} on chain {tab.design.rep_chain} "
+                           f"— {engine}, LOCAL-ONLY",
+            "confidence":  "low",                 # fold = non-trivial compute → confirm-gate
+            "refresh":     "fold",
+            "_variant_id": v.id,
+        }
+
+    def _on_fold_clicked(self) -> None:
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None:
+            self._status.setText("Select a VARIANT row first (T is the template baseline).")
+            return
+        avail = self._fold_engine_availability()
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Fold variant")
+        box.setText(f"Fold {v.id} ({len(v.sequence)} aa) — pick an engine:")
+        box.setInformativeText("ESMFold runs LOCAL-ONLY on the venv312 GPU worker (never the "
+                               "remote Atlas). The spine shows a runtime estimate and asks "
+                               "before launching.")
+        labels = {"esmfold": "ESMFold (local)", "boltz": "Boltz-2"}
+        btns: Dict[object, str] = {}
+        for eng in _FOLD_ENGINES:
+            b = box.addButton(labels.get(eng, eng), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            if not avail.get(eng, False):
+                b.setEnabled(False)
+                b.setToolTip("Available in a later stage" if eng == "boltz"
+                             else "Local ESMFold worker (venv312) not installed")
+            btns[b] = eng
+        box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        eng = btns.get(box.clickedButton())
+        if eng is None:
+            return
+        spec = self.fold_launch_spec(eng)
+        if spec is not None:
+            self.launchRequested.emit(spec)
+
+    @staticmethod
+    def _fold_from_result(result: dict) -> dict:
+        """The fold engine's step data from the executed pipeline result (engine-agnostic)."""
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") in _FOLD_ENGINES:
+                return step.get("data") or {}
+        return {}
+
+    def apply_fold_result(self, variant_id: str, result: dict) -> None:
+        """Consume the executed fold result (engine on_result seam) into the variant's
+        ResultSlots.fold via the normalized contract, then re-render the badge, recolor
+        (if the pLDDT mode is active) and couple the new model to the active row. UI thread."""
+        cd_v = self._find_variant(variant_id)
+        if cd_v is None:
+            return
+        cd, v = cd_v
+        data = self._fold_from_result(result)
+        if not data or not (data.get("new_model_id") or data.get("model_id")):
+            self._status.setText(f"{variant_id}: fold produced no model.")
+            return
+        author_resnums = [c.resnum for c in v.cells if not c.is_gap and c.resnum is not None]
+        v.results.fold = fold_summary(data, author_resnums,
+                                      reference_model_id=data.get("reference_model_id"))
+        self._persist()
+        self._rerender_results(cd, v)
+        f = v.results.fold
+        mp = f.get("mean_plddt")
+        if mp is not None:
+            self._status.setText(
+                f"{v.id} folded ({f.get('engine')}, {f.get('source')}): model "
+                f"#{f.get('model_id')}, mean pLDDT {mp:.1f} — overlaid on "
+                f"#{f.get('reference_model_id')}. Pick the 'pLDDT (result)' color mode to map it.")
+        else:
+            self._status.setText(f"{v.id} folded — model #{f.get('model_id')}.")
+
+    # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
+    def _fold_models(self, design) -> Dict[str, str]:
+        """{variant_id: predicted model_id} for variants in *design* that have a fold."""
+        out: Dict[str, str] = {}
+        for cd in design.chains.values():
+            for v in cd.variants:
+                fld = v.results.fold
+                if fld and fld.get("model_id"):
+                    out[v.id] = str(fld["model_id"])
+        return out
+
+    def fold_visibility_commands(self, tab: _ChainDesignTab) -> List[str]:
+        """Per-model 3D visibility: when 'Hide folds' is checked, hide ALL predicted
+        models; otherwise show the ACTIVE variant's model and hide the others (folds follow
+        the active row). Pure → the single source for the push, live-verify, and tests."""
+        if self._design is None:
+            return []
+        models = self._fold_models(self._design)
+        if not models:
+            return []
+        if self._fold_vis_btn.isChecked():
+            return [f"hide #{mid} models" for mid in models.values()]
+        active = tab.active_row_id
+        return [f"show #{mid} models" if vid == active else f"hide #{mid} models"
+                for vid, mid in models.items()]
+
+    def _on_fold_visibility_toggled(self, checked: bool) -> None:
+        self._fold_vis_btn.setText("Show folds" if checked else "Hide folds")
+        tab = self._cur_tab()
+        if tab is not None:
+            self._push_3d_color(tab)
+
     # ── result badges + expandable detail ───────────────────────────────────────────
     @staticmethod
     def _badge_for(v) -> str:
@@ -1061,6 +1228,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if sol and sol.get("delta") is not None:
             d = sol["delta"]
             parts.append(f"sol {d:+.2f}{'▲' if d > 0 else '▼'}")
+        fold = v.results.fold
+        if fold and fold.get("mean_plddt") is not None:
+            parts.append(f"pLDDT {fold['mean_plddt']:.0f}")
         return " · ".join(parts)
 
     def _find_variant(self, variant_id: str):
@@ -1085,8 +1255,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.badges.pop(v.id, None)
         tab._mark_active_header()                # repaint header labels (badge text)
         self._apply_color_to(tab)
-        if self._mode_key == _RESULT_DDG_MODE:
-            self._push_3d_color(tab)
+        # Push under result colour modes (re-map ddG/pLDDT) AND always couple a fresh fold
+        # model to the active row (show/hide) — _push_3d_color no-ops when nothing to do.
+        self._push_3d_color(tab)
 
     def _on_result_detail(self, tab: _ChainDesignTab, variant_id: str) -> None:
         """Expandable detail: a popup of the variant's per-mutation ddG + solubility."""
@@ -1123,6 +1294,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                        if not c.is_gap and c.resnum is not None]
             return build_color_commands_by_resnum(
                 resnums, lambda rn: ddg_color(ddg_map.get(rn)), tab.design.members)
+        if self._mode_key == _RESULT_PLDDT_MODE:
+            # pLDDT lives on the PREDICTED model, not the shared backbone — colour that
+            # model by its B-factor (where the engine stored pLDDT) with the native palette.
+            # Numbering-agnostic, and the banding matches the panel's plddt_color (sync).
+            v = tab.design.get_variant(tab.active_row_id)
+            fold = v.results.fold if v is not None else None
+            if not fold or not fold.get("model_id"):
+                return []                                # active row has no fold → nothing
+            mid = fold["model_id"]
+            return [f"show #{mid} models",
+                    f"color byattribute bfactor #{mid} palette alphafold"]
         mode = get_mode(self._mode_key)
         if mode.fn is None:
             return []

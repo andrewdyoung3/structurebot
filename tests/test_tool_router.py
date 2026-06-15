@@ -39,6 +39,74 @@ def _make_router() -> ToolRouter:
     return ToolRouter(bridge=mock_bridge, session=mock_session)
 
 
+class TestWorkbenchFoldS4b:
+    """S4b: the ESMFold workbench fold path — LOCAL-ONLY pin + open/pLDDT-colour/matchmaker
+    viz + new model id, the engine-agnostic seam the Variant Workbench launches through."""
+
+    def _bridge(self, source="local_venv312", success=True):
+        b = MagicMock()
+        b.predict.return_value = {
+            "success": success, "pdb_str": "ATOM      1  N   MET A   1\n",
+            "plddt": {1: 90.0, 2: 80.0}, "mean_plddt": 85.0, "length": 2, "source": source,
+        }
+        return b
+
+    def test_fold_opens_colors_matchmakers_local_only(self):
+        router = _make_router()
+        router.session.next_model_id.return_value = "2"
+        bridge = self._bridge()
+        with patch.object(router, "_get_esmfold_bridge", return_value=bridge):
+            res = router._run_esmfold({"sequence": "MK", "model_id": "1", "open_model": True,
+                                       "local_only": True, "compare_to": "1"})
+        assert res.success
+        # LOCAL-ONLY: the remote Atlas fallback must be disabled on a local_only fold.
+        assert bridge.predict.call_args.kwargs.get("allow_remote") is False
+        assert res.data["new_model_id"] == "2"
+        assert res.data["source"] == "local_venv312"
+        assert res.data["engine"] == "esmfold"
+        joined = "\n".join(res.viz_commands)
+        assert 'open "' in joined
+        assert "color byattribute bfactor #2 palette alphafold" in joined
+        assert "matchmaker #2 to #1" in joined
+
+    def test_fold_local_only_breach_rejected(self):
+        router = _make_router()
+        router.session.next_model_id.return_value = "2"
+        bridge = self._bridge(source="atlas_api")        # a remote source on a local_only fold
+        with patch.object(router, "_get_esmfold_bridge", return_value=bridge):
+            res = router._run_esmfold({"sequence": "M", "model_id": "1", "open_model": True,
+                                       "local_only": True, "compare_to": "1"})
+        assert not res.success
+        assert "LOCAL-ONLY" in res.error
+
+    def test_successive_folds_get_distinct_model_ids(self):
+        # repeated workbench folds must not collide: the predicted model is registered so
+        # next_model_id() advances (else the 2nd fold reuses the 1st model's id).
+        from session_state import SessionState
+        sess = SessionState()
+        sess.add_structure("1", "tmpl", metadata={"k": 1})   # template (truthy meta → no net)
+        router = ToolRouter(bridge=MagicMock(), session=sess)
+        bridge = self._bridge()
+        with patch.object(router, "_get_esmfold_bridge", return_value=bridge):
+            r1 = router._run_esmfold({"sequence": "MK", "model_id": "1", "open_model": True,
+                                      "local_only": True, "compare_to": "1", "engine": "esmfold"})
+            r2 = router._run_esmfold({"sequence": "MK", "model_id": "1", "open_model": True,
+                                      "local_only": True, "compare_to": "1", "engine": "esmfold"})
+        assert r1.data["new_model_id"] == "2"
+        assert r2.data["new_model_id"] == "3"          # advanced — no collision
+        assert "2" in sess.structures and "3" in sess.structures
+
+    def test_fold_failure_surfaces_error(self):
+        router = _make_router()
+        router.session.next_model_id.return_value = "2"
+        bridge = self._bridge(success=False)
+        bridge.predict.return_value["error"] = "worker down"
+        with patch.object(router, "_get_esmfold_bridge", return_value=bridge):
+            res = router._run_esmfold({"sequence": "M", "model_id": "1", "open_model": True,
+                                       "local_only": True})
+        assert not res.success and "worker down" in res.error
+
+
 def _mutation_scan_translator_result(chain: str = "A") -> Dict[str, Any]:
     """Fake translator result for a generic mutation scan (what the LLM returns)."""
     return {

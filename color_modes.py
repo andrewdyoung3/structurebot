@@ -104,6 +104,30 @@ def ddg_color(ddg: Optional[float]) -> Optional[str]:
     return _hex(rgb)
 
 
+# pLDDT confidence → hex (S4b result-backed scale; per-residue VALUE, not aa-keyed).
+# Banded to the canonical AlphaFold/ESMFold palette so the panel mirrors the 3D
+# `color byattribute bfactor … palette alphafold` push (panel↔3D sync invariant).
+_PLDDT_VERY_HIGH = "#0053d6"   # > 90  very high  (dark blue)
+_PLDDT_HIGH      = "#65cbf3"   # 70–90 confident  (light blue)
+_PLDDT_LOW       = "#ffdb13"   # 50–70 low        (yellow)
+_PLDDT_VERY_LOW  = "#ff7d45"   # < 50  very low   (orange)
+
+
+def plddt_color(plddt: Optional[float]) -> Optional[str]:
+    """Per-residue pLDDT (0–100) → AlphaFold-palette hex. None → no data (reset).
+    Banded (>90 / 70–90 / 50–70 / <50) to match ChimeraX's native `palette alphafold`
+    so the workbench panel color equals the 3D color for the same residue."""
+    if plddt is None:
+        return None
+    if plddt > 90:
+        return _PLDDT_VERY_HIGH
+    if plddt > 70:
+        return _PLDDT_HIGH
+    if plddt > 50:
+        return _PLDDT_LOW
+    return _PLDDT_VERY_LOW
+
+
 @dataclass(frozen=True)
 class ColorMode:
     key:   str                              # stable id
