@@ -505,6 +505,24 @@ RASP_TIMEOUT: int = int(os.environ.get("RASP_TIMEOUT", "600"))
 RASP_CACHE_DIR: Path = Path(os.environ.get("RASP_CACHE_DIR", str(_BASE / "cache" / "rasp")))
 RASP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Boltz-2 (LOCAL-ONLY multimer/monomer fold engine, dedicated ~/boltz_env GPU) ─────
+# Dedicated WSL2 venv (NOT venv312 — Boltz ships torch cu13; venv312's cu128 ESM/ESMFold/
+# ThermoMPNN must not be disturbed; same isolation precedent as RASP_PYTHON). Panel-launched
+# only (the Workbench fold picker) — deliberately NOT in TRANSLATOR_TOOL_NAMES (no NL routing).
+BOLTZ_PYTHON: str = os.environ.get("BOLTZ_PYTHON", "/home/andre/boltz_env/bin/python")
+BOLTZ_WSL_DISTRO: str = os.environ.get("BOLTZ_WSL_DISTRO", "Ubuntu-24.04")
+BOLTZ_PROBE_TIMEOUT: int = int(os.environ.get("BOLTZ_PROBE_TIMEOUT", "90"))
+# "auto" = use if WSL + boltz_env present, else the picker shows Boltz disabled; "false" off.
+BOLTZ_ENABLE: str = os.environ.get("BOLTZ_ENABLE", "auto").strip().lower()
+# Diffusion is stochastic — a FIXED seed makes a re-fold reproducible (the S4b CA-drift≈0 bar)
+# so S4c's variant-vs-WT deviation isn't confounded by sampling noise.
+BOLTZ_SEED: int = int(os.environ.get("BOLTZ_SEED", "0"))
+BOLTZ_RECYCLING_STEPS: int = int(os.environ.get("BOLTZ_RECYCLING_STEPS", "3"))
+BOLTZ_SAMPLING_STEPS: int = int(os.environ.get("BOLTZ_SAMPLING_STEPS", "200"))
+BOLTZ_DIFFUSION_SAMPLES: int = int(os.environ.get("BOLTZ_DIFFUSION_SAMPLES", "1"))
+# Wall-clock budget for one Boltz fold (GPU; a small dimer is ~1 min, larger complexes more).
+BOLTZ_TIMEOUT: int = int(os.environ.get("BOLTZ_TIMEOUT", "1800"))
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable

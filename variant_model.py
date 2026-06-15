@@ -469,7 +469,7 @@ def fold_summary(step_data: Dict[str, Any],
             plddt[int(rn)] = float(val)
     mid = d.get("new_model_id", d.get("model_id"))
     ref = reference_model_id if reference_model_id is not None else d.get("reference_model_id")
-    return {
+    out = {
         "engine":             d.get("engine", "esmfold"),
         "model_id":           str(mid) if mid is not None else None,
         "mean_plddt":         d.get("mean_plddt"),
@@ -480,6 +480,15 @@ def fold_summary(step_data: Dict[str, Any],
         "length":             d.get("length"),
         "chain":              d.get("chain", "A"),
     }
+    # Multimer-engine fields (Boltz) — ADDITIVE: present only when the engine emits them, so
+    # ESMFold (monomer) results are byte-identical to before. ipTM = interface confidence.
+    if d.get("iptm") is not None:
+        out["iptm"] = float(d["iptm"])
+    if d.get("chains_ptm") is not None:
+        out["chains_ptm"] = d["chains_ptm"]                # per-chain pTM, {chain_idx: ptm}
+    if d.get("seed") is not None:
+        out["seed"] = d["seed"]                            # seed-pinned provenance (reproducibility)
+    return out
 
 
 # combined_score → hex for the Suggest track cell (mirrors mutation_scanner's gradient

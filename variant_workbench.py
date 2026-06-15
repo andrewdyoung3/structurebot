@@ -1078,40 +1078,53 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     # ── Stage 4b: fold the active variant through an engine (user picks) ─────────────
     def _fold_engine_availability(self) -> Dict[str, bool]:
-        """Capability flag (B2 3-state): which fold engines can run NOW. ESMFold = the
-        local venv312 worker is installed; Boltz = not wired until its own stage. Engines
-        are SHOWN enabled-or-disabled in the picker, never silently dropped."""
-        esm = False
+        """Capability flag (B2 3-state): which fold engines can run NOW. ESMFold = the local
+        venv312 worker; Boltz = the dedicated ~/boltz_env import chain (WSL). Engines are SHOWN
+        enabled-or-disabled in the picker, never silently dropped."""
+        esm = boltz = False
         try:
             from esmfold_bridge import ESMFoldBridge
             esm = ESMFoldBridge().local_available()
         except Exception:
             esm = False
-        return {"esmfold": esm, "boltz": False}
+        try:
+            from boltz_bridge import boltz_available
+            boltz = boltz_available()
+        except Exception:
+            boltz = False
+        return {"esmfold": esm, "boltz": boltz}
 
-    def fold_launch_spec(self, engine: str) -> Optional[dict]:
-        """Deterministic fold spec for the ACTIVE variant through *engine*: fold its exact
-        sequence LOCAL-ONLY, open the model, pLDDT-colour it, matchmaker onto the template.
-        confidence='low' → the spine's confirm-gate (a fold is non-trivial compute). None
-        when there is no active variant. The SAME spec shape a later engine reuses."""
+    def fold_launch_spec(self, engine: str, assembly: bool = False) -> Optional[dict]:
+        """Deterministic fold spec for the ACTIVE variant through *engine*: fold LOCAL-ONLY,
+        open the model, pLDDT-colour it, matchmaker onto the WT reference. *assembly* (Boltz
+        only) folds the full homo-oligomer — one chain per `cd.members` copy, each the variant's
+        sequence — overlaid on the WT oligomer. confidence='low' → the spine's confirm-gate.
+        None when there is no active variant. The SAME spec shape every engine reuses."""
         tab = self._cur_tab()
         v = self._active_variant(tab)
         if v is None or self._design is None:
             return None
+        cd = tab.design
         ti: Dict[str, object] = {
             "model_id":   self._design.model_id,
-            "chain":      tab.design.rep_chain,
-            "sequence":   v.sequence,             # the VARIANT sequence (its mutations)
+            "chain":      cd.rep_chain,
             "engine":     engine,
             "open_model": True,
             "local_only": True,                   # LOCAL-ONLY: no remote Atlas/MSA server
-            "compare_to": self._design.model_id,  # matchmaker onto the loaded template
+            "compare_to": self._design.model_id,  # matchmaker onto the loaded WT (oligomer)
         }
+        if engine == "boltz" and assembly:
+            # the full homo-oligomer: every copy chain folded with the variant's sequence.
+            ti["chains"] = [{"id": c, "sequence": v.sequence} for (_m, c) in cd.members]
+            target = f"{len(cd.members)}-chain assembly"
+        else:
+            ti["sequence"] = v.sequence           # the VARIANT sequence (its mutations)
+            target = "monomer"
         return {
             "tool":        engine,                # esmfold|boltz → route() dispatch
             "tool_inputs": ti,
-            "user_input":  f"[Workbench] fold {v.id} on chain {tab.design.rep_chain} "
-                           f"— {engine}, LOCAL-ONLY",
+            "user_input":  f"[Workbench] fold {v.id} on chain {cd.rep_chain} "
+                           f"— {engine} {target}, LOCAL-ONLY",
             "confidence":  "low",                 # fold = non-trivial compute → confirm-gate
             "refresh":     "fold",
             "_variant_id": v.id,
@@ -1123,28 +1136,36 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if v is None:
             self._status.setText("Select a VARIANT row first (T is the template baseline).")
             return
+        cd = self._cur_tab().design
+        n_copies = len(cd.members)
         avail = self._fold_engine_availability()
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Fold variant")
-        box.setText(f"Fold {v.id} ({len(v.sequence)} aa) — pick an engine:")
-        box.setInformativeText("ESMFold runs LOCAL-ONLY on the venv312 GPU worker (never the "
-                               "remote Atlas). The spine shows a runtime estimate and asks "
-                               "before launching.")
-        labels = {"esmfold": "ESMFold (local)", "boltz": "Boltz-2"}
-        btns: Dict[object, str] = {}
-        for eng in _FOLD_ENGINES:
-            b = box.addButton(labels.get(eng, eng), QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.setText(f"Fold {v.id} ({len(v.sequence)} aa) — pick engine + target:")
+        box.setInformativeText(
+            "ESMFold = local monomer (fast). Boltz-2 = higher-quality, LOCAL-ONLY, "
+            "seed-pinned; can fold the full assembly. The spine shows a runtime estimate "
+            "and asks before launching.")
+        # Free user choice (no auto-constrain by target): each combo enabled per capability.
+        combos = [("ESMFold (monomer)", "esmfold", False),
+                  ("Boltz-2 (monomer)", "boltz", False)]
+        if n_copies > 1:
+            combos.append((f"Boltz-2 (assembly, {n_copies} chains)", "boltz", True))
+        btns: Dict[object, Tuple[str, bool]] = {}
+        for label, eng, asm in combos:
+            b = box.addButton(label, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
             if not avail.get(eng, False):
                 b.setEnabled(False)
-                b.setToolTip("Available in a later stage" if eng == "boltz"
+                b.setToolTip("Boltz env (~/boltz_env) not available" if eng == "boltz"
                              else "Local ESMFold worker (venv312) not installed")
-            btns[b] = eng
+            btns[b] = (eng, asm)
         box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         box.exec()
-        eng = btns.get(box.clickedButton())
-        if eng is None:
+        choice = btns.get(box.clickedButton())
+        if choice is None:
             return
-        spec = self.fold_launch_spec(eng)
+        eng, asm = choice
+        spec = self.fold_launch_spec(eng, assembly=asm)
         if spec is not None:
             self.launchRequested.emit(spec)
 
@@ -1176,9 +1197,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         f = v.results.fold
         mp = f.get("mean_plddt")
         if mp is not None:
+            iptm = f.get("iptm")
+            iptm_txt = f", ipTM {iptm:.3f}" if isinstance(iptm, (int, float)) else ""
             self._status.setText(
                 f"{v.id} folded ({f.get('engine')}, {f.get('source')}): model "
-                f"#{f.get('model_id')}, mean pLDDT {mp:.1f} — overlaid on "
+                f"#{f.get('model_id')}, mean pLDDT {mp:.1f}{iptm_txt} — overlaid on "
                 f"#{f.get('reference_model_id')}. Pick the 'pLDDT (result)' color mode to map it.")
         else:
             self._status.setText(f"{v.id} folded — model #{f.get('model_id')}.")
@@ -1229,8 +1252,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             d = sol["delta"]
             parts.append(f"sol {d:+.2f}{'▲' if d > 0 else '▼'}")
         fold = v.results.fold
-        if fold and fold.get("mean_plddt") is not None:
-            parts.append(f"pLDDT {fold['mean_plddt']:.0f}")
+        if fold:
+            if fold.get("mean_plddt") is not None:
+                parts.append(f"pLDDT {fold['mean_plddt']:.0f}")
+            if fold.get("iptm") is not None:        # multimer interface confidence (Boltz)
+                parts.append(f"ipTM {fold['iptm']:.2f}")
         return " · ".join(parts)
 
     def _find_variant(self, variant_id: str):

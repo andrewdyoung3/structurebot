@@ -99,7 +99,7 @@ _HYDROPHILIC_AAS = "DENQHKRST"
 # with a fold/design run for GPU memory. No-op under the Claude backend.
 _GPU_BRIDGE_TOOLS = frozenset({
     "proteinmpnn", "mpnn_esmfold", "rfdiffusion", "colabfold",
-    "validate_design", "esmfold", "esm",
+    "validate_design", "esmfold", "esm", "boltz",
 })
 
 # Representation classifier — created once so _claude_capped latch persists across calls
@@ -134,6 +134,7 @@ class ToolRouter:
         "camsol":            "💧",
         "esm":               "🧬",
         "esmfold":           "🔮",
+        "boltz":             "🧬🔮",
         "proteinmpnn":       "🔬",
         "mpnn_esmfold":      "🔬🔮",
         "rfdiffusion":       "🌀",
@@ -599,6 +600,7 @@ class ToolRouter:
         self._camsol_bridge:           Optional[Any] = None
         self._esm_bridge:              Optional[Any] = None
         self._esmfold_bridge:          Optional[Any] = None
+        self._boltz_bridge:            Optional[Any] = None
         self._proteinmpnn_bridge:      Optional[Any] = None
         self._mpnn_esmfold_pipeline:   Optional[Any] = None
         self._rfdiffusion_bridge:      Optional[Any] = None
@@ -1615,7 +1617,7 @@ class ToolRouter:
         # the tool opens, folds, and visualises the result itself.  Any `open` or
         # `matchmaker` commands the translator emitted in parallel are spurious —
         # they desync model IDs (the #2-vs-#3 bug from the live fold-overlay session).
-        _FOLD_TOOLS = frozenset({"colabfold", "validate_design", "esmfold", "mpnn_esmfold"})
+        _FOLD_TOOLS = frozenset({"colabfold", "validate_design", "esmfold", "mpnn_esmfold", "boltz"})
         if any(t in _FOLD_TOOLS for t in tools_needed):
             _raw_cmds = result.get("commands") or []
             _raw_exps = result.get("explanations") or []
@@ -1709,6 +1711,11 @@ class ToolRouter:
             inp = tool_inputs.get("esmfold", {})
             mid = inp.get("model_id") or self._first_model_id()
             return f"ESMFold foldability prediction — #{mid} (ESM Atlas API)"
+        if tool == "boltz":
+            inp    = tool_inputs.get("boltz", {})
+            nch    = len(inp.get("chains") or []) or 1
+            shape  = "monomer" if nch <= 1 else f"{nch}-chain assembly"
+            return f"Boltz-2 fold — {shape} (LOCAL-ONLY, seed-pinned)"
         if tool == "colabfold":
             inp     = tool_inputs.get("colabfold", {})
             copies  = inp.get("copies", 1)
@@ -1970,6 +1977,8 @@ class ToolRouter:
                             "chain_id": inputs.get("chain_id") or inputs.get("chain", "A"),
                         })
                 return self._run_esmfold(inputs)
+            if tool == "boltz":
+                return self._run_boltz(inputs)
             if tool == "proteinmpnn":
                 return self._run_proteinmpnn(inputs)
             if tool == "mpnn_esmfold":
@@ -2897,6 +2906,84 @@ class ToolRouter:
                 summary=summary,
                 elapsed_ms=elapsed_ms,
             )
+
+    def _run_boltz(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """LOCAL-ONLY Boltz-2 fold (monomer or assembly) on the engine-agnostic seam: open
+        the predicted (multi-chain) model, pLDDT-colour it, matchmaker onto the WT reference,
+        surface ipTM. Seed-pinned; the bridge's fail-closed guard refuses any remote-MSA
+        breach. Mirrors _run_esmfold's open_model branch — feeds the SAME _fold_viz_commands
+        + fold_summary so Boltz is a second engine, not a parallel path."""
+        import time as _time
+        model_id   = inputs.get("model_id") or self._first_model_id()
+        local_only = bool(inputs.get("local_only", True))
+
+        # Chains to fold: an explicit assembly `chains` list, else a single chain from the
+        # variant's exact `sequence` (or the loaded chain).
+        chains = inputs.get("chains")
+        if not chains:
+            seq = inputs.get("sequence") or self._fetch_sequence(model_id, inputs.get("chain"))
+            if not seq:
+                return ToolStepResult(
+                    tool="boltz", success=False,
+                    error="Boltz needs a sequence (or explicit chains) to fold.")
+            chains = [{"id": inputs.get("chain", "A"), "sequence": seq}]
+
+        bridge = self._get_boltz_bridge()
+        t0  = _time.perf_counter()
+        res = bridge.predict(chains, seed=inputs.get("seed"), allow_remote=not local_only)
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+        if not res.get("success"):
+            return ToolStepResult(
+                tool="boltz", success=False,
+                error=f"Boltz fold failed: {res.get('error')}", elapsed_ms=elapsed_ms)
+        # LOCAL-ONLY gate (defensive; the bridge's fail-closed guard already blocked the network).
+        if local_only and res.get("source") != "local_boltz_env":
+            return ToolStepResult(
+                tool="boltz", success=False,
+                error=(f"LOCAL-ONLY breach: Boltz returned source '{res.get('source')}', "
+                       f"not local_boltz_env. Refusing the fold."),
+                elapsed_ms=elapsed_ms)
+
+        cif_path = res.get("cif_path")
+        ref_id   = inputs.get("compare_to") or model_id
+        cmds, exps, new_id = self._fold_viz_commands(
+            Path(cif_path).as_posix(), {**inputs, "compare_to": ref_id})
+        try:
+            self.session.add_structure(
+                new_id, f"boltz_pred_{model_id}", path=cif_path,
+                metadata={"predicted": True, "engine": "boltz"})
+        except Exception:
+            pass
+
+        mean_plddt = res.get("mean_plddt", 0.0)
+        iptm = res.get("iptm")
+        conf = ("very high" if mean_plddt > 90 else "high" if mean_plddt > 70
+                else "low" if mean_plddt > 50 else "very low")
+        nch   = len(chains)
+        shape = "monomer" if nch <= 1 else f"{nch}-chain assembly"
+        return ToolStepResult(
+            tool="boltz", success=True,
+            data={
+                "engine":             "boltz",
+                "new_model_id":       new_id,
+                "reference_model_id": str(ref_id),
+                "mean_plddt":         mean_plddt,
+                "iptm":               iptm,
+                "chains_ptm":         res.get("chains_ptm"),
+                "plddt":              res.get("plddt", {}),
+                "length":             res.get("length"),
+                "source":             res.get("source"),
+                "seed":               res.get("seed"),
+                "cif_path":           cif_path,
+            },
+            viz_commands=cmds,
+            viz_explanations=exps,
+            summary=(f"Boltz-2 ({shape}, local): model #{new_id} — mean pLDDT "
+                     f"{mean_plddt:.1f} ({conf})"
+                     + (f", ipTM {iptm:.3f}" if isinstance(iptm, (int, float)) else "")
+                     + f", superposed on #{ref_id}. seed={res.get('seed')}."),
+            elapsed_ms=elapsed_ms,
+        )
 
     def _read_selected_residues(self, model_id: str, chain_id: str) -> List[int]:
         """
@@ -6219,6 +6306,12 @@ class ToolRouter:
             from esmfold_bridge import ESMFoldBridge
             self._esmfold_bridge = ESMFoldBridge()
         return self._esmfold_bridge
+
+    def _get_boltz_bridge(self):
+        if self._boltz_bridge is None:
+            from boltz_bridge import BoltzBridge
+            self._boltz_bridge = BoltzBridge()
+        return self._boltz_bridge
 
     def _get_proteinmpnn_bridge(self):
         if self._proteinmpnn_bridge is None:

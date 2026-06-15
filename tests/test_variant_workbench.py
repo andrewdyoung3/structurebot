@@ -545,8 +545,58 @@ class TestStage4b:
         cmds = p.fold_visibility_commands(tab)
         assert set(cmds) == {"hide #2 models", "hide #3 models"}
 
-    def test_engine_picker_capability_flag(self, _app):
+    def test_engine_picker_capability_flag(self, _app, monkeypatch):
+        # Both engines are SHOWN with a real capability verdict (B2 3-state, never dropped).
+        # Mock the probes so the unit test doesn't depend on the live WSL/venv312 envs.
+        import esmfold_bridge, boltz_bridge
+        monkeypatch.setattr(esmfold_bridge.ESMFoldBridge, "local_available", lambda self: True)
+        monkeypatch.setattr(boltz_bridge, "boltz_available", lambda: False)
         p, _, _ = self._variant_panel()
         avail = p._fold_engine_availability()
-        assert avail["boltz"] is False               # not wired until the Boltz stage
-        assert "esmfold" in avail                     # shown either enabled or disabled
+        assert avail == {"esmfold": True, "boltz": False}
+        # and when the boltz env is present, the picker enables it (no longer hard-False)
+        monkeypatch.setattr(boltz_bridge, "boltz_available", lambda: True)
+        assert p._fold_engine_availability()["boltz"] is True
+
+
+class TestBoltzStage:
+    """Boltz as the assembly + selectable-monomer engine on the SAME seam: the assembly
+    launch spec (multi-chain from cd.members), the monomer spec, and the ipTM badge."""
+
+    def _dimer_variant(self):
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
+                      session=MagicMock())
+        p.load_model("1")
+        p._add_variant()
+        tab = p._cur_tab()
+        vid = tab.design.variants[-1].id
+        tab.design.edit_variant(vid, 0, "W")        # M1W
+        return p, tab, vid
+
+    def test_boltz_assembly_spec_is_multichain(self, _app):
+        p, tab, vid = self._dimer_variant()
+        spec = p.fold_launch_spec("boltz", assembly=True)
+        ti = spec["tool_inputs"]
+        assert spec["tool"] == "boltz" and spec["refresh"] == "fold"
+        assert "chains" in ti and "sequence" not in ti
+        seq = tab.design.get_variant(vid).sequence
+        assert ti["chains"] == [{"id": "A", "sequence": seq}, {"id": "B", "sequence": seq}]
+        assert ti["local_only"] is True and ti["compare_to"] == "1"
+
+    def test_boltz_monomer_spec_single_sequence(self, _app):
+        p, tab, vid = self._dimer_variant()
+        spec = p.fold_launch_spec("boltz", assembly=False)
+        ti = spec["tool_inputs"]
+        assert "sequence" in ti and "chains" not in ti
+        assert ti["sequence"] == tab.design.get_variant(vid).sequence
+
+    def test_iptm_badge_rendered(self, _app):
+        p, tab, vid = self._dimer_variant()
+        result = {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "3", "reference_model_id": "1",
+            "mean_plddt": 96.3, "iptm": 0.959, "plddt": {1: 96.0},
+            "source": "local_boltz_env", "seed": 0}}]}
+        p.apply_fold_result(vid, result)
+        f = tab.design.get_variant(vid).results.fold
+        assert f["iptm"] == 0.959 and f["source"] == "local_boltz_env"
+        assert "ipTM 0.96" in tab.badges[vid] and "pLDDT 96" in tab.badges[vid]
