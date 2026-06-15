@@ -68,6 +68,34 @@ def _make_bridge() -> ESMFoldBridge:
     return ESMFoldBridge()
 
 
+# ── S4b: LOCAL-ONLY gate (allow_remote=False never reaches the Atlas API) ──────
+
+def test_local_only_never_calls_atlas_when_local_unavailable() -> None:
+    """allow_remote=False with no local worker → error, and _call_atlas is NEVER reached
+    (zero network in the fold path — the workbench LOCAL-ONLY guarantee)."""
+    b = _make_bridge()
+    b._local_available = lambda: False                      # type: ignore[assignment]
+    def _boom(*a, **k):
+        raise AssertionError("Atlas must not be called under allow_remote=False")
+    b._call_atlas = _boom                                   # type: ignore[assignment]
+    res = b.predict("MKVLA", allow_remote=False)
+    assert res["success"] is False
+    assert "LOCAL-ONLY" in (res.get("error") or "")
+
+
+def test_local_only_no_fallback_when_local_fails() -> None:
+    """allow_remote=False: a FAILED local run does not fall through to Atlas."""
+    b = _make_bridge()
+    b._local_available = lambda: True                       # type: ignore[assignment]
+    b._run_local = lambda *a, **k: None                     # local "fails" → None
+    def _boom(*a, **k):
+        raise AssertionError("Atlas must not be called under allow_remote=False")
+    b._call_atlas = _boom                                   # type: ignore[assignment]
+    res = b.predict("MKVLA", allow_remote=False)
+    assert res["success"] is False
+    assert "LOCAL-ONLY" in (res.get("error") or "")
+
+
 # ── Minimal mock PDB with known B-factors (pLDDT) ─────────────────────────────
 
 _MOCK_PDB = textwrap.dedent("""\

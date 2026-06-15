@@ -2748,6 +2748,73 @@ class ToolRouter:
                 ),
             )
 
+        # ── Stage 4b: workbench fold — open the predicted model, pLDDT-colour it, and
+        # matchmaker onto the reference, all LOCAL-ONLY (never the remote Atlas). This is
+        # the engine-agnostic fold seam the Variant Workbench launches through; Boltz
+        # later joins it via the same _fold_viz_commands path. ─────────────────────────
+        if inputs.get("open_model"):
+            local_only = bool(inputs.get("local_only", True))
+            t0 = _time.perf_counter()
+            res = bridge.predict(sequence, label=f"#{model_id}",
+                                 allow_remote=not local_only)
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            if not res.get("success"):
+                return ToolStepResult(
+                    tool="esmfold", success=False,
+                    error=f"ESMFold fold failed: {res.get('error')}",
+                    elapsed_ms=elapsed_ms,
+                )
+            # LOCAL-ONLY gate (defensive; allow_remote already blocked the network):
+            # a non-local source on a local_only fold is a breach, not a silent remote fold.
+            if local_only and res.get("source") != "local_venv312":
+                return ToolStepResult(
+                    tool="esmfold", success=False,
+                    error=(f"LOCAL-ONLY breach: ESMFold returned source "
+                           f"'{res.get('source')}', not local_venv312. Refusing the fold."),
+                    elapsed_ms=elapsed_ms,
+                )
+            # Persist the predicted PDB so the viz can open it (and survive session work).
+            import tempfile as _tf
+            _tmp = _tf.NamedTemporaryFile(mode="w", suffix=".pdb",
+                                          prefix=f"esmfold_{model_id}_", delete=False)
+            _tmp.write(res.get("pdb_str", ""))
+            _tmp.close()
+            pdb_path = _tmp.name
+            ref_id = inputs.get("compare_to") or model_id
+            cmds, exps, new_id = self._fold_viz_commands(
+                Path(pdb_path).as_posix(), {**inputs, "compare_to": ref_id})
+            # Register the predicted model so next_model_id() advances — otherwise a
+            # SECOND workbench fold reuses the same id (the open path doesn't otherwise
+            # update session.structures). Keeps per-variant predicted models distinct.
+            try:
+                self.session.add_structure(
+                    new_id, f"{inputs.get('engine', 'esmfold')}_pred_{model_id}",
+                    path=pdb_path, metadata={"predicted": True,
+                                             "engine": inputs.get("engine", "esmfold")})
+            except Exception:
+                pass
+            mean_plddt = res.get("mean_plddt", 0.0)
+            conf = ("very high" if mean_plddt > 90 else "high" if mean_plddt > 70
+                    else "low" if mean_plddt > 50 else "very low")
+            return ToolStepResult(
+                tool="esmfold", success=True,
+                data={
+                    "engine":             "esmfold",
+                    "new_model_id":       new_id,
+                    "reference_model_id": str(ref_id),
+                    "mean_plddt":         mean_plddt,
+                    "plddt":              res.get("plddt", {}),
+                    "length":             res.get("length"),
+                    "source":             res.get("source"),
+                    "pdb_path":           pdb_path,
+                },
+                viz_commands=cmds,
+                viz_explanations=exps,
+                summary=(f"ESMFold (local): model #{new_id} — mean pLDDT "
+                         f"{mean_plddt:.1f} ({conf} confidence), superposed on #{ref_id}."),
+                elapsed_ms=elapsed_ms,
+            )
+
         mutation_positions: List[int] = inputs.get("mutation_positions") or []
 
         t0 = _time.perf_counter()
@@ -4265,17 +4332,31 @@ class ToolRouter:
         ranked = result.get("ranked_pdb", "")
         if not ranked:
             return [], []
-
-        new_id = str(self.session.next_model_id())
         pdb_posix = Path(ranked).as_posix()
+        cmds, exps, _new_id = self._fold_viz_commands(pdb_posix, inputs)
+        return cmds, exps
+
+    def _fold_viz_commands(
+        self,
+        pdb_posix: str,
+        inputs:    Dict[str, Any],
+    ) -> tuple:
+        """ENGINE-AGNOSTIC fold viz: open a predicted-structure PDB as a NEW model,
+        colour by the native AlphaFold pLDDT palette (B-factor holds pLDDT for both
+        ColabFold AND ESMFold), open the Sequence Viewer, and — when a compare_to
+        reference resolves — superpose with matchmaker. Returns (cmds, exps, new_id).
+        The new id is session.next_model_id(), exactly what the spine assigns to the
+        open command it state-tracks. Shared by _build_colabfold_viz and the workbench
+        ESMFold fold so a later engine (Boltz) reuses one viz, not a parallel path."""
+        new_id = str(self.session.next_model_id())
 
         cmds: List[str] = []
         exps: List[str] = []
 
         cmds.append(f'open "{pdb_posix}"')
-        exps.append(f"Open the ColabFold ranked model as #{new_id}")
+        exps.append(f"Open the predicted model as #{new_id}")
         # Native AlphaFold pLDDT colouring (canonical blue→orange palette over the
-        # B-factor column, where ColabFold stores per-residue pLDDT).
+        # B-factor column, where the engine stores per-residue pLDDT).
         cmds.append(f"color byattribute bfactor #{new_id} palette alphafold")
         exps.append("Colour by pLDDT using the native AlphaFold palette (blue=confident)")
         cmds.append(f"cartoon #{new_id}")
@@ -4293,7 +4374,7 @@ class ToolRouter:
             )
         cmds.append(f"view #{new_id}")
         exps.append("Fit the predicted model in view")
-        return cmds, exps
+        return cmds, exps, new_id
 
     def _resolve_colabfold_compare_to(
         self,

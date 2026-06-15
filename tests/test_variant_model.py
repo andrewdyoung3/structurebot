@@ -20,7 +20,42 @@ from variant_model import (
     build_design_session, import_mpnn_designs, column_tracks, build_color_commands,
     build_color_commands_by_resnum, candidate_ddg, stability_summary,
     filter_new_mpnn_variants, group_scan_suggestions, suggestion_color,
+    fold_summary,
 )
+
+
+class TestFoldSummary:
+    """S4b: reduce a fold engine's step data to the normalized, engine-agnostic contract,
+    remapping the engine's 1-based pLDDT onto the variant's author resnums."""
+
+    def _data(self, source="local_venv312"):
+        return {
+            "engine": "esmfold", "new_model_id": "2", "reference_model_id": "1",
+            "mean_plddt": 85.0, "length": 3, "source": source,
+            "plddt": {1: 95.0, 2: 80.0, 3: 40.0},   # engine numbers 1..N
+        }
+
+    def test_maps_1based_plddt_to_author_resnums(self):
+        # the variant occupies author resnums 50,51,52 (non-1 start)
+        out = fold_summary(self._data(), author_resnums=[50, 51, 52])
+        assert out["plddt"] == {50: 95.0, 51: 80.0, 52: 40.0}
+
+    def test_contract_keys_and_passthrough(self):
+        out = fold_summary(self._data(), author_resnums=[1, 2, 3])
+        assert out["engine"] == "esmfold"
+        assert out["model_id"] == "2"               # new_model_id → model_id
+        assert out["reference_model_id"] == "1"
+        assert out["mean_plddt"] == 85.0
+        assert out["source"] == "local_venv312"
+        assert out["chain"] == "A"
+
+    def test_explicit_reference_override(self):
+        out = fold_summary(self._data(), author_resnums=[1, 2, 3], reference_model_id="9")
+        assert out["reference_model_id"] == "9"
+
+    def test_missing_plddt_is_empty_not_crash(self):
+        out = fold_summary({"new_model_id": "2"}, author_resnums=[1, 2])
+        assert out["plddt"] == {} and out["model_id"] == "2"
 from color_modes import ddg_color
 from seq_editor.controller import ResidueCell, ChainSeq
 

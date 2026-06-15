@@ -12,7 +12,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from color_modes import get_mode, all_modes, COLOR_MODES
+from color_modes import get_mode, all_modes, COLOR_MODES, plddt_color
+
+
+class TestPlddtColor:
+    """S4b per-residue pLDDT → AlphaFold-palette hex (banded, mirrors `palette alphafold`)."""
+
+    def test_none_is_no_data(self):
+        assert plddt_color(None) is None
+
+    def test_bands(self):
+        assert plddt_color(95) == "#0053d6"   # >90  very high (dark blue)
+        assert plddt_color(80) == "#65cbf3"   # 70-90 confident (light blue)
+        assert plddt_color(60) == "#ffdb13"   # 50-70 low (yellow)
+        assert plddt_color(30) == "#ff7d45"   # <50  very low (orange)
+
+    def test_band_edges_are_strict_lower_bounds(self):
+        # exactly on a band edge falls to the lower band (>, not >=)
+        assert plddt_color(90) == "#65cbf3"
+        assert plddt_color(70) == "#ffdb13"
+        assert plddt_color(50) == "#ff7d45"
 
 
 class TestRegistry:

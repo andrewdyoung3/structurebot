@@ -22,9 +22,10 @@ pytest.importorskip("PySide6")
 from PySide6 import QtWidgets
 
 from seq_editor.controller import ResidueCell, ChainSeq
-from variant_workbench import VariantWorkbenchPanel, _RESULT_DDG_MODE
+from variant_workbench import (VariantWorkbenchPanel, _RESULT_DDG_MODE,
+                               _RESULT_PLDDT_MODE)
 from variant_model import ChainDesign, AlignedCell
-from color_modes import get_mode, ddg_color
+from color_modes import get_mode, ddg_color, plddt_color
 
 
 @pytest.fixture(scope="module")
@@ -457,3 +458,95 @@ class TestStage4a:
         p, tab, vid = self._variant_panel()         # V1 has no stability result yet
         p._mode_key = _RESULT_DDG_MODE
         assert p.color_commands_for(tab) == []
+
+
+class TestStage4b:
+    """Engine-agnostic monomer fold seam: the launch spec, the result-apply into
+    ResultSlots.fold, the pLDDT result colour mode (panel + predicted model), per-model
+    visibility (active-row coupling + global toggle), and the engine-picker capability flag."""
+
+    def _variant_panel(self, n_variants=1):
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
+                      session=MagicMock())
+        p.load_model("1")
+        ids = []
+        for _ in range(n_variants):
+            p._add_variant()
+            tab = p._cur_tab()
+            vid = tab.design.variants[-1].id
+            tab.design.edit_variant(vid, 0, "W")    # give it a mutation (M1W)
+            ids.append(vid)
+        return p, p._cur_tab(), ids
+
+    @staticmethod
+    def _fold_result(model_id="2", ref="1", plddt=None, source="local_venv312"):
+        plddt = plddt or {1: 95.0, 2: 80.0, 3: 40.0}
+        return {"tool_step_results": [{"tool": "esmfold", "data": {
+            "engine": "esmfold", "new_model_id": model_id, "reference_model_id": ref,
+            "mean_plddt": round(sum(plddt.values()) / len(plddt), 1), "length": len(plddt),
+            "source": source, "plddt": plddt}}]}
+
+    def test_fold_launch_spec_shape(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        spec = p.fold_launch_spec("esmfold")
+        assert spec["tool"] == "esmfold" and spec["refresh"] == "fold"
+        assert spec["_variant_id"] == vid and spec["confidence"] == "low"   # → confirm-gate
+        ti = spec["tool_inputs"]
+        assert ti["open_model"] is True and ti["local_only"] is True
+        assert ti["compare_to"] == "1" and ti["engine"] == "esmfold"
+        assert ti["sequence"] == tab.design.get_variant(vid).sequence
+
+    def test_fold_launch_spec_none_for_template(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
+        p.load_model("1")                            # active row is T
+        assert p.fold_launch_spec("esmfold") is None
+
+    def test_apply_fold_result_fills_slot_and_badge(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result())
+        v = tab.design.get_variant(vid)
+        f = v.results.fold
+        assert f["model_id"] == "2" and f["source"] == "local_venv312"
+        assert f["plddt"] == {1: 95.0, 2: 80.0, 3: 40.0}   # author-resnum-keyed
+        assert "pLDDT 72" in tab.badges[vid]               # mean 71.7 → 72
+
+    def test_local_only_breach_marker_in_source(self, _app):
+        # the contract surfaces source; a non-local source is visible (not silently trusted)
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(source="atlas_api"))
+        assert tab.design.get_variant(vid).results.fold["source"] == "atlas_api"
+
+    def test_plddt_color_mode_targets_predicted_model(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p._mode_key = _RESULT_PLDDT_MODE
+        cmds = p.color_commands_for(tab)             # active row is V1 (has the fold)
+        assert cmds == ["show #2 models",
+                        "color byattribute bfactor #2 palette alphafold"]
+
+    def test_plddt_color_mode_no_fold_is_empty(self, _app):
+        p, tab, (vid,) = self._variant_panel()       # V1 not folded yet
+        p._mode_key = _RESULT_PLDDT_MODE
+        assert p.color_commands_for(tab) == []
+
+    def test_fold_visibility_couples_to_active_row(self, _app):
+        p, tab, (v1, v2) = self._variant_panel(n_variants=2)
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        p.apply_fold_result(v2, self._fold_result(model_id="3"))
+        tab.set_active_row(v2)
+        cmds = p.fold_visibility_commands(tab)
+        assert "show #3 models" in cmds and "hide #2 models" in cmds
+
+    def test_fold_visibility_global_hide_toggle(self, _app):
+        p, tab, (v1, v2) = self._variant_panel(n_variants=2)
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        p.apply_fold_result(v2, self._fold_result(model_id="3"))
+        p._fold_vis_btn.setChecked(True)             # "Hide folds"
+        cmds = p.fold_visibility_commands(tab)
+        assert set(cmds) == {"hide #2 models", "hide #3 models"}
+
+    def test_engine_picker_capability_flag(self, _app):
+        p, _, _ = self._variant_panel()
+        avail = p._fold_engine_availability()
+        assert avail["boltz"] is False               # not wired until the Boltz stage
+        assert "esmfold" in avail                     # shown either enabled or disabled

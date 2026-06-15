@@ -205,12 +205,19 @@ class ESMFoldBridge:
         sequence:  str,
         label:     str = "query",
         timeout:   int = _DEFAULT_TIMEOUT,
+        allow_remote: bool = True,
     ) -> Dict[str, Any]:
         """
         Predict structure of *sequence* using ESMFold.
 
         Tries local venv312 GPU inference first (if ESMFOLD_USE_LOCAL=True),
         then falls back to the ESM Atlas API.
+
+        *allow_remote* (default True): when False, the remote ESM Atlas fallback is
+        NEVER reached — local inference only, error if it fails/unavailable. This is
+        the LOCAL-ONLY gate (the Atlas API is the ESMFold analog of the ColabFold MSA
+        server / the breach surface): callers that must guarantee zero network in the
+        fold path (e.g. the Variant Workbench fold) pass allow_remote=False.
 
         Returns
         -------
@@ -262,9 +269,23 @@ class ESMFoldBridge:
             result = self._run_local(sequence, label, worker_timeout)
             if result is not None:
                 return result
+            if not allow_remote:
+                return self._error_result(
+                    label,
+                    "local ESMFold (venv312) inference failed and remote Atlas fallback "
+                    "is disabled (LOCAL-ONLY).",
+                )
             _pprint(
                 "  ESMFold: local inference failed — trying ESM Atlas API "
                 "(last resort — permanently unreliable, may return garbage results)..."
+            )
+
+        # ── LOCAL-ONLY gate: never touch the network when remote is disallowed ──
+        if not allow_remote:
+            return self._error_result(
+                label,
+                "ESMFold local inference is unavailable and remote Atlas fallback is "
+                "disabled (LOCAL-ONLY). Bring up the venv312 ESMFold worker.",
             )
 
         # ── Last resort: Atlas API ────────────────────────────────────────────
@@ -511,6 +532,12 @@ class ESMFoldBridge:
         return result
 
     # ── Local venv312 path ─────────────────────────────────────────────────────
+
+    def local_available(self) -> bool:
+        """Public capability signal: True when the local venv312 ESMFold worker is
+        installed (so a LOCAL-ONLY fold can run). Used by the Variant Workbench engine
+        picker to show ESMFold enabled-or-disabled (B2 3-state, never silently dropped)."""
+        return self._local_available()
 
     def _local_available(self) -> bool:
         """True if venv312 python AND esmfold_worker.py both exist on disk."""
