@@ -30,6 +30,10 @@ _gate = pytest.mark.skipif(
     reason="gated real-inference smoke — set STRUCTUREBOT_RUN_LIVE_DEPS=1 "
            "(needs the venv312 / WSL / model envs)")
 
+# Every smoke here does REAL GPU/WSL inference → serialize GPU access across processes
+# (conftest `_gpu_serialize`) so two real folds never contend for VRAM when run.
+pytestmark = pytest.mark.gpu
+
 _CRAMBIN = str(Path(__file__).parent / "fixtures" / "1crn.pdb")
 _CRAMBIN_SEQ = "TTCCPSIVARSNFNVCRLPGTPEAICATYTGCIIIPGATCPGDYAN"   # 1CRN chain A
 

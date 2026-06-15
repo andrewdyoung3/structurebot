@@ -544,6 +544,7 @@ def test_predict_errors_when_colabfold_missing(cache_tmp):
 _RUN_LIVE = os.environ.get("STRUCTUREBOT_RUN_LIVE_COLABFOLD") == "1"
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     not _RUN_LIVE,
     reason="live ColabFold fold (minutes, GPU); set STRUCTUREBOT_RUN_LIVE_COLABFOLD=1 to run",
