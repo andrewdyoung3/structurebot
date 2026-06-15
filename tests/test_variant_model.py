@@ -56,6 +56,19 @@ class TestFoldSummary:
     def test_missing_plddt_is_empty_not_crash(self):
         out = fold_summary({"new_model_id": "2"}, author_resnums=[1, 2])
         assert out["plddt"] == {} and out["model_id"] == "2"
+
+    def test_multimer_fields_additive_when_present(self):
+        # Boltz emits iptm/chains_ptm/seed → passed through ADDITIVELY
+        d = {"engine": "boltz", "new_model_id": "3", "mean_plddt": 90.0,
+             "plddt": {1: 90.0}, "iptm": 0.959, "chains_ptm": {"0": 0.97}, "seed": 7}
+        out = fold_summary(d, author_resnums=[1])
+        assert out["iptm"] == 0.959 and out["chains_ptm"] == {"0": 0.97} and out["seed"] == 7
+
+    def test_monomer_result_omits_multimer_fields(self):
+        # ESMFold (no iptm/chains_ptm) → those keys absent (byte-identical to pre-Boltz)
+        out = fold_summary({"engine": "esmfold", "new_model_id": "2", "mean_plddt": 80.0,
+                            "plddt": {1: 80.0}}, author_resnums=[1])
+        assert "iptm" not in out and "chains_ptm" not in out and "seed" not in out
 from color_modes import ddg_color
 from seq_editor.controller import ResidueCell, ChainSeq
 

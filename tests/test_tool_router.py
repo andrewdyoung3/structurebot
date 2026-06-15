@@ -107,6 +107,57 @@ class TestWorkbenchFoldS4b:
         assert not res.success and "worker down" in res.error
 
 
+class TestBoltzFoldStage:
+    """The Boltz multimer fold path — LOCAL-ONLY breach gate + open/pLDDT-colour/matchmaker
+    + ipTM, the second engine on the SAME _fold_viz_commands seam as ESMFold."""
+
+    def _bridge(self, source="local_boltz_env", success=True):
+        b = MagicMock()
+        b.predict.return_value = {
+            "success": success, "cif_path": "C:/tmp/boltz_pred.cif", "mean_plddt": 90.0,
+            "iptm": 0.959, "chains_ptm": {"0": 0.97, "1": 0.97},
+            "plddt": {1: 90.0, 2: 80.0}, "length": 2, "source": source, "seed": 0,
+        }
+        return b
+
+    def test_boltz_fold_opens_colors_matchmakers(self):
+        router = _make_router()
+        router.session.next_model_id.return_value = "2"
+        bridge = self._bridge()
+        with patch.object(router, "_get_boltz_bridge", return_value=bridge):
+            res = router._run_boltz({"chains": [{"id": "A", "sequence": "MK"},
+                                                {"id": "B", "sequence": "MK"}],
+                                     "model_id": "1", "compare_to": "1", "local_only": True})
+        assert res.success
+        assert res.data["engine"] == "boltz" and res.data["new_model_id"] == "2"
+        assert res.data["iptm"] == 0.959 and res.data["source"] == "local_boltz_env"
+        joined = "\n".join(res.viz_commands)
+        assert 'open "' in joined
+        assert "color byattribute bfactor #2 palette alphafold" in joined
+        assert "matchmaker #2 to #1" in joined
+        # multi-chain assembly: the bridge was asked to fold BOTH chains
+        assert len(bridge.predict.call_args.args[0]) == 2
+
+    def test_boltz_local_only_breach_rejected(self):
+        router = _make_router()
+        router.session.next_model_id.return_value = "2"
+        bridge = self._bridge(source="remote_msa")          # non-local source on a local_only fold
+        with patch.object(router, "_get_boltz_bridge", return_value=bridge):
+            res = router._run_boltz({"chains": [{"id": "A", "sequence": "M"}],
+                                     "model_id": "1", "compare_to": "1", "local_only": True})
+        assert not res.success and "LOCAL-ONLY" in res.error
+
+    def test_boltz_monomer_from_sequence(self):
+        router = _make_router()
+        router.session.next_model_id.return_value = "2"
+        bridge = self._bridge()
+        with patch.object(router, "_get_boltz_bridge", return_value=bridge):
+            res = router._run_boltz({"sequence": "MKV", "model_id": "1", "compare_to": "1"})
+        assert res.success
+        chains = bridge.predict.call_args.args[0]
+        assert len(chains) == 1 and chains[0]["sequence"] == "MKV"
+
+
 def _mutation_scan_translator_result(chain: str = "A") -> Dict[str, Any]:
     """Fake translator result for a generic mutation scan (what the LLM returns)."""
     return {
