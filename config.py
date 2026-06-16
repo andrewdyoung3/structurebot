@@ -522,6 +522,11 @@ BOLTZ_SAMPLING_STEPS: int = int(os.environ.get("BOLTZ_SAMPLING_STEPS", "200"))
 BOLTZ_DIFFUSION_SAMPLES: int = int(os.environ.get("BOLTZ_DIFFUSION_SAMPLES", "1"))
 # Wall-clock budget for one Boltz fold (GPU; a small dimer is ~1 min, larger complexes more).
 BOLTZ_TIMEOUT: int = int(os.environ.get("BOLTZ_TIMEOUT", "1800"))
+# S4c noise floor: total seeds (1 reference + N-1) folded to MEASURE the cross-seed WT
+# variance for a STOCHASTIC engine (Boltz). N=4 balances a usable per-residue stdev/range
+# against compute (paid once per design+combo, cached). Deterministic engines (ESMFold)
+# ignore this — their floor is the global minimum (DEVIATION_FLOOR_MIN_A in tool_router).
+DEVIATION_FLOOR_N: int = int(os.environ.get("DEVIATION_FLOOR_N", "4"))
 
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)

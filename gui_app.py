@@ -466,7 +466,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         refresh = spec.get("refresh")
         variant_id = spec.get("_variant_id")
         on_result = None
-        if refresh in ("stability", "fold"):
+        if refresh in ("stability", "fold", "deviation"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -500,6 +500,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_fold_result(variant_id, result)
                 else:
                     self.presenter.dim("Fold run cancelled — no model to attach.")
+            elif refresh == "deviation":
+                result = getattr(self, "_captured_result", None)
+                if result is not None and variant_id:
+                    self.workbench.apply_deviation_result(variant_id, result)
+                else:
+                    self.presenter.dim("Deviation run cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None

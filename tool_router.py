@@ -100,6 +100,7 @@ _HYDROPHILIC_AAS = "DENQHKRST"
 _GPU_BRIDGE_TOOLS = frozenset({
     "proteinmpnn", "mpnn_esmfold", "rfdiffusion", "colabfold",
     "validate_design", "esmfold", "esm", "boltz",
+    "variant_deviation",   # S4c: may fold the WT reference set (engine-driven) when absent
 })
 
 # Representation classifier — created once so _claude_capped latch persists across calls
@@ -155,6 +156,7 @@ class ToolRouter:
         "colabfold":             "🧬🔮",
         "validate_design":       "🧬✅",
         "conformer_comparison":  "🔄",
+        "variant_deviation":     "📐",
         "representation":        "🖼️",
         "color":                 "🎨",
         "design_goal":           "🧪",
@@ -2032,6 +2034,8 @@ class ToolRouter:
                 return self._run_validate_design(inputs, user_input=user_input)
             if tool == "conformer_comparison":
                 return self._run_conformer_comparison(inputs, user_input=user_input)
+            if tool == "variant_deviation":
+                return self._run_variant_deviation(inputs)
             if tool == "representation":
                 return self._run_representation(inputs, user_input=user_input)
             if tool == "color":
@@ -2809,6 +2813,7 @@ class ToolRouter:
                 tool="esmfold", success=True,
                 data={
                     "engine":             "esmfold",
+                    "target":             "monomer",   # ESMFold is monomer-only
                     "new_model_id":       new_id,
                     "reference_model_id": str(ref_id),
                     "mean_plddt":         mean_plddt,
@@ -2965,6 +2970,7 @@ class ToolRouter:
             tool="boltz", success=True,
             data={
                 "engine":             "boltz",
+                "target":             ("monomer" if nch <= 1 else "assembly"),
                 "new_model_id":       new_id,
                 "reference_model_id": str(ref_id),
                 "mean_plddt":         mean_plddt,
@@ -4771,6 +4777,43 @@ class ToolRouter:
 
         return per_shift, anchor_rms, all_rms
 
+    @classmethod
+    def _auto_anchor_resnums(
+        cls,
+        coords_a: Dict["Any", "Any"],
+        coords_b: Dict["Any", "Any"],
+        common:   "List[Any]",
+    ) -> "Tuple[Optional[List[Any]], str]":
+        """Iterative-prune the rigid common-residue anchor: repeatedly drop the
+        top-displaced residues (above the 40th-percentile shift) and re-fit until
+        convergence, leaving the rigid core the Kabsch superposes on.  Converges on
+        ONE rigid domain even for multimers whose chains are individually conserved
+        but whose quaternary arrangement changes (e.g. haemoglobin T↔R).
+
+        Key-type agnostic — *common* may be resnos (single-chain) or (chain, resno)
+        tuples (multichain), exactly as ``_anchor_kabsch`` consumes.  Returns
+        ``(anchor_keys, source_str)`` or ``(None, reason)`` when the fit fails.
+
+        SHARED by conformer comparison and the S4c variant-vs-WT deviation so both
+        localize divergence against the same rigid-core definition (one source)."""
+        import numpy as _np
+        anchor_resnums = list(common)
+        n_iters = 0
+        min_anchor = max(10, int(len(common) * 0.05))
+        for _iter in range(12):
+            shifts_g, _, _ = cls._anchor_kabsch(coords_a, coords_b, anchor_resnums)
+            if shifts_g is None:
+                return None, "Auto-anchor Kabsch fit failed (too few common residues)."
+            cutoff = float(_np.percentile(sorted(shifts_g.values()), 40))
+            new_anchor = [r for r in anchor_resnums if shifts_g[r] <= cutoff]
+            n_iters += 1
+            if len(new_anchor) < min_anchor or set(new_anchor) == set(anchor_resnums):
+                break
+            anchor_resnums = new_anchor
+        return anchor_resnums, (
+            f"auto-iterative ({n_iters} prune steps → {len(anchor_resnums)} residues)"
+        )
+
     @staticmethod
     def _parse_anchor_spec(anchor_str: str, common_resnums: "set") -> List[int]:
         """
@@ -5075,29 +5118,14 @@ class ToolRouter:
         common_set = set(common)
 
         if anchor_str.lower() == "auto":
-            # Iterative prune: repeatedly remove the top-displaced residues until
-            # convergence.  This reliably converges on ONE rigid domain even for
-            # multimers where each chain is individually conserved but their
-            # relative arrangement (quaternary) changes — e.g. haemoglobin T↔R.
-            anchor_resnums = list(common)
-            n_iters = 0
-            min_anchor = max(10, int(len(common) * 0.05))
-            for _iter in range(12):
-                shifts_g, _, _ = self._anchor_kabsch(coords_a, coords_b, anchor_resnums)
-                if shifts_g is None:
-                    return ToolStepResult(
-                        tool="conformer_comparison", success=False,
-                        error="Auto-anchor Kabsch fit failed (too few common residues).",
-                    )
-                cutoff = float(_np.percentile(sorted(shifts_g.values()), 40))
-                new_anchor = [r for r in anchor_resnums if shifts_g[r] <= cutoff]
-                n_iters += 1
-                if len(new_anchor) < min_anchor or set(new_anchor) == set(anchor_resnums):
-                    break
-                anchor_resnums = new_anchor
-            anchor_source = (
-                f"auto-iterative ({n_iters} prune steps → {len(anchor_resnums)} residues)"
+            anchor_resnums, anchor_source = self._auto_anchor_resnums(
+                coords_a, coords_b, common
             )
+            if anchor_resnums is None:
+                return ToolStepResult(
+                    tool="conformer_comparison", success=False,
+                    error=anchor_source,
+                )
         else:
             anchor_resnums = self._parse_anchor_spec(anchor_str, common_set)
             if len(anchor_resnums) < 3:
@@ -5311,6 +5339,231 @@ class ToolRouter:
             viz_explanations=viz_exps,
             summary=summary_line + "\n" + summary_text,
         )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # S4c: variant-vs-WT per-residue Cα deviation + per-residue noise floor
+    # ══════════════════════════════════════════════════════════════════════════
+    # GLOBAL minimum effective floor (Å). Guards a small-N per-residue floor from
+    # under-gating toward ~0, and gives a deterministic engine (ESMFold, floor 0) a
+    # non-zero floor so sub-resolution coordinate noise is never painted as signal.
+    _DEVIATION_FLOOR_MIN_A = 0.25
+
+    @staticmethod
+    def _dev_key(k: "Any") -> str:
+        """JSON-safe per-residue key: ``(chain, resno)`` → ``"chain:resno"``; else ``str``."""
+        if isinstance(k, tuple):
+            return f"{k[0]}:{k[1]}"
+        return str(k)
+
+    def _read_fold_ca(self, model_id: str, multichain: bool, chain: str) -> Dict["Any", "Any"]:
+        """Live Cα of a predicted fold model — ``{(chain,resno):xyz}`` (multichain) else
+        ``{resno:xyz}``. Reuses the conformer-comparison live readers (one source)."""
+        if multichain:
+            return self._ca_coords_live_multichain(self.bridge, str(model_id))
+        return self._ca_coords_live(self.bridge, str(model_id), chain)
+
+    def _fold_wt_reference(self, inputs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Establish the seed-pinned WT reference fold (+ per-residue noise floor) for a
+        (engine, target) combo. Folds the template T sequence(s) through the SAME engine
+        the variant used (fold-vs-fold cancellation only holds same-engine/target):
+
+          • reference  = the pinned-seed fold, opened + pLDDT-coloured + matchmadered onto
+            the crystal WT via the shared `_fold_viz_commands` (executed inline, the
+            conformer-style live pattern — the spine path only BUILDS those commands);
+          • floor (Boltz only) = fold WT at the N-1 extra seeds, Kabsch-align each onto the
+            reference via the SHARED auto-anchor, and take the per-residue CROSS-SEED MAX
+            displacement (conservative at small N); effective floor = max(that, the global
+            minimum). ESMFold is deterministic → no extra seeds, floor = the global min.
+
+        Returns the wt_ref dict ``{engine,target,seed,model_id,path,floor(str-keyed)}`` (the
+        workbench caches it on ``cd.wt_refs[combo]``), or None on a fold failure."""
+        engine     = inputs["engine"]
+        target     = inputs.get("target", "monomer")
+        multichain = bool(inputs.get("multichain"))
+        chain      = inputs.get("variant_chain", "A")
+        wt_chains  = inputs.get("wt_chains") or []
+        compare_to = inputs.get("compare_to")
+        model_id   = inputs.get("model_id")
+        seeds      = list(inputs.get("seeds") or [])
+        if engine == "boltz" and not seeds:
+            import config as _cfg
+            base = int(getattr(_cfg, "BOLTZ_SEED", 0))
+            n    = int(getattr(_cfg, "DEVIATION_FLOOR_N", 4))   # N=4: 1 reference + 3 floor
+            seeds = list(range(base, base + max(1, n)))
+
+        # ── reference fold at the pinned seed, via the engine's own bridge ────────
+        if engine == "esmfold":
+            seq = (wt_chains[0]["sequence"] if wt_chains else inputs.get("wt_sequence"))
+            if not seq:
+                return None
+            rres = self._get_esmfold_bridge().predict(seq, label="WTref", allow_remote=False)
+            ref_path = None
+            if rres.get("success"):
+                import tempfile as _tf
+                _t = _tf.NamedTemporaryFile(mode="w", suffix=".pdb",
+                                            prefix="wtref_esmfold_", delete=False)
+                _t.write(rres.get("pdb_str", "")); _t.close()
+                ref_path = _t.name
+            ref_seed = None
+        else:
+            if not wt_chains:
+                return None
+            rres = self._get_boltz_bridge().predict(
+                wt_chains, seed=(seeds[0] if seeds else None), allow_remote=False)
+            ref_path = rres.get("cif_path")
+            ref_seed = rres.get("seed")
+        if not rres.get("success") or not ref_path:
+            return None
+
+        # open + pLDDT-colour + matchmaker the reference inline (reuse the viz builder)
+        cmds, _exps, ref_mid = self._fold_viz_commands(
+            Path(ref_path).as_posix(), {**inputs, "compare_to": compare_to})
+        for c in cmds:
+            self.bridge.run_command(c)
+        try:                                  # consume the id so it isn't reused
+            self.session.add_structure(
+                ref_mid, f"wtref_{engine}_{model_id}", path=ref_path,
+                metadata={"predicted": True, "engine": engine, "wt_reference": True})
+        except Exception:
+            pass
+
+        ref_ca = self._read_fold_ca(ref_mid, multichain, chain)
+        if not ref_ca:
+            return None
+
+        # ── per-residue noise floor: cross-seed WT max displacement (Boltz only) ──
+        floor_raw: Dict["Any", float] = {}
+        if engine == "boltz" and len(seeds) > 1:
+            bridge = self._get_boltz_bridge()
+            for s in seeds[1:]:
+                fr = bridge.predict(wt_chains, seed=s, allow_remote=False)
+                fpath = fr.get("cif_path") if fr.get("success") else None
+                if not fpath:
+                    continue
+                ro = self.bridge.run_command(f'open "{Path(fpath).as_posix()}"')
+                spec = self._parse_model_spec(ro, None)
+                if not spec:
+                    continue
+                fmid = spec.lstrip("#")
+                fca = self._read_fold_ca(fmid, multichain, chain)
+                self.bridge.run_command(f"close #{fmid}")   # floor folds are not kept
+                if not fca:
+                    continue
+                common = sorted(set(ref_ca) & set(fca))
+                anchor, _src = self._auto_anchor_resnums(ref_ca, fca, common)
+                if anchor is None:
+                    continue
+                shifts, _anc, _all = self._anchor_kabsch(ref_ca, fca, anchor)
+                if not shifts:
+                    continue
+                for k, dv in shifts.items():
+                    if dv > floor_raw.get(k, 0.0):
+                        floor_raw[k] = dv
+
+        # effective floor = max(cross-seed max, global minimum) for every ref residue
+        floor: Dict[str, float] = {
+            self._dev_key(k): round(max(floor_raw.get(k, 0.0), self._DEVIATION_FLOOR_MIN_A), 3)
+            for k in ref_ca
+        }
+        return {
+            "engine": engine, "target": target, "seed": ref_seed,
+            "model_id": str(ref_mid), "path": ref_path, "floor": floor,
+            "n_floor_seeds": (len(seeds) if engine == "boltz" else 1),
+        }
+
+    def _run_variant_deviation(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """Per-residue Cα deviation of a FOLDED variant vs the seed-pinned WT REFERENCE
+        FOLD (fold-vs-fold, real atoms — not the S2 sequence preview, not the crystal).
+
+        Ensures the (engine, target) WT reference exists (folding it + its cross-seed floor
+        once per design when absent — the expensive path; reused via the cached `wt_ref`
+        otherwise), then localizes the variant's effect with the EXISTING Kabsch machinery:
+        the SHARED auto-anchor rigid-core prune + `_anchor_kabsch` (anchor-residual RMSD ≈ 0
+        is the readback quality check). Per-chain for an assembly (multichain CA). The floor
+        is returned alongside the raw deviation; the floor-GATED rendering is the panel's
+        deviation colour mode (one source: `color_modes.deviation_color`), so this tool
+        stays data-only and feeds the SAME seam as ddG/pLDDT — not a parallel render path."""
+        variant_mid = inputs.get("variant_model_id")
+        multichain  = bool(inputs.get("multichain"))
+        chain       = inputs.get("variant_chain", "A")
+        engine      = inputs.get("engine", "esmfold")
+        target      = inputs.get("target", "monomer")
+        if not variant_mid:
+            return ToolStepResult(tool="variant_deviation", success=False,
+                                  error="variant_deviation needs the folded variant's model id.")
+
+        # ── 1. Ensure the WT reference fold (+ floor) for this combo ──────────────
+        wt_ref = inputs.get("wt_ref")
+        ref_ca: Dict["Any", "Any"] = {}
+        if wt_ref and wt_ref.get("model_id"):
+            ref_ca = self._read_fold_ca(wt_ref["model_id"], multichain, chain)
+            if not ref_ca and wt_ref.get("path"):     # cached but not open → reopen
+                ro = self.bridge.run_command(f'open "{Path(wt_ref["path"]).as_posix()}"')
+                spec = self._parse_model_spec(ro, None)
+                if spec:
+                    wt_ref = {**wt_ref, "model_id": spec.lstrip("#")}
+                    ref_ca = self._read_fold_ca(wt_ref["model_id"], multichain, chain)
+        if not ref_ca:
+            wt_ref = self._fold_wt_reference(inputs)
+            if not wt_ref:
+                return ToolStepResult(
+                    tool="variant_deviation", success=False,
+                    error=(f"Could not establish the WT reference fold for {engine}:{target} "
+                           "(fold failed or no Cα read). Deviation not computed."))
+            ref_ca = self._read_fold_ca(wt_ref["model_id"], multichain, chain)
+
+        # ── 2. Variant fold Cα + matched-residue Kabsch against the reference ─────
+        var_ca = self._read_fold_ca(variant_mid, multichain, chain)
+        if not var_ca:
+            return ToolStepResult(
+                tool="variant_deviation", success=False,
+                error=(f"Could not read Cα for the variant fold #{variant_mid}. "
+                       "Check the predicted model is open."))
+        common = sorted(set(ref_ca) & set(var_ca))
+        if len(common) < 3:
+            return ToolStepResult(
+                tool="variant_deviation", success=False,
+                error=(f"Only {len(common)} common Cα between the variant fold and the WT "
+                       "reference (need ≥3) — chain ids/numbering mismatch?"))
+        anchor, anchor_src = self._auto_anchor_resnums(ref_ca, var_ca, common)
+        if anchor is None:
+            return ToolStepResult(tool="variant_deviation", success=False,
+                                  error="Variant-vs-WT anchor Kabsch fit failed.")
+        # A = reference frame, B = variant → per-residue shift = the variant's displacement
+        per_dev, anchor_resid, all_pairs = self._anchor_kabsch(ref_ca, var_ca, anchor)
+        if per_dev is None:
+            return ToolStepResult(tool="variant_deviation", success=False,
+                                  error="Variant-vs-WT Kabsch fit failed.")
+
+        floor = (wt_ref or {}).get("floor") or {}
+        dev_str = {self._dev_key(k): v for k, v in per_dev.items()}
+        gmin = self._DEVIATION_FLOOR_MIN_A
+        cleared = [k for k, v in dev_str.items() if v > floor.get(k, gmin)]
+        max_dev = max(per_dev.values()) if per_dev else 0.0
+
+        data = {
+            "engine":               engine,
+            "target":               target,
+            "multichain":           multichain,
+            "variant_chain":        chain,            # predicted monomer chain (3D target)
+            "variant_model_id":     str(variant_mid),
+            "reference_model_id":   str(wt_ref.get("model_id")),
+            "deviation":            dev_str,          # str-keyed per-residue Cα deviation (Å)
+            "floor":                floor,            # str-keyed effective per-residue floor (Å)
+            "anchor_residual_rmsd": anchor_resid,     # ≈0 confirms the fit/anchor is clean
+            "all_pairs_rmsd":       all_pairs,
+            "anchor_source":        anchor_src,
+            "n_residues":           len(per_dev),
+            "n_cleared_floor":      len(cleared),
+            "max_deviation":        round(float(max_dev), 3),
+            "floor_kind":           ("deterministic" if engine == "esmfold" else "measured"),
+            "wt_ref":               wt_ref,           # so the workbench caches it per combo
+        }
+        return ToolStepResult(
+            tool="variant_deviation", success=True, data=data,
+            summary=(f"Deviation vs WT ({engine}:{target}): {len(cleared)}/{len(per_dev)} "
+                     f"residues clear the noise floor; max {data['max_deviation']:.2f} Å, "
+                     f"anchor residual {anchor_resid:.2f} Å (≈0 = clean fit)."))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)

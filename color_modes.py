@@ -128,6 +128,43 @@ def plddt_color(plddt: Optional[float]) -> Optional[str]:
     return _PLDDT_VERY_LOW
 
 
+# ── variant-vs-WT Cα deviation (S4c result-backed scale; per-residue VALUE in Å) ────
+# Floor-GATED magnitude ramp: a residue whose deviation does NOT clear its noise floor
+# renders NEUTRAL (None → reset), so we never paint sampling noise as a result (§0 honest
+# rendering). Residues that DO clear the floor are coloured by ABSOLUTE deviation on a
+# fixed-Å cool→hot ramp (small real motion = cool, large = red). The thresholds are the
+# same fixed-Å bands as tool_router's `_DEVIATION_BUCKETS` (0.5 / 1.0 / 2.0 / 3.5 Å) —
+# NOT adaptive percentiles — so the panel cell colour equals the 3D model colour for the
+# same residue (the S2 panel↔3D sync invariant, one source for both).
+_DEV_BANDS = (
+    (0.5, "#5b8def"),   # just cleared the floor — small real motion (cool blue)
+    (1.0, "#8fd0e8"),   # cyan
+    (2.0, "#ffd166"),   # yellow
+    (3.5, "#f3953b"),   # orange
+    (float("inf"), "#e23b3b"),   # ≥3.5 Å — large displacement (red)
+)
+
+
+def deviation_color(deviation: Optional[float],
+                    floor: float = 0.0) -> Optional[str]:
+    """Per-residue variant-vs-WT Cα deviation (Å) → fixed-Å hex, FLOOR-GATED.
+
+    None → no data (reset). ``deviation <= floor`` → None (NEUTRAL: the residue moved
+    no more than the same-sequence WT moves across seeds at that position, so the shift
+    is not distinguishable from sampling noise — do not colour it as signal). Above the
+    floor → a fixed-Å cool→hot magnitude band (small real motion = cool, large = red).
+    *floor* is the residue's effective noise floor (≈0 + a global minimum for a
+    deterministic engine; the measured cross-seed WT max for a stochastic one)."""
+    if deviation is None:
+        return None
+    if deviation <= floor:
+        return None
+    for hi, hexc in _DEV_BANDS:
+        if deviation < hi:
+            return hexc
+    return _DEV_BANDS[-1][1]
+
+
 @dataclass(frozen=True)
 class ColorMode:
     key:   str                              # stable id
