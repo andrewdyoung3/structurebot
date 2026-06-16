@@ -22,9 +22,9 @@ pytest.importorskip("PySide6")
 from PySide6 import QtWidgets
 
 from seq_editor.controller import ResidueCell, ChainSeq
-from variant_workbench import (VariantWorkbenchPanel, _RESULT_DDG_MODE,
-                               _RESULT_PLDDT_MODE)
-from variant_model import ChainDesign, AlignedCell
+from variant_workbench import (VariantWorkbenchPanel, _ChainDesignTab, _RESULT_DDG_MODE,
+                               _RESULT_PLDDT_MODE, _RESULT_DEVIATION_MODE, _ROW_ROLE)
+from variant_model import ChainDesign, AlignedCell, build_design_session
 from color_modes import get_mode, ddg_color, plddt_color
 
 
@@ -157,6 +157,51 @@ class TestStage2:
         p.load_model("1")
         tab = p._cur_tab()
         assert p.color_commands_for(tab) == []   # OFF mode is non-destructive
+
+
+class TestCellEditMenu:
+    """Direct residue substitution from the sequence view: the cell context menu exposes the
+    EXISTING edit_variant substitution path (right-click a variant residue). Deletion/indels
+    are deferred (they'd shift the resnum-keyed S4c deviation numbering)."""
+
+    def _variant(self, seq="MKV"):
+        sess = MagicMock()
+        p, _ = _panel([_chainseq("1", "A", seq), _chainseq("1", "B", seq)], session=sess)
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._add_variant()
+        return p, tab, tab.design.variants[0].id, sess
+
+    def test_do_substitute_edits_cell_and_persists(self, _app):
+        p, tab, vid, sess = self._variant()
+        p._do_substitute(tab, vid, 1, "A")          # K2A
+        assert tab.design.get_variant(vid).cells[1].aa == "A"
+        assert sess.add_design_session.call_count == 3   # load + add + substitute
+
+    def test_revert_to_wt_via_substitute(self, _app):
+        p, tab, vid, _ = self._variant()
+        p._do_substitute(tab, vid, 1, "A")          # K2A
+        p._do_substitute(tab, vid, 1, "K")          # revert to WT
+        v = tab.design.get_variant(vid)
+        assert v.cells[1].aa == "K" and v.mutations == []
+
+    def test_context_menu_only_for_variant_cells(self, _app):
+        # the tab emits cellMenuRequested for a VARIANT residue but NOT for T / ruler / gaps.
+        # Use a STANDALONE tab so the only slot on cellMenuRequested is this probe — a
+        # panel-attached tab also wires _show_cell_menu, whose modal menu.exec() would block.
+        cd = next(iter(build_design_session([_chainseq("1", "A", "MKV")], "1").chains.values()))
+        vid = cd.add_variant("V1").id
+        tab = _ChainDesignTab(cd)
+        seen = []
+        tab.cellMenuRequested.connect(lambda rid, col, gp: seen.append((rid, col)))
+        block = tab._blocks[0]
+        v_item = next(block.item(r, 0) for r in range(block.rowCount())
+                      if block.item(r, 0) and block.item(r, 0).data(_ROW_ROLE) == vid)
+        t_item = next(block.item(r, 0) for r in range(block.rowCount())
+                      if block.item(r, 0) and block.item(r, 0).data(_ROW_ROLE) == "T")
+        tab._on_context_menu(block, block.visualItemRect(v_item).center())
+        tab._on_context_menu(block, block.visualItemRect(t_item).center())
+        assert seen == [(vid, 0)]                   # only the variant cell raised a menu
 
 
 class TestStage3aImport:
@@ -557,6 +602,81 @@ class TestStage4b:
         # and when the boltz env is present, the picker enables it (no longer hard-False)
         monkeypatch.setattr(boltz_bridge, "boltz_available", lambda: True)
         assert p._fold_engine_availability()["boltz"] is True
+
+    # ── Stage 4c: variant-vs-WT deviation launch + apply + floor-gated colour ────────
+    @staticmethod
+    def _dev_result(variant_mid="2", engine="esmfold", target="monomer", multichain=False,
+                    deviation=None, floor=None):
+        deviation = deviation or {"1": 0.1, "2": 1.5, "3": 0.2}
+        floor = floor or {}
+        wt_ref = {"engine": engine, "target": target, "model_id": "7",
+                  "floor": floor, "path": "/tmp/wtref"}
+        return {"tool_step_results": [{"tool": "variant_deviation", "data": {
+            "engine": engine, "target": target, "multichain": multichain,
+            "variant_chain": "A", "variant_model_id": variant_mid, "reference_model_id": "7",
+            "deviation": deviation, "floor": floor, "anchor_residual_rmsd": 0.01,
+            "all_pairs_rmsd": 0.5, "n_residues": len(deviation), "n_cleared_floor": 1,
+            "max_deviation": max(deviation.values()), "floor_kind": "deterministic",
+            "wt_ref": wt_ref}}]}
+
+    def test_deviation_launch_spec_uncached_low_confidence(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))   # esmfold monomer
+        spec = p.deviation_launch_spec()
+        assert spec["tool"] == "variant_deviation" and spec["refresh"] == "deviation"
+        assert spec["_variant_id"] == vid
+        assert spec["confidence"] == "low"          # no cached ref → folds WT → confirm-gate
+        ti = spec["tool_inputs"]
+        assert ti["variant_model_id"] == "2" and ti["engine"] == "esmfold"
+        assert ti["target"] == "monomer" and ti["multichain"] is False
+        assert ti["wt_chains"] == [{"id": "A", "sequence": "MKV"}]   # the TEMPLATE T seq, NOT the variant
+        assert ti["wt_ref"] is None and ti["compare_to"] == "1"
+
+    def test_deviation_launch_spec_cached_high_confidence(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        tab.design.wt_refs["esmfold:monomer"] = {"model_id": "7", "floor": {}}
+        spec = p.deviation_launch_spec()
+        assert spec["confidence"] == "high"         # cached ref → cheap → no fold gate
+        assert spec["tool_inputs"]["wt_ref"] == {"model_id": "7", "floor": {}}
+
+    def test_deviation_launch_spec_none_when_unfolded(self, _app):
+        p, tab, (vid,) = self._variant_panel()      # V1 not folded
+        assert p.deviation_launch_spec() is None
+
+    def test_apply_deviation_result_stores_block_and_caches_ref(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p.apply_deviation_result(vid, self._dev_result(variant_mid="2"))
+        v = tab.design.get_variant(vid)
+        assert v.results.fold["deviation"]["variant_model_id"] == "2"
+        # the WT reference is cached on the design per combo (so the next variant reuses it)
+        assert tab.design.wt_refs["esmfold:monomer"]["model_id"] == "7"
+
+    def test_deviation_panel_hex_is_floor_gated(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", deviation={"1": 0.1, "2": 1.5, "3": 0.2}))
+        hexmap = p._deviation_panel_hex(tab)
+        # res 2 (1.5 Å > 0.25 global-min floor) coloured; res 1 & 3 (sub-floor) NEUTRAL
+        assert hexmap == {2: "#ffd166"}
+
+    def test_deviation_3d_targets_predicted_model_per_chain(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", deviation={"1": 0.1, "2": 1.5, "3": 0.2}))
+        p._mode_key = _RESULT_DEVIATION_MODE
+        cmds = p.color_commands_for(tab)
+        # colours the PREDICTED variant model #2 (its own numbering), not the crystal backbone
+        assert cmds == ["show #2 models", "color #2/A #ffffff", "color #2/A:2 #ffd166"]
+
+    def test_deviation_color_mode_no_deviation_is_empty(self, _app):
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))   # folded but no deviation yet
+        p._mode_key = _RESULT_DEVIATION_MODE
+        assert p.color_commands_for(tab) == []
 
 
 class TestBoltzStage:

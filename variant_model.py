@@ -87,6 +87,12 @@ class ChainDesign:
     members:        List[Tuple[str, str]]     # all (model, chain) copies
     template_cells: List[AlignedCell]         # T, one AlignedCell per column
     variants:       List[Variant] = field(default_factory=list)
+    # S4c: seed-pinned WT reference fold + per-residue noise floor, keyed by the fold
+    # combo "engine:target" (e.g. "esmfold:monomer", "boltz:assembly"). Fold-vs-fold
+    # cancellation only holds same-engine/target, so each combo has its OWN reference;
+    # established lazily, cached once per design (not per variant). Value:
+    # {engine, target, seed, model_id, path, floor:{"resno"|"chain:resno" -> Å}}.
+    wt_refs:        Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -184,6 +190,7 @@ class DesignSession:
                 members        = [tuple(m) for m in cd.get("members", [])],
                 template_cells = [AlignedCell(**c) for c in cd.get("template_cells", [])],
                 variants       = [_variant_from_dict(v) for v in cd.get("variants", [])],
+                wt_refs        = dict(cd.get("wt_refs") or {}),
             )
         return cls(model_id=d["model_id"], chains=chains, next_id=int(d.get("next_id", 1)))
 
@@ -318,6 +325,43 @@ def build_color_commands_by_resnum(resnums: List[int],
     for (model, chain) in members:
         spec0 = f"#{model}/{chain}"
         cmds.append(f"color {spec0} {reset}")
+        for hexc, resnos in runs:
+            if hexc == reset:
+                continue
+            if len(resnos) > 1 and resnos == list(range(resnos[0], resnos[-1] + 1)):
+                rng = f"{resnos[0]}-{resnos[-1]}"
+            else:
+                rng = ",".join(str(r) for r in resnos)
+            cmds.append(f"color {spec0}:{rng} {hexc}")
+    return cmds
+
+
+def build_model_color_commands(model_id: str,
+                               per_chain_resnums: Dict[str, List[int]],
+                               value_for: Callable[[str, int], Optional[str]],
+                               reset: str = "#ffffff") -> List[str]:
+    """S4c 3D push: colour a SINGLE predicted model (`#model_id`) per chain by a
+    per-residue VALUE — the deviation lives on the folded variant model's real atoms
+    (like pLDDT), NOT on the shared crystal backbone, so this targets `#mid/<chain>`
+    rather than the `members` copies. *per_chain_resnums* maps each chain on the
+    predicted model to the ordered resnums to paint; *value_for(chain, resno)* returns a
+    hex (e.g. `color_modes.deviation_color` of that residue's floor-gated deviation) or
+    None (→ reset/neutral). Emits one `color #mid/C {reset}` baseline per chain, then
+    run-grouped `color #mid/C:<resnums> <hex>` for residues whose value clears the reset.
+    Pure / testable; same run-compaction idiom as `build_color_commands_by_resnum`."""
+    cmds: List[str] = []
+    for chain in sorted(per_chain_resnums):
+        spec0 = f"#{model_id}/{chain}"
+        cmds.append(f"color {spec0} {reset}")
+        runs: List[Tuple[str, List[int]]] = []
+        for rn in per_chain_resnums[chain]:
+            if rn is None:
+                continue
+            hexc = value_for(chain, rn) or reset
+            if runs and runs[-1][0] == hexc:
+                runs[-1][1].append(rn)
+            else:
+                runs.append((hexc, [rn]))
         for hexc, resnos in runs:
             if hexc == reset:
                 continue
@@ -471,6 +515,7 @@ def fold_summary(step_data: Dict[str, Any],
     ref = reference_model_id if reference_model_id is not None else d.get("reference_model_id")
     out = {
         "engine":             d.get("engine", "esmfold"),
+        "target":             d.get("target", "monomer"),   # monomer | assembly (S4c combo key)
         "model_id":           str(mid) if mid is not None else None,
         "mean_plddt":         d.get("mean_plddt"),
         "plddt":              plddt,                       # author-resnum-keyed

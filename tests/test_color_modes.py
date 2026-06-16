@@ -12,7 +12,38 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from color_modes import get_mode, all_modes, COLOR_MODES, plddt_color
+from color_modes import (get_mode, all_modes, COLOR_MODES, plddt_color,
+                         deviation_color)
+
+
+class TestDeviationColor:
+    """S4c floor-gated variant-vs-WT Cα deviation (Å) → fixed-Å hex (one source for
+    the panel AND the predicted-model 3D push; never paints sub-floor sampling noise)."""
+
+    def test_none_is_no_data(self):
+        assert deviation_color(None, 0.25) is None
+
+    def test_within_floor_is_neutral(self):
+        # at-or-below the floor → None (NEUTRAL), regardless of being a non-zero shift
+        assert deviation_color(0.3, 0.5) is None
+        assert deviation_color(0.5, 0.5) is None          # exactly on the floor → neutral
+
+    def test_above_floor_colours_by_magnitude(self):
+        assert deviation_color(0.6, 0.5) == "#8fd0e8"     # cleared 0.5 floor; 0.5–1.0 → cyan
+        assert deviation_color(0.4, 0.25) == "#5b8def"    # cleared 0.25 floor, <0.5 → cool blue
+        assert deviation_color(1.5, 0.25) == "#ffd166"    # 1.0–2.0 → yellow
+        assert deviation_color(3.0, 0.25) == "#f3953b"    # 2.0–3.5 → orange
+        assert deviation_color(4.0, 0.25) == "#e23b3b"    # ≥3.5 → red
+
+    def test_fixed_A_bands_not_percentile(self):
+        # absolute-Å thresholds (0.5/1.0/2.0/3.5) — independent of any distribution, so the
+        # panel cell colour equals the 3D model colour for the same residue (sync invariant)
+        assert deviation_color(0.49, 0.0) == "#5b8def"
+        assert deviation_color(0.99, 0.0) == "#8fd0e8"
+        assert deviation_color(1.99, 0.0) == "#ffd166"
+
+    def test_default_floor_zero_still_gates_zero_shift(self):
+        assert deviation_color(0.0, 0.0) is None           # no motion → neutral
 
 
 class TestPlddtColor:

@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from variant_model import (
     AlignedCell, Mutation, Variant, ChainDesign, DesignSession,
     build_design_session, import_mpnn_designs, column_tracks, build_color_commands,
-    build_color_commands_by_resnum, candidate_ddg, stability_summary,
+    build_color_commands_by_resnum, build_model_color_commands,
+    candidate_ddg, stability_summary,
     filter_new_mpnn_variants, group_scan_suggestions, suggestion_color,
     fold_summary,
 )
@@ -220,6 +221,41 @@ class TestColorCommands:
         cells = [AlignedCell(0, 1, "K"), AlignedCell(1, None, None), AlignedCell(2, 3, "K")]
         cmds = build_color_commands(cells, [("1", "A")], self._green)
         assert cmds == ["color #1/A #ffffff", "color #1/A:1,3 #00ff00"]
+
+
+class TestStage4cDeviation:
+    """S4c: the per-combo WT-reference slot persists, and the predicted-model 3D colour
+    builder targets `#mid/<chain>` in the model's own numbering (not the crystal members)."""
+
+    def test_wt_refs_roundtrip(self):
+        ds = DesignSession("1", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        cd = ds.chains["k|1/A"]
+        cd.wt_refs["boltz:assembly"] = {
+            "engine": "boltz", "target": "assembly", "seed": 0,
+            "model_id": "7", "path": "/tmp/wtref.cif",
+            "floor": {"A:1": 0.31, "B:1": 0.28}}
+        ds2 = DesignSession.from_dict(ds.to_dict())
+        wr = ds2.chains["k|1/A"].wt_refs["boltz:assembly"]
+        assert wr["model_id"] == "7" and wr["floor"]["A:1"] == 0.31
+
+    def test_missing_wt_refs_defaults_empty(self):
+        ds = DesignSession("1", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        ds2 = DesignSession.from_dict(ds.to_dict())
+        assert ds2.chains["k|1/A"].wt_refs == {}
+
+    def test_model_color_targets_predicted_model_per_chain(self):
+        # red only above-floor residues; run-grouped, reset baseline per chain, #mid spec
+        val = lambda ch, rn: ("#e23b3b" if rn in (5, 6) else None)
+        cmds = build_model_color_commands("9", {"A": [4, 5, 6, 7]}, val)
+        assert cmds == ["color #9/A #ffffff", "color #9/A:5-6 #e23b3b"]
+
+    def test_model_color_multichain_each_chain_reset_and_grouped(self):
+        val = lambda ch, rn: ("#ffd166" if (ch == "B" and rn == 2) else None)
+        cmds = build_model_color_commands("9", {"A": [1, 2], "B": [1, 2]}, val)
+        assert cmds == ["color #9/A #ffffff",
+                        "color #9/B #ffffff", "color #9/B:2 #ffd166"]
 
 
 class TestStage4aStability:

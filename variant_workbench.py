@@ -31,10 +31,12 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import all_modes, ddg_color, get_mode, plddt_color
+from color_modes import (all_modes, ddg_color, deviation_color, get_mode,
+                         plddt_color)
 from seq_library import build_numbering_header_content
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
+                           build_model_color_commands,
                            build_design_session, column_tracks,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
@@ -44,6 +46,8 @@ _COLS = 30                                  # residues per wrapped block
 _SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
 _RESULT_DDG_MODE = "result:ddg"             # S4a result-backed color mode (per-residue ddG)
 _RESULT_PLDDT_MODE = "result:plddt"         # S4b result-backed color mode (per-residue pLDDT)
+_RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα deviation
+_DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
 _FOLD_ENGINES = ("esmfold", "boltz")        # S4b engine picker order (Boltz lands its own stage)
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
@@ -107,6 +111,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
 
     cellClicked2 = QtCore.Signal(object, int, bool)   # (row_id, template col, ctrl-held)
     rowHeaderClicked = QtCore.Signal(object)          # row_id (variant header click → detail)
+    cellMenuRequested = QtCore.Signal(object, int, object)  # (row_id, col, global QPoint)
 
     def __init__(self, design: ChainDesign, suggestions: Optional[Dict[int, List[dict]]] = None):
         super().__init__()
@@ -176,6 +181,9 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             block.resizeColumnsToContents()
             block.resizeRowsToContents()
             block.cellClicked.connect(self._on_cell)
+            block.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            block.customContextMenuRequested.connect(
+                lambda pos, b=block: self._on_context_menu(b, pos))
             block.verticalHeader().sectionClicked.connect(
                 lambda section, b=block: self._on_header(b, section))
             self._blocks.append(block)
@@ -359,6 +367,18 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             ctrl = bool(mods & (QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier))
             self.cellClicked2.emit(it.data(_ROW_ROLE), int(gcol), ctrl)
 
+    def _on_context_menu(self, block, pos) -> None:
+        """Right-click on a cell → ask the panel for the substitute/delete menu. Only the
+        cell identity + a global screen position travel up; the panel owns the actions."""
+        it = block.itemAt(pos)
+        if it is None:
+            return
+        gcol = it.data(_RESNUM_ROLE)
+        row_id = it.data(_ROW_ROLE)
+        if gcol is None or row_id in (None, "T", _SUGGEST_ROW):
+            return                                  # only editable VARIANT residues get a menu
+        self.cellMenuRequested.emit(row_id, int(gcol), block.viewport().mapToGlobal(pos))
+
 
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 
@@ -463,6 +483,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._fold_vis_btn.setCheckable(True)
         self._fold_vis_btn.toggled.connect(self._on_fold_visibility_toggled)
         bar.addWidget(self._fold_vis_btn)
+        # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
+        # WT reference fold (same engine+target). Establishes the WT reference + noise floor
+        # on first use for that combo (folds T; Boltz also folds the cross-seed floor set).
+        self._dev_btn = QtWidgets.QPushButton("Deviation vs WT")
+        self._dev_btn.setToolTip("Per-residue Cα deviation of the ACTIVE folded variant vs a "
+                                 "seed-pinned WT reference fold (same engine). Floor-gated: "
+                                 "residues within the noise floor stay neutral. First use for "
+                                 "an engine folds the WT reference + its noise floor (cached).")
+        self._dev_btn.clicked.connect(self._on_deviation_clicked)
+        bar.addWidget(self._dev_btn)
         bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
@@ -470,6 +500,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._mode_combo.addItem(m.label, m.key)
         self._mode_combo.addItem("ddG (result)", _RESULT_DDG_MODE)   # S4a result-backed mode
         self._mode_combo.addItem("pLDDT (result)", _RESULT_PLDDT_MODE)  # S4b fold confidence
+        self._mode_combo.addItem("Deviation vs WT", _RESULT_DEVIATION_MODE)  # S4c floor-gated dev
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
         bar.addStretch(1)
@@ -510,6 +541,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.badges = {v.id: self._badge_for(v) for v in cd.variants if self._badge_for(v)}
             tab.cellClicked2.connect(
                 lambda rid, col, ctrl, t=tab: self._on_cell(t, rid, col, to_scan=ctrl))
+            tab.cellMenuRequested.connect(
+                lambda rid, col, gp, t=tab: self._show_cell_menu(t, rid, col, gp))
             tab.rowHeaderClicked.connect(lambda rid, t=tab: self._on_result_detail(t, rid))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
@@ -544,21 +577,59 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText("Select a residue in a VARIANT row first (T is the immutable template).")
             return
         vid, col = self._edit_target
-        aa = self._aa_combo.currentText()
-        try:
-            tab.design.edit_variant(vid, col, aa)
-        except Exception as exc:
-            self._status.setText(f"Substitution failed: {type(exc).__name__}: {exc}")
-            return
+        self._do_substitute(tab, vid, col, self._aa_combo.currentText())
+
+    def _after_variant_edit(self, tab: _ChainDesignTab, vid: str, msg: str) -> None:
+        """Shared post-edit refresh for substitute/delete/restore: re-lay the grid, keep the
+        edited variant active, re-apply panel + 3D colouring, persist, and report. ONE path
+        so the toolbar Apply, the cell context menu, and accept-suggestion stay in sync."""
         tab.rebuild()
         tab.set_active_row(vid)
         self._apply_color_to(tab)
         if tab.active_row_id == vid:
             self._push_3d_color(tab)           # active variant edited → recolor 3D (all copies)
         self._persist()
+        self._status.setText(msg)
+
+    def _do_substitute(self, tab: _ChainDesignTab, vid: str, col: int, aa: str) -> None:
+        try:
+            tab.design.edit_variant(vid, col, aa)
+        except Exception as exc:
+            self._status.setText(f"Substitution failed: {type(exc).__name__}: {exc}")
+            return
         resnum = tab.design.resnum_for_col(col)
-        self._status.setText(f"{vid}: residue {resnum} → {aa}. "
-                             f"3D recolored by {vid} (preview on the shared backbone).")
+        self._after_variant_edit(
+            tab, vid, f"{vid}: residue {resnum} → {aa}. "
+                      f"3D recolored by {vid} (preview on the shared backbone).")
+
+    def _show_cell_menu(self, tab: _ChainDesignTab, vid: str, col: int, global_pos) -> None:
+        """Right-click cell menu for a VARIANT residue: substitute (any of the 20 aa) or
+        revert to the WT residue. The SAME `edit_variant` substitution as the toolbar Apply —
+        just reachable directly on the residue. (Deletion/indels are a later increment: they
+        shift residue numbering, which the resnum-keyed S4c deviation can't absorb yet.)"""
+        v = tab.design.get_variant(vid)
+        if v is None or not (0 <= col < len(tab.design.template_cells)):
+            return
+        tab.set_active_row(vid)
+        self._edit_target = (vid, col)
+        resnum = tab.design.resnum_for_col(col)
+        wt = tab.design.template_cells[col].aa
+        cur = v.cells[col].aa if col < len(v.cells) else None
+
+        menu = QtWidgets.QMenu(self)
+        header = menu.addAction(f"{vid} · residue {resnum} (WT {wt}, now {cur})")
+        header.setEnabled(False)
+        menu.addSeparator()
+        sub = menu.addMenu("Substitute →")
+        for aa in _AA_ORDER:
+            act = sub.addAction(f"{aa}  (WT)" if aa == wt else aa)
+            if aa == cur:
+                act.setCheckable(True); act.setChecked(True)
+            act.triggered.connect(lambda _checked=False, a=aa: self._do_substitute(tab, vid, col, a))
+        if wt is not None and cur != wt:
+            menu.addAction(f"Revert to WT ({wt})",
+                           lambda: self._do_substitute(tab, vid, col, wt))
+        menu.exec(global_pos)
 
     def _on_mode_changed(self) -> None:
         self._mode_key = self._mode_combo.currentData() or "none"
@@ -784,6 +855,44 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         return {int(rn): float(p) for rn, p in (v.results.fold.get("plddt") or {}).items()
                 if p is not None}
 
+    def _active_deviation(self, tab: _ChainDesignTab) -> Optional[Dict[str, Any]]:
+        """The active variant's stored deviation block (None if not folded/no deviation)."""
+        v = tab.design.get_variant(tab.active_row_id)
+        if v is None or not v.results.fold:
+            return None
+        return v.results.fold.get("deviation")
+
+    @staticmethod
+    def _dev_chain_keys(dev: Dict[str, float], multichain: bool, rep_chain: str) -> List[str]:
+        """Ordered deviation keys for the panel's UNIQUE chain: the rep chain's entries for
+        an assembly (multichain `"chain:resno"` keys), else all (single-chain `"resno"`)."""
+        if multichain:
+            keys = [k for k in dev if k.split(":", 1)[0] == rep_chain]
+            return sorted(keys, key=lambda k: int(k.split(":", 1)[1]))
+        return sorted(dev, key=lambda k: int(k))
+
+    def _deviation_panel_hex(self, tab: _ChainDesignTab) -> Dict[int, str]:
+        """{author_resnum: hex} for the active variant's floor-gated deviation, panel side.
+        The fold numbers residues 1..N over the ungapped sequence, so the rep chain's
+        deviation keys map POSITIONALLY onto the active row's ordered author resnums (the
+        same positional contract `fold_summary` uses for pLDDT). Floor-gated via
+        `deviation_color` (the ONE source shared with the 3D push)."""
+        block = self._active_deviation(tab)
+        if not block:
+            return {}
+        dev, floor = block.get("deviation") or {}, block.get("floor") or {}
+        keys = self._dev_chain_keys(dev, bool(block.get("multichain")), tab.design.rep_chain)
+        author = [c.resnum for c in tab.active_row_cells()
+                  if not c.is_gap and c.resnum is not None]
+        out: Dict[int, str] = {}
+        for i, k in enumerate(keys):
+            if i >= len(author):
+                break
+            hexc = deviation_color(dev[k], floor.get(k, _DEVIATION_FLOOR_MIN_A))
+            if hexc:
+                out[author[i]] = hexc
+        return out
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
         if self._mode_key == _RESULT_DDG_MODE:
             hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
@@ -791,6 +900,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         elif self._mode_key == _RESULT_PLDDT_MODE:
             hexmap = {rn: plddt_color(p) for rn, p in self._active_plddt_map(tab).items()}
             tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
+        elif self._mode_key == _RESULT_DEVIATION_MODE:
+            tab.set_result_coloring(tab.active_row_id, self._deviation_panel_hex(tab))
         else:
             tab.set_color_mode(get_mode(self._mode_key))
 
@@ -1206,6 +1317,101 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         else:
             self._status.setText(f"{v.id} folded — model #{f.get('model_id')}.")
 
+    # ── Stage 4c: per-residue variant-vs-WT deviation + noise floor ──────────────────
+    def deviation_launch_spec(self) -> Optional[dict]:
+        """Deterministic spec to compute the ACTIVE folded variant's per-residue Cα
+        deviation vs a seed-pinned WT reference fold of the SAME engine+target. Reuses the
+        cached `cd.wt_refs[combo]` when present (cheap, confirm-gate skipped); otherwise the
+        router folds the WT reference + cross-seed floor (confidence='low' → the gate, since
+        that is N folds). None when the active row isn't a folded variant."""
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None or self._design is None:
+            return None
+        fold = v.results.fold
+        if not fold or not fold.get("model_id"):
+            return None
+        cd = tab.design
+        engine = fold.get("engine", "esmfold")
+        target = fold.get("target", "monomer")
+        multichain = (target == "assembly")
+        combo = f"{engine}:{target}"
+        t_seq = "".join(c.aa for c in cd.template_cells if c.aa is not None)
+        if multichain:
+            wt_chains = [{"id": c, "sequence": t_seq} for (_m, c) in cd.members]
+            variant_chain = cd.rep_chain
+        else:
+            variant_chain = "A" if engine == "esmfold" else cd.rep_chain
+            wt_chains = [{"id": variant_chain, "sequence": t_seq}]
+        ti: Dict[str, object] = {
+            "variant_model_id": fold["model_id"],
+            "engine":           engine,
+            "target":           target,
+            "multichain":       multichain,
+            "variant_chain":    variant_chain,
+            "wt_chains":        wt_chains,
+            "compare_to":       self._design.model_id,   # reference matchmaker onto crystal WT
+            "model_id":         self._design.model_id,
+            "wt_ref":           cd.wt_refs.get(combo),    # cached reference (skip folding) or None
+            "local_only":       True,
+        }
+        have_ref = bool(cd.wt_refs.get(combo))
+        return {
+            "tool":        "variant_deviation",
+            "tool_inputs": ti,
+            "user_input":  f"[Workbench] deviation {v.id} vs WT — {combo}, LOCAL-ONLY",
+            "confidence":  "high" if have_ref else "low",   # folding the WT reference → gate
+            "refresh":     "deviation",
+            "_variant_id": v.id,
+        }
+
+    def _on_deviation_clicked(self) -> None:
+        tab = self._cur_tab()
+        v = self._active_variant(tab)
+        if v is None:
+            self._status.setText("Select a VARIANT row first (T is the template baseline).")
+            return
+        if not (v.results.fold and v.results.fold.get("model_id")):
+            self._status.setText(f"Fold {v.id} first — deviation compares FOLDED models.")
+            return
+        spec = self.deviation_launch_spec()
+        if spec is not None:
+            self.launchRequested.emit(spec)
+
+    @staticmethod
+    def _deviation_from_result(result: dict) -> dict:
+        """The variant_deviation step data from the executed pipeline result."""
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "variant_deviation":
+                return step.get("data") or {}
+        return {}
+
+    def apply_deviation_result(self, variant_id: str, result: dict) -> None:
+        """Consume the executed deviation result: store the deviation block on the variant's
+        fold slot, cache the WT reference on the design (keyed by engine:target so each combo
+        reuses its own same-engine reference), persist, and re-render (the deviation color
+        mode maps it). UI thread."""
+        cd_v = self._find_variant(variant_id)
+        if cd_v is None:
+            return
+        cd, v = cd_v
+        data = self._deviation_from_result(result)
+        if not data or v.results.fold is None:
+            self._status.setText(f"{variant_id}: deviation produced no result.")
+            return
+        v.results.fold["deviation"] = data
+        wt_ref = data.get("wt_ref")
+        if wt_ref:
+            cd.wt_refs[f"{data.get('engine')}:{data.get('target')}"] = wt_ref
+        self._persist()
+        self._rerender_results(cd, v)
+        ar = data.get("anchor_residual_rmsd")
+        self._status.setText(
+            f"{v.id} deviation vs WT ({data.get('engine')}:{data.get('target')}): "
+            f"{data.get('n_cleared_floor')}/{data.get('n_residues')} residues clear the "
+            f"noise floor; max {data.get('max_deviation')} Å, anchor residual "
+            f"{ar if ar is not None else '?'} Å. Pick 'Deviation vs WT' color mode.")
+
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
     def _fold_models(self, design) -> Dict[str, str]:
         """{variant_id: predicted model_id} for variants in *design* that have a fold."""
@@ -1331,6 +1537,32 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             mid = fold["model_id"]
             return [f"show #{mid} models",
                     f"color byattribute bfactor #{mid} palette alphafold"]
+        if self._mode_key == _RESULT_DEVIATION_MODE:
+            # Deviation lives on the PREDICTED variant model's real atoms (like pLDDT),
+            # NOT the shared crystal backbone — colour #mid per chain in its OWN numbering,
+            # floor-gated via the SAME `deviation_color` the panel uses (panel↔3D sync).
+            block = self._active_deviation(tab)
+            if not block or not block.get("variant_model_id"):
+                return []
+            dev, floor = block.get("deviation") or {}, block.get("floor") or {}
+            mid = block["variant_model_id"]
+            multichain = bool(block.get("multichain"))
+            per_chain: Dict[str, List[int]] = {}
+            if multichain:
+                for k in dev:
+                    ch, rn = k.split(":", 1)
+                    per_chain.setdefault(ch, []).append(int(rn))
+            else:
+                ch = block.get("variant_chain", "A")
+                per_chain[ch] = [int(k) for k in dev]
+            for c in per_chain:
+                per_chain[c].sort()
+
+            def _val(chain: str, rn: int) -> Optional[str]:
+                k = f"{chain}:{rn}" if multichain else str(rn)
+                return deviation_color(dev.get(k), floor.get(k, _DEVIATION_FLOOR_MIN_A))
+
+            return [f"show #{mid} models"] + build_model_color_commands(mid, per_chain, _val)
         mode = get_mode(self._mode_key)
         if mode.fn is None:
             return []
