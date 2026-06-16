@@ -4454,8 +4454,8 @@ class ToolRouter:
         exps.append("Colour by pLDDT using the native AlphaFold palette (blue=confident)")
         cmds.append(f"cartoon #{new_id}")
         exps.append("Cartoon representation for the predicted model")
-        cmds.append(f"sequence chain #{new_id}")
-        exps.append("Open the Sequence Viewer for the predicted chain(s)")
+        # ChimeraX is structure-only — no Sequence Viewer (sequence lives in the
+        # StructureBot window). Removed 2026-06-16.
 
         # ── Optional structural comparison (matchmaker RMSD) ────────────────────────
         ref_spec = self._resolve_colabfold_compare_to(inputs, exclude_model=new_id)
@@ -6154,10 +6154,11 @@ class ToolRouter:
             cmds.append(open_cmd)
             design_spec = self._parse_model_spec(r, design_guess)
             if design_spec:
-                for c in (f"color byattribute bfactor {design_spec} palette alphafold",
-                          f"sequence chain {design_spec}"):
-                    self.bridge.run_command(c)
-                    cmds.append(c)
+                # Structure-only: pLDDT colour the model, but NO Sequence Viewer
+                # (sequence lives in the StructureBot window). Removed 2026-06-16.
+                c = f"color byattribute bfactor {design_spec} palette alphafold"
+                self.bridge.run_command(c)
+                cmds.append(c)
 
             # Resolve the reference spec AND a LOCAL reference PDB path (the
             # latter for the offline per-residue Cα Kabsch).
@@ -6729,24 +6730,59 @@ class ToolRouter:
         chain:    Optional[str] = None,
     ) -> Optional[str]:
         """
-        Ask ChimeraX for the sequence of a model/chain.
-        Note: 'sequence chain' outputs to the GUI log, not always the REST response.
-        This is a best-effort fallback.
+        Best-effort last-resort: read a model/chain's sequence from ChimeraX via a
+        RUNSCRIPT over the residues' one-letter codes — NOT the `sequence chain`
+        command, which would pop the Sequence Viewer (StructureBot keeps ChimeraX
+        structure-only; sequence viewing lives in the StructureBot window). Returns
+        the standard-AA sequence, or None.
         """
         if not self.bridge.is_running():
             return None
-        spec = f"#{model_id}/{chain}" if chain else f"#{model_id}"
-        result = self.bridge.run_command(f"sequence chain {spec}")
-        if result.get("error") or not result.get("value"):
+        import tempfile as _tf
+        import os as _os
+        try:
+            script = (
+                "from chimerax.atomic import AtomicStructure\n"
+                f"_mid = {str(model_id)!r}\n"
+                f"_chain = {(chain or '')!r}\n"
+                "_models = {m.id_string: m for m in session.models "
+                "if isinstance(m, AtomicStructure)}\n"
+                "_m = _models.get(_mid)\n"
+                "_seq = []\n"
+                "if _m:\n"
+                "    for _ch in _m.chains:\n"
+                "        if _chain and _ch.chain_id != _chain:\n"
+                "            continue\n"
+                "        for _r in _ch.residues:\n"
+                "            if _r is None:\n"
+                "                continue\n"
+                "            _olc = getattr(_r, 'one_letter_code', None)\n"
+                "            if _olc:\n"
+                "                _seq.append(_olc)\n"
+                "print('SEQ:' + ''.join(_seq))\n"
+            )
+            with _tf.NamedTemporaryFile(mode="w", suffix=".py", delete=False,
+                                        encoding="utf-8") as sf:
+                sf.write(script)
+                script_path = sf.name
+            try:
+                result = self.bridge.run_command(f'runscript "{script_path}"')
+            finally:
+                try:
+                    _os.unlink(script_path)
+                except Exception:
+                    pass
+        except Exception:
             return None
-        text = result["value"]
-        # Strip header line(s), join remaining text, keep only AA letters
-        lines = text.strip().splitlines()
-        seq_parts = []
-        for line in lines:
-            part = line.split(":", 1)[-1].strip()
-            seq_parts.append(part)
-        seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", "".join(seq_parts).upper())
+        value = (result or {}).get("value") if isinstance(result, dict) else None
+        if (result or {}).get("error") or not isinstance(value, str):
+            return None
+        raw = ""
+        for line in value.splitlines():
+            if line.strip().startswith("SEQ:"):
+                raw = line.split("SEQ:", 1)[1].strip()
+                break
+        seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", raw.upper())
         return seq if len(seq) >= 5 else None
 
     # ── Active-site command handler ────────────────────────────────────────────

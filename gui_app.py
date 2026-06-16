@@ -737,6 +737,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             p.success(f"✓ Ping OK ({ping['latency_ms']} ms) — {ver}")
         else:
             p.warn(f"⚠ Ping failed: {ping['result'].get('error')}")
+        # Structure-only window: hide Log/Models/CLI/Toolbar NOW (at startup), not just
+        # on first open — so the clean structure view is up before any model loads.
+        # Once-per-session guarded; the first-open call remains a no-op fallback.
+        self.bridge._maybe_apply_lean_layout()
 
     # Blackwell-safe Ollama floor: builds below this lack the sm_120 GPU fix and run on
     # CPU silently (the 0.24.0 bug). Warn if the installed binary is older.

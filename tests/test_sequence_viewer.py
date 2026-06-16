@@ -1,38 +1,28 @@
 """
 tests/test_sequence_viewer.py
 -----------------------------
-Tests for the Sequence-Viewer integration layer (sequence_viewer.py) and the
-CamSol SCF mirror. No live ChimeraX — pure file/command construction.
-
-A. build_scf_file        -- format, RGB clamping, resnum→0-based (incl non-1
-                            start + gaps), seq_index, skip-unknown-resnum
-B. build_scf_runscript   -- writes a runscript loader, returns `runscript "<py>"`
-C. Part A helpers        -- ensure_sequence_viewer_commands / mouse-mode toggle
-D. CamSol integration    -- analyze() appends sequence-viewer cmds + writes .scf
-
-Usage:
-  python -m pytest tests/test_sequence_viewer.py -v
+After the 2026-06-16 STRUCTURE-ONLY change, sequence_viewer.py holds only the pure
+ruler-content builder + the ChimeraX window layout/presentation helpers (the
+ChimeraX-side Sequence-Viewer machinery — SCF mirror, ensure/dock/consolidate/
+numbering-runscript/left-click/disentangle — was removed; sequence viewing lives in
+the StructureBot window). These tests cover what remains, plus the structure-only
+invariants: opening a model emits NO `sequence chain` command, and the lean layout
+hides the Models panel.
 """
+from __future__ import annotations
 
+import re
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sequence_viewer import (
-    build_scf_file,
-    build_scf_runscript,
-    ensure_sequence_viewer_commands,
-    dock_sequences_bottom_command,
     build_numbering_header_content,
-    numbering_header_command,
-    left_click_select_command,
     lean_layout_commands,
     default_presentation_commands,
     apply_lean_layout,
     apply_default_presentation,
-    _clamp8,
 )
 
 PASS = "[PASS]"
@@ -58,245 +48,78 @@ def _assert(cond: bool, name: str, msg: str = "") -> bool:
     return False
 
 
-def _parse_scf(path: Path):
-    """Return [(pos, seq_index, r, g, b, name), ...] from an .scf file."""
-    rows = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        body, _, comment = line.partition("//")
-        p = body.split()
-        rows.append((int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]),
-                     comment.strip()))
-    return rows
-
-
-# -- A. build_scf_file ---------------------------------------------------------
-
-def test_scf_basic_format_and_positions() -> None:
-    print("\n=== A. build_scf_file ===")
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "x.scf"
-        # chain starts at residue 1, contiguous
-        posix = build_scf_file(
-            {1: (255, 0, 0), 3: (0, 0, 255)}, [1, 2, 3, 4], out,
-            seq_index=0, region_name="agg")
-        _assert(posix.endswith("x.scf") and "/" in posix and "\\" not in posix,
-                "returns forward-slash posix path", f"got {posix!r}")
-        rows = _parse_scf(out)
-    # resnum 1 -> pos 0, resnum 3 -> pos 2; sorted by resnum
-    _assert(rows[0] == (0, 0, 255, 0, 0, "agg"), "resnum 1 -> col 0, red",
-            f"got {rows[0]}")
-    _assert(rows[1] == (2, 0, 0, 0, 255, "agg"), "resnum 3 -> col 2, blue",
-            f"got {rows[1]}")
-
-
-def test_scf_non_one_start_and_gaps() -> None:
-    """A chain numbered 2..72 (like 1IL8 A): resnum→0-based is the index in the
-    ordered residue list, not resnum-1."""
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "g.scf"
-        # ordered residues 2,3,4,7 (a gap before 7)
-        build_scf_file({2: (1, 2, 3), 7: (4, 5, 6)}, [2, 3, 4, 7], out)
-        rows = _parse_scf(out)
-    _assert(rows[0][0] == 0, "resnum 2 (first) -> col 0", f"got {rows[0][0]}")
-    _assert(rows[1][0] == 3, "resnum 7 (4th, after gap) -> col 3",
-            f"got {rows[1][0]}")
-
-
-def test_scf_rgb_clamping() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "c.scf"
-        build_scf_file({5: (300, -5, 128.7)}, [5], out)
-        rows = _parse_scf(out)
-    _assert(rows[0][2:5] == (255, 0, 129), "RGB clamped to 0-255 (rounded)",
-            f"got {rows[0][2:5]}")
-    _assert(_clamp8(256) == 255 and _clamp8(-1) == 0 and _clamp8(12.5) == 12,
-            "_clamp8 clamps + rounds")
-
-
-def test_scf_seq_index_and_skip_unknown() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "s.scf"
-        # resnum 99 is NOT in ordered_resnums → skipped
-        build_scf_file({1: (10, 20, 30), 99: (0, 0, 0)}, [1, 2], out, seq_index=2)
-        rows = _parse_scf(out)
-    _assert(len(rows) == 1, "residue absent from chain order is skipped",
-            f"got {len(rows)} rows")
-    _assert(rows[0][1] == 2, "seq_index written in column 2", f"got {rows[0][1]}")
-
-
-def test_scf_empty_when_no_colors() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "e.scf"
-        build_scf_file({}, [1, 2, 3], out)
-        _assert(out.read_text() == "", "empty residue_colors -> empty file")
-
-
-# -- B. build_scf_runscript ----------------------------------------------------
-
-def test_scf_runscript_writes_loader_and_command() -> None:
-    print("\n=== B. build_scf_runscript ===")
-    with tempfile.TemporaryDirectory() as td:
-        scf_posix = (Path(td) / "x.scf").as_posix()
-        py = Path(td) / "x.scf.py"
-        cmd = build_scf_runscript(scf_posix, py)
-        _assert(cmd == f'runscript "{py.as_posix()}"',
-                "returns runscript command with posix path", f"got {cmd!r}")
-        body = py.read_text(encoding="utf-8")
-        _assert(scf_posix in body, "loader embeds the .scf path")
-        _assert("new_region" in body and "SequenceViewer" in body,
-                "loader drives new_region on the SequenceViewer")
-        _assert("__SCF_PATH__" not in body, "template placeholder fully substituted")
-
-
-# -- C. Part A helpers ---------------------------------------------------------
-
-def test_ensure_viewer_commands() -> None:
-    print("\n=== C. Part A helpers ===")
-    _assert(ensure_sequence_viewer_commands("1", ["A", "B"]) ==
-            ["sequence chain #1/A", "sequence chain #1/B"],
-            "per-chain sequence chain commands")
-    _assert(ensure_sequence_viewer_commands("2", None) == ["sequence chain #2"],
-            "no chains -> whole-model sequence chain")
-
-
-def test_dock_sequences_bottom_command(tmp_path) -> None:
-    out = tmp_path / "dock.py"
-    cmd = dock_sequences_bottom_command(out)
-    _assert(cmd == f'runscript "{out.as_posix()}"', "returns runscript command")
-    _assert(out.exists(), "loader written")
-    body = out.read_text(encoding="utf-8")
-    _assert("BottomDockWidgetArea" in body, "loader docks to the BOTTOM area")
-    _assert("splitDockWidget" in body and "Vertical" in body,
-            "loader stacks viewers vertically")
-    _assert("SequenceViewer" in body, "loader targets Sequence Viewers")
-
-
 def _ruler_labels(content):
-    import re
     return [int(x) for x in re.findall(r"\d+", content)]
 
 
+# -- residue-number ruler (shared with the StructureBot panel via seq_library) ---
+
 def test_numbering_labels_are_actual_resnums_via_seqpos() -> None:
-    print("\n=== C2. residue-number ruler ===")
+    print("\n=== residue-number ruler ===")
     from proteinmpnn_bridge import chain_resnum_to_seqpos
-    # a non-1-start chain (2..50) → 2,12,22… by interval 10, NOT 1,11,21
-    resnums = list(range(2, 51))
+    resnums = list(range(2, 51))                     # non-1-start chain → 2,12,22…
     content = build_numbering_header_content(resnums, 10)
     _assert(_ruler_labels(content)[:3] == [2, 12, 22],
             "non-1-start chain labelled with ACTUAL resnums (2,12,22 not 1,11,21)",
             f"got {_ruler_labels(content)}")
     _assert(len(content) == len(resnums), "one column per residue")
-    # placement is via chain_resnum_to_seqpos: each label's UNITS digit sits at its
-    # canonical column → consistent with the MPNN alignment numbering
     pos1 = chain_resnum_to_seqpos(resnums)
     for r in (2, 12, 22, 42):
         col = pos1[r] - 1
         _assert(content[col] == str(r)[-1],
-                f"resnum {r} units digit at MPNN column {col}", f"content={content!r}")
+                f"resnum {r} units digit at column {col}", f"content={content!r}")
 
 
 def test_numbering_interval_and_first_last() -> None:
-    # interval 5 honored; a 1-start chain (1..25) → 1,6,11,16,21 + last (25)
     c5 = build_numbering_header_content(list(range(1, 26)), 5)
     _assert(_ruler_labels(c5) == [1, 6, 11, 16, 21, 25], "interval=5 respected + last",
             f"got {_ruler_labels(c5)}")
-    # interval 10 over 1..28 → first (1) AND last (28) both labelled (no merge)
     c10 = build_numbering_header_content(list(range(1, 29)), 10)
     labs = _ruler_labels(c10)
     _assert(labs[0] == 1 and labs[-1] == 28, "first and last residue both labelled", f"got {labs}")
-    # a last residue that would MERGE into the previous label is dropped (no "2123")
     cmerge = build_numbering_header_content(list(range(1, 24)), 10)
     _assert(2123 not in _ruler_labels(cmerge), "last label dropped when it would merge",
             f"got {_ruler_labels(cmerge)}")
-    # gap-aware: 1..50 then 60..70 → shows 60 (the real resnum), never 51
     cg = build_numbering_header_content(list(range(1, 51)) + list(range(60, 71)), 10)
     _assert(60 in _ruler_labels(cg) and 51 not in _ruler_labels(cg),
             "gap-aware (real resnum 60, not naive 51)", f"got {_ruler_labels(cg)}")
     _assert(build_numbering_header_content([], 10) == "", "empty chain -> empty ruler")
 
 
-def test_numbering_header_command_is_well_formed(tmp_path) -> None:
-    out = tmp_path / "num.py"
-    cmd = numbering_header_command("1", "A", list(range(2, 51)), 10, out_py_path=out)
-    _assert(cmd == f'runscript "{out.as_posix()}"', "returns runscript command")
-    body = out.read_text(encoding="utf-8")
-    _assert('"1/A"' in body, "loader targets the chain A viewer (ident 1/A)")
-    _assert("add_fixed_header" in body, "loader adds a fixed header (Route 2)")
-    _assert('"Numbering"' in body, "header is named 'Numbering'")
-    _assert(numbering_header_command("1", "A", [], 10, out_py_path=tmp_path / "x.py") == "",
-            "no resnums -> no command")
-
-
-def test_left_click_toggle() -> None:
-    _assert(left_click_select_command(True) == "mousemode left select",
-            "enable -> mousemode left select")
-    _assert(left_click_select_command(False) == "mousemode left rotate",
-            "disable -> mousemode left rotate (default)")
-
-
-# -- D. CamSol integration -----------------------------------------------------
-
-def test_camsol_emits_sequence_viewer_viz(monkeypatch) -> None:
-    print("\n=== D. CamSol integration ===")
-    import config as _cfg
-    import camsol_bridge as _cb
-    with tempfile.TemporaryDirectory() as td:
-        monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", Path(td))
-        # A sequence with a clearly aggregation-prone hydrophobic stretch.
-        seq = "DDDDDIIIIIWWWWWLLLLLKKKKK"
-        res = _cb.CamsolBridge().analyze(seq, model_id="1", chain="A")
-        cmds = res.viz_commands
-        # structure colours still present
-        assert any(c.startswith("color #1") for c in cmds), "structure colours kept"
-        # sequence-viewer mirror appended
-        _assert(any(c.startswith("sequence chain #1/A") for c in cmds),
-                "appends `sequence chain #1/A`", f"got {cmds}")
-        runs = [c for c in cmds if c.startswith("runscript ")]
-        _assert(len(runs) == 1, "appends one runscript SCF loader", f"got {runs}")
-        scfs = list(Path(td).glob("*.scf"))
-        _assert(len(scfs) == 1 and scfs[0].read_text().strip() != "",
-                "wrote a non-empty .scf", f"got {scfs}")
-
-
-# -- E. Lean layout + default presentation -------------------------------------
-
-class _RecordingRunner:
-    """Records commands; optionally fails (raise or error-dict) on one command."""
-    def __init__(self, fail_on=None, mode="raise"):
-        self.calls = []
-        self.fail_on = fail_on
-        self.mode = mode
-
-    def __call__(self, cmd, timeout=30):
-        self.calls.append(cmd)
-        if cmd == self.fail_on:
-            if self.mode == "raise":
-                raise RuntimeError("boom")
-            return {"value": None, "error": "nope"}
-        return {"value": "", "error": None}
-
+# -- layout + presentation command lists -----------------------------------------
 
 def test_layout_and_presentation_command_lists() -> None:
-    print("\n=== E. layout + presentation ===")
+    print("\n=== layout + presentation ===")
     import config as _cfg
     _assert(lean_layout_commands() == list(_cfg.CHIMERAX_LEAN_LAYOUT_COMMANDS),
             "lean_layout_commands == config list, in order")
     _assert(default_presentation_commands() == list(_cfg.CHIMERAX_DEFAULT_PRESENTATION_COMMANDS),
             "default_presentation_commands == config list, in order")
     _assert(lean_layout_commands()[0] == "tool hide Log", "layout starts with tool hide Log")
+    _assert('tool hide "Model Panel"' in lean_layout_commands(),
+            "lean layout hides the Models panel (structure-only)")
     _assert(default_presentation_commands()[-1] == "view",
-            "presentation ends with view")
+            "presentation ends with 'view'")
+
+
+class _Rec:
+    def __init__(self, fail_on=None):
+        self.calls = []
+        self.fail_on = fail_on
+    def __call__(self, c, timeout=30):
+        self.calls.append(c)
+        if self.fail_on and self.fail_on in c:
+            return {"value": None, "error": "boom"}
+        return {"value": "ok", "error": None}
 
 
 def test_apply_runs_all_in_order() -> None:
-    r = _RecordingRunner()
-    attempted, failed = apply_default_presentation(r)
+    r = _Rec()
+    _, failed = apply_default_presentation(r)
     _assert(r.calls == default_presentation_commands() and failed == [],
             "apply_default_presentation runs every command in order, no failures",
-            f"got {r.calls}")
-    r2 = _RecordingRunner()
+            f"calls={r.calls}")
+    r2 = _Rec()
     apply_lean_layout(r2)
     _assert(r2.calls == lean_layout_commands(), "apply_lean_layout runs layout in order")
 
@@ -305,37 +128,31 @@ def test_disable_override_paths() -> None:
     _assert(lean_layout_commands(enabled=False) == [], "layout disabled -> []")
     _assert(default_presentation_commands(enabled=False) == [],
             "presentation disabled -> []")
-    r = _RecordingRunner()
+    r = _Rec()
     apply_default_presentation(r, enabled=False)
     apply_lean_layout(r, enabled=False)
-    _assert(r.calls == [], "apply_* with enabled=False run nothing")
+    _assert(r.calls == [], "disabled apply_* issue no commands")
 
 
 def test_failing_command_does_not_abort() -> None:
-    # A raising command in the middle must NOT stop the rest.
-    r = _RecordingRunner(fail_on="color bychain", mode="raise")
+    r = _Rec(fail_on="set bgColor black")
     attempted, failed = apply_default_presentation(r)
     _assert(attempted == default_presentation_commands(),
-            "all presentation commands attempted despite a mid-list failure",
-            f"got {attempted}")
-    _assert(failed == ["color bychain"], "the failing command is recorded",
+            "every command still attempted after a failure (error-first)")
+    _assert(failed == ["set bgColor black"], "the failing command is recorded",
             f"got {failed}")
-    _assert("view" in r.calls, "commands AFTER the failure still ran")
-    # An error-dict (not a raise) is also treated as a failure, not a stop.
-    r2 = _RecordingRunner(fail_on="set bgColor black", mode="error")
-    _, failed2 = apply_default_presentation(r2)
-    _assert(failed2 == ["set bgColor black"] and r2.calls == default_presentation_commands(),
-            "error-dict failure recorded, rest still run")
 
+
+# -- bridge: structure-only open path + layout/presentation hooks -----------------
 
 def test_bridge_lean_layout_once_per_session(monkeypatch) -> None:
+    print("\n=== bridge hooks ===")
     from chimerax_bridge import ChimeraXBridge
     b = ChimeraXBridge(chimerax_path="X", port=60001)
     calls = []
     monkeypatch.setattr(b, "run_command",
                         lambda c, timeout=30: (calls.append(c),
                                                {"value": "Opened #1", "error": None})[1])
-    # Two opens in one session → layout applied exactly once.
     b.run_commands(["open 1hsg"])
     b.run_commands(["open 2lyz"])
     n_layout = sum(calls.count(c) for c in lean_layout_commands())
@@ -353,14 +170,13 @@ def test_bridge_presentation_per_open(monkeypatch) -> None:
                                                {"value": "Opened #1", "error": None})[1])
     b.run_commands(["open 1hsg"])
     b.run_commands(["open 2lyz"])
-    # presentation (e.g. `cartoon`) runs once per open → twice
     _assert(calls.count("cartoon") == 2, "presentation applied per-open (twice)",
             f"got {calls.count('cartoon')}")
 
 
-def _seq_bridge(monkeypatch, chains_value):
-    """A bridge whose run_command records calls and answers `info chains` with
-    *chains_value* and opens with a #1 model."""
+def test_open_emits_no_sequence_viewer(monkeypatch) -> None:
+    """STRUCTURE-ONLY invariant: opening a model never issues a `sequence chain`
+    command (no ChimeraX Sequence Viewer)."""
     from chimerax_bridge import ChimeraXBridge
     b = ChimeraXBridge(chimerax_path="X", port=60001)
     calls = []
@@ -368,334 +184,40 @@ def _seq_bridge(monkeypatch, chains_value):
     def fake(c, timeout=30):
         calls.append(c)
         if c.startswith("info chains"):
-            return {"value": chains_value, "error": None}
+            return {"value": "chain id /A chain_id A\nchain id /B chain_id B", "error": None}
         return {"value": "Opened #1", "error": None}
 
     monkeypatch.setattr(b, "run_command", fake)
-    return b, calls
+    b.run_commands(["open 1hsg"])
+    _assert(not any(str(c).startswith("sequence chain") for c in calls),
+            "no `sequence chain` command on open (structure-only)", f"got {calls}")
+    _assert(not any("dock_sequences" in str(c) for c in calls),
+            "no sequence-viewer dock runscript on open")
 
 
 def test_model_chains_parses_info_chains(monkeypatch) -> None:
-    b, _ = _seq_bridge(monkeypatch, "chain id /A chain_id A\nchain id /B chain_id B")
+    from chimerax_bridge import ChimeraXBridge
+    b = ChimeraXBridge(chimerax_path="X", port=60001)
+    monkeypatch.setattr(b, "run_command",
+                        lambda c, timeout=30: {"value": "chain id /A chain_id A\n"
+                                                        "chain id /B chain_id B", "error": None})
     _assert(b._model_chains("1") == ["A", "B"], "parses chain ids from info chains")
 
 
-def test_bridge_per_chain_sequence_and_dock_on_open(monkeypatch) -> None:
-    b, calls = _seq_bridge(monkeypatch, "chain id /A chain_id A\nchain id /B chain_id B")
-    b.run_commands(["open 1hsg"])
-    _assert("sequence chain #1/A" in calls and "sequence chain #1/B" in calls,
-            "opens a viewer PER CHAIN", f"got {calls}")
-    _assert("sequence chain #1" not in calls, "no grouped whole-model viewer")
-    _assert(any(c.startswith("runscript ") for c in calls),
-            "re-docks to the bottom via runscript")
-
-
-def test_bridge_per_chain_cap_falls_back_to_grouped(monkeypatch) -> None:
-    # 10 chains > default cap (8) → single grouped viewer, not 10 panels.
-    many = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCDEFGHIJ")
-    b, calls = _seq_bridge(monkeypatch, many)
-    b.run_commands(["open big"])
-    _assert("sequence chain #1" in calls, "above the cap -> grouped viewer")
-    _assert("sequence chain #1/A" not in calls, "no per-chain panels above the cap")
-
-
-# -- numbering on the per-chain open path (bridge, mocked REST) -----------------
-
-def _info_res(chain, resnums):
-    return "\n".join(f"residue id /{chain}:{n} name ALA index {i}"
-                     for i, n in enumerate(resnums))
-
-
-def _seq_bridge_numbering(monkeypatch, residues_by_chain, *,
-                          numbering=True, interval=10, fail_substr=None):
-    """A bridge whose run_command answers info chains (A,B) + info residues per chain,
-    optionally raising for a command containing *fail_substr*. Numbering config is
-    set on the config module."""
+def test_bridge_model_chain_resnums_sorted_excludes_solvent(monkeypatch) -> None:
     from chimerax_bridge import ChimeraXBridge
-    import config as _cfg
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", numbering)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL", interval)
     b = ChimeraXBridge(chimerax_path="X", port=60001)
     calls = []
+    val = "residue id /A:5 name LEU\nresidue id /A:2 name GLN\nresidue id /A:9 name VAL"
 
     def fake(c, timeout=30):
         calls.append(c)
-        if fail_substr and fail_substr in c:
-            raise RuntimeError("boom")
-        if c.startswith("info chains"):
-            return {"value": "chain id /A chain_id A\nchain id /B chain_id B", "error": None}
-        if c.startswith("info residues"):
-            ch = "A" if "/A" in c else ("B" if "/B" in c else "?")
-            return {"value": residues_by_chain.get(ch, ""), "error": None}
-        return {"value": "Opened #1", "error": None}
+        return {"value": val, "error": None}
 
     monkeypatch.setattr(b, "run_command", fake)
-    return b, calls
-
-
-def test_bridge_model_chain_resnums_sorted_excludes_solvent(monkeypatch) -> None:
-    # unordered input → sorted ascending (sequence order); solvent excluded by the
-    # `& ~solvent & ~ligand & ~ions` scoping in the issued command.
-    val = "residue id /A:5 name LEU\nresidue id /A:2 name GLN\nresidue id /A:9 name VAL"
-    b, calls = _seq_bridge_numbering(monkeypatch, {"A": val})
     _assert(b._model_chain_resnums("1", "A") == [2, 5, 9], "resnums parsed + sorted ascending")
     _assert(any("~solvent" in c and "~ligand" in c for c in calls),
             "info residues scoped to the macromolecule (no solvent/ligand bleed)")
-
-
-def test_bridge_numbering_on_open(monkeypatch) -> None:
-    resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
-    b, calls = _seq_bridge_numbering(monkeypatch, resn, interval=10)
-    b.run_commands(["open 1hsg"])
-    _assert(any("numbering_1_A" in c for c in calls) and any("numbering_1_B" in c for c in calls),
-            "a per-chain numbering runscript is emitted for each chain", f"got {calls}")
-
-
-def test_bridge_numbering_toggle_off(monkeypatch) -> None:
-    resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
-    b, calls = _seq_bridge_numbering(monkeypatch, resn, numbering=False)
-    b.run_commands(["open 1hsg"])
-    _assert(not any("numbering_" in c for c in calls), "toggle OFF -> zero numbering commands")
-    _assert("sequence chain #1/A" in calls, "per-chain viewers still open")
-    _assert(any("dock_sequences_bottom" in c for c in calls), "dock hook still runs")
-
-
-def test_bridge_numbering_failure_does_not_abort_open(monkeypatch) -> None:
-    # the chain-A numbering runscript raises → recorded + skipped, chain B + dock run on
-    resn = {"A": _info_res("A", range(2, 31)), "B": _info_res("B", range(1, 21))}
-    b, calls = _seq_bridge_numbering(monkeypatch, resn, fail_substr="numbering_1_A")
-    b.run_commands(["open 1hsg"])    # must NOT raise
-    _assert(any("numbering_1_B" in c for c in calls),
-            "chain B numbering still ran after chain A failed (error-first)")
-    _assert(any("dock_sequences_bottom" in c for c in calls),
-            "dock hook still runs after a numbering failure (open completes)")
-
-
-# ── F. Consolidated sequence-viewer grouping (mocked — no live ChimeraX) ───────
-
-from sequence_viewer import (
-    consolidated_viewers_command,
-    disentangle_chain_command,
-    resolve_group_edit_target,
-)
-
-
-def _consolidation_bridge(monkeypatch, chain_str, *, threshold=3, cap=8,
-                           numbering=True, interval=10):
-    """Bridge whose run_command records calls and answers info chains with chain_str."""
-    from chimerax_bridge import ChimeraXBridge
-    import config as _cfg
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", threshold)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", cap)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", numbering)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL", interval)
-    b = ChimeraXBridge(chimerax_path="X", port=60001)
-    calls = []
-
-    def fake(c, timeout=30):
-        calls.append(c)
-        if c.startswith("info chains"):
-            return {"value": chain_str, "error": None}
-        return {"value": "Opened #1", "error": None}
-
-    monkeypatch.setattr(b, "run_command", fake)
-    return b, calls
-
-
-def test_threshold_1_2_chains_uses_per_chain(monkeypatch, tmp_path) -> None:
-    """1-2 chains (below default threshold=3): per-chain viewers unchanged."""
-    print("\n=== F. Consolidation ===")
-    two = "chain id /A chain_id A\nchain id /B chain_id B"
-    b, calls = _consolidation_bridge(monkeypatch, two, threshold=3)
-    b.run_commands(["open 1abc"])
-    _assert("sequence chain #1/A" in calls and "sequence chain #1/B" in calls,
-            "<=threshold: per-chain viewers for A and B", f"got {calls}")
-    _assert(not any("consolidate" in c for c in calls),
-            "<=threshold: no consolidation runscript")
-
-
-def test_threshold_4_chains_uses_consolidated(monkeypatch, tmp_path) -> None:
-    """4 chains > threshold=3: consolidated viewers command issued."""
-    four = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCD")
-    b, calls = _consolidation_bridge(monkeypatch, four, threshold=3)
-    import config as _cfg
-    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
-    b.run_commands(["open 2hhb"])
-    # A runscript command for consolidation is issued (not per-chain commands)
-    _assert(any("runscript" in c and "consolidat" in c.lower() for c in calls),
-            "4 chains: consolidated runscript issued", f"got {calls}")
-    _assert("sequence chain #1/A" not in calls,
-            "4 chains: no per-chain viewer for A (consolidated takes over)")
-
-
-def test_consolidated_command_writes_file(tmp_path) -> None:
-    """consolidated_viewers_command writes a runscript and returns runscript cmd."""
-    cmd = consolidated_viewers_command(threshold=3, cap=8, interval=10,
-                                       numbering=True,
-                                       out_py_path=tmp_path / "cv.py")
-    _assert(cmd == f'runscript "{(tmp_path / "cv.py").as_posix()}"',
-            "returns runscript command with posix path", f"got {cmd!r}")
-    body = (tmp_path / "cv.py").read_text(encoding="utf-8")
-    _assert("_THRESHOLD = 3" in body and "_CAP = 8" in body,
-            "threshold/cap substituted correctly")
-    _assert("_INTERVAL = 10" in body and "_NUMBERING = True" in body,
-            "interval/numbering substituted")
-    _assert("__THRESHOLD__" not in body, "no unfilled placeholders")
-
-
-def test_consolidation_runscript_has_grouping_logic(tmp_path) -> None:
-    """Runscript groups chains by (seq_hash, rns) — different numbering → different group."""
-    cmd = consolidated_viewers_command(threshold=3, cap=8, out_py_path=tmp_path / "cv.py")
-    body = (tmp_path / "cv.py").read_text(encoding="utf-8")
-    _assert("grp_" in body, "group ident prefix 'grp_' present")
-    _assert("new_alignment" in body, "creates ChimeraX alignment")
-    _assert("seq_hash" in body or "md5" in body.lower(), "groups by sequence hash")
-    _assert("rns" in body and "resnums" in body.lower() or "r.number" in body,
-            "groups by residue numbering too")
-    _assert("identify_as" in body, "passes ident to new_alignment")
-
-
-def test_consolidation_runscript_has_ruler_logic(tmp_path) -> None:
-    """Runscript includes the residue-number ruler algorithm (same as build_numbering_header_content)."""
-    body = consolidated_viewers_command(
-        interval=10, numbering=True,
-        out_py_path=tmp_path / "cv.py"
-    )
-    script = (tmp_path / "cv.py").read_text(encoding="utf-8")
-    _assert("add_fixed_header" in script,
-            "ruler added via add_fixed_header (same API as per-chain ruler)")
-    _assert("Numbering" in script, "ruler header named 'Numbering' (consistent with per-chain)")
-    _assert("label_idxs" in script, "interval label logic present")
-    _assert("ungapped" in script, "pads ruler to alignment length via ungapped()")
-
-
-def test_consolidation_numbering_off_omits_ruler(tmp_path) -> None:
-    """numbering=False → ruler logic not reached; add_fixed_header still appears but gated."""
-    script = consolidated_viewers_command(
-        numbering=False, out_py_path=tmp_path / "cv.py",
-    )
-    body = (tmp_path / "cv.py").read_text(encoding="utf-8")
-    _assert("_NUMBERING = False" in body, "numbering=False substituted")
-
-
-def test_addressability_invariant_disentangle_command() -> None:
-    """disentangle_chain_command returns the exact ChimeraX command that opens a
-    standalone viewer — unrelated to what group alignment exists."""
-    cmd = disentangle_chain_command("1", "A")
-    _assert(cmd == "sequence chain #1/A",
-            "disentangle -> 'sequence chain #1/A'", f"got {cmd!r}")
-    cmd2 = disentangle_chain_command("2", "C")
-    _assert(cmd2 == "sequence chain #2/C",
-            "disentangle chain C of model 2", f"got {cmd2!r}")
-
-
-def test_disentangle_via_bridge(monkeypatch, tmp_path) -> None:
-    """Explicit disentangle issues 'sequence chain #N/A' via the bridge (no new machinery
-    needed — existing sequence chain command covers it)."""
-    from chimerax_bridge import ChimeraXBridge
-    b = ChimeraXBridge(chimerax_path="X", port=60001)
-    calls = []
-    monkeypatch.setattr(b, "run_command",
-                        lambda c, timeout=30: (calls.append(c),
-                                               {"value": "ok", "error": None})[1])
-    b.run_command(disentangle_chain_command("1", "A"))
-    _assert("sequence chain #1/A" in calls,
-            "bridge issues 'sequence chain #1/A' for disentangle")
-
-
-def test_dynamic_regroup_reconsolidate(monkeypatch, tmp_path) -> None:
-    """After a sequence edit, reconsolidate() re-runs consolidated_viewers_command
-    so ChimeraX rebuilds group alignments reflecting the new grouping."""
-    import config as _cfg
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", 3)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8)
-    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
-    from chimerax_bridge import ChimeraXBridge
-    b = ChimeraXBridge(chimerax_path="X", port=60001)
-    calls = []
-    monkeypatch.setattr(b, "run_command",
-                        lambda c, timeout=30: (calls.append(c),
-                                               {"value": "ok", "error": None})[1])
-    # Simulate: sequence change happened → call reconsolidate()
-    b.reconsolidate()
-    # Must issue a consolidate runscript + dock-bottom
-    _assert(any("consolidat" in c.lower() for c in calls),
-            "reconsolidate() issues consolidated_viewers_command", f"got {calls}")
-    _assert(any("dock_sequences_bottom" in c for c in calls),
-            "reconsolidate() re-docks viewers after regroup")
-
-
-def test_edit_disambiguation_no_chain_specified() -> None:
-    """resolve_group_edit_target: multiple chains, no chain specified → disambiguation."""
-    chains, msg = resolve_group_edit_target(["A", "C"], requested_chain=None)
-    _assert(chains is None,
-            "multi-chain group + no spec: None (must ask user)", f"chains={chains}")
-    _assert(msg is not None and ("A" in msg or "C" in msg),
-            "disambiguation message mentions the chains", f"msg={msg!r}")
-
-
-def test_edit_disambiguation_chain_specified() -> None:
-    """resolve_group_edit_target: requested_chain present → returns that chain only."""
-    chains, msg = resolve_group_edit_target(["A", "C"], requested_chain="A")
-    _assert(chains == ["A"] and msg is None,
-            "chain A specified in multi-chain group: ['A'] returned, no msg",
-            f"chains={chains}, msg={msg}")
-
-
-def test_edit_disambiguation_single_chain_group() -> None:
-    """resolve_group_edit_target: single-chain group → no disambiguation needed."""
-    chains, msg = resolve_group_edit_target(["B"], requested_chain=None)
-    _assert(chains == ["B"] and msg is None,
-            "single-chain group: unambiguous, no msg", f"chains={chains}, msg={msg}")
-
-
-def test_edit_disambiguation_chain_not_in_group() -> None:
-    """resolve_group_edit_target: requested chain not in group → error, never silent."""
-    chains, msg = resolve_group_edit_target(["A", "C"], requested_chain="B")
-    _assert(chains is None and msg is not None,
-            "chain not in group: None + error message (never wrong silent target)",
-            f"chains={chains}, msg={msg!r}")
-
-
-def test_consolidation_error_first_never_disrupts(monkeypatch, tmp_path) -> None:
-    """A failing consolidated_viewers_command runscript must not abort the open."""
-    import config as _cfg
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", 3)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING", True)
-    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
-    from chimerax_bridge import ChimeraXBridge
-    four = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCD")
-    b = ChimeraXBridge(chimerax_path="X", port=60001)
-    calls = []
-
-    def fake(c, timeout=30):
-        calls.append(c)
-        if c.startswith("info chains"):
-            return {"value": four, "error": None}
-        if "consolidat" in c.lower():
-            raise RuntimeError("consolidation boom")
-        return {"value": "Opened #1", "error": None}
-
-    monkeypatch.setattr(b, "run_command", fake)
-    b.run_commands(["open 2hhb"])   # must NOT raise
-    _assert(any("dock_sequences_bottom" in c for c in calls),
-            "dock hook still runs even when consolidation runscript raises (error-first)")
-
-
-def test_cap_still_falls_back_to_grouped(monkeypatch, tmp_path) -> None:
-    """10 chains > cap=8 → single whole-model viewer (existing behaviour unchanged)."""
-    import config as _cfg
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", 3)
-    monkeypatch.setattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX", 8)
-    monkeypatch.setattr(_cfg, "SEQVIEW_CACHE_DIR", tmp_path)
-    many = "\n".join(f"chain id /{ch} chain_id {ch}" for ch in "ABCDEFGHIJ")
-    b, calls = _consolidation_bridge(monkeypatch, many, threshold=3, cap=8)
-    b.run_commands(["open big"])
-    _assert("sequence chain #1" in calls, "above cap: grouped whole-model viewer")
-    _assert("sequence chain #1/A" not in calls, "no per-chain panels above cap")
-    _assert(not any("consolidat" in c.lower() for c in calls),
-            "above cap: no consolidation (whole-model fallback)")
 
 
 # -- Runner --------------------------------------------------------------------
@@ -704,27 +226,9 @@ def main() -> int:
     print("=" * 60)
     print("tests/test_sequence_viewer.py")
     print("=" * 60)
-    test_scf_basic_format_and_positions()
-    test_scf_non_one_start_and_gaps()
-    test_scf_rgb_clamping()
-    test_scf_seq_index_and_skip_unknown()
-    test_scf_empty_when_no_colors()
-    test_scf_runscript_writes_loader_and_command()
-    test_ensure_viewer_commands()
-    test_dock_sequences_bottom_command(Path(tempfile.mkdtemp()))
-    test_numbering_labels_are_actual_resnums_via_seqpos()
-    test_numbering_interval_and_first_last()
-    test_numbering_header_command_is_well_formed(Path(tempfile.mkdtemp()))
-    test_left_click_toggle()
-    test_layout_and_presentation_command_lists()
-    test_apply_runs_all_in_order()
-    test_disable_override_paths()
-    test_failing_command_does_not_abort()
-    print("\n(test_camsol_* and test_bridge_* need pytest's monkeypatch)")
-    print("\n" + "=" * 60)
-    print(f"Results: {_results['pass']} passed, {_results['fail']} failed")
-    return 0 if _results["fail"] == 0 else 1
+    import pytest
+    return pytest.main([__file__, "-q"])
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

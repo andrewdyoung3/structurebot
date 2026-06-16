@@ -21,86 +21,29 @@ REST_HOST: str = os.environ.get("CHIMERAX_HOST", "127.0.0.1")
 REST_PORT: int = int(os.environ.get("CHIMERAX_PORT", "60001"))
 REST_TIMEOUT: int = int(os.environ.get("CHIMERAX_TIMEOUT", "10"))
 
-# When a structure is opened, also open the Sequence Viewer for its chain(s) so
-# loaded PDBs show their sequence by default (applies to ALL opens, not just
-# ColabFold). Set CHIMERAX_SHOW_SEQUENCE_ON_OPEN=false to disable.
-CHIMERAX_SHOW_SEQUENCE_ON_OPEN: bool = (
-    os.environ.get("CHIMERAX_SHOW_SEQUENCE_ON_OPEN", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-
-# PER-CHAIN sequences: open one Sequence Viewer PER CHAIN (`sequence chain #N/A`,
-# `#N/B`, …) instead of a single grouped viewer. ChimeraX otherwise collapses
-# identical chains (e.g. a homodimer) into one "chains A,B" row, so a column
-# selection hits BOTH chains; per-chain viewers let the user select residues in a
-# SPECIFIC chain. Set CHIMERAX_SEQUENCE_PER_CHAIN=false to restore the grouped
-# viewer. CHIMERAX_SEQUENCE_PER_CHAIN_MAX caps it: structures with MORE chains
-# than this (e.g. a viral capsid) fall back to the single grouped viewer so we
-# never open dozens of panels.
-CHIMERAX_SEQUENCE_PER_CHAIN: bool = (
-    os.environ.get("CHIMERAX_SEQUENCE_PER_CHAIN", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-CHIMERAX_SEQUENCE_PER_CHAIN_MAX: int = int(
-    os.environ.get("CHIMERAX_SEQUENCE_PER_CHAIN_MAX", "8")
-)
-
-# DOCK the Sequence Viewer(s) along the BOTTOM edge, stacked vertically (so each
-# chain's sequence is visible at once). ChimeraX docks the viewer at the TOP by
-# default and exposes no REST command to move it, so StructureBot drives the Qt
-# dock widget directly (verified on 1.11.1). Set CHIMERAX_SEQUENCE_DOCK_BOTTOM=
-# false to leave the viewer where ChimeraX puts it.
-CHIMERAX_SEQUENCE_DOCK_BOTTOM: bool = (
-    os.environ.get("CHIMERAX_SEQUENCE_DOCK_BOTTOM", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-
-# NUMBERING: add a residue-number RULER to each per-chain Sequence Viewer, labelled
-# every N residues. The labels are the ACTUAL PDB residue numbers (auth seq IDs),
-# placed via proteinmpnn_bridge.chain_resnum_to_seqpos — so a chain that doesn't
-# start at 1 (1IL8 chain A is 2..72) shows 2,12,22… NOT 1,11,21, consistent with the
-# MPNN alignment numbering. ChimeraX 1.11.1's NATIVE numbering is position-based
-# (`numbering_start + count`, a linear offset that can't honor gaps), so this ships
-# a custom FIXED HEADER (`alignment.add_fixed_header`) instead. Set
-# CHIMERAX_SEQUENCE_NUMBERING=false to disable.
-CHIMERAX_SEQUENCE_NUMBERING: bool = (
-    os.environ.get("CHIMERAX_SEQUENCE_NUMBERING", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-CHIMERAX_SEQUENCE_NUMBER_INTERVAL: int = int(
-    os.environ.get("CHIMERAX_SEQUENCE_NUMBER_INTERVAL", "10")
-)
-
-# CONSOLIDATION: when a structure has MORE than this many chains, collapse all
-# chains with the same sequence into ONE alignment window (one row per structure ×
-# unique sequence group) instead of opening N separate per-chain panels. Keeps
-# per-chain addressability — `#N/A` targeting is unaffected. Set to 0 to always
-# consolidate; set a large number to never consolidate (uses per-chain up to
-# CHIMERAX_SEQUENCE_PER_CHAIN_MAX). Default 3: 1-3 chains → per-chain (unchanged);
-# 4-8 chains → consolidated. Verified on ChimeraX 1.11.1: new_alignment auto-
-# associates ALL chains with identical sequences → selecting a row selects all
-# copies in 3D. Set CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD=0 to always consolidate.
-CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD: int = int(
-    os.environ.get("CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD", "3")
-)
+# ChimeraX is STRUCTURE-ONLY: it never opens a Sequence Viewer. Sequence viewing
+# and editing live in the StructureBot window (Variant Workbench / seq editor).
+# (The former CHIMERAX_SHOW_SEQUENCE_ON_OPEN / _SEQUENCE_PER_CHAIN / _DOCK_BOTTOM /
+# _NUMBERING / _CONSOLIDATE_THRESHOLD flags + the ChimeraX-side sequence-viewer
+# machinery were removed 2026-06-16.)
 
 # ── Deterministic ChimeraX layout + presentation ──────────────────────────────
 # Config-driven command lists applied by StructureBot (NOT LLM-generated, NOT the
 # built-in `preset`). All tokens verified against ChimeraX 1.11.1.
 
-# LEAN LAYOUT — applied ONCE per ChimeraX session (first open). Hides the Log,
-# Command Line Interface and Toolbar panels for a clean window; KEEPS the menubar
-# and title bar. The Sequence Viewer (opened via sequence_viewer.ensure_sequence_
-# viewer_commands) is re-docked to the bottom by StructureBot. REST command/
-# runscript coloring + selection keep working with the CLI hidden (verified). Disable with
-# CHIMERAX_LEAN_LAYOUT=false. (The Sequence Viewer is re-docked to the BOTTOM,
-# stacked per chain — see CHIMERAX_SEQUENCE_DOCK_BOTTOM above.)
+# LEAN LAYOUT — applied at STARTUP (and once per ChimeraX session). Hides the Log,
+# Models (Model Panel), Command Line Interface and Toolbar panels for a clean
+# STRUCTURE-ONLY window; KEEPS the menubar and title bar. Sequence viewing/editing
+# lives in the StructureBot window, NOT in ChimeraX (no ChimeraX Sequence Viewer).
+# REST command/runscript coloring + selection keep working with the CLI hidden
+# (verified). Disable with CHIMERAX_LEAN_LAYOUT=false.
 CHIMERAX_LEAN_LAYOUT: bool = (
     os.environ.get("CHIMERAX_LEAN_LAYOUT", "true").strip().lower()
     not in ("0", "false", "no", "off")
 )
 CHIMERAX_LEAN_LAYOUT_COMMANDS: list = [
     "tool hide Log",
+    'tool hide "Model Panel"',
     'tool hide "Command Line Interface"',
     "tool hide Toolbar",
 ]
@@ -419,13 +362,6 @@ PROTEINMPNN_CACHE_DIR: Path = Path(
     os.environ.get("PROTEINMPNN_CACHE_DIR", str(_BASE / "cache" / "proteinmpnn"))
 )
 PROTEINMPNN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Sequence-Viewer integration scratch (.scf coloring files + their runscript
-# loaders) — see sequence_viewer.py. Forward-slash paths only (ChimeraX).
-SEQVIEW_CACHE_DIR: Path = Path(
-    os.environ.get("SEQVIEW_CACHE_DIR", str(_BASE / "cache" / "seqview"))
-)
-SEQVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── ThermoMPNN (fast-tier local stability voter, venv312 GPU) ───────────────────
 # ThermoMPNN (Kuhlman-Lab) — a GNN stability (ddG) predictor built ON ProteinMPNN's

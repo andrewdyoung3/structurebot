@@ -8,19 +8,12 @@ and re-exporting the existing pure spine so there is ONE copy of each.
 
 Re-exports (single source — NOT re-implemented):
   • proteinmpnn_bridge.chain_resnum_to_seqpos     — resnum → 1-based column (gap-aware)
-  • sequence_viewer.build_numbering_header_content — the resnum RULER (already pure;
-    the ChimeraX-native `numbering_header_command` calls this SAME function in-process,
-    so the ruler is genuinely one copy / both callers).
+  • sequence_viewer.build_numbering_header_content — the resnum RULER (pure; the
+    StructureBot panel's numbering header uses this SAME function in-process).
 
-New: the unique-sequence GROUPING used to collapse homo-oligomer copies into one
-row/tab ("edits apply to all copies").
-
-BOUNDARY NOTE — grouping vs the ChimeraX-native path: `sequence_viewer.
-consolidated_viewers_command` runs its grouping INSIDE a runscript over ChimeraX
-`session` objects, so it CANNOT import this helper across the process boundary. It
-uses the IDENTICAL key formula inline; `tests/test_seq_library.py` pins the two
-equal so they cannot silently drift. (The ruler had no such boundary — it is a
-true shared call.)
+The unique-sequence GROUPING below collapses homo-oligomer copies into one row/tab
+("edits apply to all copies") for the StructureBot Variant Workbench. (ChimeraX is
+structure-only — there is no longer a ChimeraX-side sequence-viewer grouping path.)
 """
 from __future__ import annotations
 
@@ -36,10 +29,8 @@ from sequence_viewer import build_numbering_header_content          # noqa: F401
 def sequence_group_key(seq: str, resnums: Sequence[int]) -> Tuple[str, Tuple[int, ...]]:
     """The unique-chain grouping key: ``(md5(seq)[:12], sorted-resnums-tuple)``.
 
-    IDENTICAL to the key in `sequence_viewer.consolidated_viewers_command`'s
-    runscript (`md5(seq).hexdigest()[:12]` + `sorted(r.number …)`) — pinned equal
-    by `tests/test_seq_library.py` so the two (one in-process, one runscript-side)
-    cannot drift.
+    ``md5(seq).hexdigest()[:12]`` + ``sorted(resnums)`` — the in-process grouping the
+    StructureBot Variant Workbench uses to collapse identical chains into one row/tab.
     """
     seq_hash = hashlib.md5((seq or "").encode()).hexdigest()[:12]
     return (seq_hash, tuple(sorted(int(r) for r in resnums)))
