@@ -514,7 +514,8 @@ class ChimeraXBridge:
             if model_id is not None:
                 self._maybe_apply_presentation_on_open()
                 self._maybe_apply_lean_layout()
-                self._maybe_show_sequence_on_open(model_id)
+                # ChimeraX is structure-only — no Sequence Viewer is opened (sequence
+                # viewing lives in the StructureBot window). Removed 2026-06-16.
                 # Fire-and-forget: hand the REAL opened model id to whoever registered
                 # (the unified GUI, for ground-truth tab focus). None elsewhere → no-op.
                 if self.on_structure_opened is not None:
@@ -577,109 +578,6 @@ class ChimeraXBridge:
             return sorted(nums)
         except Exception:
             return []
-
-    def _maybe_show_sequence_on_open(self, model_id: str) -> None:
-        """Open + associate the Sequence Viewer for the new model (config-gated by
-        CHIMERAX_SHOW_SEQUENCE_ON_OPEN).
-
-        Chain-count routing (all thresholds config-exposed):
-          ≤ CONSOLIDATE_THRESHOLD chains  → per-chain viewers (existing behaviour)
-          > CONSOLIDATE_THRESHOLD and     → consolidated: one alignment per unique
-            ≤ PER_CHAIN_MAX chains           sequence group, one row per structure,
-                                             rulers reused unchanged
-          > PER_CHAIN_MAX chains          → single whole-model viewer (fallback)
-
-        Best-effort; never disrupts the batch.
-        """
-        try:
-            import config as _cfg
-            if not getattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", True):
-                return
-            from sequence_viewer import (
-                ensure_sequence_viewer_commands,
-                dock_sequences_bottom_command,
-                numbering_header_command,
-                consolidated_viewers_command,
-                _run_error_first,
-            )
-            cap       = int(getattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX",          8))
-            threshold = int(getattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD",  3))
-            interval  = int(getattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL",       10))
-            numbering = bool(getattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING",           True))
-
-            found: List[str] = []
-            if getattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN", True):
-                found = self._model_chains(model_id)
-
-            if found and len(found) > cap:
-                # Viral-capsid fallback: single whole-model viewer
-                try:
-                    self.run_command(ensure_sequence_viewer_commands(model_id, None)[0])
-                except Exception:
-                    pass
-
-            elif found and len(found) > threshold:
-                # CONSOLIDATED: reconsolidate all open multi-chain models.
-                # Inner try/except so a failing consolidation runscript never
-                # prevents the dock-bottom hook from running.
-                try:
-                    self.run_command(consolidated_viewers_command(
-                        threshold=threshold, cap=cap,
-                        interval=interval,   numbering=numbering,
-                    ))
-                except Exception:
-                    pass
-
-            else:
-                # PER-CHAIN (≤ threshold) or per-chain disabled (found=[])
-                chains = found if found else None
-                for c in ensure_sequence_viewer_commands(model_id, chains):
-                    try:
-                        self.run_command(c)
-                    except Exception:
-                        pass
-                # Residue-number ruler for per-chain viewers. Error-first so a
-                # failure on one chain never disrupts the remaining chains or dock.
-                if chains and numbering:
-                    num_cmds: List[str] = []
-                    for ch in chains:
-                        cmd = numbering_header_command(
-                            model_id, ch,
-                            self._model_chain_resnums(model_id, ch),
-                            interval)
-                        if cmd:
-                            num_cmds.append(cmd)
-                    _run_error_first(self.run_command, num_cmds)
-
-            if getattr(_cfg, "CHIMERAX_SEQUENCE_DOCK_BOTTOM", True):
-                try:
-                    self.run_command(dock_sequences_bottom_command())
-                except Exception:
-                    pass
-        except Exception:
-            pass  # sequence viewer is non-essential; never disrupt the batch
-
-    def reconsolidate(self) -> None:
-        """Re-run consolidated sequence-viewer grouping for all open multi-chain
-        models. Call after a single-chain sequence edit to trigger dynamic regroup:
-        the edited chain diverges from its former group → ChimeraX auto-destroys the
-        old alignment and creates a fresh one that reflects the new grouping.
-        Best-effort; never raises."""
-        try:
-            import config as _cfg
-            from sequence_viewer import consolidated_viewers_command, dock_sequences_bottom_command
-            cap       = int(getattr(_cfg, "CHIMERAX_SEQUENCE_PER_CHAIN_MAX",          8))
-            threshold = int(getattr(_cfg, "CHIMERAX_SEQUENCE_CONSOLIDATE_THRESHOLD",  3))
-            interval  = int(getattr(_cfg, "CHIMERAX_SEQUENCE_NUMBER_INTERVAL",       10))
-            numbering = bool(getattr(_cfg, "CHIMERAX_SEQUENCE_NUMBERING",           True))
-            self.run_command(consolidated_viewers_command(
-                threshold=threshold, cap=cap,
-                interval=interval,   numbering=numbering,
-            ))
-            if getattr(_cfg, "CHIMERAX_SEQUENCE_DOCK_BOTTOM", True):
-                self.run_command(dock_sequences_bottom_command())
-        except Exception:
-            pass
 
     def _maybe_apply_presentation_on_open(self) -> None:
         """Apply the deterministic default presentation (config-gated) right after

@@ -31,14 +31,8 @@ class TestGroupingKey:
         assert sl.sequence_group_key("ABCDE", [3, 1, 2]) == (
             hashlib.md5(b"ABCDE").hexdigest()[:12], (1, 2, 3))
 
-    def test_native_runscript_uses_the_same_formula(self):
-        # PIN: the ChimeraX-native consolidation grouping can't import this helper
-        # (runscript boundary) — assert its inline key formula is still md5(...)[:12]
-        # + sorted resnums, so a runscript change that diverges trips this test.
-        src = (Path(__file__).parent.parent / "sequence_viewer.py").read_text()
-        assert "hexdigest()[:12]" in src
-        assert re.search(r"sorted\(r\.number", src)
-        assert "key = (seq_hash, rns)" in src
+    # (The ChimeraX-native consolidation runscript was removed 2026-06-16 — ChimeraX is
+    # structure-only — so there is no longer a runscript-boundary formula to pin here.)
 
 
 class TestGrouping:

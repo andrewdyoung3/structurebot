@@ -296,7 +296,6 @@ def test_bridge_on_structure_opened_fires(_app, monkeypatch):
     monkeypatch.setattr(b, "run_command", lambda c, timeout=30: {"value": "opened #3", "error": None})
     monkeypatch.setattr(b, "_maybe_apply_presentation_on_open", lambda: None)
     monkeypatch.setattr(b, "_maybe_apply_lean_layout", lambda: None)
-    monkeypatch.setattr(b, "_maybe_show_sequence_on_open", lambda mid: None)
     b.run_commands(["open foo.pdb"])
     assert got == ["3"]                                       # the REAL opened id, from the bridge
 

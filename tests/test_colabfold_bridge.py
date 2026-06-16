@@ -453,7 +453,8 @@ def test_viz_commands_basic():
     joined = "\n".join(cmds)
     assert any(c.startswith("open ") for c in cmds)
     assert "color byattribute bfactor" in joined and "palette alphafold" in joined
-    assert any(c.startswith("sequence chain ") for c in cmds)
+    # Structure-only: the predicted-model viz no longer opens a ChimeraX Sequence Viewer.
+    assert not any(c.startswith("sequence chain") for c in cmds)
     assert len(cmds) == len(exps)
     # No structure loaded → no matchmaker
     assert "matchmaker" not in joined
@@ -473,49 +474,22 @@ def test_viz_empty_when_no_pdb():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ChimeraX sequence-on-open hook
+# Structure-only: ChimeraX never opens a Sequence Viewer (sequence lives in the
+# StructureBot window). The former sequence-on-open hook was removed 2026-06-16.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_sequence_on_open_fires_for_structure(monkeypatch):
-    monkeypatch.setattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", True)
+def test_open_emits_no_sequence_viewer(monkeypatch):
     bridge = ChimeraXBridge(chimerax_path="X", port=60001)
     calls = []
 
     def fake_run(command, timeout=30):
         calls.append(command)
-        # The open returns a body that names the new model id.
         if command.startswith("open "):
             return {"value": "Opened test.pdb as #3, 1 model(s)", "error": None}
         return {"value": "", "error": None}
 
     monkeypatch.setattr(bridge, "run_command", fake_run)
     bridge.run_commands(["open 1hsg"])
-    assert "sequence chain #3" in calls
-
-
-def test_sequence_on_open_disabled(monkeypatch):
-    monkeypatch.setattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", False)
-    bridge = ChimeraXBridge(chimerax_path="X", port=60001)
-    calls = []
-    monkeypatch.setattr(
-        bridge, "run_command",
-        lambda command, timeout=30: (calls.append(command),
-                                     {"value": "Opened #1", "error": None})[1],
-    )
-    bridge.run_commands(["open 1hsg"])
-    assert not any(c.startswith("sequence chain") for c in calls)
-
-
-def test_sequence_on_open_skips_session(monkeypatch):
-    monkeypatch.setattr(_cfg, "CHIMERAX_SHOW_SEQUENCE_ON_OPEN", True)
-    bridge = ChimeraXBridge(chimerax_path="X", port=60001)
-    calls = []
-    monkeypatch.setattr(
-        bridge, "run_command",
-        lambda command, timeout=30: (calls.append(command),
-                                     {"value": "session restored #1", "error": None})[1],
-    )
-    bridge.run_commands(["open mysession.cxs"])
     assert not any(c.startswith("sequence chain") for c in calls)
 
 

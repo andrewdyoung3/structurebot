@@ -302,14 +302,8 @@ class CamsolBridge:
         viz_cmds, viz_exps = _build_viz_commands(
             scores, model_id, chain, start_resno
         )
-
-        # Mirror the same per-residue colouring onto the Sequence Viewer (.scf).
-        # Error-first: if anything fails, the structure colouring above stands.
-        seq_cmds, seq_exps = self._build_sequence_viewer_viz(
-            scores_dict, model_id, chain
-        )
-        viz_cmds += seq_cmds
-        viz_exps += seq_exps
+        # (The Sequence-Viewer .scf colour mirror was removed 2026-06-16 — ChimeraX is
+        # structure-only; CamSol colours the 3D structure, sequence lives in StructureBot.)
 
         n_agg = len(hot_spots)
         pct   = 100.0 * n_agg / len(scores) if scores else 0
@@ -333,63 +327,6 @@ class CamsolBridge:
             viz_explanations = viz_exps,
             summary          = summary,
         )
-
-    # ── Sequence-Viewer mirror (.scf) ─────────────────────────────────────────
-    @staticmethod
-    def _build_sequence_viewer_viz(
-        scores_dict: Dict[int, float],
-        model_id:    str,
-        chain:       Optional[str],
-    ) -> Tuple[List[str], List[str]]:
-        """
-        Build commands that mirror the CamSol aggregation gradient onto the
-        ChimeraX Sequence Viewer: open + associate the chain, then load an .scf
-        of the SAME per-residue colours via a runscript.
-
-        Returns ([commands], [explanations]); ([], []) on any failure so the
-        structure colouring is never broken by a sequence-viewer issue.
-        """
-        try:
-            import config as _cfg
-            from sequence_viewer import (
-                build_scf_file,
-                build_scf_runscript,
-                ensure_sequence_viewer_commands,
-            )
-
-            # Per-residue RGB (skip the neutral white band — nothing to mark).
-            residue_colors: Dict[int, Tuple[int, int, int]] = {}
-            for resno, score in scores_dict.items():
-                name = _assign_colour(score)
-                if name == "white":
-                    continue
-                residue_colors[resno] = _COLOUR_RGB.get(name, (255, 255, 255))
-            if not residue_colors:
-                return [], []
-
-            ordered_resnums = sorted(scores_dict)        # contiguous chain order
-            tag = f"model{model_id}_{chain or 'all'}"
-            scf_path = Path(_cfg.SEQVIEW_CACHE_DIR) / f"camsol_{tag}.scf"
-            py_path  = Path(_cfg.SEQVIEW_CACHE_DIR) / f"camsol_{tag}.scf.py"
-
-            scf_posix = build_scf_file(
-                residue_colors, ordered_resnums, scf_path,
-                seq_index=0, region_name="CamSol aggregation",
-            )
-            run_cmd = build_scf_runscript(scf_posix, py_path)
-
-            cmds = ensure_sequence_viewer_commands(
-                model_id, [chain] if chain else None
-            )
-            cmds.append(run_cmd)
-            exps = (
-                [f"Open + associate the Sequence Viewer for chain {chain or 'all'}"]
-                * len(cmds[:-1])
-                + ["Mirror the CamSol colours onto the sequence (.scf regions)"]
-            )
-            return cmds, exps
-        except Exception:
-            return [], []
 
     # ── Protein-Sol web API (optional) ────────────────────────────────────────
 
