@@ -7692,23 +7692,35 @@ class ToolRouter:
 
     def _opclass_model_scope(self, user_input: str, model_id: str) -> str:
         """The model scope for an op-class command (the §0 rule), used for BOTH whole-model
-        and subregion targets: the ENGLISH is authoritative — an explicit `#N`/`model N`
-        wins; otherwise the command applies to ALL VISIBLE models (hidden ones untouched),
-        NOT a single default or a stale/latest fold. A subregion (chain/residue/keyword)
-        narrows WITHIN this scope (`#1,2/A`); it never re-broadens the model dimension to a
-        hidden model. Falls back to `model_id` only when display state is unavailable (never
-        widens blindly). Returns a bare atomspec model part, possibly comma-joined."""
+        and subregion targets: the ENGLISH is authoritative. Precedence:
+          1. explicit `#N` / `model N` → that model;
+          2. SEMANTIC model words — "template"/"reference"/"crystal"/"WT" → the loaded
+             (primary) structure; "variant"/"fold"/"prediction" → the OTHER visible models
+             (the predicted folds), i.e. visible minus primary;
+          3. otherwise ALL VISIBLE models (hidden ones untouched), never a stale default.
+        A subregion (chain/residue/keyword) narrows WITHIN this scope (`#1,2/A`); it never
+        re-broadens the model dimension to a hidden model. Falls back to `model_id` only
+        when display state is unavailable. Returns a bare atomspec model part (may be
+        comma-joined)."""
         ui = user_input or ""
         mexp = (re.search(r"#(\d+(?:\.\d+)*)\b", ui)
                 or re.search(r"\bmodels?\s+#?(\d+(?:\.\d+)*)\b", ui, re.I))
         if mexp:
-            return mexp.group(1)                              # explicit model wins
+            return mexp.group(1)                              # 1. explicit model wins
+        primary = str(self._primary_model_id())
+        if re.search(r"\b(template|reference|crystal|wild[\s-]?type|wt)\b", ui, re.I):
+            return primary                                    # 2a. the loaded reference model
         try:
             vis = self.bridge.visible_model_ids() if self.bridge is not None else None
         except Exception:
             vis = None
-        if isinstance(vis, list) and vis:
-            return ",".join(str(v) for v in vis)             # ALL VISIBLE models
+        vis = [str(v) for v in vis] if isinstance(vis, list) else []
+        if re.search(r"\b(variants?|folds?|predictions?|predicted)\b", ui, re.I):
+            others = [v for v in vis if v != primary]         # 2b. the predicted fold(s)
+            if others:
+                return ",".join(others)                       # (visible minus the template)
+        if vis:
+            return ",".join(vis)                              # 3. ALL VISIBLE models
         return str(model_id)                                  # probe unavailable → default
 
     def _resolve_opclass_target(
@@ -8233,10 +8245,13 @@ class ToolRouter:
         else:
             level = max(0, min(100, self._transparency_levels.get(spec, 0) + amount))
         self._transparency_levels[spec] = level
-        # NO explicit target → ChimeraX's default covers atoms, BONDS, cartoons, surfaces,
-        # and ring fills. (`target acs` was narrower and missed BONDS, so a stick/ball-and-
-        # stick representation couldn't be set/reset — the "reset to 0 had no effect" bug.)
-        cmd  = f"transparency {spec} {level}"
+        # EXPLICIT target abcs = atoms+bonds+cartoons+surfaces, so transparency applies
+        # whatever the shown representation. Two ChimeraX-1.11.1 gotchas this avoids:
+        # (1) a BARE `transparency #N 50` (no target) SILENTLY no-ops on cartoons (the
+        #     verified §5 silent-success gap — see _run_conformer_comparison); and
+        # (2) `target acs` omits BONDS, so a stick/ball-and-stick rep couldn't be set/reset.
+        # abcs covers both — cartoon/surface (c/s), spheres (a), and sticks/ball-and-stick (b).
+        cmd  = f"transparency {spec} {level} target abcs"
         cmd  = _scope_chain_refs_to_macromolecule([cmd])[0][0]   # scope a bare chain ref
         r = self.bridge.run_command(cmd)
         if r.get("error"):

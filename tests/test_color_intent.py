@@ -664,7 +664,7 @@ class TestTransparencyOpclass:
     def test_absolute_all_visible(self):
         r = self._router(["1", "2"])
         result = r._run_transparency({"_user_input": "make it 50% transparent"})
-        assert result.data["commands"] == ["transparency #1,2 50"], \
+        assert result.data["commands"] == ["transparency #1,2 50 target abcs"], \
             result.data["commands"]
         assert result.data["level"] == 50
 
@@ -673,7 +673,7 @@ class TestTransparencyOpclass:
         r._run_transparency({"_user_input": "make it 40% transparent"})       # absolute → 40
         result = r._run_transparency({"_user_input": "increase transparency by 30%"})  # +30
         assert result.data["level"] == 70
-        assert result.data["commands"] == ["transparency #1 70"], \
+        assert result.data["commands"] == ["transparency #1 70 target abcs"], \
             result.data["commands"]
 
     def test_relative_clamps(self):
@@ -685,15 +685,61 @@ class TestTransparencyOpclass:
     def test_explicit_model_wins(self):
         r = self._router(["1", "2"])
         result = r._run_transparency({"_user_input": "make #2 30% transparent"})
-        assert result.data["commands"] == ["transparency #2 30"], \
+        assert result.data["commands"] == ["transparency #2 30 target abcs"], \
             result.data["commands"]
 
     def test_chain_is_macromolecule_scoped(self):
         r = self._router(["1"])
         result = r._run_transparency({"_user_input": "make chain A 50% transparent"})
         assert result.data["commands"] == \
-            ["transparency (#1/A & ~ligand & ~solvent & ~ions) 50"], \
+            ["transparency (#1/A & ~ligand & ~solvent & ~ions) 50 target abcs"], \
             result.data["commands"]
+
+    def test_template_word_targets_only_the_reference_model(self):
+        # "make template 50% transparent" must hit ONLY the loaded reference (#1), not the
+        # visible variant fold (#2) — the reported bug where it transparented both.
+        r = self._router(["1", "2"])
+        result = r._run_transparency({"_user_input": "make template 50% transparent"})
+        assert result.data["commands"] == ["transparency #1 50 target abcs"], \
+            result.data["commands"]
+
+    def test_fold_word_targets_only_the_prediction(self):
+        # "make the fold transparent" → the predicted model(s) = visible minus the template
+        r = self._router(["1", "2"])
+        result = r._run_transparency({"_user_input": "make the fold 50% transparent"})
+        assert result.data["commands"] == ["transparency #2 50 target abcs"], \
+            result.data["commands"]
+
+
+class TestOpclassSemanticModelWords:
+    """The op-class resolver maps the workbench's semantic model words to specific models:
+    'template'/'reference'/'crystal'/'WT' → the loaded reference; 'variant'/'fold' → the
+    predicted model(s) (visible minus the reference). Shared by color/representation too."""
+
+    def setup_method(self):
+        import tool_router
+        tool_router._color_classify_fn = None
+
+    def _router(self, visible):
+        mb = MagicMock()
+        mb.run_command.return_value = {"value": "", "error": None}
+        mb.visible_model_ids.return_value = visible
+        ms = MagicMock()
+        ms.structures = {"1": {"name": "1hsg"}, "2": {"name": "fold"}}
+        ms.get_structure.return_value = {"name": "1hsg"}
+        return ToolRouter(bridge=mb, session=ms)
+
+    def test_color_template_targets_reference(self):
+        r = self._router(["1", "2"])
+        result = r._run_color({"_user_input": "color the template by chain",
+                               "intent_key": "color.by_chain"})
+        assert result.data["commands"] == ["color #1 bychain"], result.data["commands"]
+
+    def test_color_variant_targets_prediction(self):
+        r = self._router(["1", "2"])
+        result = r._run_color({"_user_input": "color the variant by chain",
+                               "intent_key": "color.by_chain"})
+        assert result.data["commands"] == ["color #2 bychain"], result.data["commands"]
 
 
 # ── 9c. Residue-range + DEFER through _run_color ────────────────────────────────
