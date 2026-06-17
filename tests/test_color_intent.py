@@ -21,6 +21,7 @@ Test groups
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -709,6 +710,20 @@ class TestTransparencyOpclass:
         result = r._run_transparency({"_user_input": "make the fold 50% transparent"})
         assert result.data["commands"] == ["transparency #2 50 target abcs"], \
             result.data["commands"]
+
+    def test_target_must_include_bonds_and_cartoons(self):
+        # PIN (regression guard): the transparency target MUST contain 'b' (bonds → sticks/
+        # ball-and-stick) and 'c' (cartoons → a BARE `transparency #N <pct>` silently NO-OPS
+        # on cartoons in ChimeraX 1.11.1). This catches a regression to `target acs` or a
+        # bare command — the gap that let the last regression through. Asserts the INVARIANT,
+        # not just the current string.
+        r = self._router(["1"])
+        cmd = r._run_transparency({"_user_input": "make it 50% transparent"}).data["commands"][0]
+        m = re.search(r"\btarget\s+(\w+)", cmd)
+        assert m, f"transparency command must carry an explicit target: {cmd!r}"
+        target = m.group(1)
+        assert "b" in target and "c" in target, \
+            f"target {target!r} must include bonds (b) and cartoons (c)"
 
 
 class TestOpclassSemanticModelWords:
