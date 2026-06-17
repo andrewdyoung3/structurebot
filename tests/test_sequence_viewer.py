@@ -145,7 +145,10 @@ def test_failing_command_does_not_abort() -> None:
 
 # -- bridge: structure-only open path + layout/presentation hooks -----------------
 
-def test_bridge_lean_layout_once_per_session(monkeypatch) -> None:
+def test_bridge_lean_layout_reapplied_per_open(monkeypatch) -> None:
+    # Determinism fix (2026-06-17): the lean layout is RE-APPLIED on EVERY structure open
+    # (idempotent `tool hide`), because ChimeraX re-shows panels (Log/Models) on load — a
+    # once-per-session apply left the panel state non-deterministic across opens.
     print("\n=== bridge hooks ===")
     from chimerax_bridge import ChimeraXBridge
     b = ChimeraXBridge(chimerax_path="X", port=60001)
@@ -156,9 +159,8 @@ def test_bridge_lean_layout_once_per_session(monkeypatch) -> None:
     b.run_commands(["open 1hsg"])
     b.run_commands(["open 2lyz"])
     n_layout = sum(calls.count(c) for c in lean_layout_commands())
-    _assert(n_layout == len(lean_layout_commands()),
-            "lean layout applied exactly once across two opens", f"got {n_layout}")
-    _assert(b._lean_layout_applied, "guard flag set after first open")
+    _assert(n_layout == 2 * len(lean_layout_commands()),
+            "lean layout re-applied once per open (twice across two opens)", f"got {n_layout}")
 
 
 def test_bridge_presentation_per_open(monkeypatch) -> None:
