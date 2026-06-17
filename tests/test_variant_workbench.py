@@ -715,8 +715,24 @@ class TestStage4b:
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
         p._mode_key = _RESULT_PLDDT_MODE
         cmds = p.color_commands_for(tab)             # active row is V1 (has the fold)
-        assert cmds == ["show #2 models",
-                        "color byattribute bfactor #2 palette alphafold"]
+        # colour ONLY — visibility is owned by fold_visibility_commands (no `show` here, or
+        # it would re-show a model the Variant-fold toggle just hid).
+        assert cmds == ["color byattribute bfactor #2 palette alphafold"]
+
+    def test_plddt_mode_does_not_defeat_variant_fold_toggle(self, _app):
+        # Regression: folding AUTO-surfaces pLDDT mode; in that mode color_commands_for used
+        # to emit `show #mid`, which runs AFTER fold_visibility_commands in _push_3d_color and
+        # silently re-showed the fold the "Variant fold" toggle had just hidden → the toggle
+        # appeared to do nothing (the user-reported Boltz-multimer symptom). The COMBINED push
+        # must hide the active fold and never re-show it.
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))   # → active row V1, pLDDT mode
+        tab.set_active_row(vid)
+        assert p._mode_key == _RESULT_PLDDT_MODE                    # auto-surfaced by the fold
+        p._show_fold_cb.setChecked(False)                          # turn "Variant fold" OFF
+        combined = p.fold_visibility_commands(tab) + p.color_commands_for(tab)
+        assert "hide #2 models" in combined
+        assert "show #2 models" not in combined                    # NOT re-shown by the colour push
 
     def test_plddt_color_mode_no_fold_is_empty(self, _app):
         p, tab, (vid,) = self._variant_panel()       # V1 not folded yet
@@ -766,6 +782,27 @@ class TestStage4b:
         p._show_fold_cb.setChecked(False)            # Fold OFF → hide the fold, keep reference
         cmds = p.fold_visibility_commands(tab)
         assert "show #1 models" in cmds and "hide #2 models" in cmds
+
+    def test_fold_menu_actions_are_wired(self, _app):
+        # Regression guard for the toolbar→menu refactor: the Fold ▾ visibility items are
+        # CHECKABLE QActions whose `toggled`/`triggered` must still reach the handlers.
+        # The other fold-visibility tests assert the PURE method + setChecked() only, so a
+        # DROPPED signal connection would slip past them — this drives the actual user
+        # gesture (`QAction.trigger()` == a menu click) and asserts the handler ran.
+        p, tab, (v1,) = self._variant_panel()
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        tab.set_active_row(v1)
+        calls = {"n": 0}
+        orig = p._push_3d_color
+        p._push_3d_color = lambda t: (calls.__setitem__("n", calls["n"] + 1), orig(t))[1]
+        for act in (p._fold_vis_btn, p._show_fold_cb, p._show_ref_cb):
+            assert act.isCheckable()                 # the toggle survived the QAction conversion
+            before_checked, before_n = act.isChecked(), calls["n"]
+            act.trigger()                            # == a user click on the menu item
+            assert act.isChecked() != before_checked         # state toggled
+            assert calls["n"] == before_n + 1                # AND the handler fired (signal live)
+        # the global Hide-folds action also updates its own label via its handler
+        assert p._fold_vis_btn.text() in ("Hide folds", "Show folds")
 
     def test_engine_picker_capability_flag(self, _app, monkeypatch):
         # Both engines are SHOWN with a real capability verdict (B2 3-state, never dropped).
@@ -846,8 +883,10 @@ class TestStage4b:
             variant_mid="2", deviation={"1": 0.1, "2": 1.5, "3": 0.2}))
         p._mode_key = _RESULT_DEVIATION_MODE
         cmds = p.color_commands_for(tab)
-        # colours the PREDICTED variant model #2 (its own numbering), not the crystal backbone
-        assert cmds == ["show #2 models", "color #2/A #ffffff", "color #2/A:2 #ffd166"]
+        # colours the PREDICTED variant model #2 (its own numbering), not the crystal backbone.
+        # No `show` — visibility is owned by fold_visibility_commands (else the Variant-fold
+        # toggle would be re-defeated, the same bug as the pLDDT mode).
+        assert cmds == ["color #2/A #ffffff", "color #2/A:2 #ffd166"]
 
     def test_deviation_color_mode_no_deviation_is_empty(self, _app):
         p, tab, (vid,) = self._variant_panel()
