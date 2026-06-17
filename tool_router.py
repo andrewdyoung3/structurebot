@@ -8233,8 +8233,10 @@ class ToolRouter:
         else:
             level = max(0, min(100, self._transparency_levels.get(spec, 0) + amount))
         self._transparency_levels[spec] = level
-        # target acs = atoms+cartoons+surfaces, so the level applies whatever the shown rep.
-        cmd  = f"transparency {spec} {level} target acs"
+        # NO explicit target → ChimeraX's default covers atoms, BONDS, cartoons, surfaces,
+        # and ring fills. (`target acs` was narrower and missed BONDS, so a stick/ball-and-
+        # stick representation couldn't be set/reset — the "reset to 0 had no effect" bug.)
+        cmd  = f"transparency {spec} {level}"
         cmd  = _scope_chain_refs_to_macromolecule([cmd])[0][0]   # scope a bare chain ref
         r = self.bridge.run_command(cmd)
         if r.get("error"):

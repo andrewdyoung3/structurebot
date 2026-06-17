@@ -664,7 +664,7 @@ class TestTransparencyOpclass:
     def test_absolute_all_visible(self):
         r = self._router(["1", "2"])
         result = r._run_transparency({"_user_input": "make it 50% transparent"})
-        assert result.data["commands"] == ["transparency #1,2 50 target acs"], \
+        assert result.data["commands"] == ["transparency #1,2 50"], \
             result.data["commands"]
         assert result.data["level"] == 50
 
@@ -673,7 +673,7 @@ class TestTransparencyOpclass:
         r._run_transparency({"_user_input": "make it 40% transparent"})       # absolute → 40
         result = r._run_transparency({"_user_input": "increase transparency by 30%"})  # +30
         assert result.data["level"] == 70
-        assert result.data["commands"] == ["transparency #1 70 target acs"], \
+        assert result.data["commands"] == ["transparency #1 70"], \
             result.data["commands"]
 
     def test_relative_clamps(self):
@@ -685,14 +685,14 @@ class TestTransparencyOpclass:
     def test_explicit_model_wins(self):
         r = self._router(["1", "2"])
         result = r._run_transparency({"_user_input": "make #2 30% transparent"})
-        assert result.data["commands"] == ["transparency #2 30 target acs"], \
+        assert result.data["commands"] == ["transparency #2 30"], \
             result.data["commands"]
 
     def test_chain_is_macromolecule_scoped(self):
         r = self._router(["1"])
         result = r._run_transparency({"_user_input": "make chain A 50% transparent"})
         assert result.data["commands"] == \
-            ["transparency (#1/A & ~ligand & ~solvent & ~ions) 50 target acs"], \
+            ["transparency (#1/A & ~ligand & ~solvent & ~ions) 50"], \
             result.data["commands"]
 
 
