@@ -1718,8 +1718,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             if not fold or not fold.get("model_id"):
                 return []                                # active row has no fold → nothing
             mid = fold["model_id"]
-            return [f"show #{mid} models",
-                    f"color byattribute bfactor #{mid} palette alphafold"]
+            # Visibility is owned SOLELY by fold_visibility_commands (which _push_3d_color
+            # runs first); colouring a hidden model is harmless and it shows when re-shown.
+            # Emitting `show #mid` here would re-show a model the "Variant fold"/"Hide folds"
+            # toggle just hid (the toggles run before this) → the toggle would silently no-op.
+            return [f"color byattribute bfactor #{mid} palette alphafold"]
         if self._mode_key == _RESULT_DEVIATION_MODE:
             # Deviation lives on the PREDICTED variant model's real atoms (like pLDDT),
             # NOT the shared crystal backbone — colour #mid per chain in its OWN numbering,
@@ -1745,7 +1748,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 k = f"{chain}:{rn}" if multichain else str(rn)
                 return deviation_color(dev.get(k), floor.get(k, _DEVIATION_FLOOR_MIN_A))
 
-            return [f"show #{mid} models"] + build_model_color_commands(mid, per_chain, _val)
+            # Visibility owned by fold_visibility_commands (see the pLDDT branch note) — do
+            # NOT re-show #mid here or the "Variant fold"/"Hide folds" toggle would no-op.
+            return build_model_color_commands(mid, per_chain, _val)
         mode = get_mode(self._mode_key)
         if mode.fn is None:
             return []

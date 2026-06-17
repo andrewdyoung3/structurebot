@@ -180,8 +180,11 @@ checks.append(("floor-gated panel colour (some residues clear floor → coloured
 checks.append(("within-floor residues stay NEUTRAL (gated, not all painted)",
                len(panel_hex) < (block.get("n_residues") or 0)))
 checks.append(("3D push targets the PREDICTED variant model (#pred), not the crystal",
-               bool(pred) and any(f"#{pred}/" in c for c in cmds)
-               and any(c == f"show #{pred} models" for c in cmds)))
+               bool(pred) and any(f"#{pred}/" in c for c in cmds)))
+# visibility of #pred is owned by fold_visibility_commands (not the colour push, which would
+# otherwise re-show a toggle-hidden model); confirm it shows the active variant's model there.
+checks.append(("fold_visibility_commands shows the active variant model (#pred)",
+               f"show #{pred} models" in panel.fold_visibility_commands(tab)))
 
 # second variant reuses the cached WT reference (no re-fold → cheap → confidence='high')
 v2 = add_variant()
