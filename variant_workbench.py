@@ -481,6 +481,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
+        # The toolbar groups the low-frequency tool/fold controls behind two QToolButton
+        # menus (Tools ▾ / Fold ▾) so the row sheds width and the window narrows to ~content
+        # width; the high-frequency authoring/test/colour controls stay as direct widgets.
+        # The menu entries are QActions wired to the SAME handlers the old buttons used —
+        # no parallel UI path. (State read elsewhere — _scan_set_lbl.text(), _fold_vis_btn/
+        # _show_fold_cb/_show_ref_cb .isChecked()/.setChecked() — works identically on QAction.)
         bar = QtWidgets.QHBoxLayout()
         bar.setContentsMargins(6, 4, 6, 0)
         self._add_btn = QtWidgets.QPushButton("+ Add variant")
@@ -495,34 +501,39 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._apply_btn.clicked.connect(self._apply_substitution)
         bar.addWidget(self._apply_btn)
         bar.addSpacing(12)
-        # Stage 3a: pull the latest cached tool results into the panel (import = capture).
-        self._import_btn = QtWidgets.QPushButton("Import MPNN designs")
-        self._import_btn.clicked.connect(self._import_mpnn)
-        bar.addWidget(self._import_btn)
-        self._sugg_btn = QtWidgets.QPushButton("Load scan suggestions")
-        self._sugg_btn.clicked.connect(self._load_suggestions)
-        bar.addWidget(self._sugg_btn)
-        bar.addSpacing(12)
-        # Stage 3b: launch tools FROM the panel through the engine spine (confirm-gate +
-        # real subprocess). Scope = the scan set (clicked columns); empty → whole chain.
-        self._scan_btn = QtWidgets.QPushButton("Scan…")
+
+        # Tools ▾ — Stage-3b LAUNCH (Scan / Run ProteinMPNN, through the engine spine) +
+        # Stage-3a cached-result IMPORT + the scan-set status/clear.
+        self._tools_btn = QtWidgets.QToolButton()
+        self._tools_btn.setText("Tools")
+        self._tools_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._tools_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        tools_menu = QtWidgets.QMenu(self._tools_btn)
+        tools_menu.setToolTipsVisible(True)
+        self._scan_btn = tools_menu.addAction("Scan…")
         self._scan_btn.setToolTip("Mutation-scan the scan set (Ctrl+click residues to build "
                                   "it; whole chain if empty) through the tool spine.")
-        self._scan_btn.clicked.connect(self._on_scan_clicked)
-        bar.addWidget(self._scan_btn)
-        self._mpnn_run_btn = QtWidgets.QPushButton("Run ProteinMPNN…")
+        self._scan_btn.triggered.connect(self._on_scan_clicked)
+        self._mpnn_run_btn = tools_menu.addAction("Run ProteinMPNN…")
         self._mpnn_run_btn.setToolTip("Redesign the chain (the scan set via Ctrl+click, or "
                                       "whole chain) with ProteinMPNN through the tool spine.")
-        self._mpnn_run_btn.clicked.connect(self._on_mpnn_clicked)
-        bar.addWidget(self._mpnn_run_btn)
-        self._scan_set_lbl = QtWidgets.QLabel("scan set: 0")
-        self._scan_set_lbl.setStyleSheet("color:#888;")
-        bar.addWidget(self._scan_set_lbl)
-        self._clear_scan_btn = QtWidgets.QPushButton("Clear")
+        self._mpnn_run_btn.triggered.connect(self._on_mpnn_clicked)
+        tools_menu.addSeparator()
+        # Stage 3a: pull the latest cached tool results into the panel (import = capture).
+        self._import_btn = tools_menu.addAction("Import MPNN designs")
+        self._import_btn.triggered.connect(self._import_mpnn)
+        self._sugg_btn = tools_menu.addAction("Load scan suggestions")
+        self._sugg_btn.triggered.connect(self._load_suggestions)
+        tools_menu.addSeparator()
+        self._scan_set_lbl = tools_menu.addAction("scan set: 0")
+        self._scan_set_lbl.setEnabled(False)          # display-only live count
+        self._clear_scan_btn = tools_menu.addAction("Clear scan set")
         self._clear_scan_btn.setToolTip("Clear the scan set.")
-        self._clear_scan_btn.clicked.connect(self._clear_scan_set)
-        bar.addWidget(self._clear_scan_btn)
+        self._clear_scan_btn.triggered.connect(self._clear_scan_set)
+        self._tools_btn.setMenu(tools_menu)
+        bar.addWidget(self._tools_btn)
         bar.addSpacing(12)
+
         # Stage 4a: per-variant action buttons (act on the ACTIVE variant row).
         # Stability runs the 4-axis voter on the variant's EXACT mutations through the
         # engine spine (deep → confirm-gate); solubility is the pure CamSol scalar (instant).
@@ -536,40 +547,52 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "template (instant, local).")
         self._sol_btn.clicked.connect(self._on_test_solubility)
         bar.addWidget(self._sol_btn)
-        # Stage 4b: fold the ACTIVE variant through an engine (user picks; ESMFold local),
-        # opening a real pLDDT-coloured model matchmaker-overlaid on the template. Gated.
-        self._fold_btn = QtWidgets.QPushButton("Fold…")
+        bar.addSpacing(12)
+
+        # Fold ▾ — Stage-4b fold the ACTIVE variant (engine picker; ESMFold local) +
+        # fold/reference visibility + the tile escape-hatch.
+        self._fold_menu_btn = QtWidgets.QToolButton()
+        self._fold_menu_btn.setText("Fold")
+        self._fold_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._fold_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        fold_menu = QtWidgets.QMenu(self._fold_menu_btn)
+        fold_menu.setToolTipsVisible(True)
+        # Fold the ACTIVE variant, opening a real pLDDT-coloured model matchmaker-overlaid
+        # on the template. Gated.
+        self._fold_btn = fold_menu.addAction("Fold…")
         self._fold_btn.setToolTip("Fold the ACTIVE variant (you pick the engine; ESMFold runs "
                                   "LOCAL-ONLY) → a pLDDT-coloured model overlaid on the template.")
-        self._fold_btn.clicked.connect(self._on_fold_clicked)
-        bar.addWidget(self._fold_btn)
-        self._fold_vis_btn = QtWidgets.QPushButton("Hide folds")
+        self._fold_btn.triggered.connect(self._on_fold_clicked)
+        self._fold_vis_btn = fold_menu.addAction("Hide folds")
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
         self._fold_vis_btn.toggled.connect(self._on_fold_visibility_toggled)
-        bar.addWidget(self._fold_vis_btn)
         # Escape hatch: lay the variant folds + the WT reference out SIDE-BY-SIDE (not
         # overlaid) in the one 3D scene via ChimeraX `tile`. Targets the specific fold models
         # (not bare `tile`, which would drag in any hidden models). Shared camera; the models
         # leave superposition (accepted — this is "lay them out", not "overlay").
-        self._tile_btn = QtWidgets.QPushButton("Tile folds")
+        self._tile_btn = fold_menu.addAction("Tile folds")
         self._tile_btn.setToolTip("Lay the variant folds + reference out side-by-side (not "
                                   "overlaid). Select a variant afterwards to return to the "
                                   "overlay. Needs ≥2 models.")
-        self._tile_btn.clicked.connect(self._on_tile_clicked)
-        bar.addWidget(self._tile_btn)
+        self._tile_btn.triggered.connect(self._on_tile_clicked)
+        fold_menu.addSeparator()
         # Independent overlay toggles (distinct from the global "Hide folds"): show just the
         # active variant's FOLD, just the WT REFERENCE, or both (default).
-        self._show_fold_cb = QtWidgets.QCheckBox("Fold")
+        self._show_fold_cb = fold_menu.addAction("Fold (overlay)")
+        self._show_fold_cb.setCheckable(True)
         self._show_fold_cb.setChecked(True)
         self._show_fold_cb.setToolTip("Show the ACTIVE variant's predicted fold in the overlay.")
         self._show_fold_cb.toggled.connect(self._on_overlay_toggle)
-        bar.addWidget(self._show_fold_cb)
-        self._show_ref_cb = QtWidgets.QCheckBox("Reference")
+        self._show_ref_cb = fold_menu.addAction("Reference (overlay)")
+        self._show_ref_cb.setCheckable(True)
         self._show_ref_cb.setChecked(True)
         self._show_ref_cb.setToolTip("Show the WT reference structure in the overlay.")
         self._show_ref_cb.toggled.connect(self._on_overlay_toggle)
-        bar.addWidget(self._show_ref_cb)
+        self._fold_menu_btn.setMenu(fold_menu)
+        bar.addWidget(self._fold_menu_btn)
+        bar.addSpacing(12)
+
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
         # WT reference fold (same engine+target). Establishes the WT reference + noise floor
         # on first use for that combo (folds T; Boltz also folds the cross-seed floor set).
@@ -1060,7 +1083,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._pool.start(w)
 
     def _update_scan_label(self) -> None:
-        self._scan_set_lbl.setText(f"scan set: {len(self._scan_cols)}")
+        n = len(self._scan_cols)
+        self._scan_set_lbl.setText(f"scan set: {n}")        # in-menu count (tests read .text())
+        self._tools_btn.setText(f"Tools ({n})" if n else "Tools")  # at-a-glance badge on the button
 
     def _clear_scan_set(self) -> None:
         self._scan_cols.clear()
