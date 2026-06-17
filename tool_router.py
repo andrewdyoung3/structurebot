@@ -8233,10 +8233,13 @@ class ToolRouter:
         else:
             level = max(0, min(100, self._transparency_levels.get(spec, 0) + amount))
         self._transparency_levels[spec] = level
-        # NO explicit target → ChimeraX's default covers atoms, BONDS, cartoons, surfaces,
-        # and ring fills. (`target acs` was narrower and missed BONDS, so a stick/ball-and-
-        # stick representation couldn't be set/reset — the "reset to 0 had no effect" bug.)
-        cmd  = f"transparency {spec} {level}"
+        # EXPLICIT target abcs = atoms+bonds+cartoons+surfaces, so transparency applies
+        # whatever the shown representation. Two ChimeraX-1.11.1 gotchas this avoids:
+        # (1) a BARE `transparency #N 50` (no target) SILENTLY no-ops on cartoons (the
+        #     verified §5 silent-success gap — see _run_conformer_comparison); and
+        # (2) `target acs` omits BONDS, so a stick/ball-and-stick rep couldn't be set/reset.
+        # abcs covers both — cartoon/surface (c/s), spheres (a), and sticks/ball-and-stick (b).
+        cmd  = f"transparency {spec} {level} target abcs"
         cmd  = _scope_chain_refs_to_macromolecule([cmd])[0][0]   # scope a bare chain ref
         r = self.bridge.run_command(cmd)
         if r.get("error"):
