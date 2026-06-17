@@ -484,6 +484,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._scan_cols: set = set()        # template columns chosen as the scan scope
         self._mode_key = "none"
         self._scan_cache_snapshot = None    # (model_id, prior scan cache) for stability runs
+        self._tiled = False                 # True after "Tile folds"; next row-select un-tiles
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1087,9 +1088,29 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     def _push_3d_color(self, tab: _ChainDesignTab) -> None:
         """Recolor the 3D by the tab's ACTIVE row across all copies AND make predicted fold
         models follow the active row (per-model visibility). No-op for the OFF mode with no
-        folds (non-destructive: we do not know the pre-overlay coloring to restore)."""
-        cmds = self.fold_visibility_commands(tab) + self.color_commands_for(tab)
+        folds (non-destructive: we do not know the pre-overlay coloring to restore).
+        If a `tile` is in effect, this RESTORES superposition first (item 4: tile is a
+        transient comparison — the next active-row push returns to the overlay)."""
+        restore = self._tiled
+        cmds = self.untile_commands() if restore else []
+        if restore:
+            self._tiled = False
+        cmds += self.fold_visibility_commands(tab) + self.color_commands_for(tab)
+        if restore:
+            cmds.append("view")          # frame the restored overlay (after show/hide)
         self._run_commands_bg(cmds)
+
+    def untile_commands(self) -> List[str]:
+        """Re-superpose every variant fold onto the WT reference — the inverse of
+        `tile_commands` (which laid them side-by-side and broke superposition). Re-running
+        matchmaker restores the overlay; the caller appends a `view` AFTER visibility is set
+        so the final overlaid set is framed. [] if no design / no folds. Pure → single
+        source for the push + tests."""
+        if self._design is None:
+            return []
+        ref = str(self._design.model_id)
+        folds = [m for m in self._fold_models(self._design).values() if m and m != ref]
+        return [f"matchmaker #{m} to #{ref}" for m in folds]
 
     def _run_commands_bg(self, cmds: List[str]) -> None:
         """Fire-and-forget a ChimeraX command list off the UI thread (the shared 3D push)."""
@@ -1690,9 +1711,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText("Tile needs ≥2 models (the reference + at least one folded variant).")
             return
         self._run_commands_bg(cmds)
+        self._tiled = True               # next row-select restores superposition (item 4)
         n = cmds[-1].count("#")
         self._status.setText(f"Tiled {n} models side-by-side (superposition broken — select a "
-                             f"variant to return to the overlay).")
+                             f"variant to snap back to the overlay).")
 
     # ── result badges + expandable detail ───────────────────────────────────────────
     @staticmethod

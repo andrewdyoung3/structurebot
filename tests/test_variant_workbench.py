@@ -771,6 +771,29 @@ class TestStage4b:
         cmds = p.fold_visibility_commands(tab)
         assert "show #2 models" in cmds and "hide #3 models" in cmds
 
+    def test_tile_then_select_snaps_back_to_overlay(self, _app):
+        # §9 item (4): tile breaks superposition; the NEXT row-select must re-superpose
+        # (re-matchmaker the folds to the reference) + reframe, then apply normal active-row
+        # visibility — tile is a transient comparison, select returns to the overlay.
+        p, tab, (v1, v2) = self._variant_panel(n_variants=2)
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        p.apply_fold_result(v2, self._fold_result(model_id="3"))
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._on_tile_clicked()
+        assert p._tiled is True
+        assert any(c.startswith("tile ") for c in pushed)
+        pushed.clear()
+        p._select_variant_row(tab, v1)                 # select a row → snap back
+        assert p._tiled is False
+        assert "matchmaker #2 to #1" in pushed and "matchmaker #3 to #1" in pushed  # re-superpose
+        assert pushed[-1] == "view"                    # frame the restored overlay last
+        assert "show #2 models" in pushed and "hide #3 models" in pushed            # active-row coupling
+        # a subsequent select must NOT re-untile (the flag is cleared)
+        pushed.clear()
+        p._select_variant_row(tab, v2)
+        assert not any(c.startswith("matchmaker") for c in pushed)
+
     def test_overlay_toggles_independent(self, _app):
         p, tab, (v1,) = self._variant_panel()
         p.apply_fold_result(v1, self._fold_result(model_id="2"))
