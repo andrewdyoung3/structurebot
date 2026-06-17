@@ -24,7 +24,8 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from seq_editor.controller import ResidueCell, ChainSeq
 from variant_workbench import (VariantWorkbenchPanel, _ChainDesignTab, _RESULT_DDG_MODE,
                                _RESULT_PLDDT_MODE, _RESULT_DEVIATION_MODE, _ROW_ROLE)
-from variant_model import ChainDesign, AlignedCell, build_design_session
+from variant_model import (ChainDesign, AlignedCell, build_design_session,
+                           build_fold_column_map)
 from color_modes import get_mode, ddg_color, plddt_color
 
 
@@ -161,8 +162,8 @@ class TestStage2:
 
 class TestCellEditMenu:
     """Direct residue substitution from the sequence view: the cell context menu exposes the
-    EXISTING edit_variant substitution path (right-click a variant residue). Deletion/indels
-    are deferred (they'd shift the resnum-keyed S4c deviation numbering)."""
+    EXISTING edit_variant substitution path (right-click a variant residue). Deletion is the
+    Stage-A indel (see TestIndelDeletion*); insertion is Stage B."""
 
     def _variant(self, seq="MKV"):
         sess = MagicMock()
@@ -1016,3 +1017,106 @@ class TestDeleteVariant:
         assert not any("hide #" in c for c in pushed)    # no fold → no hide command
         assert tab.design.get_variant(v2) is None
         assert tab.design.get_variant(v1) is not None
+
+
+class TestIndelDeletionModel:
+    """Stage A pure model: variant residue deletion (cell→gap + IndelEvent), restore, the
+    fold-column map, and persistence. No Qt."""
+
+    def _design(self, seq="MKVLW"):
+        cd = ChainDesign(group_key="g", rep_model="1", rep_chain="A",
+                         members=[("1", "A")],
+                         template_cells=[AlignedCell(col=i, resnum=i + 1, aa=a)
+                                         for i, a in enumerate(seq)])
+        cd.add_variant("V1")
+        return cd
+
+    def test_delete_sets_gap_and_records_event(self):
+        cd = self._design()
+        cd.edit_variant("V1", 1, "A")                 # substitute first (to prove it's dropped)
+        cd.delete_variant_residue("V1", 1)            # delete the (substituted) residue at col 1
+        v = cd.get_variant("V1")
+        assert v.cells[1].is_gap and v.cells[1].resnum is None
+        assert [e.kind for e in v.indels] == ["deletion"]
+        assert v.indels[0].col == 1 and v.indels[0].resnum == 2
+        assert all(m.resnum != 2 for m in v.mutations)   # the substitution at resnum 2 dropped
+        assert v.sequence == "MVLW"                       # K (col1) removed
+
+    def test_restore_rebuilds_from_template_and_drops_event(self):
+        cd = self._design()
+        cd.delete_variant_residue("V1", 2)
+        cd.restore_variant_residue("V1", 2)
+        v = cd.get_variant("V1")
+        assert not v.cells[2].is_gap and v.cells[2].aa == "V" and v.cells[2].resnum == 3
+        assert v.indels == []
+        assert v.sequence == "MKVLW"
+
+    def test_delete_guards(self):
+        import pytest as _pt
+        cd = self._design()
+        with _pt.raises(KeyError):
+            cd.delete_variant_residue("nope", 0)
+        cd.delete_variant_residue("V1", 0)
+        with _pt.raises(ValueError):                       # already a gap
+            cd.delete_variant_residue("V1", 0)
+
+    def test_to_from_dict_round_trips_deletion(self):
+        from variant_model import DesignSession
+        cd = self._design()
+        cd.delete_variant_residue("V1", 2)
+        sess = DesignSession(model_id="1", chains={"k": cd})
+        back = DesignSession.from_dict(sess.to_dict())
+        v = back.chains["k"].get_variant("V1")
+        assert v.cells[2].is_gap
+        assert [e.kind for e in v.indels] == ["deletion"] and v.indels[0].resnum == 3
+
+    def test_fold_column_map_identity_for_substitution_only(self):
+        cd = self._design()
+        cd.edit_variant("V1", 0, "A")                     # substitution, no length change
+        m = build_fold_column_map(cd.get_variant("V1"), cd.template_cells)
+        assert m == {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}        # identity
+
+    def test_fold_column_map_shifts_after_deletion(self):
+        cd = self._design()                               # MKVLW, resnums 1..5
+        cd.delete_variant_residue("V1", 2)                # delete col 2 (V, resnum 3)
+        m = build_fold_column_map(cd.get_variant("V1"), cd.template_cells)
+        # variant fold has 4 residues: 1,2 map to ref 1,2; the deleted col 3 is ABSENT;
+        # residues after pair to template pos+1 (3->4, 4->5) — the shift resnum==resnum misses
+        assert m == {1: 1, 2: 2, 3: 4, 4: 5}
+
+
+class TestIndelDeletionPanel:
+    """Stage A panel: the cell-menu delete/restore, the deletion-column click cue, and the
+    deviation spec carrying the fold-column map."""
+
+    def _panel(self):
+        p, _ = _panel([_chainseq("1", "A", "MKVLW"), _chainseq("1", "B", "MKVLW")],
+                      session=MagicMock())
+        p.load_model("1")
+        p._add_variant()
+        return p, p._cur_tab(), p._cur_tab().design.variants[-1].id
+
+    def test_delete_then_restore_via_handlers(self, _app):
+        p, tab, vid = self._panel()
+        p._do_delete_residue(tab, vid, 2)
+        assert tab.design.get_variant(vid).cells[2].is_gap
+        p._do_restore_residue(tab, vid, 2)
+        assert not tab.design.get_variant(vid).cells[2].is_gap
+
+    def test_deletion_column_click_cue(self, _app):
+        p, tab, vid = self._panel()
+        p._do_delete_residue(tab, vid, 2)
+        p._on_cell(tab, vid, 2)                            # click the deleted column
+        assert "DELETED" in p._status.text() and tab.active_row_id == vid
+
+    def test_deviation_spec_carries_fold_column_map(self, _app):
+        p, tab, vid = self._panel()
+        p.apply_fold_result(vid, {"tool_step_results": [{"tool": "esmfold", "data": {
+            "engine": "esmfold", "new_model_id": "2", "reference_model_id": "1",
+            "mean_plddt": 80.0, "length": 5, "source": "local_venv312",
+            "plddt": {1: 90.0}}}]})
+        tab.set_active_row(vid)
+        p._do_delete_residue(tab, vid, 2)                  # deletion → non-identity map
+        spec = p.deviation_launch_spec()
+        m = spec["tool_inputs"]["fold_column_map"]
+        assert m == {1: 1, 2: 2, 3: 4, 4: 5}              # shifted after the deletion

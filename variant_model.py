@@ -53,6 +53,19 @@ class Mutation:
 
 
 @dataclass
+class IndelEvent:
+    """An insertion/deletion on a variant — distinct from a substitution Mutation (whose
+    (resnum, from_aa, to_aa) shape can't encode a length change). Stage A: kind="deletion"
+    (a variant residue removed → its cell becomes a gap). `col` locates it on the shared
+    column axis; `resnum`/`from_aa` record the deleted residue for provenance + revert (the
+    TEMPLATE cell at that column still holds its WT resnum/aa, so a restore is lossless)."""
+    kind:    str                    # "deletion" (Stage A) | "insertion" (Stage B)
+    col:     int
+    resnum:  Optional[int] = None   # template author resnum at the column
+    from_aa: Optional[str] = None   # the residue removed (deletion)
+
+
+@dataclass
 class ResultSlots:
     """Per-variant computed results — ALL empty in Stage 1 (Stage 4 fills them)."""
     fold:       Optional[Dict[str, Any]] = None
@@ -69,6 +82,7 @@ class Variant:
     provenance: Dict[str, Any] = field(default_factory=dict)   # e.g. {"mpnn_run":R,"design_k":k}
     cells:      List[AlignedCell] = field(default_factory=list)   # one per column (pre-shape b)
     mutations:  List[Mutation] = field(default_factory=list)      # substitutions vs template
+    indels:     List[IndelEvent] = field(default_factory=list)    # deletions (Stage A) / insertions
     results:    ResultSlots = field(default_factory=ResultSlots)
 
     @property
@@ -161,6 +175,52 @@ class ChainDesign:
                     {"resnum": tmpl.resnum, "to_aa": aa, **note})
         v.mutations.sort(key=lambda m: m.resnum)
 
+    def delete_variant_residue(self, variant_id: str, col: int) -> None:
+        """DELETE a residue from a VARIANT: set its cell at *col* to a GAP and record a
+        deletion `IndelEvent`. Guarded — variant only (T immutable), a NON-gap variant cell
+        at a real template column. Drops any substitution Mutation at that template position
+        (the residue no longer exists). LOSSLESS/REVERTABLE: the template cell still holds
+        (resnum, aa), so `restore_variant_residue` rebuilds it. This is a cell change on the
+        EXISTING axis — it never renumbers the template or siblings (deletion = the easy
+        indel axis); the resnum-keyed deviation is handled by the panel's column-pairing map,
+        NOT by this method."""
+        v = self.get_variant(variant_id)
+        if v is None:
+            raise KeyError(f"variant not found: {variant_id!r}")
+        if not (0 <= col < len(self.template_cells)) or col >= len(v.cells):
+            raise ValueError(f"column out of range: {col}")
+        tmpl = self.template_cells[col]
+        cell = v.cells[col]
+        if tmpl.is_gap or tmpl.resnum is None:
+            raise ValueError("cannot delete at a non-template column")
+        if cell.is_gap:
+            raise ValueError("cell is already a gap (nothing to delete)")
+        removed_aa = cell.aa
+        cell.aa = None
+        cell.resnum = None
+        v.mutations = [m for m in v.mutations if m.resnum != tmpl.resnum]
+        acc = v.provenance.get("accepted")
+        if isinstance(acc, list):
+            v.provenance["accepted"] = [a for a in acc if a.get("resnum") != tmpl.resnum]
+        v.indels = [e for e in v.indels if e.col != col]          # idempotent per column
+        v.indels.append(IndelEvent(kind="deletion", col=col,
+                                   resnum=tmpl.resnum, from_aa=removed_aa))
+        v.indels.sort(key=lambda e: e.col)
+
+    def restore_variant_residue(self, variant_id: str, col: int) -> None:
+        """Undo a deletion: rebuild the variant's cell at *col* from the TEMPLATE (WT
+        resnum + aa) and drop the deletion event. Lossless to the template baseline (a prior
+        substitution at this position is NOT restored — restore returns to WT)."""
+        v = self.get_variant(variant_id)
+        if v is None:
+            raise KeyError(f"variant not found: {variant_id!r}")
+        if not (0 <= col < len(self.template_cells)) or col >= len(v.cells):
+            raise ValueError(f"column out of range: {col}")
+        tmpl = self.template_cells[col]
+        v.cells[col].resnum = tmpl.resnum
+        v.cells[col].aa = tmpl.aa
+        v.indels = [e for e in v.indels if e.col != col]
+
     def delete_variant(self, variant_id: str) -> bool:
         """Remove a variant ROW (and everything on it — mutations, provenance, and its
         ResultSlots fold/deviation/stability/solubility/scans) from this design. Returns
@@ -212,6 +272,7 @@ def _variant_from_dict(v: Dict[str, Any]) -> Variant:
         provenance=dict(v.get("provenance", {})),
         cells=[AlignedCell(**c) for c in v.get("cells", [])],
         mutations=[Mutation(**m) for m in v.get("mutations", [])],
+        indels=[IndelEvent(**e) for e in v.get("indels", [])],
         results=ResultSlots(**(v.get("results") or {})),
     )
 
@@ -259,6 +320,33 @@ def column_tracks(design: "ChainDesign") -> Tuple[List[str], List[float]]:
         consensus.append(top)
         conservation.append(round(topn / len(colvals), 3))
     return consensus, conservation
+
+
+def build_fold_column_map(variant: "Variant",
+                          template_cells: List[AlignedCell]) -> Dict[int, int]:
+    """`{variant_fold_resnum: reference_fold_resnum}` — the indel-aware correspondence that
+    pairs a folded variant to the WT reference fold by COLUMN, never by resnum. Both folds
+    are numbered 1..len by the engine (the variant fold over the variant's non-gap cells, the
+    reference fold over the template's non-gap cells). This walks the shared column axis,
+    assigning each its running 1-based position, and pairs ONLY columns where BOTH have a
+    residue. A deletion (variant gap) is ABSENT (no variant-fold residue); residues AFTER it
+    pair to the template position +1 — the shift the resnum==resnum path gets wrong. For a
+    substitution-only variant (no gaps either side) this is the IDENTITY map {j: j} — the
+    additive guarantee. Pure / mock-testable."""
+    m: Dict[int, int] = {}
+    var_pos = 0
+    ref_pos = 0
+    for col, tcell in enumerate(template_cells):
+        vcell = variant.cells[col] if col < len(variant.cells) else None
+        t_res = (tcell is not None) and (not tcell.is_gap)
+        v_res = (vcell is not None) and (not vcell.is_gap)
+        if t_res:
+            ref_pos += 1
+        if v_res:
+            var_pos += 1
+        if t_res and v_res:
+            m[var_pos] = ref_pos
+    return m
 
 
 def build_color_commands(cells: List[AlignedCell],

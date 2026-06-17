@@ -5582,6 +5582,23 @@ class ToolRouter:
                 tool="variant_deviation", success=False,
                 error=(f"Could not read Cα for the variant fold #{variant_mid}. "
                        "Check the predicted model is open."))
+        # INDEL-AWARE column pairing (additive): re-key the variant fold onto the REFERENCE
+        # fold numbering via the panel-built {variant_fold_resnum: reference_fold_resnum} map,
+        # so a deletion's downstream residues pair to the correct template position (not the
+        # one-off-shifted mis-pair resnum==resnum would produce). An identity map
+        # (substitution-only) is a no-op → byte-identical; an ABSENT map → current behavior.
+        # FAIL LOUD if the fold carries a residue the map doesn't cover (never mis-pair).
+        fold_map = inputs.get("fold_column_map")
+        if fold_map and not multichain:
+            fold_map = {int(k): int(v) for k, v in fold_map.items()}
+            missing = [j for j in var_ca if j not in fold_map]
+            if missing:
+                return ToolStepResult(
+                    tool="variant_deviation", success=False,
+                    error=(f"Fold-column map is missing {len(missing)} variant-fold "
+                           f"residue(s) (e.g. {sorted(missing)[:5]}) — sequence/fold length "
+                           "mismatch; deviation not computed (refusing to mis-pair)."))
+            var_ca = {fold_map[j]: xyz for j, xyz in var_ca.items()}
         common = sorted(set(ref_ca) & set(var_ca))
         if len(common) < 3:
             return ToolStepResult(

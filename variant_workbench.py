@@ -36,7 +36,7 @@ from color_modes import (all_modes, ddg_color, deviation_color, get_mode,
 from seq_library import build_numbering_header_content
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
-                           build_model_color_commands,
+                           build_model_color_commands, build_fold_column_map,
                            build_design_session, column_tracks,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
@@ -733,12 +733,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._edit_target = (vid, col)
         resnum = tab.design.resnum_for_col(col)
         wt = tab.design.template_cells[col].aa
-        cur = v.cells[col].aa if col < len(v.cells) else None
+        cell = v.cells[col] if col < len(v.cells) else None
+        cur = cell.aa if cell is not None else None
+        is_gap = cell is not None and cell.is_gap
 
         menu = QtWidgets.QMenu(self)
-        header = menu.addAction(f"{vid} · residue {resnum} (WT {wt}, now {cur})")
+        header = menu.addAction(f"{vid} · residue {resnum} "
+                                + ("(DELETED)" if is_gap else f"(WT {wt}, now {cur})"))
         header.setEnabled(False)
         menu.addSeparator()
+        if is_gap:                                       # a deleted cell → offer Restore
+            menu.addAction(f"Restore residue (WT {wt})",
+                           lambda: self._do_restore_residue(tab, vid, col))
+            menu.exec(global_pos)
+            return
         sub = menu.addMenu("Substitute →")
         for aa in _AA_ORDER:
             act = sub.addAction(f"{aa}  (WT)" if aa == wt else aa)
@@ -748,7 +756,30 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if wt is not None and cur != wt:
             menu.addAction(f"Revert to WT ({wt})",
                            lambda: self._do_substitute(tab, vid, col, wt))
+        menu.addSeparator()
+        menu.addAction("Delete residue",
+                       lambda: self._do_delete_residue(tab, vid, col))
         menu.exec(global_pos)
+
+    def _do_delete_residue(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        try:
+            tab.design.delete_variant_residue(vid, col)
+        except Exception as exc:
+            self._status.setText(f"Delete failed: {type(exc).__name__}: {exc}")
+            return
+        resnum = tab.design.resnum_for_col(col)
+        self._after_variant_edit(
+            tab, vid, f"{vid}: residue {resnum} DELETED (cell → gap; a fold/deviation now "
+                      f"treats it as removed). Right-click the gap → Restore to undo.")
+
+    def _do_restore_residue(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        try:
+            tab.design.restore_variant_residue(vid, col)
+        except Exception as exc:
+            self._status.setText(f"Restore failed: {type(exc).__name__}: {exc}")
+            return
+        resnum = tab.design.resnum_for_col(col)
+        self._after_variant_edit(tab, vid, f"{vid}: residue {resnum} restored to WT.")
 
     def _on_row_menu(self, tab: _ChainDesignTab, vid: str, global_pos) -> None:
         """Right-click on a VARIANT row header → a 'Delete variant' menu. Row-level removal
@@ -994,8 +1025,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._edit_target = (row_id, col)
             resnum = tab.design.resnum_for_col(col)
             wt = tab.design.template_cells[col].aa if 0 <= col < len(tab.design.template_cells) else "?"
-            self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
-                                 f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+            vv = tab.design.get_variant(row_id)
+            deleted = vv is not None and col < len(vv.cells) and vv.cells[col].is_gap
+            if deleted:                                     # decision #3: keep selecting the
+                self._status.setText(                       # crystal residue + surface the cue
+                    f"Residue {resnum} — DELETED in {row_id} (the crystal residue is selected; "
+                    f"right-click the gap → Restore to undo).")
+            else:
+                self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
+                                     f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
             self._apply_color_to(tab)                       # panel result-coloring FOLLOWS active
             self._push_3d_color(tab)
 
@@ -1584,6 +1622,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "wt_ref":           cd.wt_refs.get(combo),    # cached reference (skip folding) or None
             "local_only":       True,
         }
+        # INDEL-AWARE pairing (Stage A, monomer): carry the variant-fold→reference-fold
+        # column map so a deletion's downstream residues pair correctly. Identity for a
+        # substitution-only variant → byte-identical deviation (the additive guarantee).
+        if not multichain:
+            ti["fold_column_map"] = build_fold_column_map(v, cd.template_cells)
         have_ref = bool(cd.wt_refs.get(combo))
         return {
             "tool":        "variant_deviation",
