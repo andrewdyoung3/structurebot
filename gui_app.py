@@ -315,12 +315,21 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         bl.addWidget(self.output)
         bl.addWidget(self.input)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        split.addWidget(self.tabs)
-        split.addWidget(bottom)
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 3)
-        self.setCentralWidget(split)
+        # Sequence-favored vertical split: the workbench grid gets the majority (3:2 vs the
+        # console/log) so startup isn't a thin sequence strip over a tall log. The divider is
+        # a draggable QSplitter; the user's adjustment is persisted via QSettings and restored
+        # on the next launch (falling back to the 3:2 default on first run / a stale state).
+        self.split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.split.addWidget(self.tabs)
+        self.split.addWidget(bottom)
+        self.split.setStretchFactor(0, 3)        # workbench grows faster than the console (2)
+        self.split.setStretchFactor(1, 2)
+        self.split.setSizes([600, 400])          # initial 3:2 (Qt scales to the real height)
+        self._settings = QtCore.QSettings("StructureBot", "StructureBot")
+        _saved_split = self._settings.value("ui/splitState")
+        if _saved_split is not None:
+            self.split.restoreState(_saved_split)
+        self.setCentralWidget(self.split)
 
         tb = self.addToolBar("main")
         self.cancel_action = tb.addAction("Cancel", self._on_cancel)
@@ -933,6 +942,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # restore prompt has something to restore.
         try:
             self.session.save("session.json")
+        except Exception:
+            pass
+        # Persist the user's grid↔console divider position for the next launch.
+        try:
+            self._settings.setValue("ui/splitState", self.split.saveState())
         except Exception:
             pass
         # Ollama (a bundled daemon WE started) is stopped. ChimeraX is left running like
