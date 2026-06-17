@@ -767,6 +767,27 @@ class TestStage4b:
         cmds = p.fold_visibility_commands(tab)
         assert "show #1 models" in cmds and "hide #2 models" in cmds
 
+    def test_fold_menu_actions_are_wired(self, _app):
+        # Regression guard for the toolbar→menu refactor: the Fold ▾ visibility items are
+        # CHECKABLE QActions whose `toggled`/`triggered` must still reach the handlers.
+        # The other fold-visibility tests assert the PURE method + setChecked() only, so a
+        # DROPPED signal connection would slip past them — this drives the actual user
+        # gesture (`QAction.trigger()` == a menu click) and asserts the handler ran.
+        p, tab, (v1,) = self._variant_panel()
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        tab.set_active_row(v1)
+        calls = {"n": 0}
+        orig = p._push_3d_color
+        p._push_3d_color = lambda t: (calls.__setitem__("n", calls["n"] + 1), orig(t))[1]
+        for act in (p._fold_vis_btn, p._show_fold_cb, p._show_ref_cb):
+            assert act.isCheckable()                 # the toggle survived the QAction conversion
+            before_checked, before_n = act.isChecked(), calls["n"]
+            act.trigger()                            # == a user click on the menu item
+            assert act.isChecked() != before_checked         # state toggled
+            assert calls["n"] == before_n + 1                # AND the handler fired (signal live)
+        # the global Hide-folds action also updates its own label via its handler
+        assert p._fold_vis_btn.text() in ("Hide folds", "Show folds")
+
     def test_engine_picker_capability_flag(self, _app, monkeypatch):
         # Both engines are SHOWN with a real capability verdict (B2 3-state, never dropped).
         # Mock the probes so the unit test doesn't depend on the live WSL/venv312 envs.
