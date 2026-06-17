@@ -579,6 +579,43 @@ class ChimeraXBridge:
         except Exception:
             return []
 
+    def visible_model_ids(self) -> List[str]:
+        """Top-level ids of the currently-DISPLAYED atomic structures, read from the live
+        `display` state (NOT just the loaded set) — so a HIDDEN model/fold is excluded.
+        Submodels collapse to their top-level id ('2.1' → '2') so '#2' covers an assembly.
+        Sorted numerically; [] on any failure (callers fall back to a default, never widen
+        blindly). Backs the op-class resolver's all-visible model-scope rule."""
+        script = (
+            "from chimerax.atomic import all_atomic_structures\n"
+            "ids=set()\n"
+            "for m in all_atomic_structures(session):\n"
+            "    if bool(m.display):\n"
+            "        ids.add(m.id_string.split('.')[0])\n"
+            "print('VIS:'+','.join(sorted(ids, key=lambda s: int(s) if s.isdigit() else 1<<30)))\n"
+        )
+        try:
+            import tempfile as _tmp, os as _os
+            fd, path = _tmp.mkstemp(suffix=".py")
+            try:
+                with _os.fdopen(fd, "w") as f:
+                    f.write(script)
+                r = self.run_command(f'runscript "{path}"')
+            finally:
+                try:
+                    _os.unlink(path)
+                except OSError:
+                    pass
+            value = r.get("value") if isinstance(r, dict) else None
+            if not isinstance(value, str):
+                return []
+            for line in value.splitlines():
+                line = line.strip()
+                if line.startswith("VIS:"):
+                    return [x for x in line[4:].split(",") if x]
+            return []
+        except Exception:
+            return []
+
     def _maybe_apply_presentation_on_open(self) -> None:
         """Apply the deterministic default presentation (config-gated) right after
         a structure loads, before any analysis colouring. Error-first."""

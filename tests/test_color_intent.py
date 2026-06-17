@@ -74,9 +74,14 @@ def _cx_err(error: str) -> dict:
     return {"value": None, "error": error}
 
 
-def _router_with_bridge(run_command_results: list) -> ToolRouter:
+def _router_with_bridge(run_command_results: list, visible: list | None = None) -> ToolRouter:
     mock_bridge  = MagicMock()
     mock_bridge.run_command.side_effect = run_command_results
+    # Op-class whole-model resolution reads display state via this dedicated bridge
+    # method (NOT run_command, so command sequences are unaffected). Default None →
+    # MagicMock → the resolver falls back to the primary model (#1), the pre-rule case.
+    if visible is not None:
+        mock_bridge.visible_model_ids.return_value = visible
     mock_session = MagicMock()
     mock_session.structures = {"1": {"name": "1hsg"}}
     mock_session.get_structure.return_value = {"name": "1hsg"}
@@ -544,6 +549,82 @@ class TestOpclassTargetResolver:
         t = self._r()._resolve_opclass_target(
             "color residues within 5 angstroms of the ligand green", "1")
         assert t["defer"] is True
+
+
+# ── 9d. The §0 all-visible model-scope rule (the wrong-model regression) ─────────
+
+class TestOpclassAllVisibleModels:
+    """An unspecified op-class command (no model / no subregion) applies to ALL VISIBLE
+    models — read from live display state, NOT a single default or a stale/latest fold.
+    An explicit #N wins; a hidden model is left untouched; a named subregion keeps the
+    existing single-model handling (unchanged). The regression: 'show only as cartoon'
+    targeted a hidden fold #2 while the displayed crystal #1 kept its side chains."""
+
+    def setup_method(self):
+        import tool_router
+        tool_router._color_classify_fn = None
+        tool_router._repr_classify_fn = None
+
+    def _router(self, visible):
+        mb = MagicMock()
+        mb.run_command.return_value = {"value": "", "error": None}
+        mb.visible_model_ids.return_value = visible      # the live display-state probe
+        ms = MagicMock()
+        ms.structures = {"1": {"name": "1hsg"}, "2": {"name": "fold"}}
+        ms.get_structure.return_value = {"name": "1hsg"}
+        return ToolRouter(bridge=mb, session=ms)
+
+    def test_unspecified_color_targets_all_visible(self):
+        r = self._router(["1", "2"])
+        result = r._run_color({"_user_input": "color by chain", "intent_key": "color.by_chain"})
+        assert result.data["commands"] == ["color #1,2 bychain"], result.data["commands"]
+
+    def test_unspecified_representation_targets_all_visible(self):
+        r = self._router(["1", "2"])
+        result = r._run_representation({"_user_input": "show only as cartoon",
+                                        "intent_key": "view.cartoon_only"})
+        assert all("#1,2" in c for c in result.data["commands"]), result.data["commands"]
+
+    def test_hidden_model_excluded(self):
+        # fold #2 hidden → only the visible crystal #1 is targeted (the reported bug)
+        r = self._router(["1"])
+        result = r._run_color({"_user_input": "color by chain", "intent_key": "color.by_chain"})
+        assert result.data["commands"] == ["color #1 bychain"], result.data["commands"]
+
+    def test_explicit_model_wins_over_visible(self):
+        # "#2" named explicitly → that model only, even though #1 is also visible
+        r = self._router(["1", "2"])
+        result = r._run_color({"_user_input": "color #2 by chain", "intent_key": "color.by_chain"})
+        assert result.data["commands"] == ["color #2 bychain"], result.data["commands"]
+
+    def test_whole_model_phrasing_spans_visible(self):
+        r = self._router(["1", "2"])
+        result = r._run_color({"_user_input": "color the whole model red", "intent_key": None})
+        assert result.data["commands"] == ["color #1,2 red"], result.data["commands"]
+
+    def test_named_subregion_narrows_within_visible(self):
+        # a named subregion (chain A) narrows WITHIN the visible-model scope (NOT a hidden
+        # default) — the chain-scope guard handles the multi-model #1,2/A form.
+        r = self._router(["1", "2"])
+        result = r._run_color({"_user_input": "color chain A red", "intent_key": None})
+        assert result.data["commands"] == \
+            ["color (#1,2/A & ~ligand & ~solvent & ~ions) red"], result.data["commands"]
+
+    def test_subregion_targets_only_visible_model(self):
+        # the reported bug: template (#1) hidden, V1 (#2) visible → "show chain A as sticks"
+        # must target the VISIBLE #2/A, never the hidden #1/A.
+        r = self._router(["2"])                       # only #2 visible
+        result = r._run_representation(
+            {"_user_input": "show chain A as sticks", "intent_key": "view.sticks"})
+        assert all("#2/A" in c for c in result.data["commands"]), result.data["commands"]
+        assert not any("#1/A" in c for c in result.data["commands"]), result.data["commands"]
+
+    def test_probe_failure_falls_back_to_primary(self):
+        # display probe unavailable (returns []) → fall back to the primary model, never
+        # widen blindly.
+        r = self._router([])
+        result = r._run_color({"_user_input": "color by chain", "intent_key": "color.by_chain"})
+        assert result.data["commands"] == ["color #1 bychain"], result.data["commands"]
 
 
 # ── 9c. Residue-range + DEFER through _run_color ────────────────────────────────

@@ -7660,6 +7660,27 @@ class ToolRouter:
         re.IGNORECASE | re.VERBOSE,
     )
 
+    def _opclass_model_scope(self, user_input: str, model_id: str) -> str:
+        """The model scope for an op-class command (the §0 rule), used for BOTH whole-model
+        and subregion targets: the ENGLISH is authoritative — an explicit `#N`/`model N`
+        wins; otherwise the command applies to ALL VISIBLE models (hidden ones untouched),
+        NOT a single default or a stale/latest fold. A subregion (chain/residue/keyword)
+        narrows WITHIN this scope (`#1,2/A`); it never re-broadens the model dimension to a
+        hidden model. Falls back to `model_id` only when display state is unavailable (never
+        widens blindly). Returns a bare atomspec model part, possibly comma-joined."""
+        ui = user_input or ""
+        mexp = (re.search(r"#(\d+(?:\.\d+)*)\b", ui)
+                or re.search(r"\bmodels?\s+#?(\d+(?:\.\d+)*)\b", ui, re.I))
+        if mexp:
+            return mexp.group(1)                              # explicit model wins
+        try:
+            vis = self.bridge.visible_model_ids() if self.bridge is not None else None
+        except Exception:
+            vis = None
+        if isinstance(vis, list) and vis:
+            return ",".join(str(v) for v in vis)             # ALL VISIBLE models
+        return str(model_id)                                  # probe unavailable → default
+
     def _resolve_opclass_target(
         self, user_input: str, model_id: str,
     ) -> Dict[str, Any]:
@@ -7682,7 +7703,11 @@ class ToolRouter:
         else ligand/solvent/ions keyword; else the whole model.
         """
         ui  = user_input or ""
-        mid = str(model_id)
+        # `mid` is the §0 model scope for EVERY target (whole-model AND subregion): an
+        # explicit #N, else ALL VISIBLE models, else the default. A subregion narrows
+        # within it (`#1,2/A`); it never targets a hidden model. One resolution → one
+        # bridge probe per op-class command.
+        mid = self._opclass_model_scope(ui, model_id)
 
         # 1. Explicit residue selection (range / list / single), optionally
         #    chain-qualified → an EXPRESSIBLE `:N` / `:N-M` / `:n,m` spec. Done
@@ -7721,7 +7746,8 @@ class ToolRouter:
             return {"spec": None, "chain": None, "keyword": None,
                     "target_desc": "a finer selection", "defer": True}
 
-        # 3. Explicit whole-model phrasing — an intended, explicit broadening.
+        # 3. Explicit whole-model phrasing — an intended, explicit broadening. Applies
+        #    to ALL VISIBLE models (the §0 rule), not just the default one.
         if re.search(r"\b(?:each|every|all|both|per)\s+chains?\b"
                      r"|\bwhole\s+(?:model|structure|thing)\b|\beverything\b",
                      ui, re.I):
@@ -7752,8 +7778,8 @@ class ToolRouter:
                     "keyword": keyword, "target_desc": f"the {keyword}",
                     "defer": False}
 
-        # 6. No target named → the whole model (the common "color by chain" /
-        #    "show as cartoon" case).
+        # 6. No target named → ALL VISIBLE models (the §0 rule; the common "color by
+        #    chain" / "show only as cartoon" case — the reported regression).
         return {"spec": f"#{mid}", "chain": None, "keyword": None,
                 "target_desc": "whole model", "defer": False}
 
