@@ -159,6 +159,7 @@ class ToolRouter:
         "variant_deviation":     "📐",
         "representation":        "🖼️",
         "color":                 "🎨",
+        "transparency":          "👻",
         "design_goal":           "🧪",
     }
 
@@ -621,6 +622,10 @@ class ToolRouter:
         # Per-target representation snapshots keyed by ChimeraX spec string (e.g. "#1")
         # Each value is a list of restore commands captured before the last render.
         self._repr_snapshots:          Dict[str, List[str]] = {}
+        # Per-target transparency level (0=opaque … 100=invisible), keyed by the resolved
+        # atomspec, so a RELATIVE request ("increase transparency by 50%") adjusts the
+        # tracked level and emits an absolute `transparency` (ChimeraX has no relative form).
+        self._transparency_levels:     Dict[str, int] = {}
 
     # ── Phase 1: Route (no execution) ─────────────────────────────────────────
 
@@ -1153,6 +1158,7 @@ class ToolRouter:
         _repr_key    = None
         _color_intent = False  # color op-class override (set below)
         _color_key    = None
+        _transparency_intent = False  # transparency op-class override (set below)
         _design_intent = False  # design-intent op-class override (set below)
 
         # ── Viewer representation intent override (FIRST — highest priority) ────
@@ -1207,6 +1213,17 @@ class ToolRouter:
                 }
                 _color_intent = True
                 _claimed      = True
+
+        # ── Transparency op-class override ─────────────────────────────────────
+        # Orthogonal to color/representation ("make it 50% transparent" is neither a
+        # colour scheme nor a display style). Checked after them (a phrase can't be
+        # both) and guarded by _claimed. The level/relative parsing + the all-visible
+        # model scope run in _run_transparency; translator commands are cleared.
+        if user_input and not _claimed and self._detect_transparency_phrase(user_input):
+            tools_needed = ["transparency"]
+            tool_inputs  = {"transparency": {"_user_input": user_input}}
+            _transparency_intent = True
+            _claimed             = True
 
         # ── Design-intent op-class override (goal → tool-invocation profile) ────
         # SINGLE SOURCE OF TRUTH for a goal-directed redesign. Fires only on the
@@ -1596,6 +1613,12 @@ class ToolRouter:
             result["commands"]     = []
             result["explanations"] = []
 
+        # Transparency: clear translator-emitted commands — rendered deterministically
+        # (absolute level from the tracked state) in _run_transparency.
+        if _transparency_intent:
+            result["commands"]     = []
+            result["explanations"] = []
+
         # Design-intent: the op-class owns the whole redesign; drop any translator
         # commands so nothing runs alongside the profile-driven ProteinMPNN.
         if _design_intent:
@@ -1679,6 +1702,8 @@ class ToolRouter:
                 desc = defn.description if defn else key
                 return f"Color: {desc} (deterministic render)"
             return "Color (resolving intent…)"
+        if tool == "transparency":
+            return "Transparency (deterministic render)"
         if tool == "design_goal":
             inp = tool_inputs.get("design_goal", {})
             key = inp.get("intent_key")
@@ -2040,6 +2065,8 @@ class ToolRouter:
                 return self._run_representation(inputs, user_input=user_input)
             if tool == "color":
                 return self._run_color(inputs, user_input=user_input)
+            if tool == "transparency":
+                return self._run_transparency(inputs, user_input=user_input)
             if tool == "design_goal":
                 return self._run_design_goal(inputs, user_input=user_input)
             if tool == "bio_assembly":
@@ -4454,7 +4481,7 @@ class ToolRouter:
         exps.append(f"Open the predicted model as #{new_id}")
         # Native AlphaFold pLDDT colouring (canonical blue→orange palette over the
         # B-factor column, where the engine stores per-residue pLDDT).
-        cmds.append(f"color byattribute bfactor #{new_id} palette alphafold")
+        cmds.append(f"color byattribute bfactor #{new_id} palette alphafold target acs")
         exps.append("Colour by pLDDT using the native AlphaFold palette (blue=confident)")
         cmds.append(f"cartoon #{new_id}")
         exps.append("Cartoon representation for the predicted model")
@@ -4490,7 +4517,10 @@ class ToolRouter:
         real_id = (self._parse_model_spec(r, guess) or f"#{guess}").lstrip("#")
         cmds = [open_cmd]
         exps = [f"Open the predicted model as #{real_id} (id read back from the open response)"]
-        viz = [f"color byattribute bfactor #{real_id} palette alphafold",
+        # target atoms+cartoons+surfaces so the pLDDT colour survives a later
+        # representation change (e.g. an NL "show as spheres" reveals coloured atoms,
+        # not default-coloured ones).
+        viz = [f"color byattribute bfactor #{real_id} palette alphafold target acs",
                f"cartoon #{real_id}"]
         vexp = ["Colour by pLDDT (AlphaFold palette)", "Cartoon representation"]
         ref_spec = self._resolve_colabfold_compare_to(inputs, exclude_model=real_id)
@@ -8138,6 +8168,84 @@ class ToolRouter:
                 "resolution": resolution,
                 "commands":   executed,
             },
+        )
+
+    # ── Transparency op-class ───────────────────────────────────────────────────────
+    _TRANSPARENCY_RE = re.compile(
+        r"\btransparen\w*\b|\bopaque\b|\bsee[\s-]?through\b", re.IGNORECASE)
+
+    def _detect_transparency_phrase(self, user_input: str) -> bool:
+        """A transparency request (transparent / transparency / opaque / see-through)."""
+        return bool(self._TRANSPARENCY_RE.search(user_input or ""))
+
+    def _parse_transparency_request(self, user_input: str) -> Tuple[str, int]:
+        """Parse → (mode, amount). mode='absolute' → amount is the target % (0=opaque,
+        100=invisible); mode='relative' → amount is a signed delta. ChimeraX `transparency`
+        is ABSOLUTE-only, so a relative ask is applied against the tracked per-target level.
+        The number regex requires %/percent or a `by/to/at` lead-in so a model id (`#2`) is
+        never mistaken for a level."""
+        low = (user_input or "").lower()
+        # Strip model refs ('#2', 'model 2') BEFORE the number parse so a model id is never
+        # read as a transparency level — the model scope is resolved separately.
+        low = re.sub(r"#[\d.,]+", " ", low)
+        low = re.sub(r"\bmodels?\s+#?\d+", " ", low)
+        if re.search(r"\bopaque\b|\bno\s+transparency\b|\bnot\s+transparent\b"
+                     r"|\bsolid\b|\bremove\s+transparency\b", low):
+            return ("absolute", 0)
+        num_m = (re.search(r"(\d+)\s*(?:%|percent|pct)", low)        # "50%", "50 percent"
+                 or re.search(r"\b(?:by|to|at)\s+(\d+)\b", low)       # "by 50", "to 30"
+                 or re.search(r"(\d+)\s*(?:%|percent)?\s*transparen", low))  # "50 transparent"
+        num = int(num_m.group(1)) if num_m else None
+        inc = bool(re.search(r"\b(increase|increased|more|raise|add|up)\b", low))
+        dec = bool(re.search(r"\b(decrease|decreased|less|reduce|lower|down)\b", low))
+        if inc or dec:
+            delta = num if num is not None else 25          # bare "more transparent" → a step
+            return ("relative", delta if inc else -delta)
+        if num is not None:
+            return ("absolute", num)
+        if re.search(r"\b(fully|completely|totally|max(?:imum)?|very)\b", low):
+            return ("absolute", 100)
+        return ("absolute", 50)                              # bare "make it transparent"
+
+    def _run_transparency(self, inputs: Dict[str, Any], user_input: str = "") -> ToolStepResult:
+        """Set ChimeraX transparency on the §0 op-class scope (ALL VISIBLE models / explicit
+        #N / a chain etc. — reusing the shared resolver). ABSOLUTE sets the level; RELATIVE
+        adjusts the tracked per-target level (ChimeraX has no relative form), clamped 0–100.
+        Chain refs are macromolecule-scoped like color/representation (no ligand bleed)."""
+        from translator import _scope_chain_refs_to_macromolecule
+        if self.bridge is None:
+            return ToolStepResult(tool="transparency", success=False,
+                                  error="ChimeraX bridge unavailable.")
+        ui       = user_input or inputs.get("_user_input", "")
+        model_id = str(inputs.get("model_id") or self._primary_model_id())
+        tgt      = self._resolve_opclass_target(ui, model_id)
+        if tgt["defer"]:
+            return ToolStepResult(
+                tool="transparency", success=False,
+                error=("This transparency request targets a finer selection (e.g. a residue "
+                       "range, a zone, or a binding pocket) the resolver can't express. "
+                       "Rephrase with a chain (e.g. 'chain A'), 'the ligand', or the whole "
+                       "model."))
+        spec          = tgt["spec"]
+        mode, amount  = self._parse_transparency_request(ui)
+        if mode == "absolute":
+            level = max(0, min(100, amount))
+        else:
+            level = max(0, min(100, self._transparency_levels.get(spec, 0) + amount))
+        self._transparency_levels[spec] = level
+        # target acs = atoms+cartoons+surfaces, so the level applies whatever the shown rep.
+        cmd  = f"transparency {spec} {level} target acs"
+        cmd  = _scope_chain_refs_to_macromolecule([cmd])[0][0]   # scope a bare chain ref
+        r = self.bridge.run_command(cmd)
+        if r.get("error"):
+            return ToolStepResult(tool="transparency", success=False,
+                                  error=f"Command failed: {cmd!r} → {r['error']}")
+        return ToolStepResult(
+            tool="transparency", success=True,
+            summary=(f"Set transparency to {level}% on {tgt['target_desc']} "
+                     f"({mode})\nCommands: {cmd}"),
+            viz_commands=[], viz_explanations=[],
+            data={"resolution": mode, "level": level, "spec": spec, "commands": [cmd]},
         )
 
     def __repr__(self) -> str:

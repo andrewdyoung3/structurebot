@@ -70,9 +70,9 @@ class TestWorkbenchFoldS4b:
         assert res.viz_commands == []
         calls = [c.args[0] for c in router.bridge.run_command.call_args_list]
         assert any(s.startswith('open "') for s in calls)
-        assert "color byattribute bfactor #2 palette alphafold" in calls
+        assert "color byattribute bfactor #2 palette alphafold target acs" in calls
         assert "matchmaker #2 to #1" in calls
-        assert "color byattribute bfactor #2 palette alphafold" in res.data["commands"]
+        assert "color byattribute bfactor #2 palette alphafold target acs" in res.data["commands"]
 
     def test_fold_local_only_breach_rejected(self):
         router = _make_router()
@@ -141,7 +141,7 @@ class TestBoltzFoldStage:
         assert res.viz_commands == []
         calls = [c.args[0] for c in router.bridge.run_command.call_args_list]
         assert any(s.startswith('open "') for s in calls)
-        assert "color byattribute bfactor #2 palette alphafold" in calls
+        assert "color byattribute bfactor #2 palette alphafold target acs" in calls
         assert "matchmaker #2 to #1" in calls
         # multi-chain assembly: the bridge was asked to fold BOTH chains
         assert len(bridge.predict.call_args.args[0]) == 2

@@ -716,8 +716,9 @@ class TestStage4b:
         p._mode_key = _RESULT_PLDDT_MODE
         cmds = p.color_commands_for(tab)             # active row is V1 (has the fold)
         # colour ONLY — visibility is owned by fold_visibility_commands (no `show` here, or
-        # it would re-show a model the Variant-fold toggle just hid).
-        assert cmds == ["color byattribute bfactor #2 palette alphafold"]
+        # it would re-show a model the Variant-fold toggle just hid). `target acs` so the
+        # colour survives a later representation change (spheres show coloured atoms).
+        assert cmds == ["color byattribute bfactor #2 palette alphafold target acs"]
 
     def test_plddt_mode_does_not_defeat_variant_fold_toggle(self, _app):
         # Regression: folding AUTO-surfaces pLDDT mode; in that mode color_commands_for used
