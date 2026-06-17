@@ -1111,7 +1111,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 out[author[i]] = hexc
         return out
 
+    def _refresh_color_mode_availability(self, tab: _ChainDesignTab) -> None:
+        """Grey out a RESULT colour mode (ddG / pLDDT / Deviation vs WT) when the ACTIVE
+        variant has no such result yet — so e.g. selecting 'Color: Deviation vs WT' can't be
+        a silent no-op before the 'Deviation vs WT' button has computed it. If the CURRENT
+        mode just became unavailable (e.g. switching to a row that hasn't been folded/scanned),
+        revert the combo to None so the displayed mode always matches what's painted."""
+        avail = {
+            _RESULT_DDG_MODE:       bool(self._active_ddg_map(tab)),
+            _RESULT_PLDDT_MODE:     bool(self._active_plddt_map(tab)),
+            _RESULT_DEVIATION_MODE: bool(self._active_deviation(tab)),
+        }
+        model = self._mode_combo.model()
+        for i in range(self._mode_combo.count()):
+            key = self._mode_combo.itemData(i)
+            if key in avail and (item := model.item(i)) is not None:
+                item.setEnabled(avail[key])
+        if self._mode_key in avail and not avail[self._mode_key]:
+            self._select_result_mode("none")          # current result has no data → revert
+            self._mode_key = "none"
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
+        self._refresh_color_mode_availability(tab)    # grey result modes lacking data
         if self._mode_key == _RESULT_DDG_MODE:
             hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
             tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
@@ -1705,6 +1726,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                     out[v.id] = str(fld["model_id"])
         return out
 
+    def _wt_ref_model_ids(self) -> List[str]:
+        """Model ids of the seed-pinned WT REFERENCE folds (the deviation comparison basis),
+        across all chains/combos — distinct from the loaded crystal and the variant folds.
+        Hidden by fold_visibility_commands (computation artifact, not the displayed result)."""
+        ids: List[str] = []
+        if self._design is None:
+            return ids
+        for cd in self._design.chains.values():
+            for ref in (cd.wt_refs or {}).values():
+                mid = (ref or {}).get("model_id")
+                if mid and str(mid) not in ids:
+                    ids.append(str(mid))
+        return ids
+
     def fold_visibility_commands(self, tab: _ChainDesignTab) -> List[str]:
         """Per-model 3D visibility coupled to the active row — the clean ≤2 overlay. Two
         INDEPENDENT toggles: show the WT REFERENCE (the loaded model) and/or the ACTIVE
@@ -1718,6 +1753,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         ref = str(self._design.model_id)                 # the WT reference (loaded crystal)
         cmds.append(f"show #{ref} models" if self._show_ref_cb.isChecked()
                     else f"hide #{ref} models")
+        # WT REFERENCE FOLDS (the deviation's seed-pinned comparison basis) are a computation
+        # artifact, NOT the displayed result — the deviation is read off the variant fold's
+        # floor-gated colouring. _fold_wt_reference opens + overlays them; hide them here so
+        # they don't clutter/occlude the variant fold (they previously persisted untoggleable).
+        for wt_mid in self._wt_ref_model_ids():
+            cmds.append(f"hide #{wt_mid} models")
         models = self._fold_models(self._design)
         if not models:
             return cmds

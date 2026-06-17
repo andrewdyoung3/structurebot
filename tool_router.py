@@ -1875,6 +1875,12 @@ class ToolRouter:
                 f"High-accuracy ddG validation — #{mid} "
                 f"({n} trajectories x {cyc} cycles, median + confidence)"
             )
+        if tool == "variant_deviation":
+            inp    = tool_inputs.get("variant_deviation", {})
+            engine = inp.get("engine", "esmfold")
+            target = inp.get("target", "monomer")
+            return (f"Variant-vs-WT Cα deviation ({engine}:{target}) — folds the WT "
+                    "reference if absent, then per-residue floor-gated deviation")
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────

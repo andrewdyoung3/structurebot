@@ -919,6 +919,43 @@ class TestStage4b:
         p._mode_key = _RESULT_DEVIATION_MODE
         assert p.color_commands_for(tab) == []
 
+    def test_wt_reference_fold_is_hidden_not_overlaid(self, _app):
+        # the WT REFERENCE fold (deviation comparison basis, model #7) is a computation
+        # artifact — fold_visibility_commands HIDES it so it doesn't clutter/occlude the
+        # variant fold (the deviation is read off the variant fold's colouring).
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p.apply_deviation_result(vid, self._dev_result(variant_mid="2"))   # caches wt_ref #7
+        tab.set_active_row(vid)
+        assert p._wt_ref_model_ids() == ["7"]
+        assert "hide #7 models" in p.fold_visibility_commands(tab)
+
+    @staticmethod
+    def _mode_enabled(p, key):
+        m = p._mode_combo.model()
+        for i in range(p._mode_combo.count()):
+            if p._mode_combo.itemData(i) == key:
+                return m.item(i).isEnabled()
+        return None
+
+    def test_result_modes_greyed_until_computed(self, _app):
+        # a result colour mode is DISABLED until its calc has run for the active variant —
+        # so selecting 'Deviation vs WT' isn't a silent no-op before the button computes it.
+        p, tab, (vid,) = self._variant_panel()
+        tab.set_active_row(vid)
+        p._apply_color_to(tab)                                          # refresh (no results yet)
+        assert self._mode_enabled(p, _RESULT_DEVIATION_MODE) is False
+        assert self._mode_enabled(p, _RESULT_PLDDT_MODE) is False
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))       # fold → pLDDT available
+        tab.set_active_row(vid)
+        p._apply_color_to(tab)
+        assert self._mode_enabled(p, _RESULT_PLDDT_MODE) is True
+        assert self._mode_enabled(p, _RESULT_DEVIATION_MODE) is False   # deviation NOT yet run
+        p.apply_deviation_result(vid, self._dev_result(variant_mid="2"))
+        tab.set_active_row(vid)
+        p._apply_color_to(tab)
+        assert self._mode_enabled(p, _RESULT_DEVIATION_MODE) is True    # now computed → available
+
 
 class TestBoltzStage:
     """Boltz as the assembly + selectable-monomer engine on the SAME seam: the assembly
