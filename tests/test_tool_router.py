@@ -64,10 +64,15 @@ class TestWorkbenchFoldS4b:
         assert res.data["new_model_id"] == "2"
         assert res.data["source"] == "local_venv312"
         assert res.data["engine"] == "esmfold"
-        joined = "\n".join(res.viz_commands)
-        assert 'open "' in joined
-        assert "color byattribute bfactor #2 palette alphafold" in joined
-        assert "matchmaker #2 to #1" in joined
+        # V3 fix: open + viz run LIVE (real id read back from the open response; here the
+        # mock open has no '#N' so the id falls back to next_model_id()=="2"). viz_commands
+        # is empty (already executed) — assert the LIVE bridge calls + the recorded commands.
+        assert res.viz_commands == []
+        calls = [c.args[0] for c in router.bridge.run_command.call_args_list]
+        assert any(s.startswith('open "') for s in calls)
+        assert "color byattribute bfactor #2 palette alphafold" in calls
+        assert "matchmaker #2 to #1" in calls
+        assert "color byattribute bfactor #2 palette alphafold" in res.data["commands"]
 
     def test_fold_local_only_breach_rejected(self):
         router = _make_router()
@@ -131,10 +136,13 @@ class TestBoltzFoldStage:
         assert res.success
         assert res.data["engine"] == "boltz" and res.data["new_model_id"] == "2"
         assert res.data["iptm"] == 0.959 and res.data["source"] == "local_boltz_env"
-        joined = "\n".join(res.viz_commands)
-        assert 'open "' in joined
-        assert "color byattribute bfactor #2 palette alphafold" in joined
-        assert "matchmaker #2 to #1" in joined
+        # V3 fix: open + viz run LIVE against the real (mock-fallback "2") id; viz_commands
+        # empty (already executed).
+        assert res.viz_commands == []
+        calls = [c.args[0] for c in router.bridge.run_command.call_args_list]
+        assert any(s.startswith('open "') for s in calls)
+        assert "color byattribute bfactor #2 palette alphafold" in calls
+        assert "matchmaker #2 to #1" in calls
         # multi-chain assembly: the bridge was asked to fold BOTH chains
         assert len(bridge.predict.call_args.args[0]) == 2
 

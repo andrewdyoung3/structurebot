@@ -455,8 +455,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if self._in_flight:
             self.presenter.warn("A request is already running — wait for it to finish.")
             return
-        self.output.append(render_html(
-            f"<pre style='margin:0;color:#7fd1ff'><b>&gt; {escape(spec.get('user_input',''))}</b></pre>"))
+        # Append the pre-built HTML DIRECTLY to the QTextEdit (same as the manual-input
+        # echo above). Do NOT pass it through render_html() — that's the Rich→HTML exporter,
+        # which would ESCAPE this already-HTML string into literal `<pre…>` characters.
+        self.output.append(
+            f"<pre style='margin:0;color:#7fd1ff'><b>&gt; {escape(spec.get('user_input',''))}</b></pre>")
         self._in_flight = True
         self._pending_focus = []
         self._opened_mids = []
