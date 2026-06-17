@@ -161,6 +161,17 @@ class ChainDesign:
                     {"resnum": tmpl.resnum, "to_aa": aa, **note})
         v.mutations.sort(key=lambda m: m.resnum)
 
+    def delete_variant(self, variant_id: str) -> bool:
+        """Remove a variant ROW (and everything on it — mutations, provenance, and its
+        ResultSlots fold/deviation/stability/solubility/scans) from this design. Returns
+        True if a row was removed. ROW-LEVEL ONLY: never touches `template_cells` (the
+        residue numbering / column axis), sibling variants, or the shared `wt_refs` (the
+        WT reference folds, which are per-engine and outlive any one variant). This does
+        NOT renumber anything — residue/indel deletion is a SEPARATE deferred increment."""
+        before = len(self.variants)
+        self.variants = [v for v in self.variants if v.id != variant_id]
+        return len(self.variants) < before
+
 
 @dataclass
 class DesignSession:

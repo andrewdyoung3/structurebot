@@ -937,3 +937,59 @@ class TestBoltzStage:
         f = tab.design.get_variant(vid).results.fold
         assert f["iptm"] == 0.959 and f["source"] == "local_boltz_env"
         assert "ipTM 0.96" in tab.badges[vid] and "pLDDT 96" in tab.badges[vid]
+
+
+class TestDeleteVariant:
+    """§9 item (1): ROW-delete a variant — removes the row + its results, hides its fold
+    model (HIDE not close), never touches residue numbering or the shared wt_refs."""
+
+    def _panel2(self, n_variants=2):
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
+                      session=MagicMock())
+        p.load_model("1")
+        ids = []
+        for _ in range(n_variants):
+            p._add_variant()
+            ids.append(p._cur_tab().design.variants[-1].id)
+        return p, p._cur_tab(), ids
+
+    @staticmethod
+    def _fold(model_id="2"):
+        return {"tool_step_results": [{"tool": "esmfold", "data": {
+            "engine": "esmfold", "new_model_id": model_id, "reference_model_id": "1",
+            "mean_plddt": 80.0, "length": 3, "source": "local_venv312",
+            "plddt": {1: 95.0, 2: 80.0, 3: 40.0}}}]}
+
+    def test_delete_variant_pure_keeps_others_and_numbering(self, _app):
+        p, tab, (v1, v2) = self._panel2()
+        cd = tab.design
+        cols_before = list(c.resnum for c in cd.template_cells)
+        cd.wt_refs["esmfold:monomer"] = {"engine": "esmfold", "model_id": "9"}
+        assert cd.delete_variant(v1) is True
+        assert cd.get_variant(v1) is None and cd.get_variant(v2) is not None
+        assert [c.resnum for c in cd.template_cells] == cols_before     # numbering untouched
+        assert cd.wt_refs.get("esmfold:monomer") is not None           # shared ref untouched
+        assert cd.delete_variant("nope") is False                      # idempotent miss
+
+    def test_delete_folded_variant_hides_model(self, _app):
+        p, tab, (v1, v2) = self._panel2()
+        p.apply_fold_result(v1, self._fold(model_id="2"))
+        tab.set_active_row(v1)
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._delete_variant(tab, v1)
+        assert "hide #2 models" in pushed                # fold model hidden (not closed)
+        assert not any(c.startswith("close") for c in pushed)
+        assert tab.design.get_variant(v1) is None        # row gone
+        assert tab.design.get_variant(v2) is not None    # sibling unaffected
+        assert tab.active_row_id == "T"                  # active fell back off the deleted row
+        assert v1 not in tab.badges
+
+    def test_delete_unfolded_variant_no_model_command(self, _app):
+        p, tab, (v1, v2) = self._panel2()
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._delete_variant(tab, v2)
+        assert not any("hide #" in c for c in pushed)    # no fold → no hide command
+        assert tab.design.get_variant(v2) is None
+        assert tab.design.get_variant(v1) is not None
