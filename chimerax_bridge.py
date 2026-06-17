@@ -513,7 +513,7 @@ class ChimeraXBridge:
             model_id = self._opened_model_id(cmd, result)
             if model_id is not None:
                 self._maybe_apply_presentation_on_open()
-                self._maybe_apply_lean_layout()
+                self._reapply_lean_layout()      # re-hide panels ChimeraX re-shows on open
                 # ChimeraX is structure-only — no Sequence Viewer is opened (sequence
                 # viewing lives in the StructureBot window). Removed 2026-06-16.
                 # Fire-and-forget: hand the REAL opened model id to whoever registered
@@ -625,9 +625,23 @@ class ChimeraXBridge:
         except Exception:
             pass
 
+    def _reapply_lean_layout(self) -> None:
+        """Re-apply the lean window layout (config-gated, idempotent `tool hide`). Unlike
+        the once-per-session startup apply, this runs on EVERY structure open: ChimeraX
+        re-shows panels (Log/Models) when a structure loads, so a once-only apply left the
+        panel state non-deterministic across opens. Re-hiding here makes consecutive opens
+        identical. Error-first (a failure never disrupts the open)."""
+        try:
+            from sequence_viewer import apply_lean_layout
+            apply_lean_layout(self.run_command)
+        except Exception:
+            pass
+
     def _maybe_apply_lean_layout(self) -> None:
-        """Apply the lean window layout ONCE per ChimeraX session (config-gated).
-        The guard is set before running so a partial failure never causes a retry."""
+        """Apply the lean window layout ONCE per ChimeraX session (config-gated) — the
+        STARTUP path (clean pre-model view). The per-open re-apply lives in
+        `_reapply_lean_layout`. The guard is set before running so a partial failure never
+        causes a retry."""
         if self._lean_layout_applied:
             return
         self._lean_layout_applied = True
