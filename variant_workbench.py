@@ -1646,6 +1646,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not (v.results.fold and v.results.fold.get("model_id")):
             self._status.setText(f"Fold {v.id} first — deviation compares FOLDED models.")
             return
+        # Stage A: indel-aware column pairing is MONOMER-only. Refuse an indel variant folded
+        # as an ASSEMBLY rather than silently mis-pair at the deletion (the §0 silent-wrong
+        # guard — multichain per-chain mapping is a later phase).
+        if v.indels and v.results.fold.get("target") == "assembly":
+            self._status.setText(
+                f"{v.id} has {len(v.indels)} indel(s) AND was folded as an ASSEMBLY — "
+                f"indel-aware deviation is monomer-only for now. Fold {v.id} as a MONOMER "
+                f"to compare (refusing to mis-pair the multimer deletion).")
+            return
         spec = self.deviation_launch_spec()
         if spec is not None:
             self.launchRequested.emit(spec)

@@ -1120,3 +1120,31 @@ class TestIndelDeletionPanel:
         spec = p.deviation_launch_spec()
         m = spec["tool_inputs"]["fold_column_map"]
         assert m == {1: 1, 2: 2, 3: 4, 4: 5}              # shifted after the deletion
+
+    def test_assembly_indel_deviation_refuses_not_mispair(self, _app):
+        # §0 guard: an indel variant folded as an ASSEMBLY must REFUSE deviation (monomer-only
+        # column pairing) rather than silently mis-pair. No launch; honest message.
+        p, tab, vid = self._panel()
+        emitted = []
+        p.launchRequested.connect(lambda spec: emitted.append(spec))
+        p.apply_fold_result(vid, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "2", "reference_model_id": "1",
+            "mean_plddt": 90.0, "target": "assembly", "iptm": 0.84, "plddt": {1: 90.0}}}]})
+        tab.set_active_row(vid)
+        p._do_delete_residue(tab, vid, 2)
+        p._on_deviation_clicked()
+        assert emitted == []                               # refused, not launched
+        assert "monomer" in p._status.text().lower()
+
+    def test_monomer_indel_deviation_launches(self, _app):
+        # the verified Stage-A path: a MONOMER indel variant DOES launch (guard doesn't block).
+        p, tab, vid = self._panel()
+        emitted = []
+        p.launchRequested.connect(lambda spec: emitted.append(spec))
+        p.apply_fold_result(vid, {"tool_step_results": [{"tool": "esmfold", "data": {
+            "engine": "esmfold", "new_model_id": "2", "reference_model_id": "1",
+            "mean_plddt": 80.0, "target": "monomer", "plddt": {1: 90.0}}}]})
+        tab.set_active_row(vid)
+        p._do_delete_residue(tab, vid, 2)
+        p._on_deviation_clicked()
+        assert len(emitted) == 1 and "fold_column_map" in emitted[0]["tool_inputs"]
