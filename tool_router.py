@@ -7660,6 +7660,27 @@ class ToolRouter:
         re.IGNORECASE | re.VERBOSE,
     )
 
+    def _whole_model_scope(self, user_input: str, model_id: str) -> str:
+        """The model scope for an op-class command whose target is the WHOLE model (no
+        chain/residue/keyword subregion), per the §0 rule: the ENGLISH is authoritative —
+        an explicit `#N`/`model N` wins; otherwise the command applies to ALL VISIBLE
+        models (hidden ones untouched), NOT a single default or a stale/latest fold.
+        Falls back to `model_id` only when display state is unavailable (never widens
+        blindly). Returns a bare atomspec model part, possibly comma-joined ('1' / '1,2').
+        Subregion targets do NOT call this — their explicit-scope handling is unchanged."""
+        ui = user_input or ""
+        mexp = (re.search(r"#(\d+(?:\.\d+)*)\b", ui)
+                or re.search(r"\bmodels?\s+#?(\d+(?:\.\d+)*)\b", ui, re.I))
+        if mexp:
+            return mexp.group(1)                              # explicit model wins
+        try:
+            vis = self.bridge.visible_model_ids() if self.bridge is not None else None
+        except Exception:
+            vis = None
+        if isinstance(vis, list) and vis:
+            return ",".join(str(v) for v in vis)             # ALL VISIBLE models
+        return str(model_id)                                  # probe unavailable → default
+
     def _resolve_opclass_target(
         self, user_input: str, model_id: str,
     ) -> Dict[str, Any]:
@@ -7682,6 +7703,9 @@ class ToolRouter:
         else ligand/solvent/ions keyword; else the whole model.
         """
         ui  = user_input or ""
+        # `mid` is the single-model default used by SUBREGION targets (chain / residue /
+        # keyword) — their explicit-scope handling is UNCHANGED. The WHOLE-MODEL steps
+        # (3, 6) instead resolve the §0 all-visible scope via _whole_model_scope.
         mid = str(model_id)
 
         # 1. Explicit residue selection (range / list / single), optionally
@@ -7721,11 +7745,13 @@ class ToolRouter:
             return {"spec": None, "chain": None, "keyword": None,
                     "target_desc": "a finer selection", "defer": True}
 
-        # 3. Explicit whole-model phrasing — an intended, explicit broadening.
+        # 3. Explicit whole-model phrasing — an intended, explicit broadening. Applies
+        #    to ALL VISIBLE models (the §0 rule), not just the default one.
         if re.search(r"\b(?:each|every|all|both|per)\s+chains?\b"
                      r"|\bwhole\s+(?:model|structure|thing)\b|\beverything\b",
                      ui, re.I):
-            return {"spec": f"#{mid}", "chain": None, "keyword": None,
+            scope = self._whole_model_scope(ui, model_id)
+            return {"spec": f"#{scope}", "chain": None, "keyword": None,
                     "target_desc": "whole model", "defer": False}
 
         # 4. Explicit chain ref ("chain A" / "/A"), but NOT residue-qualified
@@ -7752,9 +7778,10 @@ class ToolRouter:
                     "keyword": keyword, "target_desc": f"the {keyword}",
                     "defer": False}
 
-        # 6. No target named → the whole model (the common "color by chain" /
-        #    "show as cartoon" case).
-        return {"spec": f"#{mid}", "chain": None, "keyword": None,
+        # 6. No target named → ALL VISIBLE models (the §0 rule; the common "color by
+        #    chain" / "show only as cartoon" case — the reported regression).
+        scope = self._whole_model_scope(ui, model_id)
+        return {"spec": f"#{scope}", "chain": None, "keyword": None,
                 "target_desc": "whole model", "defer": False}
 
     # Target phrases removed before ALIAS / scheme matching only. A target sitting
