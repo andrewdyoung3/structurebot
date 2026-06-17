@@ -125,6 +125,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
 
     cellClicked2 = QtCore.Signal(object, int, bool)   # (row_id, template col, ctrl-held)
     rowHeaderSelected = QtCore.Signal(object)         # row_id (header click → SELECT active row)
+    rowMenuRequested  = QtCore.Signal(object, object)  # (row_id, global QPoint) — header right-click
     cellMenuRequested = QtCore.Signal(object, int, object)  # (row_id, col, global QPoint)
 
     def __init__(self, design: ChainDesign, suggestions: Optional[Dict[int, List[dict]]] = None):
@@ -221,17 +222,17 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         return f"{vid}  {badge}" if badge else vid
 
     def eventFilter(self, obj, event) -> bool:
-        """Row-header click router. A left-click ANYWHERE on a row header → SELECT that variant
-        as the active row — the only header action (always, never a modal). The per-mutation
-        result-DETAIL display is PARKED (the badge-region approach was dead), so there is no
-        detail gesture here for now. Returns False (never consumes — normal header painting
+        """Row-header click router. LEFT-click ANYWHERE on a row header → SELECT that variant
+        as the active row. RIGHT-click on a VARIANT header → emit rowMenuRequested (the panel
+        shows a 'Delete variant' menu). T (template) has no menu. The per-mutation result-
+        DETAIL display is PARKED. Returns False (never consumes — normal header painting
         proceeds)."""
         block = self._vp_to_block.get(obj)
         if block is None:
             return False
         if event.type() != QtCore.QEvent.Type.MouseButtonPress:
             return False
-        if event.button() != QtCore.Qt.LeftButton:
+        if event.button() not in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
             return False
         vh = block.verticalHeader()
         try:
@@ -242,7 +243,13 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         rid = self._row_ids[section] if 0 <= section < len(self._row_ids) else None
         if rid in (None, _SUGGEST_ROW):
             return False
-        self.rowHeaderSelected.emit(rid)                 # click → SELECT (always)
+        if event.button() == QtCore.Qt.RightButton:
+            if rid != "T":                               # T is the immutable template — no delete
+                self.rowMenuRequested.emit(rid, event.globalPosition().toPoint()
+                                           if hasattr(event, "globalPosition")
+                                           else event.globalPos())
+            return False
+        self.rowHeaderSelected.emit(rid)                 # left-click → SELECT (always)
         return False
 
     def _put(self, block, row, col, text, gcol, row_id, aa, *, edited=False, faint=False):
@@ -654,6 +661,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.cellMenuRequested.connect(
                 lambda rid, col, gp, t=tab: self._show_cell_menu(t, rid, col, gp))
             tab.rowHeaderSelected.connect(lambda rid, t=tab: self._select_variant_row(t, rid))
+            tab.rowMenuRequested.connect(lambda rid, gp, t=tab: self._on_row_menu(t, rid, gp))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
         self._status.setText(
@@ -740,6 +748,46 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             menu.addAction(f"Revert to WT ({wt})",
                            lambda: self._do_substitute(tab, vid, col, wt))
         menu.exec(global_pos)
+
+    def _on_row_menu(self, tab: _ChainDesignTab, vid: str, global_pos) -> None:
+        """Right-click on a VARIANT row header → a 'Delete variant' menu. Row-level removal
+        only (no confirmation — this is a workbench). T never reaches here (filtered in the
+        tab's event handler)."""
+        v = tab.design.get_variant(vid)
+        if v is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        header = menu.addAction(f"{vid} ({len(v.mutations)} mutation(s))")
+        header.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Delete variant", lambda: self._delete_variant(tab, vid))
+        menu.exec(global_pos)
+
+    def _delete_variant(self, tab: _ChainDesignTab, vid: str) -> None:
+        """Remove a variant ROW: hide its predicted fold model (HIDE, never close — per the
+        fold-output decision), drop the row + its results from the design, re-render, move
+        the active row off it if needed, persist. ROW-LEVEL ONLY — never touches residue
+        numbering or the deviation reference data (that is the deferred indel increment)."""
+        v = tab.design.get_variant(vid)
+        if v is None:
+            return
+        # Hide the variant's predicted fold model if one exists (don't close it).
+        fold = v.results.fold or {}
+        mid = fold.get("model_id")
+        if mid:
+            self._run_commands_bg([f"hide #{mid} models"])
+        if not tab.design.delete_variant(vid):
+            return
+        if tab.active_row_id == vid:                  # active row gone → fall back to T
+            tab.set_active_row("T")
+            self._edit_target = None
+        tab.badges.pop(vid, None)
+        tab.rebuild()
+        self._apply_color_to(tab)
+        self._push_3d_color(tab)                      # refresh fold visibility for the new active row
+        self._persist()
+        self._status.setText(f"Deleted variant {vid} (row removed; its fold model hidden, "
+                             f"not closed). Residue numbering untouched.")
 
     def _on_mode_changed(self) -> None:
         self._mode_key = self._mode_combo.currentData() or "none"
