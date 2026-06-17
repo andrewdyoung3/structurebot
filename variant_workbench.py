@@ -57,6 +57,20 @@ _AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 _T_BG  = QtGui.QColor("#eef4ff")
 _EDIT_BG = QtGui.QColor("#ffd27f")          # mirrors seq_editor edited-cell highlight
 _RESET_BG = QtGui.QColor("#ffffff")         # neutral / no-opinion under a color mode
+_GLYPH_DARK = QtGui.QColor("#1a1a1a")       # default readable glyph on light/default cells
+# Out-of-focus (non-active) rows under a RESULT mode: an EXPLICIT light bg + a dim-but-clearly
+# -readable glyph. Explicit (not a cleared/inherited brush) so it never goes dark-on-dark under
+# a dark widget palette — de-emphasised vs the active row, yet legible.
+_DIM_BG = QtGui.QColor("#eceef2")
+_DIM_FG = QtGui.QColor("#3c4250")
+
+
+def _contrast_fg(qcolor: QtGui.QColor) -> QtGui.QColor:
+    """A glyph colour that stays legible on *qcolor*: dark glyph on a light cell, white glyph
+    on a dark one (e.g. deep-blue pLDDT >90 / saturated ddG). Keeps every coloured cell's
+    letter readable rather than black-on-dark."""
+    lum = (0.299 * qcolor.red() + 0.587 * qcolor.green() + 0.114 * qcolor.blue()) / 255.0
+    return _GLYPH_DARK if lum > 0.55 else QtGui.QColor("#ffffff")
 
 
 # ── off-thread HTTP workers (mirror seq_editor _SelectWorker) ──────────────────────
@@ -110,7 +124,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
     a click on the sparse inline Suggest track emits (_SUGGEST_ROW, col)."""
 
     cellClicked2 = QtCore.Signal(object, int, bool)   # (row_id, template col, ctrl-held)
-    rowHeaderClicked = QtCore.Signal(object)          # row_id (variant header click → detail)
+    rowHeaderSelected = QtCore.Signal(object)         # row_id (header click → SELECT active row)
     cellMenuRequested = QtCore.Signal(object, int, object)  # (row_id, col, global QPoint)
 
     def __init__(self, design: ChainDesign, suggestions: Optional[Dict[int, List[dict]]] = None):
@@ -123,6 +137,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         self._result_coloring: Optional[Tuple[str, Dict[int, str]]] = None  # (row_id, resnum->hex)
         self._blocks: List[QtWidgets.QTableWidget] = []
         self._row_ids: List[Optional[str]] = []     # by table row index
+        self._vp_to_block: Dict[Any, QtWidgets.QTableWidget] = {}  # header viewport → its block
         self.setWidgetResizable(True)
         self._build()
 
@@ -132,6 +147,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         v = QtWidgets.QVBoxLayout(inner)
         v.setSpacing(12)
         self._blocks = []
+        self._vp_to_block = {}
         design = self.design
         n = len(design.template_cells)
 
@@ -184,8 +200,14 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             block.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             block.customContextMenuRequested.connect(
                 lambda pos, b=block: self._on_context_menu(b, pos))
-            block.verticalHeader().sectionClicked.connect(
-                lambda section, b=block: self._on_header(b, section))
+            # Row-header clicks: NAME region → SELECT (active row); BADGE region → result
+            # detail. sectionClicked gives only the row index (not the click-x), so an event
+            # filter on the header viewport reads the x to split name-vs-badge.
+            vh = block.verticalHeader()
+            vh.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            vp = vh.viewport()
+            vp.installEventFilter(self)
+            self._vp_to_block[vp] = block
             self._blocks.append(block)
             v.addWidget(block)
         v.addStretch(1)
@@ -198,12 +220,30 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         badge = self.badges.get(vid)
         return f"{vid}  {badge}" if badge else vid
 
-    def _on_header(self, block, section: int) -> None:
-        """A click on a row's vertical header → request the expandable result detail
-        (variant rows only)."""
+    def eventFilter(self, obj, event) -> bool:
+        """Row-header click router. A left-click ANYWHERE on a row header → SELECT that variant
+        as the active row — the only header action (always, never a modal). The per-mutation
+        result-DETAIL display is PARKED (the badge-region approach was dead), so there is no
+        detail gesture here for now. Returns False (never consumes — normal header painting
+        proceeds)."""
+        block = self._vp_to_block.get(obj)
+        if block is None:
+            return False
+        if event.type() != QtCore.QEvent.Type.MouseButtonPress:
+            return False
+        if event.button() != QtCore.Qt.LeftButton:
+            return False
+        vh = block.verticalHeader()
+        try:
+            y = int(event.position().y())                # Qt6 QMouseEvent
+        except AttributeError:
+            y = event.y()
+        section = vh.logicalIndexAt(y)
         rid = self._row_ids[section] if 0 <= section < len(self._row_ids) else None
-        if rid not in (None, "T", _SUGGEST_ROW):
-            self.rowHeaderClicked.emit(rid)
+        if rid in (None, _SUGGEST_ROW):
+            return False
+        self.rowHeaderSelected.emit(rid)                 # click → SELECT (always)
+        return False
 
     def _put(self, block, row, col, text, gcol, row_id, aa, *, edited=False, faint=False):
         it = QtWidgets.QTableWidgetItem(text)
@@ -272,18 +312,26 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                         continue
                     if not active:
                         it.setBackground(self._default_bg(row_id, bool(it.data(_EDITED_ROLE))))
+                        it.setForeground(QtGui.QBrush(_GLYPH_DARK))
                         continue
                     aa = it.data(_AA_ROLE)
                     hexc = mode.color_for(aa) if aa not in (None, "-") else None
-                    it.setBackground(QtGui.QBrush(QtGui.QColor(hexc) if hexc else _RESET_BG))
+                    if hexc:
+                        qc = QtGui.QColor(hexc)
+                        it.setBackground(QtGui.QBrush(qc))
+                        it.setForeground(QtGui.QBrush(_contrast_fg(qc)))
+                    else:
+                        it.setBackground(QtGui.QBrush(_RESET_BG))
+                        it.setForeground(QtGui.QBrush(_GLYPH_DARK))
 
     # ── result color mode (S4a): paint ONE row by per-residue computed value ─────────
     def set_result_coloring(self, active_row_id: str, resnum_to_hex: Dict[int, str]) -> None:
         """Paint the ACTIVE row's cells by a per-RESNUM result value (e.g. ddG via
-        color_modes.ddg_color); every other sequence cell renders the white reset — so the
-        result mode mirrors the 3D (which recolors only the active row's residues). Records
-        the coloring so rebuild() can re-apply it. The aa-modes are untouched (this is the
-        result-mode path; the panel chooses which to call)."""
+        color_modes.ddg_color), mirroring the 3D (which recolors only the active row's
+        residues — its no-data cells reset to white). NON-active rows keep their PLAIN
+        readable default (T tint / edit highlight / clear) — NOT a white blank — so every
+        sequence stays legible (the white-reset is active-row↔3D sync, not a global blank).
+        Coloured cells get a contrasting glyph. Records the coloring so rebuild() re-applies."""
         self._mode = get_mode("none")
         self._result_coloring = (active_row_id, dict(resnum_to_hex))
         for block in self._blocks:
@@ -295,9 +343,26 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                     row_id = it.data(_ROW_ROLE)
                     if row_id is None or row_id == _SUGGEST_ROW:
                         continue
+                    if row_id != active_row_id:                  # non-active → dim BUT readable
+                        edited = bool(it.data(_EDITED_ROLE))
+                        if row_id == "T":
+                            bg = _T_BG                            # keep T's identity tint
+                        elif edited:
+                            bg = _EDIT_BG                         # keep edits visible
+                        else:
+                            bg = _DIM_BG                          # EXPLICIT light (never clear→dark)
+                        it.setBackground(QtGui.QBrush(bg))
+                        it.setForeground(QtGui.QBrush(_GLYPH_DARK if edited else _DIM_FG))
+                        continue
                     rn = self.design.resnum_for_col(it.data(_RESNUM_ROLE))
-                    hexc = resnum_to_hex.get(rn) if row_id == active_row_id else None
-                    it.setBackground(QtGui.QBrush(QtGui.QColor(hexc) if hexc else _RESET_BG))
+                    hexc = resnum_to_hex.get(rn)
+                    if hexc:
+                        qc = QtGui.QColor(hexc)
+                        it.setBackground(QtGui.QBrush(qc))
+                        it.setForeground(QtGui.QBrush(_contrast_fg(qc)))
+                    else:
+                        it.setBackground(QtGui.QBrush(_RESET_BG))   # active row, no data → reset
+                        it.setForeground(QtGui.QBrush(_GLYPH_DARK))
 
     def color_hex_at(self, row_id: str, col: int) -> Optional[str]:
         """The painted background hex of (row_id, template col) — for the sync-invariant
@@ -483,6 +548,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._fold_vis_btn.setCheckable(True)
         self._fold_vis_btn.toggled.connect(self._on_fold_visibility_toggled)
         bar.addWidget(self._fold_vis_btn)
+        # Escape hatch: lay the variant folds + the WT reference out SIDE-BY-SIDE (not
+        # overlaid) in the one 3D scene via ChimeraX `tile`. Targets the specific fold models
+        # (not bare `tile`, which would drag in any hidden models). Shared camera; the models
+        # leave superposition (accepted — this is "lay them out", not "overlay").
+        self._tile_btn = QtWidgets.QPushButton("Tile folds")
+        self._tile_btn.setToolTip("Lay the variant folds + reference out side-by-side (not "
+                                  "overlaid). Select a variant afterwards to return to the "
+                                  "overlay. Needs ≥2 models.")
+        self._tile_btn.clicked.connect(self._on_tile_clicked)
+        bar.addWidget(self._tile_btn)
+        # Independent overlay toggles (distinct from the global "Hide folds"): show just the
+        # active variant's FOLD, just the WT REFERENCE, or both (default).
+        self._show_fold_cb = QtWidgets.QCheckBox("Fold")
+        self._show_fold_cb.setChecked(True)
+        self._show_fold_cb.setToolTip("Show the ACTIVE variant's predicted fold in the overlay.")
+        self._show_fold_cb.toggled.connect(self._on_overlay_toggle)
+        bar.addWidget(self._show_fold_cb)
+        self._show_ref_cb = QtWidgets.QCheckBox("Reference")
+        self._show_ref_cb.setChecked(True)
+        self._show_ref_cb.setToolTip("Show the WT reference structure in the overlay.")
+        self._show_ref_cb.toggled.connect(self._on_overlay_toggle)
+        bar.addWidget(self._show_ref_cb)
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
         # WT reference fold (same engine+target). Establishes the WT reference + noise floor
         # on first use for that combo (folds T; Boltz also folds the cross-seed floor set).
@@ -543,7 +630,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 lambda rid, col, ctrl, t=tab: self._on_cell(t, rid, col, to_scan=ctrl))
             tab.cellMenuRequested.connect(
                 lambda rid, col, gp, t=tab: self._show_cell_menu(t, rid, col, gp))
-            tab.rowHeaderClicked.connect(lambda rid, t=tab: self._on_result_detail(t, rid))
+            tab.rowHeaderSelected.connect(lambda rid, t=tab: self._select_variant_row(t, rid))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
         self._status.setText(
@@ -828,6 +915,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if row_id == "T":
             tab.set_active_row("T")
             self._edit_target = None
+            self._apply_color_to(tab)                       # panel result-coloring FOLLOWS active
             self._push_3d_color(tab)
         elif row_id is not None:                            # a variant row
             tab.set_active_row(row_id)
@@ -836,7 +924,27 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             wt = tab.design.template_cells[col].aa if 0 <= col < len(tab.design.template_cells) else "?"
             self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
                                  f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+            self._apply_color_to(tab)                       # panel result-coloring FOLLOWS active
             self._push_3d_color(tab)
+
+    def _select_variant_row(self, tab: _ChainDesignTab, row_id) -> None:
+        """Row-header NAME click → SELECT *row_id* as the active row and drive the 3D via the
+        active-row coupling (HIDE switching: `_push_3d_color` → `fold_visibility_commands`
+        shows this variant's fold + the reference, hides the other folds). A ROW-level select
+        (no per-column edit target) and SILENT — never the results modal (that is the badge
+        gesture). Mirrors the cell-click select. Prerequisite for the active-row fold switch."""
+        if tab is None or row_id is None:
+            return
+        tab.set_active_row(row_id)
+        self._edit_target = None
+        self._apply_color_to(tab)                           # panel result-coloring FOLLOWS active
+        self._push_3d_color(tab)
+        if row_id == "T":
+            self._status.setText("Selected T (template baseline) — the active row.")
+        else:
+            self._status.setText(
+                f"Selected {row_id} — the active row (fold + reference shown, others hidden). "
+                f"Click its result badge for the per-mutation detail.")
 
     # ── coloring helpers ───────────────────────────────────────────────────────────
     def _active_ddg_map(self, tab: _ChainDesignTab) -> Dict[int, float]:
@@ -910,11 +1018,27 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         models follow the active row (per-model visibility). No-op for the OFF mode with no
         folds (non-destructive: we do not know the pre-overlay coloring to restore)."""
         cmds = self.fold_visibility_commands(tab) + self.color_commands_for(tab)
+        self._run_commands_bg(cmds)
+
+    def _run_commands_bg(self, cmds: List[str]) -> None:
+        """Fire-and-forget a ChimeraX command list off the UI thread (the shared 3D push)."""
         if not cmds:
             return
         w = _ColorWorker(self._c, cmds)
-        w.signals.failed.connect(lambda e: self._status.setText(f"Workbench 3D color failed: {e}"))
+        w.signals.failed.connect(lambda e: self._status.setText(f"Workbench 3D command failed: {e}"))
         self._pool.start(w)
+
+    def _select_result_mode(self, mode_key: str) -> None:
+        """Set the active color mode + sync the combo display WITHOUT re-firing
+        _on_mode_changed (the caller re-renders). Auto-surfaces a fresh result's mode."""
+        self._mode_key = mode_key
+        cb = self._mode_combo
+        for i in range(cb.count()):
+            if cb.itemData(i) == mode_key:
+                cb.blockSignals(True)
+                cb.setCurrentIndex(i)
+                cb.blockSignals(False)
+                return
 
     # ── column-click → 3D select (ALL copies), off the UI thread ───────────────────
     def _select_column(self, design: ChainDesign, col: int) -> None:
@@ -1290,8 +1414,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     def apply_fold_result(self, variant_id: str, result: dict) -> None:
         """Consume the executed fold result (engine on_result seam) into the variant's
-        ResultSlots.fold via the normalized contract, then re-render the badge, recolor
-        (if the pLDDT mode is active) and couple the new model to the active row. UI thread."""
+        ResultSlots.fold via the normalized contract, then re-render the badge, AUTO-SURFACE
+        the pLDDT result mode (no manual step), and couple the new model to the active row.
+        Re-folding the SAME variant REPLACES its prior model (close it — never stack). UI thread."""
         cd_v = self._find_variant(variant_id)
         if cd_v is None:
             return
@@ -1300,10 +1425,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not data or not (data.get("new_model_id") or data.get("model_id")):
             self._status.setText(f"{variant_id}: fold produced no model.")
             return
+        prior_mid = (v.results.fold or {}).get("model_id")     # re-fold → replace this
         author_resnums = [c.resnum for c in v.cells if not c.is_gap and c.resnum is not None]
         v.results.fold = fold_summary(data, author_resnums,
                                       reference_model_id=data.get("reference_model_id"))
+        new_mid = v.results.fold.get("model_id")
         self._persist()
+        # REPLACE-ON-REFOLD: close the variant's prior predicted model so re-folding doesn't
+        # accumulate (one model per variant). New + old are distinct models → no race with
+        # the recolor push below.
+        if prior_mid and str(prior_mid) != str(new_mid):
+            self._run_commands_bg([f"close #{prior_mid}"])
+        # AUTO-SURFACE: switch to the pLDDT result mode so the fresh fold maps itself (the
+        # _rerender_results below applies it); reuses the single color_modes seam.
+        self._select_result_mode(_RESULT_PLDDT_MODE)
         self._rerender_results(cd, v)
         f = v.results.fold
         mp = f.get("mean_plddt")
@@ -1313,9 +1448,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText(
                 f"{v.id} folded ({f.get('engine')}, {f.get('source')}): model "
                 f"#{f.get('model_id')}, mean pLDDT {mp:.1f}{iptm_txt} — overlaid on "
-                f"#{f.get('reference_model_id')}. Pick the 'pLDDT (result)' color mode to map it.")
+                f"#{f.get('reference_model_id')}, pLDDT-coloured (auto).")
         else:
-            self._status.setText(f"{v.id} folded — model #{f.get('model_id')}.")
+            self._status.setText(f"{v.id} folded — model #{f.get('model_id')} (pLDDT-coloured, auto).")
 
     # ── Stage 4c: per-residue variant-vs-WT deviation + noise floor ──────────────────
     def deviation_launch_spec(self) -> Optional[dict]:
@@ -1404,13 +1539,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if wt_ref:
             cd.wt_refs[f"{data.get('engine')}:{data.get('target')}"] = wt_ref
         self._persist()
+        self._select_result_mode(_RESULT_DEVIATION_MODE)   # AUTO-SURFACE the deviation mode
         self._rerender_results(cd, v)
         ar = data.get("anchor_residual_rmsd")
         self._status.setText(
             f"{v.id} deviation vs WT ({data.get('engine')}:{data.get('target')}): "
             f"{data.get('n_cleared_floor')}/{data.get('n_residues')} residues clear the "
             f"noise floor; max {data.get('max_deviation')} Å, anchor residual "
-            f"{ar if ar is not None else '?'} Å. Pick 'Deviation vs WT' color mode.")
+            f"{ar if ar is not None else '?'} Å (floor-gated colour, auto).")
 
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
     def _fold_models(self, design) -> Dict[str, str]:
@@ -1424,25 +1560,66 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         return out
 
     def fold_visibility_commands(self, tab: _ChainDesignTab) -> List[str]:
-        """Per-model 3D visibility: when 'Hide folds' is checked, hide ALL predicted
-        models; otherwise show the ACTIVE variant's model and hide the others (folds follow
-        the active row). Pure → the single source for the push, live-verify, and tests."""
+        """Per-model 3D visibility coupled to the active row — the clean ≤2 overlay. Two
+        INDEPENDENT toggles: show the WT REFERENCE (the loaded model) and/or the ACTIVE
+        variant's FOLD (others always hidden). The global 'Hide folds' button force-hides
+        ALL folds (overrides the Fold toggle). Re-selecting an already-folded variant
+        RE-SHOWS its fold here (`show #mid`) — the whole point of the HIDE design (switch-back
+        = show, not re-fold). Pure → the single source for the push, live-verify, and tests."""
         if self._design is None:
             return []
+        cmds: List[str] = []
+        ref = str(self._design.model_id)                 # the WT reference (loaded crystal)
+        cmds.append(f"show #{ref} models" if self._show_ref_cb.isChecked()
+                    else f"hide #{ref} models")
         models = self._fold_models(self._design)
         if not models:
-            return []
-        if self._fold_vis_btn.isChecked():
-            return [f"hide #{mid} models" for mid in models.values()]
+            return cmds
+        hide_all = self._fold_vis_btn.isChecked() or not self._show_fold_cb.isChecked()
         active = tab.active_row_id
-        return [f"show #{mid} models" if vid == active else f"hide #{mid} models"
-                for vid, mid in models.items()]
+        for vid, mid in models.items():
+            show = (not hide_all) and (vid == active)    # only the ACTIVE variant's fold shows
+            cmds.append(f"show #{mid} models" if show else f"hide #{mid} models")
+        return cmds
 
     def _on_fold_visibility_toggled(self, checked: bool) -> None:
         self._fold_vis_btn.setText("Show folds" if checked else "Hide folds")
         tab = self._cur_tab()
         if tab is not None:
             self._push_3d_color(tab)
+
+    def _on_overlay_toggle(self, _checked: bool = False) -> None:
+        """Fold / Reference overlay toggles changed → re-push the visibility coupling."""
+        tab = self._cur_tab()
+        if tab is not None:
+            self._push_3d_color(tab)
+
+    def tile_commands(self) -> List[str]:
+        """The commands to lay the WT reference + every variant fold out SIDE-BY-SIDE:
+        `show` each target then `tile` THOSE SPECIFIC ids — never bare `tile`, which would
+        drag in any hidden/unrelated models. [] when fewer than 2 targets exist. Pure →
+        the single source for the push, live-verify, and tests."""
+        if self._design is None:
+            return []
+        fold_ids = list(self._fold_models(self._design).values())
+        specs: List[str] = []
+        for m in [str(self._design.model_id)] + fold_ids:   # reference first, then folds
+            if m and m not in specs:
+                specs.append(m)
+        if len(specs) < 2:
+            return []
+        return ([f"show #{m} models" for m in specs]
+                + ["tile " + " ".join(f"#{m}" for m in specs)])
+
+    def _on_tile_clicked(self) -> None:
+        cmds = self.tile_commands()
+        if not cmds:
+            self._status.setText("Tile needs ≥2 models (the reference + at least one folded variant).")
+            return
+        self._run_commands_bg(cmds)
+        n = cmds[-1].count("#")
+        self._status.setText(f"Tiled {n} models side-by-side (superposition broken — select a "
+                             f"variant to return to the overlay).")
 
     # ── result badges + expandable detail ───────────────────────────────────────────
     @staticmethod
@@ -1491,28 +1668,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # model to the active row (show/hide) — _push_3d_color no-ops when nothing to do.
         self._push_3d_color(tab)
 
-    def _on_result_detail(self, tab: _ChainDesignTab, variant_id: str) -> None:
-        """Expandable detail: a popup of the variant's per-mutation ddG + solubility."""
-        v = tab.design.get_variant(variant_id)
-        if v is None:
-            return
-        lines: List[str] = []
-        stab = v.results.stability
-        if stab and stab.get("rows"):
-            lines.append(f"Stability ({stab.get('tier')} tier) — ΣddG "
-                         f"{('%+.2f' % stab['sum_ddg']) if stab.get('sum_ddg') is not None else 'n/a'}:")
-            for r in stab["rows"]:
-                dd = r.get("ddg")
-                lines.append(f"  {r['from_aa']}{r['resnum']}{r['to_aa']}: "
-                             f"ddG {('%+.2f' % dd) if dd is not None else 'n/c'} "
-                             f"[{r.get('ddg_source','?')}]")
-        sol = v.results.solubility
-        if sol:
-            lines.append(f"Solubility: {sol.get('variant'):+.2f} "
-                         f"(Δ {sol.get('delta'):+.2f} vs T)")
-        if not lines:
-            lines = [f"{variant_id}: no results yet. Use Test stability / Test solubility."]
-        QtWidgets.QMessageBox.information(self, f"{variant_id} results", "\n".join(lines))
+    # (The per-mutation result-detail popup was REMOVED 2026-06-17 — the modal had no purpose
+    # with the detail-display PARKED, and it mis-fired on selection. A future increment will
+    # build a proper detail surface; until then a header click only ever SELECTS.)
 
     # exposed for tests / live-verify: the exact color commands the active row pushes
     def color_commands_for(self, tab: _ChainDesignTab):

@@ -446,6 +446,29 @@ def test_parse_template_and_quick():
 # Viz command construction
 # ══════════════════════════════════════════════════════════════════════════════
 
+def test_open_and_viz_reads_real_id_not_guess():
+    # V3 fix: the predicted model's viz + stored id come from the REAL `open` response,
+    # NOT a next_model_id() guess (a desynced guess mis-targets colour/matchmaker/view).
+    from unittest.mock import MagicMock
+    r = ToolRouter(bridge=MagicMock(), session=SessionState())
+    r.session.next_model_id = lambda: 9                  # the GUESS (deliberately wrong)
+    calls = []
+
+    def run(cmd, timeout=30):
+        calls.append(cmd)
+        if cmd.startswith("open "):
+            return {"value": "Opened foo.pdb as #5, 1 model(s)", "error": None}  # REAL id = 5
+        return {"value": "", "error": None}
+
+    r.bridge.run_command = run
+    r._resolve_colabfold_compare_to = lambda inputs, exclude_model: "#1"
+    real_id, cmds, _exps = r._open_and_viz_fold_live("foo.pdb", {})
+    assert real_id == "5"                                # the REAL id, not the guess 9
+    assert any("color byattribute bfactor #5" in c for c in calls)
+    assert any("matchmaker #5 to #1" in c for c in calls)
+    assert not any("#9" in c for c in calls)             # the guess never targets anything
+
+
 def test_viz_commands_basic():
     r = ToolRouter(bridge=None, session=SessionState())
     result = {"ranked_pdb": "C:/cache/colabfold_x/ranked.pdb", "copies": 1}

@@ -2794,7 +2794,8 @@ class ToolRouter:
             _tmp.close()
             pdb_path = _tmp.name
             ref_id = inputs.get("compare_to") or model_id
-            cmds, exps, new_id = self._fold_viz_commands(
+            # Open LIVE + read the REAL model id back (V3 fix — no next_model_id() guess).
+            new_id, cmds, exps = self._open_and_viz_fold_live(
                 Path(pdb_path).as_posix(), {**inputs, "compare_to": ref_id})
             # Register the predicted model so next_model_id() advances — otherwise a
             # SECOND workbench fold reuses the same id (the open path doesn't otherwise
@@ -2821,9 +2822,10 @@ class ToolRouter:
                     "length":             res.get("length"),
                     "source":             res.get("source"),
                     "pdb_path":           pdb_path,
+                    "commands":           cmds,         # executed live (transparency)
                 },
-                viz_commands=cmds,
-                viz_explanations=exps,
+                viz_commands=[],          # already executed live against the REAL id
+                viz_explanations=[],
                 summary=(f"ESMFold (local): model #{new_id} — mean pLDDT "
                          f"{mean_plddt:.1f} ({conf} confidence), superposed on #{ref_id}."),
                 elapsed_ms=elapsed_ms,
@@ -2951,7 +2953,8 @@ class ToolRouter:
 
         cif_path = res.get("cif_path")
         ref_id   = inputs.get("compare_to") or model_id
-        cmds, exps, new_id = self._fold_viz_commands(
+        # Open LIVE + read the REAL model id back (V3 fix — no next_model_id() guess).
+        new_id, cmds, exps = self._open_and_viz_fold_live(
             Path(cif_path).as_posix(), {**inputs, "compare_to": ref_id})
         try:
             self.session.add_structure(
@@ -2981,9 +2984,10 @@ class ToolRouter:
                 "source":             res.get("source"),
                 "seed":               res.get("seed"),
                 "cif_path":           cif_path,
+                "commands":           cmds,         # executed live (transparency)
             },
-            viz_commands=cmds,
-            viz_explanations=exps,
+            viz_commands=[],          # already executed live against the REAL id
+            viz_explanations=[],
             summary=(f"Boltz-2 ({shape}, local): model #{new_id} — mean pLDDT "
                      f"{mean_plddt:.1f} ({conf})"
                      + (f", ipTM {iptm:.3f}" if isinstance(iptm, (int, float)) else "")
@@ -4469,6 +4473,36 @@ class ToolRouter:
         exps.append("Fit the predicted model in view")
         return cmds, exps, new_id
 
+    def _open_and_viz_fold_live(self, pdb_posix: str, inputs: Dict[str, Any]) -> tuple:
+        """Open a predicted-structure file LIVE and read the REAL assigned model id back from
+        the `open` response — NOT a `next_model_id()` GUESS. The guess desyncs from ChimeraX's
+        actual id (e.g. after the S4c deviation WT-reference folds consume ids), so a guessed
+        id mis-targets colour/matchmaker/view AND poisons the stored `model_id` → the fold
+        appears to do nothing and the active-row HIDE switch shows the wrong model (the 'V3'
+        failure). Here we open, parse the real id, then colour-by-pLDDT + matchmaker + view
+        against THAT id, all via self.bridge (so the spine's `on_structure_opened` still
+        captures the open for tab focus). Returns (real_id, cmds_run, explanations). The
+        caller returns viz_commands=[] — these already executed, and re-running the `open`
+        would duplicate the model."""
+        open_cmd = f'open "{pdb_posix}"'
+        r = self.bridge.run_command(open_cmd)
+        guess = str(self.session.next_model_id())
+        real_id = (self._parse_model_spec(r, guess) or f"#{guess}").lstrip("#")
+        cmds = [open_cmd]
+        exps = [f"Open the predicted model as #{real_id} (id read back from the open response)"]
+        viz = [f"color byattribute bfactor #{real_id} palette alphafold",
+               f"cartoon #{real_id}"]
+        vexp = ["Colour by pLDDT (AlphaFold palette)", "Cartoon representation"]
+        ref_spec = self._resolve_colabfold_compare_to(inputs, exclude_model=real_id)
+        if ref_spec:
+            viz.append(f"matchmaker #{real_id} to {ref_spec}")
+            vexp.append(f"Superpose onto {ref_spec} (matchmaker RMSD in the log)")
+        viz.append(f"view #{real_id}")
+        vexp.append("Fit the predicted model in view")
+        for c in viz:
+            self.bridge.run_command(c)
+        return real_id, cmds + viz, exps + vexp
+
     def _resolve_colabfold_compare_to(
         self,
         inputs:        Dict[str, Any],
@@ -5415,11 +5449,10 @@ class ToolRouter:
         if not rres.get("success") or not ref_path:
             return None
 
-        # open + pLDDT-colour + matchmaker the reference inline (reuse the viz builder)
-        cmds, _exps, ref_mid = self._fold_viz_commands(
+        # Open LIVE + read the REAL id back (V3 fix — a guessed id would mis-target the viz
+        # AND the CA read below, silently corrupting the deviation against this reference).
+        ref_mid, _cmds, _exps = self._open_and_viz_fold_live(
             Path(ref_path).as_posix(), {**inputs, "compare_to": compare_to})
-        for c in cmds:
-            self.bridge.run_command(c)
         try:                                  # consume the id so it isn't reused
             self.session.add_structure(
                 ref_mid, f"wtref_{engine}_{model_id}", path=ref_path,

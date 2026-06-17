@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 pytest.importorskip("PySide6")
-from PySide6 import QtWidgets
+from PySide6 import QtWidgets, QtCore, QtGui
 
 from seq_editor.controller import ResidueCell, ChainSeq
 from variant_workbench import (VariantWorkbenchPanel, _ChainDesignTab, _RESULT_DDG_MODE,
@@ -202,6 +202,155 @@ class TestCellEditMenu:
         tab._on_context_menu(block, block.visualItemRect(v_item).center())
         tab._on_context_menu(block, block.visualItemRect(t_item).center())
         assert seen == [(vid, 0)]                   # only the variant cell raised a menu
+
+
+class TestFoldOutputUsability:
+    """Fold-output UX: auto-surface the result mode on a fresh fold/deviation, REPLACE the
+    prior model on re-fold (no stacking), and TILE the specific fold models side-by-side."""
+
+    def _folded_panel(self):
+        sess = MagicMock()
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")], session=sess)
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._add_variant()
+        vid = tab.design.variants[0].id
+        tab.design.edit_variant(vid, 0, "W")
+        return p, tab, vid
+
+    @staticmethod
+    def _fold_result(model_id="2", engine="esmfold"):
+        return {"tool_step_results": [{"tool": engine, "data": {
+            "engine": engine, "target": "monomer", "new_model_id": model_id,
+            "reference_model_id": "1", "mean_plddt": 80.0, "length": 3,
+            "source": "local_venv312", "plddt": {1: 90.0, 2: 80.0, 3: 70.0}}}]}
+
+    def test_auto_surface_plddt_on_fold(self, _app):
+        p, tab, vid = self._folded_panel()
+        p._mode_key = "none"
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        assert p._mode_key == _RESULT_PLDDT_MODE                  # auto-surfaced, no manual step
+        assert p._mode_combo.currentData() == _RESULT_PLDDT_MODE  # combo display synced
+
+    def test_no_close_on_first_fold(self, _app):
+        p, tab, vid = self._folded_panel()
+        captured = []
+        p._run_commands_bg = lambda cmds: captured.extend(cmds)
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        assert not any(str(c).startswith("close ") for c in captured)
+
+    def test_replace_on_refold_closes_prior(self, _app):
+        p, tab, vid = self._folded_panel()
+        captured = []
+        p._run_commands_bg = lambda cmds: captured.extend(cmds)
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))   # first fold
+        captured.clear()
+        p.apply_fold_result(vid, self._fold_result(model_id="5"))   # re-fold → replace #2
+        assert "close #2" in captured
+
+    def test_auto_surface_deviation(self, _app):
+        p, tab, vid = self._folded_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        dev = {"tool_step_results": [{"tool": "variant_deviation", "data": {
+            "engine": "esmfold", "target": "monomer", "multichain": False,
+            "variant_chain": "A", "variant_model_id": "2", "reference_model_id": "7",
+            "deviation": {"1": 0.1}, "floor": {}, "anchor_residual_rmsd": 0.01,
+            "all_pairs_rmsd": 0.5, "n_residues": 1, "n_cleared_floor": 0,
+            "max_deviation": 0.1, "floor_kind": "deterministic",
+            "wt_ref": {"engine": "esmfold", "target": "monomer", "model_id": "7", "floor": {}}}}]}
+        p._mode_key = "none"
+        p.apply_deviation_result(vid, dev)
+        assert p._mode_key == _RESULT_DEVIATION_MODE
+
+    def test_tile_commands_targets_specific_models(self, _app):
+        p, tab, v1 = self._folded_panel()
+        p._add_variant()
+        v2 = tab.design.variants[1].id
+        tab.design.edit_variant(v2, 0, "Y")
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        p.apply_fold_result(v2, self._fold_result(model_id="3"))
+        cmds = p.tile_commands()
+        assert cmds[-1] == "tile #1 #2 #3"            # reference + folds, SPECIFIC ids
+        assert {"show #1 models", "show #2 models", "show #3 models"} <= set(cmds)
+
+    def test_tile_commands_empty_under_two(self, _app):
+        p, tab, vid = self._folded_panel()            # no folds → only the reference (#1)
+        assert p.tile_commands() == []
+
+    def test_result_mode_nonactive_row_stays_readable(self, _app):
+        # legibility: under a result mode the active row shows the result colour; NON-active
+        # rows get an EXPLICIT dim-but-readable bg (never white-blanked or clear→dark).
+        from variant_workbench import _DIM_BG
+        cd = next(iter(build_design_session([_chainseq("1", "A", "MKV")], "1").chains.values()))
+        cd.add_variant("V1")
+        cd.add_variant("V2")
+        tab = _ChainDesignTab(cd)
+        tab.set_result_coloring("V1", {1: "#0053d6"})    # active V1, dark-blue result at resnum 1
+        assert tab.color_hex_at("V1", 0) == "#0053d6"    # active row coloured
+        assert tab.color_hex_at("T", 0) != "#ffffff"     # non-active T keeps its tint, not white
+        assert tab.color_hex_at("V2", 0) == _DIM_BG.name()  # non-active variant → explicit dim bg
+
+    def test_contrast_fg_dark_vs_light(self, _app):
+        from variant_workbench import _contrast_fg
+        assert _contrast_fg(QtGui.QColor("#0053d6")).name() == "#ffffff"   # dark bg → white glyph
+        assert _contrast_fg(QtGui.QColor("#ffffff")).name() == "#1a1a1a"   # light bg → dark glyph
+
+
+class TestRowHeaderSelect:
+    """A SINGLE row-header click anywhere SELECTS the variant (active row, silent — never a
+    modal, even for a FOLDED variant that carries a badge). DOUBLE-click → result detail.
+    Prerequisite for the active-row HIDE switching (the old name/badge x-split misfired)."""
+
+    def _tab_with_variant(self, badge=None):
+        cd = next(iter(build_design_session([_chainseq("1", "A", "MKV")], "1").chains.values()))
+        cd.add_variant("V1")
+        tab = _ChainDesignTab(cd)
+        if badge:
+            tab.badges["V1"] = badge
+            tab.rebuild()
+        return tab
+
+    @staticmethod
+    def _evt(kind):
+        p = QtCore.QPointF(5.0, 5.0)
+        return QtGui.QMouseEvent(kind, p, p, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                                 QtCore.Qt.NoModifier)
+
+    def _fire(self, tab, monkeypatch):
+        block = tab._blocks[0]
+        vh = block.verticalHeader()
+        section = tab._row_ids.index("V1")
+        monkeypatch.setattr(vh, "logicalIndexAt", lambda _y: section)
+        sel = []
+        tab.rowHeaderSelected.connect(sel.append)
+        tab.eventFilter(vh.viewport(), self._evt(QtCore.QEvent.Type.MouseButtonPress))
+        return sel
+
+    def test_single_click_selects_no_badge(self, _app, monkeypatch):
+        tab = self._tab_with_variant(badge=None)
+        assert self._fire(tab, monkeypatch) == ["V1"]
+
+    def test_single_click_selects_folded_variant_with_badge(self, _app, monkeypatch):
+        # THE BUG FIX: a folded variant carries a (pLDDT) badge; a click must still SELECT it
+        # (the old x-split swallowed it into the now-removed detail modal).
+        tab = self._tab_with_variant(badge="pLDDT 80 · ipTM 0.96")
+        assert self._fire(tab, monkeypatch) == ["V1"]
+
+    def test_no_rowheaderclicked_signal(self, _app):
+        # the detail modal is removed/parked — the header has no detail signal anymore
+        tab = self._tab_with_variant(badge="pLDDT 80")
+        assert not hasattr(tab, "rowHeaderClicked")
+
+    def test_select_variant_row_sets_active_silently(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
+                      session=MagicMock())
+        p.load_model("1")
+        tab = p._cur_tab()
+        p._add_variant()
+        vid = tab.design.variants[0].id
+        tab.set_active_row("T")
+        p._select_variant_row(tab, vid)              # header-name select (no results on V1)
+        assert tab.active_row_id == vid and p._edit_target is None
 
 
 class TestStage3aImport:
@@ -588,7 +737,35 @@ class TestStage4b:
         p.apply_fold_result(v2, self._fold_result(model_id="3"))
         p._fold_vis_btn.setChecked(True)             # "Hide folds"
         cmds = p.fold_visibility_commands(tab)
-        assert set(cmds) == {"hide #2 models", "hide #3 models"}
+        # global Hide-folds hides every fold; the WT reference (#1) stays shown by default.
+        assert {"hide #2 models", "hide #3 models"} <= set(cmds)
+        assert not any(c.startswith("show #2") or c.startswith("show #3") for c in cmds)
+        assert "show #1 models" in cmds              # reference toggle (default on) independent
+
+    def test_switch_back_reshows_active_fold(self, _app):
+        # the HIDE design's whole point: re-selecting a folded variant RE-SHOWS its fold.
+        p, tab, (v1, v2) = self._variant_panel(n_variants=2)
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        p.apply_fold_result(v2, self._fold_result(model_id="3"))
+        tab.set_active_row(v2)
+        cmds = p.fold_visibility_commands(tab)
+        assert "show #3 models" in cmds and "hide #2 models" in cmds
+        tab.set_active_row(v1)                       # switch BACK to v1
+        cmds = p.fold_visibility_commands(tab)
+        assert "show #2 models" in cmds and "hide #3 models" in cmds
+
+    def test_overlay_toggles_independent(self, _app):
+        p, tab, (v1,) = self._variant_panel()
+        p.apply_fold_result(v1, self._fold_result(model_id="2"))
+        tab.set_active_row(v1)
+        assert {"show #1 models", "show #2 models"} <= set(p.fold_visibility_commands(tab))
+        p._show_ref_cb.setChecked(False)             # Reference OFF → hide the reference only
+        cmds = p.fold_visibility_commands(tab)
+        assert "hide #1 models" in cmds and "show #2 models" in cmds
+        p._show_ref_cb.setChecked(True)
+        p._show_fold_cb.setChecked(False)            # Fold OFF → hide the fold, keep reference
+        cmds = p.fold_visibility_commands(tab)
+        assert "show #1 models" in cmds and "hide #2 models" in cmds
 
     def test_engine_picker_capability_flag(self, _app, monkeypatch):
         # Both engines are SHOWN with a real capability verdict (B2 3-state, never dropped).
