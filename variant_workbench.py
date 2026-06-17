@@ -1722,7 +1722,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             # runs first); colouring a hidden model is harmless and it shows when re-shown.
             # Emitting `show #mid` here would re-show a model the "Variant fold"/"Hide folds"
             # toggle just hid (the toggles run before this) → the toggle would silently no-op.
-            return [f"color byattribute bfactor #{mid} palette alphafold"]
+            # target acs → the pLDDT colour survives a later NL representation change (spheres
+            # reveal coloured atoms, not default-coloured ones).
+            return [f"color byattribute bfactor #{mid} palette alphafold target acs"]
         if self._mode_key == _RESULT_DEVIATION_MODE:
             # Deviation lives on the PREDICTED variant model's real atoms (like pLDDT),
             # NOT the shared crystal backbone — colour #mid per chain in its OWN numbering,

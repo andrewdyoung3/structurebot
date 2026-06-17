@@ -627,6 +627,75 @@ class TestOpclassAllVisibleModels:
         assert result.data["commands"] == ["color #1 bychain"], result.data["commands"]
 
 
+# ── 9e. Transparency op-class (absolute + relative-tracked, all-visible scope) ───
+
+class TestTransparencyOpclass:
+    """'increase transparency by 50%' used to free-translate and no-op. Transparency is now
+    a first-class op-class on the all-visible model-scope rule: ABSOLUTE sets the level;
+    RELATIVE adjusts a tracked per-target level (ChimeraX `transparency` is absolute-only)."""
+
+    def _router(self, visible=("1",)):
+        mb = MagicMock()
+        mb.run_command.return_value = {"value": "", "error": None}
+        mb.visible_model_ids.return_value = list(visible)
+        ms = MagicMock()
+        ms.structures = {"1": {"name": "1hsg"}}
+        ms.get_structure.return_value = {"name": "1hsg"}
+        return ToolRouter(bridge=mb, session=ms)
+
+    def test_detect_phrase(self):
+        r = self._router()
+        assert r._detect_transparency_phrase("increase transparency by 50%")
+        assert r._detect_transparency_phrase("make it opaque")
+        assert r._detect_transparency_phrase("make the surface see-through")
+        assert not r._detect_transparency_phrase("color chain A red")
+
+    def test_parse_absolute_relative_opaque(self):
+        r = self._router()
+        assert r._parse_transparency_request("make it 50% transparent") == ("absolute", 50)
+        assert r._parse_transparency_request("set transparency to 30") == ("absolute", 30)
+        assert r._parse_transparency_request("make it opaque") == ("absolute", 0)
+        assert r._parse_transparency_request("increase transparency by 50%") == ("relative", 50)
+        assert r._parse_transparency_request("make it more transparent") == ("relative", 25)
+        assert r._parse_transparency_request("less transparent") == ("relative", -25)
+        # a model id must NOT be read as a level
+        assert r._parse_transparency_request("make #2 transparent") == ("absolute", 50)
+
+    def test_absolute_all_visible(self):
+        r = self._router(["1", "2"])
+        result = r._run_transparency({"_user_input": "make it 50% transparent"})
+        assert result.data["commands"] == ["transparency #1,2 50 target acs"], \
+            result.data["commands"]
+        assert result.data["level"] == 50
+
+    def test_relative_tracks_level(self):
+        r = self._router(["1"])
+        r._run_transparency({"_user_input": "make it 40% transparent"})       # absolute → 40
+        result = r._run_transparency({"_user_input": "increase transparency by 30%"})  # +30
+        assert result.data["level"] == 70
+        assert result.data["commands"] == ["transparency #1 70 target acs"], \
+            result.data["commands"]
+
+    def test_relative_clamps(self):
+        r = self._router(["1"])
+        r._run_transparency({"_user_input": "make it 90% transparent"})
+        result = r._run_transparency({"_user_input": "increase transparency by 50%"})
+        assert result.data["level"] == 100                                    # clamped
+
+    def test_explicit_model_wins(self):
+        r = self._router(["1", "2"])
+        result = r._run_transparency({"_user_input": "make #2 30% transparent"})
+        assert result.data["commands"] == ["transparency #2 30 target acs"], \
+            result.data["commands"]
+
+    def test_chain_is_macromolecule_scoped(self):
+        r = self._router(["1"])
+        result = r._run_transparency({"_user_input": "make chain A 50% transparent"})
+        assert result.data["commands"] == \
+            ["transparency (#1/A & ~ligand & ~solvent & ~ions) 50 target acs"], \
+            result.data["commands"]
+
+
 # ── 9c. Residue-range + DEFER through _run_color ────────────────────────────────
 
 class TestColorResidueAndDefer:
