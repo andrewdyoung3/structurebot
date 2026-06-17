@@ -602,13 +602,22 @@ class TestOpclassAllVisibleModels:
         result = r._run_color({"_user_input": "color the whole model red", "intent_key": None})
         assert result.data["commands"] == ["color #1,2 red"], result.data["commands"]
 
-    def test_named_subregion_keeps_single_model(self):
-        # a named subregion (chain A) is UNCHANGED — single-model default, NOT all-visible
-        # (its #1,2/A form isn't expressible by the chain-scope guard; explicit scope wins).
+    def test_named_subregion_narrows_within_visible(self):
+        # a named subregion (chain A) narrows WITHIN the visible-model scope (NOT a hidden
+        # default) — the chain-scope guard handles the multi-model #1,2/A form.
         r = self._router(["1", "2"])
         result = r._run_color({"_user_input": "color chain A red", "intent_key": None})
         assert result.data["commands"] == \
-            ["color (#1/A & ~ligand & ~solvent & ~ions) red"], result.data["commands"]
+            ["color (#1,2/A & ~ligand & ~solvent & ~ions) red"], result.data["commands"]
+
+    def test_subregion_targets_only_visible_model(self):
+        # the reported bug: template (#1) hidden, V1 (#2) visible → "show chain A as sticks"
+        # must target the VISIBLE #2/A, never the hidden #1/A.
+        r = self._router(["2"])                       # only #2 visible
+        result = r._run_representation(
+            {"_user_input": "show chain A as sticks", "intent_key": "view.sticks"})
+        assert all("#2/A" in c for c in result.data["commands"]), result.data["commands"]
+        assert not any("#1/A" in c for c in result.data["commands"]), result.data["commands"]
 
     def test_probe_failure_falls_back_to_primary(self):
         # display probe unavailable (returns []) → fall back to the primary model, never

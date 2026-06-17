@@ -112,7 +112,7 @@ def _sanitize_zone_syntax(
 _MACRO_SCOPE = "~ligand & ~solvent & ~ions"
 _CHAIN_REF_RE = re.compile(
     r"(?:(?<=[\s(|,&])|^)"                  # spec boundary (NOT '~' → leave negations)
-    r"(?P<tok>(?:#\d+)?/[A-Za-z0-9]+)"      # optional model + a bare chain id
+    r"(?P<tok>(?:#[\d.,]+)?/[A-Za-z0-9]+)"  # optional model (incl. '#1,2' / '#2.1') + chain id
 )
 
 
