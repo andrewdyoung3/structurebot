@@ -5751,6 +5751,12 @@ class ToolRouter:
         dmin = self._DDM_FLOOR_MIN_A
         disrupted = [k for k, v in ddm_str.items() if v > floor_ddm.get(k, dmin)]
         max_ddm = max(ddm.values()) if ddm else 0.0
+        # DIAGNOSTIC: residues with a sizeable RAW dRMSD that the cross-seed floor GATES to white
+        # (real displacement vs the WT FOLD declared noise) — the top few name where to look.
+        ddm_suppressed = sorted(
+            ((k, v, floor_ddm.get(k, dmin)) for k, v in ddm_str.items()
+             if v > dmin and v <= floor_ddm.get(k, dmin)),
+            key=lambda t: -t[1])
         # SECONDARY (reported, not painted): Cα-lDDT — local-fold integrity (distinguishes a
         # MELTED region, low lDDT, from one that merely MOVED intact, high lDDT but high dRMSD).
         lddt = self._per_residue_lddt(ref_ca, var_ca, common)
@@ -5788,6 +5794,9 @@ class ToolRouter:
             "fold_column_map":      ({str(j): r for j, r in applied_map.items()}
                                      if applied_map else None),
             "max_ddm":              round(float(max_ddm), 3),
+            "n_ddm_suppressed":     len(ddm_suppressed),  # DIAGNOSTIC: real dRMSD gated by floor
+            "ddm_suppressed_top":   [[k, round(v, 2), round(f, 2)]
+                                     for k, v, f in ddm_suppressed[:6]],
             "min_lddt":             round(float(min_lddt), 4),
             "mean_lddt":            mean_lddt,
             "n_disrupted":          len(disrupted),   # residues above the dRMSD floor (painted)
@@ -5808,9 +5817,13 @@ class ToolRouter:
             summary=(f"Deviation vs WT ({engine}:{target}) — dRMSD: "
                      f"{len(disrupted)}/{len(ddm)} residues disrupted (above the cross-seed "
                      f"dRMSD floor); max {max_ddm:.2f} Å. Local integrity (lDDT) min "
-                     f"{min_lddt:.3f}, mean {mean_lddt:.3f}. [diagnostic: old Cα-RMSD path = "
-                     f"{len(cleared)}/{len(per_dev)} cleared over a {anchor_size}/{n_common} "
-                     f"core, {n_floor_suppressed} floor-suppressed — superposition artifact.]"))
+                     f"{min_lddt:.3f}, mean {mean_lddt:.3f}. [diagnostic: {len(ddm_suppressed)} "
+                     f"dRMSD floor-suppressed"
+                     + (f" — top " + ", ".join(f"ref{k} raw {v:.1f}/floor {f:.1f}"
+                                               for k, v, f in ddm_suppressed[:4])
+                        if ddm_suppressed else "")
+                     + f"; old Cα-RMSD {len(cleared)}/{len(per_dev)} over {anchor_size}/"
+                     f"{n_common} core.]"))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)

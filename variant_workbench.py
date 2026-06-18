@@ -1090,10 +1090,43 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                     f"Residue {resnum} — DELETED in {row_id} (the crystal residue is selected; "
                     f"right-click the gap → Restore to undo).")
             else:
-                self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
-                                     f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+                readout = self._residue_deviation_readout(tab, col)   # DIAGNOSTIC probe
+                base = (f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
+                        f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+                self._status.setText(f"{base}  [deviation] {readout}" if readout else base)
             self._apply_color_to(tab)                       # panel result-coloring FOLLOWS active
             self._push_3d_color(tab)
+
+    def _residue_deviation_readout(self, tab: _ChainDesignTab, col: int) -> str:
+        """DIAGNOSTIC probe: the clicked variant residue's per-residue dRMSD vs its floor (and
+        lDDT), so a 'white but visibly displaced' residue can be checked directly — is its raw
+        dRMSD genuinely low (the variant didn't change it vs the WT FOLD — note the metric
+        references the WT *fold*, while the 3D overlays on the *crystal*), or high-but-GATED by
+        the floor? Empty when not in deviation mode / no value for the residue."""
+        if self._mode_key != _RESULT_DEVIATION_MODE:
+            return ""
+        block = self._active_deviation(tab)
+        if not block:
+            return ""
+        v = tab.design.get_variant(tab.active_row_id)
+        if v is None or not (0 <= col < len(tab.design.template_cells)):
+            return ""
+        if tab.design.template_cells[col].is_gap:
+            return "inserted (no WT reference)"
+        var_pos = sum(1 for c in range(col + 1)
+                      if c < len(v.cells) and v.cells[c] is not None and not v.cells[c].is_gap)
+        if var_pos == 0:
+            return ""
+        ref = build_fold_column_map(v, tab.design.template_cells).get(var_pos)
+        ddm = block.get("ddm") or {}
+        if ref is None or str(ref) not in ddm:
+            return ""
+        dv = ddm[str(ref)]
+        df = (block.get("floor_ddm") or {}).get(str(ref), _DDM_FLOOR_MIN_A)
+        lv = (block.get("lddt") or {}).get(str(ref))
+        state = "shown" if dv > df else "GATED→white"
+        s = f"ref{ref}: dRMSD {dv:.1f} vs floor {df:.1f} Å → {state}"
+        return s + (f"; lDDT {lv:.2f}" if lv is not None else "")
 
     def _select_variant_row(self, tab: _ChainDesignTab, row_id) -> None:
         """Row-header NAME click → SELECT *row_id* as the active row and drive the 3D via the

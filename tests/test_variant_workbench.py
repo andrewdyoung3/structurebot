@@ -962,6 +962,24 @@ class TestStage4b:
         # the inserted residue (var 2) is never coloured → stays on the #ffffff baseline.
         assert cmds == ["color #2/A #ffffff", "color #2/A:3 #f3953b"]
 
+    def test_residue_deviation_readout_probe(self, _app):
+        # diagnostic probe: clicking a residue in deviation mode reports its dRMSD vs floor.
+        from variant_workbench import _RESULT_DEVIATION_MODE as _DEV
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4},
+            floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5}))
+        p._mode_key = _DEV
+        # col 1 (variant resnum 2) → ref 2, dRMSD 6.0 > floor 0.5 → shown
+        r = p._residue_deviation_readout(tab, 1)
+        assert "dRMSD 6.0 vs floor 0.5" in r and "shown" in r
+        # col 0 (variant resnum 1) → ref 1, dRMSD 0.3 ≤ floor 0.5 → gated
+        assert "GATED→white" in p._residue_deviation_readout(tab, 0)
+        # not in deviation mode → empty
+        p._mode_key = "none"
+        assert p._residue_deviation_readout(tab, 1) == ""
+
     def test_deviation_color_mode_no_deviation_is_empty(self, _app):
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))   # folded but no deviation yet
