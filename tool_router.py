@@ -5630,6 +5630,15 @@ class ToolRouter:
         gmin = self._DEVIATION_FLOOR_MIN_A
         cleared = [k for k, v in dev_str.items() if v > floor.get(k, gmin)]
         max_dev = max(per_dev.values()) if per_dev else 0.0
+        # DIAGNOSTIC (confirm-root-cause, no behaviour change): the auto-anchor iteratively
+        # prunes movers to a rigid core — a TINY core mislocalizes the per-residue shift to the
+        # lever-arm extremes. `anchor_size`/`n_common` expose how aggressive that prune got.
+        # `n_floor_suppressed` = residues whose RAW deviation exceeds the global-min floor but is
+        # gated by a higher MEASURED (Boltz cross-seed) floor — i.e. real motion painted neutral.
+        anchor_size = len(anchor)
+        n_common = len(common)
+        n_floor_suppressed = sum(1 for k, v in dev_str.items()
+                                 if v > gmin and v <= floor.get(k, gmin))
 
         data = {
             "engine":               engine,
@@ -5649,6 +5658,9 @@ class ToolRouter:
             "anchor_residual_rmsd": anchor_resid,     # ≈0 confirms the fit/anchor is clean
             "all_pairs_rmsd":       all_pairs,
             "anchor_source":        anchor_src,
+            "anchor_size":          anchor_size,      # DIAGNOSTIC: rigid-core residue count
+            "n_common":             n_common,         # DIAGNOSTIC: paired residues fed to the fit
+            "n_floor_suppressed":   n_floor_suppressed,  # DIAGNOSTIC: real motion gated by floor
             "n_residues":           len(per_dev),
             "n_cleared_floor":      len(cleared),
             "max_deviation":        round(float(max_dev), 3),
@@ -5659,7 +5671,9 @@ class ToolRouter:
             tool="variant_deviation", success=True, data=data,
             summary=(f"Deviation vs WT ({engine}:{target}): {len(cleared)}/{len(per_dev)} "
                      f"residues clear the noise floor; max {data['max_deviation']:.2f} Å, "
-                     f"anchor residual {anchor_resid:.2f} Å (≈0 = clean fit)."))
+                     f"anchor residual {anchor_resid:.2f} Å over {anchor_size}/{n_common} "
+                     f"core residues; {n_floor_suppressed} floor-suppressed (≈0 = clean fit). "
+                     f"[diagnostic: a tiny core relative to {n_common} mislocalizes the shift.]"))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)

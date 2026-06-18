@@ -1765,11 +1765,55 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._select_result_mode(_RESULT_DEVIATION_MODE)   # AUTO-SURFACE the deviation mode
         self._rerender_results(cd, v)
         ar = data.get("anchor_residual_rmsd")
+        flank = self._insertion_flank_diag(cd, v, data)    # DIAGNOSTIC: raw-vs-floor at insert flanks
         self._status.setText(
             f"{v.id} deviation vs WT ({data.get('engine')}:{data.get('target')}): "
             f"{data.get('n_cleared_floor')}/{data.get('n_residues')} residues clear the "
             f"noise floor; max {data.get('max_deviation')} Å, anchor residual "
-            f"{ar if ar is not None else '?'} Å (floor-gated colour, auto).")
+            f"{ar if ar is not None else '?'} Å over {data.get('anchor_size','?')}/"
+            f"{data.get('n_common','?')} core residues; "
+            f"{data.get('n_floor_suppressed','?')} floor-suppressed."
+            + (f"  [insertion flanks] {flank}" if flank else ""))
+
+    def _insertion_flank_diag(self, cd: ChainDesign, v, block: Dict[str, Any]) -> str:
+        """DIAGNOSTIC (confirm-root-cause): for each insertion, the RAW (ungated) Cα deviation
+        vs the floor at the SHARED residues immediately flanking it — distinguishes 'tiny-anchor
+        superposition mislocalizes the shift' (raw also low) from 'floor suppresses real motion'
+        (raw high but ≤ floor → painted white). Empty when the variant has no insertion."""
+        if not getattr(v, "indels", None) or not any(e.kind == "insertion" for e in v.indels):
+            return ""
+        dev, floor = block.get("deviation") or {}, block.get("floor") or {}
+        fmap = build_fold_column_map(v, cd.template_cells)      # {var_fold_resnum: ref_resnum}
+        # classify each variant non-gap cell as shared (in fmap) or inserted (template-gap col)
+        var_pos = 0
+        inserted: List[int] = []
+        for col, tcell in enumerate(cd.template_cells):
+            vcell = v.cells[col] if col < len(v.cells) else None
+            if vcell is not None and not vcell.is_gap:
+                var_pos += 1
+                if tcell.is_gap:
+                    inserted.append(var_pos)
+        if not inserted:
+            return ""
+        runs: List[List[int]] = []
+        for p in inserted:                                     # contiguous inserted runs
+            if runs and p == runs[-1][-1] + 1:
+                runs[-1].append(p)
+            else:
+                runs.append([p])
+        parts: List[str] = []
+        for run in runs:
+            for tag, vp in (("before", run[0] - 1), ("after", run[-1] + 1)):
+                ref = fmap.get(vp)
+                if ref is None:
+                    continue
+                raw = dev.get(str(ref))
+                if raw is None:
+                    continue
+                fl = floor.get(str(ref), _DEVIATION_FLOOR_MIN_A)
+                tag2 = "GATED→white" if raw <= fl else "shown"
+                parts.append(f"ref{ref}({tag}): raw {raw:.2f} vs floor {fl:.2f} Å → {tag2}")
+        return "; ".join(parts)
 
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
     def _fold_models(self, design) -> Dict[str, str]:

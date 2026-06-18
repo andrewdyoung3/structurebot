@@ -892,6 +892,27 @@ class TestStage4b:
         # the WT reference is cached on the design per combo (so the next variant reuses it)
         assert tab.design.wt_refs["esmfold:monomer"]["model_id"] == "7"
 
+    def test_insertion_flank_diagnostic(self, _app):
+        # confirm-root-cause instrumentation: the flank readout reports RAW deviation vs floor
+        # at the SHARED residues bracketing an insertion, flagging floor-gated (→white) ones.
+        p, tab, (vid,) = self._variant_panel()
+        tab.design.insert_variant_residues(vid, 0, "G")     # insert G after resnum 1 (col 0)
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        # ref2 (the after-insert flank) has real motion (3 Å) but a high MEASURED floor (5 Å) →
+        # it is painted white despite real motion; ref1 (before) is genuinely quiet.
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2",
+            deviation={"1": 0.10, "2": 3.00, "3": 0.20},
+            floor={"1": 0.25, "2": 5.00, "3": 0.25},
+            fold_column_map={"1": 1, "3": 2, "4": 3}))      # var2 = the inserted G (omitted)
+        v = tab.design.get_variant(vid)
+        diag = p._insertion_flank_diag(tab.design, v, v.results.fold["deviation"])
+        assert "ref1(before): raw 0.10 vs floor 0.25" in diag and "GATED" in diag
+        assert "ref2(after): raw 3.00 vs floor 5.00" in diag and "GATED→white" in diag
+        # no insertion → empty diagnostic
+        p2, tab2, (vid2,) = self._variant_panel()
+        assert p2._insertion_flank_diag(tab2.design, tab2.design.get_variant(vid2), {}) == ""
+
     def test_deviation_panel_hex_is_floor_gated(self, _app):
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
