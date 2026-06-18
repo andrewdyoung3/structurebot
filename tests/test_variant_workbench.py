@@ -255,10 +255,11 @@ class TestFoldOutputUsability:
         dev = {"tool_step_results": [{"tool": "variant_deviation", "data": {
             "engine": "esmfold", "target": "monomer", "multichain": False,
             "variant_chain": "A", "variant_model_id": "2", "reference_model_id": "7",
-            "deviation": {"1": 0.1}, "floor": {}, "anchor_residual_rmsd": 0.01,
-            "all_pairs_rmsd": 0.5, "n_residues": 1, "n_cleared_floor": 0,
-            "max_deviation": 0.1, "floor_kind": "deterministic",
-            "wt_ref": {"engine": "esmfold", "target": "monomer", "model_id": "7", "floor": {}}}}]}
+            "ddm": {"1": 0.3}, "floor_ddm": {}, "lddt": {"1": 0.95}, "floor_lddt": {},
+            "n_residues": 1, "n_disrupted": 0, "max_ddm": 0.3,
+            "min_lddt": 0.95, "mean_lddt": 0.95, "floor_kind": "deterministic",
+            "wt_ref": {"engine": "esmfold", "target": "monomer", "model_id": "7",
+                       "floor_ddm": {}, "floor_lddt": {}}}}]}
         p._mode_key = "none"
         p.apply_deviation_result(vid, dev)
         assert p._mode_key == _RESULT_DEVIATION_MODE
@@ -845,27 +846,22 @@ class TestStage4b:
     # ── Stage 4c: variant-vs-WT deviation launch + apply + floor-gated colour ────────
     @staticmethod
     def _dev_result(variant_mid="2", engine="esmfold", target="monomer", multichain=False,
-                    deviation=None, floor=None, fold_column_map=None,
-                    lddt=None, floor_lddt=None, ddm=None, floor_ddm=None):
-        deviation = deviation or {"1": 0.1, "2": 1.5, "3": 0.2}
-        floor = floor or {}
+                    fold_column_map=None, lddt=None, floor_lddt=None, ddm=None, floor_ddm=None):
         lddt = lddt if lddt is not None else {"1": 0.99, "2": 0.40, "3": 0.97}
         floor_lddt = floor_lddt if floor_lddt is not None else {}
         ddm = ddm if ddm is not None else {"1": 0.3, "2": 6.0, "3": 0.4}
         floor_ddm = floor_ddm if floor_ddm is not None else {}
         wt_ref = {"engine": engine, "target": target, "model_id": "7",
-                  "floor": floor, "floor_lddt": floor_lddt, "floor_ddm": floor_ddm,
-                  "path": "/tmp/wtref"}
+                  "floor_lddt": floor_lddt, "floor_ddm": floor_ddm, "path": "/tmp/wtref"}
         return {"tool_step_results": [{"tool": "variant_deviation", "data": {
             "engine": engine, "target": target, "multichain": multichain,
             "variant_chain": "A", "variant_model_id": variant_mid, "reference_model_id": "7",
             "ddm": ddm, "floor_ddm": floor_ddm, "lddt": lddt, "floor_lddt": floor_lddt,
-            "deviation": deviation, "floor": floor, "anchor_residual_rmsd": 0.01,
-            "all_pairs_rmsd": 0.5, "n_residues": len(ddm), "n_cleared_floor": 1,
+            "n_residues": len(ddm),
             "n_disrupted": sum(1 for k, x in ddm.items() if x > floor_ddm.get(k, 0.5)),
             "max_ddm": max(ddm.values()),
             "min_lddt": min(lddt.values()), "mean_lddt": round(sum(lddt.values())/len(lddt), 4),
-            "max_deviation": max(deviation.values()), "floor_kind": "deterministic",
+            "floor_kind": "deterministic",
             "fold_column_map": fold_column_map, "wt_ref": wt_ref}}]}
 
     def test_deviation_launch_spec_uncached_low_confidence(self, _app):
@@ -902,26 +898,28 @@ class TestStage4b:
         # the WT reference is cached on the design per combo (so the next variant reuses it)
         assert tab.design.wt_refs["esmfold:monomer"]["model_id"] == "7"
 
-    def test_insertion_flank_diagnostic(self, _app):
-        # diagnostic readout: per-residue dRMSD vs the floor at the SHARED residues bracketing an
-        # insertion — flags which flank is disrupted (dRMSD above floor → shown).
+    def test_panel_excludes_inserted_residue_and_pairs_shared(self, _app):
+        # LOAD-BEARING at the panel: after an insertion the inserted residue has no WT counterpart
+        # (resnum None → excluded from the painted author set, click readout flags it), while a
+        # post-insertion shared residue pairs to its CORRECT reference resnum and paints.
+        from variant_workbench import _RESULT_DEVIATION_MODE as _DEV
         p, tab, (vid,) = self._variant_panel()
-        tab.design.insert_variant_residues(vid, 0, "G")     # insert G after resnum 1 (col 0)
+        tab.design.insert_variant_residues(vid, 0, "G")     # MKV → M G K V; G at col 1 (inserted)
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
-        # ref2 (after-insert flank) dRMSD 6.0 > floor 0.5 → disrupted (shown); ref1 quiet.
+        # ddm keyed by REFERENCE resnum; var2 (the inserted G) omitted from the map. var3 (K) → ref2.
         p.apply_deviation_result(vid, self._dev_result(
-            variant_mid="2",
-            ddm={"1": 0.3, "2": 6.0, "3": 0.4},
-            floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5},
-            lddt={"1": 0.95, "2": 0.40, "3": 0.92},
-            fold_column_map={"1": 1, "3": 2, "4": 3}))      # var2 = the inserted G (omitted)
-        v = tab.design.get_variant(vid)
-        diag = p._insertion_flank_diag(tab.design, v, v.results.fold["deviation"])
-        assert "ref1(before): dRMSD 0.3 vs floor 0.5 Å → neutral" in diag
-        assert "ref2(after): dRMSD 6.0 vs floor 0.5 Å → shown" in diag
-        # no insertion → empty diagnostic
-        p2, tab2, (vid2,) = self._variant_panel()
-        assert p2._insertion_flank_diag(tab2.design, tab2.design.get_variant(vid2), {}) == ""
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4},
+            floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5}, lddt={"1": 0.95, "2": 0.40, "3": 0.92},
+            fold_column_map={"1": 1, "3": 2, "4": 3}))      # var2 = the inserted G (no ref)
+        p._mode_key = _DEV
+        ins_cell = tab.design.get_variant(vid).cells[1]
+        assert ins_cell.aa == "G" and ins_cell.resnum is None            # inserted: no WT resnum
+        assert "inserted" in p._residue_deviation_readout(tab, 1).lower()  # col 1 flagged inserted
+        # col 2 (K = variant resnum 3 → REFERENCE resnum 2) reads its correct ref + is confident
+        r2 = p._residue_deviation_readout(tab, 2)
+        assert "ref2" in r2 and "CONFIDENT" in r2
+        # panel paint pairs by reference resnum onto the shared author resnums (insert excluded)
+        assert p._deviation_panel_hex(tab).get(2) is not None             # K (ref2, dRMSD 6.0) painted
 
     def test_deviation_panel_hex_is_floor_gated(self, _app):
         p, tab, (vid,) = self._variant_panel()

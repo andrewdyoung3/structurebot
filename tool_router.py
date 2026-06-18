@@ -5584,14 +5584,11 @@ class ToolRouter:
         if not ref_ca:
             return None
 
-        # ── per-residue noise floor: cross-seed WT variation (Boltz only) ─────────
-        # TWO floors, both from the SAME extra-seed WT folds:
-        #   • floor_raw  = cross-seed MAX Kabsch displacement (Å) — kept for the diagnostic /
-        #     legacy Cα-deviation summary (it is the one that inflates to 10-15 Å on flexible/
-        #     re-orienting regions because it rides on rigid-body superposition).
-        #   • lddt_floor_raw = cross-seed MIN Cα-lDDT — the SUPERPOSITION-FREE noise model the
-        #     lDDT colouring gates on (how much the WT's own local structure varies seed↔seed).
-        floor_raw: Dict["Any", float] = {}
+        # ── per-residue noise floors: cross-seed WT variation (Boltz only) ────────
+        # Both SUPERPOSITION-FREE, from the extra-seed WT folds — how much the WT's OWN structure
+        # varies seed↔seed, the noise the variant must beat to count as a real change:
+        #   • ddm_floor_raw  = cross-seed MAX per-residue dRMSD (Å).
+        #   • lddt_floor_raw = cross-seed MIN per-residue lDDT (worst local self-consistency).
         lddt_floor_raw: Dict["Any", float] = {}
         ddm_floor_raw: Dict["Any", float] = {}
         if engine == "boltz" and len(seeds) > 1:
@@ -5611,37 +5608,21 @@ class ToolRouter:
                 if not fca:
                     continue
                 common = sorted(set(ref_ca) & set(fca))
-                seed_lddt = self._per_residue_lddt(ref_ca, fca, common)   # superposition-free
-                for k, lv in seed_lddt.items():
+                for k, lv in self._per_residue_lddt(ref_ca, fca, common).items():
                     if k not in lddt_floor_raw or lv < lddt_floor_raw[k]:
                         lddt_floor_raw[k] = lv           # worst (lowest) self-consistency
-                seed_ddm = self._per_residue_ddm(ref_ca, fca, common)     # superposition-free
-                for k, dv in seed_ddm.items():
+                for k, dv in self._per_residue_ddm(ref_ca, fca, common).items():
                     if dv > ddm_floor_raw.get(k, 0.0):
                         ddm_floor_raw[k] = dv            # cross-seed MAX dRMSD
-                anchor, _src = self._auto_anchor_resnums(ref_ca, fca, common)
-                if anchor is None:
-                    continue
-                shifts, _anc, _all = self._anchor_kabsch(ref_ca, fca, anchor)
-                if not shifts:
-                    continue
-                for k, dv in shifts.items():
-                    if dv > floor_raw.get(k, 0.0):
-                        floor_raw[k] = dv
 
-        # legacy displacement floor = max(cross-seed max, global minimum) — diagnostic only now
-        floor: Dict[str, float] = {
-            self._dev_key(k): round(max(floor_raw.get(k, 0.0), self._DEVIATION_FLOOR_MIN_A), 3)
-            for k in ref_ca
-        }
-        # lDDT floor = min(cross-seed-min lDDT, neutral cap) — secondary local-integrity metric.
+        # lDDT floor = min(cross-seed-min lDDT, neutral cap) — local-integrity noise.
         floor_lddt: Dict[str, float] = {
             self._dev_key(k): round(min(lddt_floor_raw.get(k, 1.0), self._LDDT_NEUTRAL_CAP), 4)
             for k in ref_ca
         }
         # dRMSD floor (Å) = max(cross-seed max, global min) — the PAINTED signal's gate. Built
-        # superposition-free (no anchor), so it does NOT inflate to the 10-15 Å the Kabsch floor
-        # hit on re-orienting WT regions; the variant must move MORE than the WT does seed↔seed.
+        # superposition-free (no anchor), so it does NOT inflate the way a rigid-body-fit floor
+        # does on re-orienting WT regions; the variant must move MORE than the WT does seed↔seed.
         floor_ddm: Dict[str, float] = {
             self._dev_key(k): round(max(ddm_floor_raw.get(k, 0.0), self._DDM_FLOOR_MIN_A), 3)
             for k in ref_ca
@@ -5649,22 +5630,22 @@ class ToolRouter:
         return {
             "engine": engine, "target": target, "seed": ref_seed,
             "model_id": str(ref_mid), "path": ref_path,
-            "floor": floor, "floor_lddt": floor_lddt, "floor_ddm": floor_ddm,
+            "floor_lddt": floor_lddt, "floor_ddm": floor_ddm,
             "n_floor_seeds": (len(seeds) if engine == "boltz" else 1),
         }
 
     def _run_variant_deviation(self, inputs: Dict[str, Any]) -> "ToolStepResult":
-        """Per-residue Cα deviation of a FOLDED variant vs the seed-pinned WT REFERENCE
+        """Per-residue variant-vs-WT deviation of a FOLDED variant vs the seed-pinned WT REFERENCE
         FOLD (fold-vs-fold, real atoms — not the S2 sequence preview, not the crystal).
 
-        Ensures the (engine, target) WT reference exists (folding it + its cross-seed floor
-        once per design when absent — the expensive path; reused via the cached `wt_ref`
-        otherwise), then localizes the variant's effect with the EXISTING Kabsch machinery:
-        the SHARED auto-anchor rigid-core prune + `_anchor_kabsch` (anchor-residual RMSD ≈ 0
-        is the readback quality check). Per-chain for an assembly (multichain CA). The floor
-        is returned alongside the raw deviation; the floor-GATED rendering is the panel's
-        deviation colour mode (one source: `color_modes.deviation_color`), so this tool
-        stays data-only and feeds the SAME seam as ddG/pLDDT — not a parallel render path."""
+        Ensures the (engine, target) WT reference exists (folding it + its cross-seed floors once
+        per design when absent — the expensive path; reused via the cached `wt_ref` otherwise),
+        then computes two SUPERPOSITION-FREE per-residue signals over the indel-paired residues:
+        `ddm` (all-pairs distance-RMSD, the painted magnitude) and `lddt` (local-distance-difference,
+        the secondary local-integrity signal), each gated by its cross-seed noise floor. Per-chain
+        for an assembly (multichain CA). Data-only: the floor-gated 3-tier rendering is the panel's
+        deviation colour mode (one source: `color_modes.combined_disruption_color`), feeding the
+        SAME seam as ddG/pLDDT — not a parallel render path."""
         variant_mid = inputs.get("variant_model_id")
         multichain  = bool(inputs.get("multichain"))
         chain       = inputs.get("variant_chain", "A")
@@ -5701,17 +5682,14 @@ class ToolRouter:
                 tool="variant_deviation", success=False,
                 error=(f"Could not read Cα for the variant fold #{variant_mid}. "
                        "Check the predicted model is open."))
-        # INDEL-AWARE column pairing (additive): re-key the variant fold onto the REFERENCE
-        # fold numbering via the panel-built {variant_fold_resnum: reference_fold_resnum} map,
-        # so a deletion's downstream residues pair to the correct template position (not the
-        # one-off-shifted mis-pair resnum==resnum would produce). An identity map
-        # (substitution-only) is a no-op → byte-identical; an ABSENT map → current behavior.
-        # A variant-fold residue NOT in the map is an INSERTED residue (a variant residue at a
-        # template-gap column — build_fold_column_map omits it by design, no WT counterpart);
-        # it is DROPPED so the inserted residue is excluded from the deviation (rendered
-        # neutral), while the shared residues still pair correctly across the insertion. (For
-        # substitution/deletion variants the map covers every fold residue → nothing dropped →
-        # byte-identical.) The anchor-residual RMSD (≈0) is the readback quality check.
+        # INDEL-AWARE column pairing (additive): re-key the variant fold onto the REFERENCE fold
+        # numbering via the panel-built {variant_fold_resnum: reference_fold_resnum} map, so a
+        # deletion's downstream residues pair to the correct template position (not the one-off
+        # mis-pair resnum==resnum would give), and an INSERTED residue (a variant residue at a
+        # template-gap column — build_fold_column_map omits it by design, no WT counterpart) is
+        # DROPPED (excluded, rendered neutral). Identity map (substitution-only) → no-op; an
+        # ABSENT map → resnum==resnum. The pairing is what every per-residue value below is keyed
+        # on, so it's the load-bearing correctness guarantee for indels.
         fold_map = inputs.get("fold_column_map")
         applied_map: Optional[Dict[int, int]] = None
         if fold_map and not multichain:
@@ -5723,56 +5701,26 @@ class ToolRouter:
                 tool="variant_deviation", success=False,
                 error=(f"Only {len(common)} common Cα between the variant fold and the WT "
                        "reference (need ≥3) — chain ids/numbering mismatch?"))
-        anchor, anchor_src = self._auto_anchor_resnums(ref_ca, var_ca, common)
-        if anchor is None:
-            return ToolStepResult(tool="variant_deviation", success=False,
-                                  error="Variant-vs-WT anchor Kabsch fit failed.")
-        # A = reference frame, B = variant → per-residue shift = the variant's displacement
-        per_dev, anchor_resid, all_pairs = self._anchor_kabsch(ref_ca, var_ca, anchor)
-        if per_dev is None:
-            return ToolStepResult(tool="variant_deviation", success=False,
-                                  error="Variant-vs-WT Kabsch fit failed.")
-
-        floor = (wt_ref or {}).get("floor") or {}
-        dev_str = {self._dev_key(k): v for k, v in per_dev.items()}
-        gmin = self._DEVIATION_FLOOR_MIN_A
-        cleared = [k for k, v in dev_str.items() if v > floor.get(k, gmin)]
-        max_dev = max(per_dev.values()) if per_dev else 0.0
 
         # ── PAINTED signal: superposition-free per-residue dRMSD (variant vs WT ref) ──
-        # The deviation colour mode paints this. Distances only (no rigid-body fit), so it rises
-        # for a rigidly DISPLACED-but-intact element (its distances to the stationary part change
-        # — what lDDT misses and the Kabsch metric mislocalized) AND for local change, but stays
-        # ~0 for a whole-body move. Keyed by the SAME reference resnum as `deviation`; inserted
-        # residues are absent from `common` → excluded (no WT counterpart), like the Cα path.
+        # Distances only (no rigid-body fit), so it rises for a rigidly DISPLACED-but-intact
+        # element (its distances to the stationary part change — what lDDT misses) AND for local
+        # change, but stays ~0 for a whole-body move. Keyed by REFERENCE resnum over `common`;
+        # inserted residues are absent (no WT counterpart) → excluded.
         ddm = self._per_residue_ddm(ref_ca, var_ca, common)
         ddm_str = {self._dev_key(k): v for k, v in ddm.items()}
         floor_ddm = (wt_ref or {}).get("floor_ddm") or {}
         dmin = self._DDM_FLOOR_MIN_A
         disrupted = [k for k, v in ddm_str.items() if v > floor_ddm.get(k, dmin)]
         max_ddm = max(ddm.values()) if ddm else 0.0
-        # DIAGNOSTIC: residues with a sizeable RAW dRMSD that the cross-seed floor GATES to white
-        # (real displacement vs the WT FOLD declared noise) — the top few name where to look.
-        ddm_suppressed = sorted(
-            ((k, v, floor_ddm.get(k, dmin)) for k, v in ddm_str.items()
-             if v > dmin and v <= floor_ddm.get(k, dmin)),
-            key=lambda t: -t[1])
-        # SECONDARY (reported, not painted): Cα-lDDT — local-fold integrity (distinguishes a
-        # MELTED region, low lDDT, from one that merely MOVED intact, high lDDT but high dRMSD).
+        # SECONDARY (reported + used in the 3-tier gate, not the magnitude): Cα-lDDT — local-fold
+        # integrity, distinguishing a MELTED region (low lDDT) from one that merely MOVED intact
+        # (high lDDT, high dRMSD).
         lddt = self._per_residue_lddt(ref_ca, var_ca, common)
         lddt_str = {self._dev_key(k): v for k, v in lddt.items()}
         floor_lddt = (wt_ref or {}).get("floor_lddt") or {}
         min_lddt = min(lddt.values()) if lddt else 1.0
         mean_lddt = round(sum(lddt.values()) / len(lddt), 4) if lddt else 1.0
-
-        # DIAGNOSTIC (kept through live-verify): the OLD Kabsch path — the auto-anchor iteratively
-        # prunes movers to a rigid core; a TINY core mislocalizes the per-residue shift to the
-        # lever-arm extremes (and the floor inherits it). Surfaced so the lDDT result can be
-        # compared against what the superposition metric was doing. Stripped before merge.
-        anchor_size = len(anchor)
-        n_common = len(common)
-        n_floor_suppressed = sum(1 for k, v in dev_str.items()
-                                 if v > gmin and v <= floor.get(k, gmin))
 
         data = {
             "engine":               engine,
@@ -5781,34 +5729,21 @@ class ToolRouter:
             "variant_chain":        chain,            # predicted monomer chain (3D target)
             "variant_model_id":     str(variant_mid),
             "reference_model_id":   str(wt_ref.get("model_id")),
-            "ddm":                  ddm_str,          # PAINTED: per-residue dRMSD (Å)
+            "ddm":                  ddm_str,          # PAINTED magnitude: per-residue dRMSD (Å)
             "floor_ddm":            floor_ddm,        # cross-seed dRMSD noise floor (gate)
-            "lddt":                 lddt_str,         # SECONDARY: per-residue Cα-lDDT (1=conserved)
-            "floor_lddt":           floor_lddt,       # cross-seed lDDT floor
-            "deviation":            dev_str,          # Cα RMSD (diagnostic only, not paint)
-            "floor":                floor,            # displacement floor (diagnostic)
-            # {variant_fold_resnum: reference_fold_resnum} actually applied (monomer indel) — all
+            "lddt":                 lddt_str,         # per-residue Cα-lDDT (1=conserved)
+            "floor_lddt":           floor_lddt,       # cross-seed lDDT floor (gate)
+            # {variant_fold_resnum: reference_fold_resnum} actually applied (monomer indel) — the
             # per-residue maps are keyed by REFERENCE resnum; the 3D push inverts this to paint
             # the VARIANT model in its OWN numbering (inserted residues, absent here, stay
             # neutral). None → identity (substitution-only / no map).
             "fold_column_map":      ({str(j): r for j, r in applied_map.items()}
                                      if applied_map else None),
             "max_ddm":              round(float(max_ddm), 3),
-            "n_ddm_suppressed":     len(ddm_suppressed),  # DIAGNOSTIC: real dRMSD gated by floor
-            "ddm_suppressed_top":   [[k, round(v, 2), round(f, 2)]
-                                     for k, v, f in ddm_suppressed[:6]],
             "min_lddt":             round(float(min_lddt), 4),
             "mean_lddt":            mean_lddt,
-            "n_disrupted":          len(disrupted),   # residues above the dRMSD floor (painted)
-            "anchor_residual_rmsd": anchor_resid,     # ≈0 confirms the fit/anchor is clean
-            "all_pairs_rmsd":       all_pairs,
-            "anchor_source":        anchor_src,
-            "anchor_size":          anchor_size,      # DIAGNOSTIC: rigid-core residue count
-            "n_common":             n_common,         # DIAGNOSTIC: paired residues fed to the fit
-            "n_floor_suppressed":   n_floor_suppressed,  # DIAGNOSTIC: real motion gated by floor
-            "n_residues":           len(per_dev),
-            "n_cleared_floor":      len(cleared),
-            "max_deviation":        round(float(max_dev), 3),
+            "n_residues":           len(ddm),
+            "n_disrupted":          len(disrupted),   # residues above the dRMSD floor
             "floor_kind":           ("deterministic" if engine == "esmfold" else "measured"),
             "wt_ref":               wt_ref,           # so the workbench caches it per combo
         }
@@ -5816,14 +5751,8 @@ class ToolRouter:
             tool="variant_deviation", success=True, data=data,
             summary=(f"Deviation vs WT ({engine}:{target}) — dRMSD: "
                      f"{len(disrupted)}/{len(ddm)} residues disrupted (above the cross-seed "
-                     f"dRMSD floor); max {max_ddm:.2f} Å. Local integrity (lDDT) min "
-                     f"{min_lddt:.3f}, mean {mean_lddt:.3f}. [diagnostic: {len(ddm_suppressed)} "
-                     f"dRMSD floor-suppressed"
-                     + (f" — top " + ", ".join(f"ref{k} raw {v:.1f}/floor {f:.1f}"
-                                               for k, v, f in ddm_suppressed[:4])
-                        if ddm_suppressed else "")
-                     + f"; old Cα-RMSD {len(cleared)}/{len(per_dev)} over {anchor_size}/"
-                     f"{n_common} core.]"))
+                     f"floor); max {max_ddm:.2f} Å · local integrity (lDDT) min "
+                     f"{min_lddt:.3f}, mean {mean_lddt:.3f}."))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)
