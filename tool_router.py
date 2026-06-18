@@ -1152,7 +1152,12 @@ class ToolRouter:
         # (The two REWRITE overrides — proline, mpnn_esmfold — also set it, since
         # they sit high in the order; they are naturally inert once a higher
         # full-replace has claimed, because their target tool is no longer present.)
-        _claimed     = False
+        # A PANEL tool request (engine.handle_tool_request) already chose the tool
+        # deterministically → pre-claim so the NL intent overrides can't re-route it on the
+        # synthetic label (e.g. "[Workbench] fold V1 … boltz monomer" must run Boltz, not be
+        # stolen by the ColabFold intent's "fold"+"monomer" match). The additive mutation-scan
+        # tiering runs after this block regardless, so panel Scan launches are unaffected.
+        _claimed     = bool(translator_result.get("_explicit_tool"))
         _ba_intent   = False  # bio-assembly generation override (set below)
         _repr_intent = False  # viewer representation override (set below)
         _repr_key    = None

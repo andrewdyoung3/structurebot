@@ -505,6 +505,12 @@ class RequestEngine:
             "confidence":           confidence,
             "tools_needed":         [tool],
             "tool_inputs":          {tool: dict(tool_inputs or {})},
+            # The panel chose the tool deterministically — route()'s NL intent overrides
+            # (colabfold/representation/color/…) must NOT re-route it based on the synthetic
+            # user_input label (e.g. "fold V1 … boltz monomer" must NOT become a ColabFold
+            # run). route() reads this and pre-claims so those overrides skip; the additive
+            # mutation-scan tiering still runs.
+            "_explicit_tool":       True,
         }
         self._run_pipeline(result, user_input, presenter, on_result=on_result)
 

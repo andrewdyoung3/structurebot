@@ -232,6 +232,39 @@ def test_proline_phrase_routes_to_proline_bridge():
     assert proline_inp.get("chain")    == "A"
 
 
+def _panel_route(tool, user_input):
+    """route() a deterministic PANEL tool request (the `_explicit_tool` marker that
+    engine.handle_tool_request sets) → resolved tools_needed."""
+    r = _make_router()
+    result = {"commands": [], "explanations": [], "warnings": [],
+              "clarification_needed": None, "confidence": "low",
+              "tools_needed": [tool], "tool_inputs": {tool: {}},
+              "_explicit_tool": True}
+    return r.route(result, user_input=user_input)["tools_needed"]
+
+
+def test_panel_boltz_monomer_not_rerouted_to_colabfold():
+    # the reported bug: "[Workbench] fold V1 … boltz monomer" matched the ColabFold intent
+    # ('fold'+'monomer') and got re-routed to ColabFold. The panel marker must prevent it.
+    out = _panel_route("boltz", "[Workbench] fold V1 on chain A — boltz monomer, LOCAL-ONLY")
+    assert out == ["boltz"], out
+
+
+def test_panel_esmfold_monomer_not_rerouted_to_colabfold():
+    out = _panel_route("esmfold", "[Workbench] fold V1 on chain A — esmfold monomer, LOCAL-ONLY")
+    assert out == ["esmfold"], out
+
+
+def test_nl_monomer_fold_still_routes_colabfold():
+    # the NL override is UNCHANGED for free-translated requests (no _explicit_tool marker).
+    r = _make_router()
+    result = {"commands": [], "explanations": [], "warnings": [],
+              "clarification_needed": None, "confidence": "low",
+              "tools_needed": ["chimerax"], "tool_inputs": {}}
+    out = r.route(result, user_input="fold this as a monomer")["tools_needed"]
+    assert out == ["colabfold"], out
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # High-accuracy ddG validation tier routing
 # ════════════════════════════════════════════════════════════════════════════════
