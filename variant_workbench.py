@@ -1954,6 +1954,19 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             dev, floor = block.get("deviation") or {}, block.get("floor") or {}
             mid = block["variant_model_id"]
             multichain = bool(block.get("multichain"))
+            # `dev`/`floor` are keyed by REFERENCE-fold resnum (the router re-keyed the variant
+            # onto the WT numbering for an indel). The model #mid is numbered in the VARIANT
+            # fold's OWN order — so remap ref→variant here before painting, or an insertion's
+            # downstream residues (and the inserted residue itself) get the wrong colour.
+            # Inserted residues have no reference counterpart → absent from the remap → they
+            # fall to the neutral baseline (decision d). None map → identity (sub-only).
+            fmap = block.get("fold_column_map")
+            if fmap and not multichain:
+                ref_to_var = {int(r): int(j) for j, r in fmap.items()}
+                dev = {str(ref_to_var[int(k)]): val for k, val in dev.items()
+                       if int(k) in ref_to_var}
+                floor = {str(ref_to_var[int(k)]): val for k, val in floor.items()
+                         if int(k) in ref_to_var}
             per_chain: Dict[str, List[int]] = {}
             if multichain:
                 for k in dev:

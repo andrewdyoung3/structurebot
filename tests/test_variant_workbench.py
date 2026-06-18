@@ -845,7 +845,7 @@ class TestStage4b:
     # ── Stage 4c: variant-vs-WT deviation launch + apply + floor-gated colour ────────
     @staticmethod
     def _dev_result(variant_mid="2", engine="esmfold", target="monomer", multichain=False,
-                    deviation=None, floor=None):
+                    deviation=None, floor=None, fold_column_map=None):
         deviation = deviation or {"1": 0.1, "2": 1.5, "3": 0.2}
         floor = floor or {}
         wt_ref = {"engine": engine, "target": target, "model_id": "7",
@@ -856,7 +856,7 @@ class TestStage4b:
             "deviation": deviation, "floor": floor, "anchor_residual_rmsd": 0.01,
             "all_pairs_rmsd": 0.5, "n_residues": len(deviation), "n_cleared_floor": 1,
             "max_deviation": max(deviation.values()), "floor_kind": "deterministic",
-            "wt_ref": wt_ref}}]}
+            "fold_column_map": fold_column_map, "wt_ref": wt_ref}}]}
 
     def test_deviation_launch_spec_uncached_low_confidence(self, _app):
         p, tab, (vid,) = self._variant_panel()
@@ -912,6 +912,24 @@ class TestStage4b:
         # No `show` — visibility is owned by fold_visibility_commands (else the Variant-fold
         # toggle would be re-defeated, the same bug as the pLDDT mode).
         assert cmds == ["color #2/A #ffffff", "color #2/A:2 #ffd166"]
+
+    def test_deviation_3d_remaps_onto_variant_numbering_for_insertion(self, _app):
+        # Stage B 3D-paint fix: `deviation`/`floor` are keyed by REFERENCE-fold resnum, but the
+        # variant MODEL is numbered in its OWN fold order. With an insertion the painter must
+        # remap ref→variant so a downstream residue paints at its VARIANT resnum and the
+        # INSERTED residue (no ref counterpart) stays neutral — not the crystal-numbered colour.
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        # insertion after variant col → fold has an inserted residue at variant resnum 2; the
+        # shared residues are variant 1→ref 1 and variant 3→ref 2 (ref 2 moved 1.5 Å).
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", deviation={"1": 0.1, "2": 1.5},
+            fold_column_map={"1": 1, "3": 2}))             # var 2 (insert) absent → neutral
+        p._mode_key = _RESULT_DEVIATION_MODE
+        cmds = p.color_commands_for(tab)
+        # ref 2 (1.5 Å) repaints at VARIANT resnum 3, NOT ref-resnum 2 (which is the insert);
+        # the inserted residue (var 2) is never coloured → stays on the #ffffff baseline.
+        assert cmds == ["color #2/A #ffffff", "color #2/A:3 #ffd166"]
 
     def test_deviation_color_mode_no_deviation_is_empty(self, _app):
         p, tab, (vid,) = self._variant_panel()

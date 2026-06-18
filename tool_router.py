@@ -5605,9 +5605,10 @@ class ToolRouter:
         # substitution/deletion variants the map covers every fold residue → nothing dropped →
         # byte-identical.) The anchor-residual RMSD (≈0) is the readback quality check.
         fold_map = inputs.get("fold_column_map")
+        applied_map: Optional[Dict[int, int]] = None
         if fold_map and not multichain:
-            fold_map = {int(k): int(v) for k, v in fold_map.items()}
-            var_ca = {fold_map[j]: xyz for j, xyz in var_ca.items() if j in fold_map}
+            applied_map = {int(k): int(v) for k, v in fold_map.items()}
+            var_ca = {applied_map[j]: xyz for j, xyz in var_ca.items() if j in applied_map}
         common = sorted(set(ref_ca) & set(var_ca))
         if len(common) < 3:
             return ToolStepResult(
@@ -5639,6 +5640,12 @@ class ToolRouter:
             "reference_model_id":   str(wt_ref.get("model_id")),
             "deviation":            dev_str,          # str-keyed per-residue Cα deviation (Å)
             "floor":                floor,            # str-keyed effective per-residue floor (Å)
+            # {variant_fold_resnum: reference_fold_resnum} actually applied (monomer indel) —
+            # both `deviation` and `floor` above are keyed by REFERENCE resnum; the 3D push
+            # inverts this to paint the VARIANT model in its OWN numbering (inserted residues,
+            # absent here, stay neutral). None → identity (substitution-only / no map).
+            "fold_column_map":      ({str(j): r for j, r in applied_map.items()}
+                                     if applied_map else None),
             "anchor_residual_rmsd": anchor_resid,     # ≈0 confirms the fit/anchor is clean
             "all_pairs_rmsd":       all_pairs,
             "anchor_source":        anchor_src,

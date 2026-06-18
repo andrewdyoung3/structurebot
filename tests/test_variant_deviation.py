@@ -137,6 +137,20 @@ class TestRunVariantDeviation:
         assert d["deviation"]["19"] > 1.5                        # shared residue pairs at ref 19
         # the inserted residue (way off-axis) was DROPPED — never appears at any ref resnum
         assert all(dv < 1.0 for k, dv in d["deviation"].items() if k != "19")
+        # the APPLIED map is echoed (str-keyed) so the 3D push can invert ref→variant numbering
+        assert d["fold_column_map"] == {str(j): r for j, r in fold_map.items()}
+
+    def test_fold_column_map_echo_none_when_substitution_only(self):
+        # no map / identity → no remap needed downstream → echo None (the 3D push uses identity).
+        ref = _rigid(30)
+        var = _displace(ref, {10}, [2.0, 0.0, 0.0])
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"}})
+        assert out.success and out.data["fold_column_map"] is None
 
     def test_missing_variant_model_errors(self):
         out = _router()._run_variant_deviation({"engine": "esmfold"})
