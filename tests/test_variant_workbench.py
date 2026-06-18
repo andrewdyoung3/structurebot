@@ -846,20 +846,24 @@ class TestStage4b:
     @staticmethod
     def _dev_result(variant_mid="2", engine="esmfold", target="monomer", multichain=False,
                     deviation=None, floor=None, fold_column_map=None,
-                    lddt=None, floor_lddt=None):
+                    lddt=None, floor_lddt=None, ddm=None, floor_ddm=None):
         deviation = deviation or {"1": 0.1, "2": 1.5, "3": 0.2}
         floor = floor or {}
         lddt = lddt if lddt is not None else {"1": 0.99, "2": 0.40, "3": 0.97}
         floor_lddt = floor_lddt if floor_lddt is not None else {}
+        ddm = ddm if ddm is not None else {"1": 0.3, "2": 6.0, "3": 0.4}
+        floor_ddm = floor_ddm if floor_ddm is not None else {}
         wt_ref = {"engine": engine, "target": target, "model_id": "7",
-                  "floor": floor, "floor_lddt": floor_lddt, "path": "/tmp/wtref"}
+                  "floor": floor, "floor_lddt": floor_lddt, "floor_ddm": floor_ddm,
+                  "path": "/tmp/wtref"}
         return {"tool_step_results": [{"tool": "variant_deviation", "data": {
             "engine": engine, "target": target, "multichain": multichain,
             "variant_chain": "A", "variant_model_id": variant_mid, "reference_model_id": "7",
-            "lddt": lddt, "floor_lddt": floor_lddt,
+            "ddm": ddm, "floor_ddm": floor_ddm, "lddt": lddt, "floor_lddt": floor_lddt,
             "deviation": deviation, "floor": floor, "anchor_residual_rmsd": 0.01,
-            "all_pairs_rmsd": 0.5, "n_residues": len(lddt), "n_cleared_floor": 1,
-            "n_disrupted": sum(1 for k, x in lddt.items() if x < floor_lddt.get(k, 0.9)),
+            "all_pairs_rmsd": 0.5, "n_residues": len(ddm), "n_cleared_floor": 1,
+            "n_disrupted": sum(1 for k, x in ddm.items() if x > floor_ddm.get(k, 0.5)),
+            "max_ddm": max(ddm.values()),
             "min_lddt": min(lddt.values()), "mean_lddt": round(sum(lddt.values())/len(lddt), 4),
             "max_deviation": max(deviation.values()), "floor_kind": "deterministic",
             "fold_column_map": fold_column_map, "wt_ref": wt_ref}}]}
@@ -899,21 +903,22 @@ class TestStage4b:
         assert tab.design.wt_refs["esmfold:monomer"]["model_id"] == "7"
 
     def test_insertion_flank_diagnostic(self, _app):
-        # diagnostic readout: per-residue Cα-lDDT vs the lDDT floor at the SHARED residues
-        # bracketing an insertion — flags which flank is disrupted (lDDT below floor → shown).
+        # diagnostic readout: per-residue dRMSD vs the floor at the SHARED residues bracketing an
+        # insertion — flags which flank is disrupted (dRMSD above floor → shown).
         p, tab, (vid,) = self._variant_panel()
         tab.design.insert_variant_residues(vid, 0, "G")     # insert G after resnum 1 (col 0)
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
-        # ref2 (after-insert flank) lDDT 0.40 < floor 0.90 → disrupted (shown); ref1 conserved.
+        # ref2 (after-insert flank) dRMSD 6.0 > floor 0.5 → disrupted (shown); ref1 quiet.
         p.apply_deviation_result(vid, self._dev_result(
             variant_mid="2",
+            ddm={"1": 0.3, "2": 6.0, "3": 0.4},
+            floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5},
             lddt={"1": 0.95, "2": 0.40, "3": 0.92},
-            floor_lddt={"1": 0.90, "2": 0.90, "3": 0.90},
             fold_column_map={"1": 1, "3": 2, "4": 3}))      # var2 = the inserted G (omitted)
         v = tab.design.get_variant(vid)
         diag = p._insertion_flank_diag(tab.design, v, v.results.fold["deviation"])
-        assert "ref1(before): lDDT 0.95 vs floor 0.90 → neutral" in diag
-        assert "ref2(after): lDDT 0.40 vs floor 0.90 → shown" in diag
+        assert "ref1(before): dRMSD 0.3 vs floor 0.5 Å → neutral" in diag
+        assert "ref2(after): dRMSD 6.0 vs floor 0.5 Å → shown" in diag
         # no insertion → empty diagnostic
         p2, tab2, (vid2,) = self._variant_panel()
         assert p2._insertion_flank_diag(tab2.design, tab2.design.get_variant(vid2), {}) == ""
@@ -922,40 +927,40 @@ class TestStage4b:
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
         p.apply_deviation_result(vid, self._dev_result(
-            variant_mid="2", lddt={"1": 0.99, "2": 0.40, "3": 0.97}))
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4}))
         hexmap = p._deviation_panel_hex(tab)
-        # res 2 (lDDT 0.40 < 0.90 cap) → severe (red); res 1 & 3 (≥ cap) NEUTRAL
-        assert hexmap == {2: "#e23b3b"}
+        # res 2 (dRMSD 6.0 > 0.5 floor; 5.0–8.0 band) → orange; res 1 & 3 (sub-floor) NEUTRAL
+        assert hexmap == {2: "#f3953b"}
 
     def test_deviation_3d_targets_predicted_model_per_chain(self, _app):
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
         p.apply_deviation_result(vid, self._dev_result(
-            variant_mid="2", lddt={"1": 0.99, "2": 0.40, "3": 0.97}))
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4}))
         p._mode_key = _RESULT_DEVIATION_MODE
         cmds = p.color_commands_for(tab)
         # colours the PREDICTED variant model #2 (its own numbering), not the crystal backbone.
         # No `show` — visibility is owned by fold_visibility_commands (else the Variant-fold
         # toggle would be re-defeated, the same bug as the pLDDT mode).
-        assert cmds == ["color #2/A #ffffff", "color #2/A:2 #e23b3b"]
+        assert cmds == ["color #2/A #ffffff", "color #2/A:2 #f3953b"]
 
     def test_deviation_3d_remaps_onto_variant_numbering_for_insertion(self, _app):
-        # Stage B 3D-paint fix (lDDT): `lddt`/`floor_lddt` are keyed by REFERENCE-fold resnum,
+        # Stage B 3D-paint fix (dRMSD): `ddm`/`floor_ddm` are keyed by REFERENCE-fold resnum,
         # but the variant MODEL is numbered in its OWN fold order. With an insertion the painter
         # must remap ref→variant so a disrupted shared residue paints at its VARIANT resnum and
         # the INSERTED residue (no ref counterpart) stays neutral.
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
         # inserted residue at variant resnum 2; shared variant 1→ref 1, variant 3→ref 2 (ref 2
-        # disrupted, lDDT 0.40).
+        # disrupted, dRMSD 6.0).
         p.apply_deviation_result(vid, self._dev_result(
-            variant_mid="2", lddt={"1": 0.99, "2": 0.40},
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0},
             fold_column_map={"1": 1, "3": 2}))             # var 2 (insert) absent → neutral
         p._mode_key = _RESULT_DEVIATION_MODE
         cmds = p.color_commands_for(tab)
-        # ref 2 (lDDT 0.40) repaints at VARIANT resnum 3, NOT ref-resnum 2 (which is the insert);
+        # ref 2 (dRMSD 6.0) repaints at VARIANT resnum 3, NOT ref-resnum 2 (which is the insert);
         # the inserted residue (var 2) is never coloured → stays on the #ffffff baseline.
-        assert cmds == ["color #2/A #ffffff", "color #2/A:3 #e23b3b"]
+        assert cmds == ["color #2/A #ffffff", "color #2/A:3 #f3953b"]
 
     def test_deviation_color_mode_no_deviation_is_empty(self, _app):
         p, tab, (vid,) = self._variant_panel()

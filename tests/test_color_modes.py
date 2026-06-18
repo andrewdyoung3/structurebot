@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from color_modes import (get_mode, all_modes, COLOR_MODES, plddt_color,
-                         deviation_color, lddt_disruption_color)
+                         deviation_color, lddt_disruption_color, ddm_color)
 
 
 class TestDeviationColor:
@@ -44,6 +44,31 @@ class TestDeviationColor:
 
     def test_default_floor_zero_still_gates_zero_shift(self):
         assert deviation_color(0.0, 0.0) is None           # no motion → neutral
+
+
+class TestDdmColor:
+    """The PAINTED disruption ramp — per-residue dRMSD (Å, superposition-free), floor-gated,
+    cool→hot by magnitude (one source for panel + 3D push)."""
+
+    def test_none_is_no_data(self):
+        assert ddm_color(None, 0.5) is None
+
+    def test_at_or_below_floor_is_neutral(self):
+        assert ddm_color(0.4, 0.5) is None
+        assert ddm_color(0.5, 0.5) is None                 # exactly on floor → neutral
+
+    def test_above_floor_warm_by_magnitude(self):
+        assert ddm_color(0.8, 0.5) == "#5b8def"            # 0.5–1.0 → cool blue
+        assert ddm_color(2.0, 0.5) == "#8fd0e8"            # 1.0–2.5 → cyan
+        assert ddm_color(4.0, 0.5) == "#ffd166"            # 2.5–5.0 → yellow
+        assert ddm_color(6.0, 0.5) == "#f3953b"            # 5.0–8.0 → orange
+        assert ddm_color(12.0, 0.5) == "#e23b3b"           # ≥8 → severe (red)
+
+    def test_higher_floor_suppresses(self):
+        # a WT region that wobbles more across seeds (higher floor) only paints when the variant
+        # exceeds THAT — the superposition-free analog of the deviation floor gate.
+        assert ddm_color(2.0, 3.0) is None                 # 2.0 ≤ 3.0 floor → neutral
+        assert ddm_color(4.0, 3.0) == "#ffd166"            # above the 3.0 floor → shown
 
 
 class TestLddtDisruptionColor:

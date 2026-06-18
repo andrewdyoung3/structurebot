@@ -176,6 +176,35 @@ _LDDT_BANDS = (
 )
 
 
+# dRMSD (all-pairs distance-RMSD, Å) ramp — the PAINTED disruption signal. Magnitude in Å like
+# the old deviation ramp (cool→hot, floor-gated), but the value is SUPERPOSITION-FREE so it is
+# honest for rigidly-displaced-but-intact structure (lights up) and a whole-body move (stays
+# neutral). Bands are wider than the Cα ramp because dRMSD aggregates many pairwise changes.
+_DDM_BANDS = (
+    (1.0, "#5b8def"),   # just cleared — small relative change (cool blue)
+    (2.5, "#8fd0e8"),   # cyan
+    (5.0, "#ffd166"),   # yellow
+    (8.0, "#f3953b"),   # orange
+    (float("inf"), "#e23b3b"),   # ≥8 Å — large rearrangement (red)
+)
+
+
+def ddm_color(ddm: Optional[float], floor: float = 0.5) -> Optional[str]:
+    """Per-residue dRMSD (Å, superposition-free all-pairs distance-RMSD) → fixed-Å hex,
+    FLOOR-GATED. None → no data. ``ddm <= floor`` → None (NEUTRAL: changed no more than the WT
+    does across seeds). Above the floor → cool→hot by magnitude. Captures rigid DISPLACEMENT of
+    intact structure (which lDDT misses) without the anchor/lever-arm blow-up of the Cα-RMSD
+    ramp; a whole-body rigid move preserves all distances → 0 → neutral."""
+    if ddm is None:
+        return None
+    if ddm <= floor:
+        return None
+    for hi, hexc in _DDM_BANDS:
+        if ddm < hi:
+            return hexc
+    return _DDM_BANDS[-1][1]
+
+
 def lddt_disruption_color(lddt: Optional[float],
                           floor: float = 0.9) -> Optional[str]:
     """Per-residue Cα-lDDT (variant-vs-WT, 1=locally conserved) → fixed hex, FLOOR-GATED.

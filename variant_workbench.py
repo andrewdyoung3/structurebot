@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import (all_modes, ddg_color, deviation_color, get_mode,
+from color_modes import (all_modes, ddg_color, ddm_color, deviation_color, get_mode,
                          lddt_disruption_color, plddt_color)
 from seq_library import (build_numbering_header_content,
                          build_numbering_header_with_insertions)
@@ -50,6 +50,7 @@ _RESULT_PLDDT_MODE = "result:plddt"         # S4b result-backed color mode (per-
 _RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα deviation
 _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
 _LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
+_DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
 _FOLD_ENGINES = ("esmfold", "boltz")        # S4b engine picker order (Boltz lands its own stage)
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
@@ -1147,25 +1148,25 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         return sorted(dev, key=lambda k: int(k))
 
     def _deviation_panel_hex(self, tab: _ChainDesignTab) -> Dict[int, str]:
-        """{author_resnum: hex} for the active variant's floor-gated Cα-lDDT disruption, panel
+        """{author_resnum: hex} for the active variant's floor-gated dRMSD disruption, panel
         side. The fold numbers residues 1..N over the ungapped sequence, so the rep chain's
-        lDDT keys map POSITIONALLY onto the active row's ordered author resnums (the same
-        positional contract `fold_summary` uses for pLDDT). Gated via `lddt_disruption_color`
-        (the ONE source shared with the 3D push). Inserted residues are absent from the lDDT
-        keys (no WT counterpart) → they never land on an author resnum → neutral."""
+        dRMSD keys map POSITIONALLY onto the active row's ordered author resnums (the same
+        positional contract `fold_summary` uses for pLDDT). Gated via `ddm_color` (the ONE
+        source shared with the 3D push). Inserted residues are absent from the dRMSD keys (no
+        WT counterpart) → they never land on an author resnum → neutral."""
         block = self._active_deviation(tab)
         if not block:
             return {}
-        lddt = block.get("lddt") or {}
-        floor_lddt = block.get("floor_lddt") or {}
-        keys = self._dev_chain_keys(lddt, bool(block.get("multichain")), tab.design.rep_chain)
+        ddm = block.get("ddm") or {}
+        floor_ddm = block.get("floor_ddm") or {}
+        keys = self._dev_chain_keys(ddm, bool(block.get("multichain")), tab.design.rep_chain)
         author = [c.resnum for c in tab.active_row_cells()
                   if not c.is_gap and c.resnum is not None]
         out: Dict[int, str] = {}
         for i, k in enumerate(keys):
             if i >= len(author):
                 break
-            hexc = lddt_disruption_color(lddt[k], floor_lddt.get(k, _LDDT_NEUTRAL_CAP))
+            hexc = ddm_color(ddm[k], floor_ddm.get(k, _DDM_FLOOR_MIN_A))
             if hexc:
                 out[author[i]] = hexc
         return out
@@ -1767,26 +1768,25 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._persist()
         self._select_result_mode(_RESULT_DEVIATION_MODE)   # AUTO-SURFACE the deviation mode
         self._rerender_results(cd, v)
-        flank = self._insertion_flank_diag(cd, v, data)    # DIAGNOSTIC: lDDT-vs-floor at insert flanks
+        flank = self._insertion_flank_diag(cd, v, data)    # DIAGNOSTIC: dRMSD-vs-floor at insert flanks
         self._status.setText(
-            f"{v.id} disruption vs WT ({data.get('engine')}:{data.get('target')}) — Cα-lDDT: "
-            f"{data.get('n_disrupted','?')}/{data.get('n_residues','?')} residues below the "
-            f"cross-seed lDDT floor; min lDDT {data.get('min_lddt','?')}, "
-            f"mean {data.get('mean_lddt','?')}.  [old Cα-RMSD diag: "
-            f"{data.get('n_cleared_floor','?')} cleared, max {data.get('max_deviation','?')} Å, "
+            f"{v.id} disruption vs WT ({data.get('engine')}:{data.get('target')}) — dRMSD: "
+            f"{data.get('n_disrupted','?')}/{data.get('n_residues','?')} residues above the "
+            f"cross-seed floor; max {data.get('max_ddm','?')} Å. Local integrity lDDT "
+            f"min {data.get('min_lddt','?')}, mean {data.get('mean_lddt','?')}.  "
+            f"[old Cα-RMSD diag: {data.get('n_cleared_floor','?')} cleared, "
             f"{data.get('anchor_size','?')}/{data.get('n_common','?')} core, "
             f"{data.get('n_floor_suppressed','?')} suppressed]"
             + (f"  [insertion flanks] {flank}" if flank else ""))
 
     def _insertion_flank_diag(self, cd: ChainDesign, v, block: Dict[str, Any]) -> str:
-        """DIAGNOSTIC (kept through live-verify): for each insertion, the Cα-lDDT vs its floor at
-        the SHARED residues immediately flanking it (and, for comparison, the OLD Cα-RMSD raw vs
-        its floor). Shows the lDDT metric localizing the insertion where the superposition
-        metric did not. Empty when the variant has no insertion."""
+        """DIAGNOSTIC (kept through live-verify): for each insertion, the dRMSD vs its floor at
+        the SHARED residues immediately flanking it (with the lDDT alongside, to read MELTED vs
+        merely DISPLACED). Empty when the variant has no insertion."""
         if not getattr(v, "indels", None) or not any(e.kind == "insertion" for e in v.indels):
             return ""
-        lddt, fl_lddt = block.get("lddt") or {}, block.get("floor_lddt") or {}
-        dev, floor = block.get("deviation") or {}, block.get("floor") or {}
+        ddm, fl_ddm = block.get("ddm") or {}, block.get("floor_ddm") or {}
+        lddt = block.get("lddt") or {}
         fmap = build_fold_column_map(v, cd.template_cells)      # {var_fold_resnum: ref_resnum}
         # classify each variant non-gap cell as shared (in fmap) or inserted (template-gap col)
         var_pos = 0
@@ -1809,16 +1809,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         for run in runs:
             for tag, vp in (("before", run[0] - 1), ("after", run[-1] + 1)):
                 ref = fmap.get(vp)
-                if ref is None or str(ref) not in lddt:
+                if ref is None or str(ref) not in ddm:
                     continue
-                lv = lddt[str(ref)]
-                lf = fl_lddt.get(str(ref), _LDDT_NEUTRAL_CAP)
-                shown = "shown" if lv < lf else "neutral"
-                extra = ""
-                if str(ref) in dev:
-                    extra = (f" (old RMSD {dev[str(ref)]:.1f} vs "
-                             f"{floor.get(str(ref), _DEVIATION_FLOOR_MIN_A):.1f} Å)")
-                parts.append(f"ref{ref}({tag}): lDDT {lv:.2f} vs floor {lf:.2f} → {shown}{extra}")
+                dv = ddm[str(ref)]
+                df = fl_ddm.get(str(ref), _DDM_FLOOR_MIN_A)
+                shown = "shown" if dv > df else "neutral"
+                lv = lddt.get(str(ref))
+                extra = f" (lDDT {lv:.2f})" if lv is not None else ""
+                parts.append(f"ref{ref}({tag}): dRMSD {dv:.1f} vs floor {df:.1f} Å → {shown}{extra}")
         return "; ".join(parts)
 
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
@@ -1995,17 +1993,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             # reveal coloured atoms, not default-coloured ones).
             return [f"color byattribute bfactor #{mid} palette alphafold target acs"]
         if self._mode_key == _RESULT_DEVIATION_MODE:
-            # The disruption (Cα-lDDT) lives on the PREDICTED variant model's real atoms (like
+            # The disruption (dRMSD) lives on the PREDICTED variant model's real atoms (like
             # pLDDT), NOT the shared crystal backbone — colour #mid per chain in its OWN
-            # numbering, floor-gated via the SAME `lddt_disruption_color` the panel uses (sync).
+            # numbering, floor-gated via the SAME `ddm_color` the panel uses (panel↔3D sync).
             block = self._active_deviation(tab)
             if not block or not block.get("variant_model_id"):
                 return []
-            lddt = block.get("lddt") or {}
-            floor_lddt = block.get("floor_lddt") or {}
+            ddm = block.get("ddm") or {}
+            floor_ddm = block.get("floor_ddm") or {}
             mid = block["variant_model_id"]
             multichain = bool(block.get("multichain"))
-            # `lddt`/`floor_lddt` are keyed by REFERENCE-fold resnum (the router re-keyed the
+            # `ddm`/`floor_ddm` are keyed by REFERENCE-fold resnum (the router re-keyed the
             # variant onto the WT numbering for an indel). The model #mid is numbered in the
             # VARIANT fold's OWN order — so remap ref→variant here before painting, or an
             # insertion's downstream residues get the wrong colour. Inserted residues have no
@@ -2013,24 +2011,24 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             fmap = block.get("fold_column_map")
             if fmap and not multichain:
                 ref_to_var = {int(r): int(j) for j, r in fmap.items()}
-                lddt = {str(ref_to_var[int(k)]): val for k, val in lddt.items()
-                        if int(k) in ref_to_var}
-                floor_lddt = {str(ref_to_var[int(k)]): val for k, val in floor_lddt.items()
-                              if int(k) in ref_to_var}
+                ddm = {str(ref_to_var[int(k)]): val for k, val in ddm.items()
+                       if int(k) in ref_to_var}
+                floor_ddm = {str(ref_to_var[int(k)]): val for k, val in floor_ddm.items()
+                             if int(k) in ref_to_var}
             per_chain: Dict[str, List[int]] = {}
             if multichain:
-                for k in lddt:
+                for k in ddm:
                     ch, rn = k.split(":", 1)
                     per_chain.setdefault(ch, []).append(int(rn))
             else:
                 ch = block.get("variant_chain", "A")
-                per_chain[ch] = [int(k) for k in lddt]
+                per_chain[ch] = [int(k) for k in ddm]
             for c in per_chain:
                 per_chain[c].sort()
 
             def _val(chain: str, rn: int) -> Optional[str]:
                 k = f"{chain}:{rn}" if multichain else str(rn)
-                return lddt_disruption_color(lddt.get(k), floor_lddt.get(k, _LDDT_NEUTRAL_CAP))
+                return ddm_color(ddm.get(k), floor_ddm.get(k, _DDM_FLOOR_MIN_A))
 
             # Visibility owned by fold_visibility_commands (see the pLDDT branch note) — do
             # NOT re-show #mid here or the "Variant fold"/"Hide folds" toggle would no-op.

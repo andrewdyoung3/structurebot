@@ -152,21 +152,22 @@ class TestRunVariantDeviation:
             "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"}})
         assert out.success and out.data["fold_column_map"] is None
 
-    def test_returns_lddt_primary_signal(self):
-        # the deviation tool now also computes the SUPERPOSITION-FREE Cα-lDDT (the paint signal).
+    def test_returns_ddm_painted_signal_and_lddt_secondary(self):
+        # the tool paints superposition-free dRMSD and ALSO reports lDDT (local integrity).
         ref = _rigid(30)
-        var = _displace(ref, {10, 11, 12}, [6.0, 0.0, 0.0])   # big local shove → lDDT drops there
+        var = _displace(ref, {10, 11, 12}, [6.0, 0.0, 0.0])   # big local shove
         r = _router()
         r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
         out = r._run_variant_deviation({
             "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
             "variant_chain": "A", "multichain": False,
-            "wt_ref": {"model_id": "7", "floor": {}, "floor_lddt": {}, "path": "/tmp/r.pdb"}})
+            "wt_ref": {"model_id": "7", "floor": {}, "floor_lddt": {}, "floor_ddm": {},
+                       "path": "/tmp/r.pdb"}})
         assert out.success
         d = out.data
-        assert "lddt" in d and "floor_lddt" in d
-        assert d["min_lddt"] < 1.0 and d["mean_lddt"] <= 1.0
-        assert d["n_disrupted"] >= 1                          # shoved residues fall below the cap
+        assert "ddm" in d and "floor_ddm" in d and "lddt" in d
+        assert d["max_ddm"] > 0.0 and d["min_lddt"] < 1.0
+        assert d["n_disrupted"] >= 1                          # shoved residues above the dRMSD floor
 
     def test_missing_variant_model_errors(self):
         out = _router()._run_variant_deviation({"engine": "esmfold"})
@@ -261,3 +262,42 @@ class TestPerResidueLddt:
         m = ToolRouter._per_residue_lddt(ref, var, sorted(ref))
         assert m[21] == min(m.values()) and m[21] < 0.9  # the moved residue is the most disrupted
         assert sum(1 for v in m.values() if v > 0.9) >= 30   # the rest stay locally conserved
+
+
+class TestPerResidueDdm:
+    """The PAINTED per-residue dRMSD (all-pairs distance-RMSD) — captures rigid DISPLACEMENT of
+    intact structure (what lDDT misses), zero for a whole-body rigid move (no false signal)."""
+
+    def test_identical_is_zero(self):
+        coords = _rigid(20)
+        m = ToolRouter._per_residue_ddm(coords, coords, sorted(coords))
+        assert m and all(abs(v) < 1e-9 for v in m.values())
+
+    def test_whole_body_rigid_move_is_zero(self):
+        # the key advantage over Kabsch-with-bad-anchor: a global rotation+translation preserves
+        # EVERY pairwise distance → dRMSD 0 everywhere (no lever-arm artifact).
+        ref = _rigid(30)
+        th = 0.9
+        R = np.array([[np.cos(th), -np.sin(th), 0.0],
+                      [np.sin(th),  np.cos(th), 0.0],
+                      [0.0, 0.0, 1.0]])
+        t = np.array([40.0, 10.0, -20.0])
+        moved = {k: R @ v + t for k, v in ref.items()}
+        m = ToolRouter._per_residue_ddm(ref, moved, sorted(ref))
+        assert all(abs(v) < 1e-6 for v in m.values())
+
+    def test_rigid_displacement_of_a_block_lights_up(self):
+        # THE user's case: a contiguous block moved rigidly keeps its INTERNAL distances (lDDT
+        # stays ~1, reads white) but its distances to the REST change → dRMSD rises. Deterministic
+        # extended-chain geometry (3.8 Å spacing along x) so the contrast is exact.
+        ref = {i: np.array([i * 3.8, 0.0, 0.0]) for i in range(1, 41)}
+        block = set(range(1, 11))                          # residues 1..10 move together (+12 x)
+        var = {k: (v + np.array([12.0, 0.0, 0.0]) if k in block else v.copy())
+               for k, v in ref.items()}
+        ddm = ToolRouter._per_residue_ddm(ref, var, sorted(ref))
+        lddt = ToolRouter._per_residue_lddt(ref, var, sorted(ref))
+        # block-interior residue 5: all its in-radius neighbours are in the block (moved with it)
+        # → lDDT ≈ 1.0 (white under lDDT), yet its distances to residues 11..40 changed → dRMSD
+        # is large. The metric the user wants lights up exactly where lDDT could not.
+        assert lddt[5] > 0.99
+        assert ddm[5] > 5.0
