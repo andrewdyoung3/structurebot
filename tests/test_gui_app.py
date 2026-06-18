@@ -287,6 +287,24 @@ def test_preflight_ollama_model_missing_is_blocking(_app, monkeypatch):
     assert "REQUIRED" in errs and "missing" in errs and "pull" in errs
 
 
+def test_preflight_restore_captures_design_mids(_app, monkeypatch):
+    # restore offers + restores a design-only session, and records the model ids to re-display
+    # on the UI thread (so the workbench rehydrates against the still-open ChimeraX models).
+    from session_state import SessionState
+    st = SessionState()
+    st.add_design_session("1", {"model_id": "1", "chains": {}, "next_id": 1})
+    monkeypatch.setattr(SessionState, "try_load",
+                        staticmethod(lambda path: (st, None)))
+    obj = types.SimpleNamespace(presenter=MagicMock(), bridge=MagicMock(),
+                                session=SessionState(), router=None, workbench=MagicMock())
+    obj._blocking_restore = lambda summary: "restore"
+    obj._preflight_restore = types.MethodType(W._preflight_restore, obj)
+    obj._preflight_restore()
+    assert obj.session is st                                   # the design-only session restored
+    assert obj._restore_mids == ["1"]                         # its model id queued for re-display
+    obj.workbench.attach_session.assert_called_once_with(st)   # panel re-pointed at the new session
+
+
 def test_bridge_on_structure_opened_fires(_app, monkeypatch):
     from chimerax_bridge import ChimeraXBridge
     b = ChimeraXBridge.__new__(ChimeraXBridge)

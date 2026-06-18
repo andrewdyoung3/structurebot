@@ -700,6 +700,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.input.setEnabled(True)
         self.input.setFocus()
         self.statusBar().showMessage("Ready")
+        # Re-display any restored workbench designs now that we're on the UI thread. show_model →
+        # workbench.load_model rehydrates the persisted variants/results (the models are still
+        # open in the surviving ChimeraX). No-op when nothing was restored.
+        for mid in getattr(self, "_restore_mids", []) or []:
+            try:
+                self.show_model(mid)
+            except Exception as exc:
+                self.presenter.warn(f"Restore display #{mid} failed: {exc}")
+        self._restore_mids = []
 
     def _run_preflight(self) -> None:
         """Worker-thread preflight: bring up ChimeraX + Ollama, render the ✓ checklist to
@@ -911,15 +920,26 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if err or state is None:
             return
         if not (state.structures or state.scan_results
-                or getattr(state, "double_mutant_results", None) or state.command_history):
+                or getattr(state, "double_mutant_results", None) or state.command_history
+                or getattr(state, "design_sessions", None)):
             return
         summary = (f"{len(state.structures)} structure(s), "
                    f"{len(state.scan_results)} scan result(s), "
+                   f"{len(getattr(state, 'design_sessions', {}) or {})} workbench design(s), "
                    f"{len(state.command_history)} prior command(s).")
         choice = self._blocking_restore(summary)
         if choice == "restore":
             self.session = state
             self.router = ToolRouter(self.bridge, self.session)
+            # Re-point the workbench at the RESTORED session — it was constructed with the old
+            # (empty) one, so without this its rehydrate reads the wrong object and edits never
+            # persist into the restored file.
+            self.workbench.attach_session(state)
+            # Re-DISPLAY the workbench designs on the UI thread once preflight finishes (this
+            # runs on the preflight worker). ChimeraX is left running across an app restart, so
+            # the crystal + fold models are still open → show_model → workbench.load_model
+            # rehydrates the persisted variants/results against the live models (no re-fold).
+            self._restore_mids = list((getattr(state, "design_sessions", {}) or {}).keys())
             self.presenter.success(f"✓ Restored session: {summary}")
         elif choice == "clear":
             try:

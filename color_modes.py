@@ -165,6 +165,96 @@ def deviation_color(deviation: Optional[float],
     return _DEV_BANDS[-1][1]
 
 
+# Cα-lDDT disruption ramp — by lDDT VALUE (1 = locally conserved … 0 = fully changed), so the
+# scale is INVERTED vs deviation: LOWER lDDT = MORE disrupted = warmer. Floor-gated like the
+# deviation ramp (lDDT ≥ floor → neutral: changed no more than the WT does across seeds).
+_LDDT_BANDS = (
+    (0.50, "#e23b3b"),   # < 0.50 — severe local change (red)
+    (0.65, "#f3953b"),   # orange
+    (0.80, "#ffd166"),   # yellow
+    (0.90, "#8fd0e8"),   # cyan — mild
+)
+
+
+# dRMSD (all-pairs distance-RMSD, Å) ramp — the PAINTED disruption signal. Magnitude in Å like
+# the old deviation ramp (cool→hot, floor-gated), but the value is SUPERPOSITION-FREE so it is
+# honest for rigidly-displaced-but-intact structure (lights up) and a whole-body move (stays
+# neutral). Bands are wider than the Cα ramp because dRMSD aggregates many pairwise changes.
+_DDM_BANDS = (
+    (1.0, "#5b8def"),   # just cleared — small relative change (cool blue)
+    (2.5, "#8fd0e8"),   # cyan
+    (5.0, "#ffd166"),   # yellow
+    (8.0, "#f3953b"),   # orange
+    (float("inf"), "#e23b3b"),   # ≥8 Å — large rearrangement (red)
+)
+
+
+def ddm_color(ddm: Optional[float], floor: float = 0.5) -> Optional[str]:
+    """Per-residue dRMSD (Å, superposition-free all-pairs distance-RMSD) → fixed-Å hex,
+    FLOOR-GATED. None → no data. ``ddm <= floor`` → None (NEUTRAL: changed no more than the WT
+    does across seeds). Above the floor → cool→hot by magnitude. Captures rigid DISPLACEMENT of
+    intact structure (which lDDT misses) without the anchor/lever-arm blow-up of the Cα-RMSD
+    ramp; a whole-body rigid move preserves all distances → 0 → neutral."""
+    if ddm is None:
+        return None
+    if ddm <= floor:
+        return None
+    for hi, hexc in _DDM_BANDS:
+        if ddm < hi:
+            return hexc
+    return _DDM_BANDS[-1][1]
+
+
+def lddt_disruption_color(lddt: Optional[float],
+                          floor: float = 0.9) -> Optional[str]:
+    """Per-residue Cα-lDDT (variant-vs-WT, 1=locally conserved) → fixed hex, FLOOR-GATED.
+
+    None → no data (reset). ``lddt >= floor`` → None (NEUTRAL: the local structure changed no
+    more than the same-sequence WT changes across seeds → not distinguishable from sampling
+    noise). Below the floor → a warm-by-severity band (lower lDDT = redder). *floor* is the
+    residue's cross-seed lDDT noise floor (capped at the neutral cap; a deterministic engine
+    has no cross-seed spread so the cap alone gates). SUPERPOSITION-FREE → a re-orienting domain
+    stays conserved (high lDDT) instead of the lever-arm blow-up the Cα-RMSD ramp produced."""
+    if lddt is None:
+        return None
+    if lddt >= floor:
+        return None
+    for hi, hexc in _LDDT_BANDS:
+        if lddt < hi:
+            return hexc
+    return _LDDT_BANDS[-1][1]
+
+
+# "diverges from the template but WITHIN the WT reference's own cross-seed noise" — a muted slate
+# grey, distinct from the white baseline (confident tight fit) AND the cool→hot disruption ramp.
+_UNCERTAIN_HEX = "#8a8f99"
+
+
+def combined_disruption_color(ddm: Optional[float], floor_ddm: float,
+                              lddt: Optional[float], floor_lddt: float,
+                              min_a: float = 0.5) -> Optional[str]:
+    """The PAINTED 'deviation vs WT' colour — a 3-TIER encoding of magnitude × confidence:
+
+      • CONFIDENT disruption — beyond the WT's cross-seed noise in EITHER global position
+        (dRMSD > floor_ddm) OR local structure (lDDT < floor_lddt) → the cool→hot ramp by dRMSD
+        magnitude (a residue shown only via lDDT still colours by its displacement so the scale
+        stays one thing). This is a real variant-driven change.
+      • DISTINCT-BUT-UNCERTAIN — diverges from the template (dRMSD > min_a) but within that noise
+        → a muted GREY: 'the variant differs here, but the WT reference is itself this variable —
+        not a confident effect.'
+      • ALIGNED — dRMSD ≤ min_a → None (white baseline: a tight, confident fit / rigid region).
+
+    The single source for the panel cells and the 3D push."""
+    confident = (ddm is not None and ddm > floor_ddm) or (lddt is not None and lddt < floor_lddt)
+    if confident:
+        if ddm is not None:
+            return ddm_color(ddm, 0.0) or "#5b8def"  # magnitude by displacement (gate passed)
+        return lddt_disruption_color(lddt, 1.0)      # dRMSD missing → lDDT severity
+    if ddm is not None and ddm > min_a:
+        return _UNCERTAIN_HEX                         # distinct from template, within WT noise
+    return None                                      # aligned / rigid → neutral (white)
+
+
 @dataclass(frozen=True)
 class ColorMode:
     key:   str                              # stable id

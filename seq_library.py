@@ -23,7 +23,8 @@ from typing import Dict, List, Sequence, Tuple
 
 # Re-export the pure spine (one source of truth; do not re-implement).
 from proteinmpnn_bridge import chain_resnum_to_seqpos               # noqa: F401
-from sequence_viewer import build_numbering_header_content          # noqa: F401
+from sequence_viewer import (build_numbering_header_content,        # noqa: F401
+                             build_numbering_header_with_insertions)  # noqa: F401
 
 
 def sequence_group_key(seq: str, resnums: Sequence[int]) -> Tuple[str, Tuple[int, ...]]:

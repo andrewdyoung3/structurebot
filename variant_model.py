@@ -59,10 +59,11 @@ class IndelEvent:
     (a variant residue removed → its cell becomes a gap). `col` locates it on the shared
     column axis; `resnum`/`from_aa` record the deleted residue for provenance + revert (the
     TEMPLATE cell at that column still holds its WT resnum/aa, so a restore is lossless)."""
-    kind:    str                    # "deletion" (Stage A) | "insertion" (Stage B)
-    col:     int
-    resnum:  Optional[int] = None   # template author resnum at the column
-    from_aa: Optional[str] = None   # the residue removed (deletion)
+    kind:     str                   # "deletion" (Stage A) | "insertion" (Stage B)
+    col:      int                   # current first column of the event (kept accurate on axis growth/shrink)
+    resnum:   Optional[int] = None  # deletion: the removed resnum; insertion: the "after" template resnum
+    from_aa:  Optional[str] = None  # deletion: the residue removed
+    residues: Optional[str] = None  # insertion: the inserted aa string (the deleted side uses from_aa)
 
 
 @dataclass
@@ -220,6 +221,80 @@ class ChainDesign:
         v.cells[col].resnum = tmpl.resnum
         v.cells[col].aa = tmpl.aa
         v.indels = [e for e in v.indels if e.col != col]
+
+    def _reindex_cols(self) -> None:
+        """Re-set every cell's `.col` to its list index after an axis grow/shrink (template
+        + all variants stay in lockstep so every row has the same column count)."""
+        for i, c in enumerate(self.template_cells):
+            c.col = i
+        for vv in self.variants:
+            for i, c in enumerate(vv.cells):
+                c.col = i
+
+    def insert_variant_residues(self, variant_id: str, after_col: int, residues: str) -> None:
+        """INSERT residues into a VARIANT after column *after_col* (after_col=-1 → before the
+        first column). Grows the SHARED axis by k=len(residues) NEW columns: the template and
+        every OTHER variant get k GAP cells there (resnum=None, aa=None), the inserting variant
+        gets the k residues (aa set, resnum=None — an inserted residue has no crystal resnum),
+        and ALL cells re-index. INDEPENDENT per-variant blocks: a sibling's insertion at the
+        same locus is its OWN columns (this never coalesces). Records an insertion IndelEvent
+        (residues + the 'after' template resnum); existing events past the insert point shift
+        by +k so they stay accurate. Guarded: variant only, standard aa, valid position."""
+        v = self.get_variant(variant_id)
+        if v is None:
+            raise KeyError(f"variant not found: {variant_id!r}")
+        seq = (residues or "").strip().upper()
+        if not seq or any(a not in _STD_AA for a in seq):
+            raise ValueError(f"not standard amino acids: {residues!r}")
+        n = len(self.template_cells)
+        if not (-1 <= after_col < n):
+            raise ValueError(f"insertion position out of range: {after_col}")
+        ip = after_col + 1                        # first NEW column index
+        k = len(seq)
+        after_resnum = (self.template_cells[after_col].resnum if after_col >= 0 else None)
+        self.template_cells[ip:ip] = [AlignedCell(col=ip + i, resnum=None, aa=None)
+                                      for i in range(k)]
+        for vv in self.variants:
+            if vv.id == variant_id:
+                cells = [AlignedCell(col=ip + i, resnum=None, aa=seq[i]) for i in range(k)]
+            else:
+                cells = [AlignedCell(col=ip + i, resnum=None, aa=None) for i in range(k)]
+            vv.cells[ip:ip] = cells
+            for e in vv.indels:                   # shift events past the insert point
+                if e.col >= ip:
+                    e.col += k
+        self._reindex_cols()
+        v.indels.append(IndelEvent(kind="insertion", col=ip, resnum=after_resnum, residues=seq))
+        v.indels.sort(key=lambda e: e.col)
+
+    def remove_variant_insertion(self, variant_id: str, col: int) -> None:
+        """Undo an insertion: remove the contiguous block of INSERTED columns (template gap +
+        THIS variant non-gap) containing *col*, shrinking the shared axis back, and drop the
+        matching event; later events shift by -k. Guarded: *col* must be one of this variant's
+        inserted columns. Restores the axis (no residues left behind)."""
+        v = self.get_variant(variant_id)
+        if v is None:
+            raise KeyError(f"variant not found: {variant_id!r}")
+        if not (0 <= col < len(self.template_cells)):
+            raise ValueError(f"column out of range: {col}")
+        if not self.template_cells[col].is_gap or v.cells[col].is_gap:
+            raise ValueError("not an inserted column for this variant")
+        lo = hi = col                             # expand to this variant's contiguous insert run
+        while lo - 1 >= 0 and self.template_cells[lo - 1].is_gap and not v.cells[lo - 1].is_gap:
+            lo -= 1
+        while (hi + 1 < len(self.template_cells) and self.template_cells[hi + 1].is_gap
+               and not v.cells[hi + 1].is_gap):
+            hi += 1
+        k = hi - lo + 1
+        del self.template_cells[lo:hi + 1]
+        for vv in self.variants:
+            del vv.cells[lo:hi + 1]
+            vv.indels = [e for e in vv.indels
+                         if not (vv.id == variant_id and lo <= e.col <= hi)]
+            for e in vv.indels:
+                if e.col > hi:
+                    e.col -= k
+        self._reindex_cols()
 
     def delete_variant(self, variant_id: str) -> bool:
         """Remove a variant ROW (and everything on it — mutations, provenance, and its

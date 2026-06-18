@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from color_modes import (get_mode, all_modes, COLOR_MODES, plddt_color,
-                         deviation_color)
+                         deviation_color, lddt_disruption_color, ddm_color,
+                         combined_disruption_color)
 
 
 class TestDeviationColor:
@@ -44,6 +45,79 @@ class TestDeviationColor:
 
     def test_default_floor_zero_still_gates_zero_shift(self):
         assert deviation_color(0.0, 0.0) is None           # no motion → neutral
+
+
+class TestDdmColor:
+    """The PAINTED disruption ramp — per-residue dRMSD (Å, superposition-free), floor-gated,
+    cool→hot by magnitude (one source for panel + 3D push)."""
+
+    def test_none_is_no_data(self):
+        assert ddm_color(None, 0.5) is None
+
+    def test_at_or_below_floor_is_neutral(self):
+        assert ddm_color(0.4, 0.5) is None
+        assert ddm_color(0.5, 0.5) is None                 # exactly on floor → neutral
+
+    def test_above_floor_warm_by_magnitude(self):
+        assert ddm_color(0.8, 0.5) == "#5b8def"            # 0.5–1.0 → cool blue
+        assert ddm_color(2.0, 0.5) == "#8fd0e8"            # 1.0–2.5 → cyan
+        assert ddm_color(4.0, 0.5) == "#ffd166"            # 2.5–5.0 → yellow
+        assert ddm_color(6.0, 0.5) == "#f3953b"            # 5.0–8.0 → orange
+        assert ddm_color(12.0, 0.5) == "#e23b3b"           # ≥8 → severe (red)
+
+    def test_higher_floor_suppresses(self):
+        # a WT region that wobbles more across seeds (higher floor) only paints when the variant
+        # exceeds THAT — the superposition-free analog of the deviation floor gate.
+        assert ddm_color(2.0, 3.0) is None                 # 2.0 ≤ 3.0 floor → neutral
+        assert ddm_color(4.0, 3.0) == "#ffd166"            # above the 3.0 floor → shown
+
+
+class TestCombinedDisruptionColor:
+    """The PAINTED 3-tier gate: CONFIDENT (warm ramp) if dRMSD OR lDDT beats the WT cross-seed
+    noise; DISTINCT-BUT-UNCERTAIN (grey) if it diverges but within that noise; ALIGNED (white)
+    otherwise. Encodes magnitude × confidence so a floppy-WT loop reads grey, not white/warm."""
+
+    def test_aligned_is_neutral(self):
+        assert combined_disruption_color(0.3, 0.5, 0.99, 0.9) is None     # ≤ min_a → white
+
+    def test_confident_by_ddm(self):
+        # dRMSD clears its floor; lDDT fine → coloured by dRMSD magnitude (5–8 → orange)
+        assert combined_disruption_color(6.0, 0.5, 0.95, 0.9) == "#f3953b"
+
+    def test_confident_by_lddt_when_ddm_floor_too_high(self):
+        # dRMSD 6.9 GATED by a floppy-WT floor 7.7, but lDDT 0.47 < floor 0.9 → confident, warm
+        assert combined_disruption_color(6.9, 7.7, 0.47, 0.9) == "#f3953b"
+
+    def test_uncertain_is_grey(self):
+        # the yellow/Ile loop: diverges (dRMSD 6.9 > 0.5) but within the WT noise on BOTH
+        # (≤ floor 7.7, lDDT 0.60 ≥ floor 0.50) → muted grey, NOT white and NOT warm
+        assert combined_disruption_color(6.9, 7.7, 0.60, 0.50) == "#8a8f99"
+
+    def test_lddt_only_no_ddm_falls_back_to_lddt_ramp(self):
+        assert combined_disruption_color(None, 0.5, 0.30, 0.9) == "#e23b3b"
+
+
+class TestLddtDisruptionColor:
+    """Superposition-free Cα-lDDT disruption ramp — INVERTED vs deviation (low lDDT = warm),
+    floor-gated by the cross-seed lDDT noise floor (one source for panel + 3D push)."""
+
+    def test_none_is_no_data(self):
+        assert lddt_disruption_color(None, 0.9) is None
+
+    def test_at_or_above_floor_is_neutral(self):
+        assert lddt_disruption_color(0.95, 0.9) is None    # ≥ floor → conserved (neutral)
+        assert lddt_disruption_color(0.90, 0.9) is None    # exactly on floor → neutral
+
+    def test_below_floor_warm_by_severity(self):
+        assert lddt_disruption_color(0.85, 0.9) == "#8fd0e8"   # 0.80–0.90 → cyan (mild)
+        assert lddt_disruption_color(0.70, 0.9) == "#ffd166"   # 0.65–0.80 → yellow
+        assert lddt_disruption_color(0.60, 0.9) == "#f3953b"   # 0.50–0.65 → orange
+        assert lddt_disruption_color(0.30, 0.9) == "#e23b3b"   # < 0.50 → severe (red)
+
+    def test_lower_floor_suppresses_flexible_region(self):
+        # a flexible WT region with a LOW cross-seed floor only paints when even more disrupted
+        assert lddt_disruption_color(0.70, 0.6) is None        # 0.70 ≥ 0.6 floor → neutral
+        assert lddt_disruption_color(0.50, 0.6) == "#f3953b"   # below the 0.6 floor → shown
 
 
 class TestPlddtColor:

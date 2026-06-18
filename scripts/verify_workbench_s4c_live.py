@@ -1,23 +1,25 @@
 """
-Live-verify Stage 4c — per-residue variant-vs-WT Cα deviation + per-residue noise floor —
-against REAL ChimeraX (:60001) + the REAL local fold engines (venv312 ESMFold; ~/boltz_env
-Boltz). Proves the deviation is computed on FOLDED models via the EXISTING Kabsch machinery,
-the noise floor is honest (ESMFold deterministic ≈ global-min; Boltz measured cross-seed),
-and the floor-GATED colouring lands on BOTH the panel cells AND the 3D folded model through
-the SAME color_modes seam as ddG/pLDDT (engine-agnostic, not a parallel path).
+Live-verify the variant-vs-WT DEVIATION feature — SUPERPOSITION-FREE per-residue dRMSD + Cα-lDDT,
+3-tier colouring — against REAL ChimeraX (:60001) + the REAL local fold engines (venv312 ESMFold;
+~/boltz_env Boltz). Proves the deviation is computed fold-vs-fold on the FOLDED models, the
+cross-seed noise floors are honest (ESMFold deterministic → floor = the caps; Boltz measured), and
+the 3-tier colouring lands on BOTH the panel cells AND the 3D folded model through the SAME
+color_modes seam as ddG/pLDDT (engine-agnostic, not a parallel path).
 
 On a freshly-opened 1HSG (WT homodimer A+B):
   ESMFold path (deterministic, fast):
-    1. Fold a variant (monomer); then "Deviation vs WT" → folds the WT reference (template T)
-       at the pinned engine, computes per-residue Cα deviation via auto-anchor + _anchor_kabsch.
-    2. ANCHOR RESIDUAL ≈ 0 (clean rigid-core fit — the readback quality check).
-    3. FLOOR = the global minimum everywhere (deterministic engine → no cross-seed motion).
-    4. FLOOR-GATED COLOUR: panel cells + 3D #pred coloured; sub-floor residues NEUTRAL,
-       residues clearing the floor magnitude-coloured — SAME color_modes.deviation_color.
+    1. Fold a variant (monomer); then "Deviation vs WT" → folds the WT reference (template T) at
+       the pinned engine, computes per-residue dRMSD (all-pairs distance-RMSD) + Cα-lDDT, both
+       superposition-free, both keyed by reference resnum via the indel column-pairing map.
+    2. The OLD Cα-RMSD/anchor-Kabsch path is gone (no 'deviation'/'anchor_residual_rmsd' fields).
+    3. FLOORS = the caps everywhere (deterministic engine → no cross-seed motion): dRMSD floor =
+       the global min (_DDM_FLOOR_MIN_A), lDDT floor = the neutral cap (_LDDT_NEUTRAL_CAP).
+    4. 3-TIER COLOUR: panel cells + 3D #pred via combined_disruption_color — white (aligned) /
+       grey #8a8f99 (distinct but within WT noise) / cool→hot ramp (confident disruption).
     5. WT reference cached per combo (cd.wt_refs["esmfold:monomer"]); a 2nd variant reuses it.
   Boltz path (assembly, measured floor — MINUTES; skipped if ~/boltz_env absent):
-    6. Assembly deviation: WT reference folded across N=4 seeds → a MEASURED per-residue floor
-       (some residues exceed the global minimum); deviation + colouring PER-CHAIN.
+    6. Assembly deviation: WT reference folded across N=4 seeds → a MEASURED per-residue dRMSD
+       floor (some residues exceed the global minimum); dRMSD/lDDT + colouring PER-CHAIN.
 
 Run: venv/Scripts/python.exe scripts/verify_workbench_s4c_live.py   (folds — minutes)
 """
@@ -39,7 +41,7 @@ from tool_router import ToolRouter
 from request_engine import RequestEngine
 from presenter import Presenter
 from variant_workbench import (VariantWorkbenchPanel, _RESULT_DEVIATION_MODE,
-                               _DEVIATION_FLOOR_MIN_A)
+                               _DDM_FLOOR_MIN_A, _LDDT_NEUTRAL_CAP)
 
 bridge = ChimeraXBridge(port=60001)
 run = bridge.run_command
@@ -151,33 +153,38 @@ drive(panel.fold_launch_spec("esmfold"), panel.apply_fold_result, v1)
 fold = cd.get_variant(v1).results.fold or {}
 checks.append(("ESMFold variant folded", bool(fold.get("model_id"))))
 
-print("[esmfold] Deviation vs WT — folds the WT reference (template T) then Kabsch…")
+print("[esmfold] Deviation vs WT — folds the WT reference (template T), then dRMSD + lDDT…")
 dev_spec = panel.deviation_launch_spec()
 checks.append(("deviation spec confidence='low' (no cached ref → folds WT → gate)",
                dev_spec is not None and dev_spec["confidence"] == "low"))
 drive(dev_spec, panel.apply_deviation_result, v1)
 block = (cd.get_variant(v1).results.fold or {}).get("deviation") or {}
-ar = block.get("anchor_residual_rmsd")
-floor_vals = set((block.get("floor") or {}).values())
-print(f"[esmfold] anchor residual={ar} Å; floor_kind={block.get('floor_kind')}; "
-      f"n_cleared={block.get('n_cleared_floor')}/{block.get('n_residues')}; floor_vals={floor_vals}")
-checks.append(("deviation computed on the folded model", bool(block.get("deviation"))))
-checks.append(("anchor residual ≈ 0 (clean rigid-core fit readback)",
-               ar is not None and ar < 0.5))
-checks.append(("ESMFold floor is the global minimum (deterministic → no cross-seed motion)",
-               floor_vals == {_DEVIATION_FLOOR_MIN_A}))
+floor_ddm_vals = set((block.get("floor_ddm") or {}).values())
+floor_lddt_vals = set((block.get("floor_lddt") or {}).values())
+print(f"[esmfold] floor_kind={block.get('floor_kind')}; n_disrupted="
+      f"{block.get('n_disrupted')}/{block.get('n_residues')}; max_ddm={block.get('max_ddm')} Å; "
+      f"mean_lddt={block.get('mean_lddt')}; floor_ddm={floor_ddm_vals}; floor_lddt={floor_lddt_vals}")
+checks.append(("dRMSD computed on the folded model", bool(block.get("ddm"))))
+checks.append(("lDDT computed alongside (secondary)", bool(block.get("lddt"))))
+checks.append(("the OLD Cα-RMSD/anchor path is gone (no 'deviation'/'anchor_residual_rmsd')",
+               "deviation" not in block and "anchor_residual_rmsd" not in block))
+checks.append(("ESMFold dRMSD floor is the global minimum (deterministic → no cross-seed motion)",
+               floor_ddm_vals == {_DDM_FLOOR_MIN_A}))
+checks.append(("ESMFold lDDT floor is the neutral cap (deterministic)",
+               floor_lddt_vals == {_LDDT_NEUTRAL_CAP}))
 checks.append(("WT reference cached per combo (esmfold:monomer)",
                bool(cd.wt_refs.get("esmfold:monomer"))))
 
-# floor-gated colouring — panel cells + 3D model, SAME color_modes.deviation_color
+# 3-tier colouring — panel cells + 3D model, SAME color_modes.combined_disruption_color
 panel._mode_key = _RESULT_DEVIATION_MODE
 panel_hex = panel._deviation_panel_hex(tab)
 cmds = panel.color_commands_for(tab)
 pred = block.get("variant_model_id")
-print(f"[esmfold] panel-coloured residues={len(panel_hex)}; 3D cmds[:3]={cmds[:3]}")
-checks.append(("floor-gated panel colour (some residues clear floor → coloured)",
+grey = sum(1 for h in panel_hex.values() if h == "#8a8f99")
+print(f"[esmfold] panel-coloured residues={len(panel_hex)} (grey/uncertain={grey}); 3D cmds[:3]={cmds[:3]}")
+checks.append(("3-tier panel colour present (some residues non-neutral)",
                len(panel_hex) >= 1))
-checks.append(("within-floor residues stay NEUTRAL (gated, not all painted)",
+checks.append(("gated → not every residue painted (white aligned tier survives)",
                len(panel_hex) < (block.get("n_residues") or 0)))
 checks.append(("3D push targets the PREDICTED variant model (#pred), not the crystal",
                bool(pred) and any(f"#{pred}/" in c for c in cmds)))
@@ -204,13 +211,12 @@ if panel._fold_engine_availability().get("boltz") and len(cd.members) > 1:
         print("[boltz] Deviation vs WT — folds WT reference across N=4 seeds (floor)…")
         drive(panel.deviation_launch_spec(), panel.apply_deviation_result, vb)
         bblock = (cd.get_variant(vb).results.fold or {}).get("deviation") or {}
-        bfloor = bblock.get("floor") or {}
-        measured = [v for v in bfloor.values() if v > _DEVIATION_FLOOR_MIN_A]
-        chains = {k.split(":", 1)[0] for k in (bblock.get("deviation") or {}) if ":" in k}
-        print(f"[boltz] floor_kind={bblock.get('floor_kind')}; measured>{_DEVIATION_FLOOR_MIN_A}Å "
-              f"residues={len(measured)}; chains={chains}; anchor residual="
-              f"{bblock.get('anchor_residual_rmsd')}")
-        checks.append(("Boltz floor is MEASURED (some residues exceed the global minimum)",
+        bfloor = bblock.get("floor_ddm") or {}
+        measured = [v for v in bfloor.values() if v > _DDM_FLOOR_MIN_A]
+        chains = {k.split(":", 1)[0] for k in (bblock.get("ddm") or {}) if ":" in k}
+        print(f"[boltz] floor_kind={bblock.get('floor_kind')}; dRMSD floor>{_DDM_FLOOR_MIN_A}Å "
+              f"residues={len(measured)}; chains={chains}; max_ddm={bblock.get('max_ddm')}")
+        checks.append(("Boltz dRMSD floor is MEASURED (some residues exceed the global minimum)",
                        bblock.get("floor_kind") == "measured" and len(measured) >= 1))
         checks.append(("assembly deviation is PER-CHAIN (≥2 chains keyed)", len(chains) >= 2))
         panel._mode_key = _RESULT_DEVIATION_MODE

@@ -64,6 +64,40 @@ def build_numbering_header_content(
     return "".join(chars)
 
 
+def build_numbering_header_with_insertions(col_resnums, interval: int = 10) -> str:
+    """Per-column ruler for an axis that MAY contain INSERTED (gap) columns. `col_resnums` is
+    one entry per column: the author resnum, or None for an inserted (template-gap) column.
+    Real (non-gap) columns are numbered every `interval`-th residue (units digit at the column,
+    FASTA style, last real residue too); each inserted column shows the PDB-style insertion-code
+    LETTER of its contiguous run (A, B, C…) so '52' followed by 'A','B' reads 52A, 52B. A run
+    BEFORE the first real residue still gets letters (the leading-insertion marker). Used by the
+    Variant Workbench (insertions); the plain `build_numbering_header_content` is unchanged for
+    the gap-free callers."""
+    n = len(col_resnums)
+    chars = [" "] * n
+    real = [i for i, r in enumerate(col_resnums) if r is not None]
+    if real and interval >= 1:
+        idxs = list(range(0, len(real), interval))
+        if (len(real) - 1) not in idxs:
+            idxs.append(len(real) - 1)
+        for p in idxs:
+            col = real[p]
+            s = str(int(col_resnums[col]))
+            start = col - (len(s) - 1)              # units digit at the column, digits extend left
+            for j, ch in enumerate(s):
+                c = start + j
+                if 0 <= c < n:
+                    chars[c] = ch
+    run = 0
+    for i, r in enumerate(col_resnums):             # insertion-code letters at gap columns
+        if r is None:
+            chars[i] = chr(ord("A") + (run % 26))
+            run += 1
+        else:
+            run = 0
+    return "".join(chars)
+
+
 # ── Deterministic layout + presentation ─────────────────────────────────────────
 # Config-driven command lists (config.CHIMERAX_*), applied by StructureBot — NOT
 # LLM-generated, NOT the built-in `preset`.  apply_* run them error-first so a

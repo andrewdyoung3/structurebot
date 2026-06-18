@@ -31,13 +31,14 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import (all_modes, ddg_color, deviation_color, get_mode,
-                         plddt_color)
-from seq_library import build_numbering_header_content
+from color_modes import (all_modes, combined_disruption_color, ddg_color,
+                         get_mode, plddt_color)
+from seq_library import (build_numbering_header_content,
+                         build_numbering_header_with_insertions)
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
                            build_model_color_commands, build_fold_column_map,
-                           build_design_session, column_tracks,
+                           build_design_session, column_tracks, DesignSession,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
                            suggestion_color)
@@ -48,6 +49,8 @@ _RESULT_DDG_MODE = "result:ddg"             # S4a result-backed color mode (per-
 _RESULT_PLDDT_MODE = "result:plddt"         # S4b result-backed color mode (per-residue pLDDT)
 _RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα deviation
 _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
+_LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
+_DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
 _FOLD_ENGINES = ("esmfold", "boltz")        # S4b engine picker order (Boltz lands its own stage)
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
@@ -152,9 +155,10 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         design = self.design
         n = len(design.template_cells)
 
-        ruler = build_numbering_header_content(
-            [c.resnum for c in design.template_cells if c.resnum is not None], interval=10)
-        ruler = (ruler + " " * n)[:n]               # guard length (gap cells)
+        # Per-column ruler: real columns numbered, INSERTED (template-gap) columns get PDB
+        # insertion-code letters (52A, 52B…). Length == n by construction (one entry/column).
+        ruler = build_numbering_header_with_insertions(
+            [c.resnum for c in design.template_cells], interval=10)
         consensus, conservation = column_tracks(design)
         cons_pct = ["·▁▂▃▄▅▆▇█"[min(8, int(c * 8))] for c in conservation]
 
@@ -631,6 +635,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status.setStyleSheet("color:#888;padding:2px 6px;")
         lay.addWidget(self._status)
 
+    def attach_session(self, session) -> None:
+        """Re-point the panel at a different SessionState — used on session RESTORE, where the
+        app swaps `self.session` for the loaded one. Without this the panel keeps writing to /
+        reading from the ORIGINAL (empty) session, so a restored design never rehydrates and new
+        edits never persist into the restored file."""
+        self._session = session
+
     # ── load + render ─────────────────────────────────────────────────────────────
     def load_model(self, model_id: str) -> None:
         """Read the model over REST, build + render the DesignSession, persist it.
@@ -644,6 +655,21 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText(f"Workbench: model #{model_id} has no chains.")
             return
         self._design = build_design_session(chain_seqs, str(model_id))
+        # REHYDRATE a persisted design for this model (variants + indels + fold/deviation
+        # results) instead of discarding it — the fresh build above is the template/validation
+        # baseline. Rehydrate only when the persisted design's unique-chain set matches the live
+        # model (same structure), else keep the fresh build. ChimeraX persists across an app
+        # restart, so the referenced fold model ids stay valid → 3D + the cached deviation come
+        # back with no re-fold. A corrupt/mismatched persisted blob falls back to fresh.
+        persisted = (self._session.get_design_session(str(model_id))
+                     if self._session is not None else None)
+        if persisted:
+            try:
+                restored = DesignSession.from_dict(persisted)
+                if set(restored.chains) == set(self._design.chains):
+                    self._design = restored
+            except Exception:
+                pass
         self._edit_target = None
         self._scan_cols.clear()
         self._update_scan_label()
@@ -722,22 +748,34 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                       f"3D recolored by {vid} (preview on the shared backbone).")
 
     def _show_cell_menu(self, tab: _ChainDesignTab, vid: str, col: int, global_pos) -> None:
-        """Right-click cell menu for a VARIANT residue: substitute (any of the 20 aa) or
-        revert to the WT residue. The SAME `edit_variant` substitution as the toolbar Apply —
-        just reachable directly on the residue. (Deletion/indels are a later increment: they
-        shift residue numbering, which the resnum-keyed S4c deviation can't absorb yet.)"""
+        """Right-click cell menu for a VARIANT residue: substitute (any of the 20 aa), revert
+        to the WT residue, delete the residue, or insert residues after it. The substitution is
+        the SAME `edit_variant` as the toolbar Apply, just reachable on the residue. An INSERTED
+        column (template gap + this-variant residue) offers only Remove insertion; a DELETED cell
+        (template residue + this-variant gap) offers only Restore."""
         v = tab.design.get_variant(vid)
         if v is None or not (0 <= col < len(tab.design.template_cells)):
             return
         tab.set_active_row(vid)
         self._edit_target = (vid, col)
         resnum = tab.design.resnum_for_col(col)
+        tmpl_gap = tab.design.template_cells[col].is_gap
         wt = tab.design.template_cells[col].aa
         cell = v.cells[col] if col < len(v.cells) else None
         cur = cell.aa if cell is not None else None
         is_gap = cell is not None and cell.is_gap
 
         menu = QtWidgets.QMenu(self)
+        if tmpl_gap:                                     # an INSERTED column (no WT counterpart)
+            if is_gap or cell is None:                   # this variant doesn't share the insertion
+                return
+            header = menu.addAction(f"{vid} · inserted {cur} (no WT — column added by this variant)")
+            header.setEnabled(False)
+            menu.addSeparator()
+            menu.addAction("Remove insertion",
+                           lambda: self._do_remove_insertion(tab, vid, col))
+            menu.exec(global_pos)
+            return
         header = menu.addAction(f"{vid} · residue {resnum} "
                                 + ("(DELETED)" if is_gap else f"(WT {wt}, now {cur})"))
         header.setEnabled(False)
@@ -759,6 +797,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         menu.addSeparator()
         menu.addAction("Delete residue",
                        lambda: self._do_delete_residue(tab, vid, col))
+        menu.addAction("Insert residues after…",
+                       lambda: self._do_insert_residues(tab, vid, col))
         menu.exec(global_pos)
 
     def _do_delete_residue(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
@@ -780,6 +820,38 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         resnum = tab.design.resnum_for_col(col)
         self._after_variant_edit(tab, vid, f"{vid}: residue {resnum} restored to WT.")
+
+    def _do_insert_residues(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        """Insert one or more residues into THIS variant after the clicked column. Adds new
+        columns owned by this variant; the template and every sibling row gap there (PDB
+        insertion-code numbering, e.g. 52A/52B). Inserted residues have no WT counterpart →
+        they are excluded from the deviation, not on the crystal until the variant is folded."""
+        resnum = tab.design.resnum_for_col(col)
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Insert residues",
+            f"Residues to insert after residue {resnum} (1-letter, e.g. GGSGG):")
+        if not ok:
+            return
+        seq = "".join(text.split()).upper()
+        if not seq:
+            self._status.setText("Insert cancelled (no residues entered).")
+            return
+        try:
+            tab.design.insert_variant_residues(vid, col, seq)
+        except Exception as exc:
+            self._status.setText(f"Insert failed: {type(exc).__name__}: {exc}")
+            return
+        self._after_variant_edit(
+            tab, vid, f"{vid}: inserted {seq} after residue {resnum} ({len(seq)} new column(s); "
+                      f"template + siblings gap there). Re-fold the variant to build them.")
+
+    def _do_remove_insertion(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        try:
+            tab.design.remove_variant_insertion(vid, col)
+        except Exception as exc:
+            self._status.setText(f"Remove insertion failed: {type(exc).__name__}: {exc}")
+            return
+        self._after_variant_edit(tab, vid, f"{vid}: insertion removed (axis restored).")
 
     def _on_row_menu(self, tab: _ChainDesignTab, vid: str, global_pos) -> None:
         """Right-click on a VARIANT row header → a 'Delete variant' menu. Row-level removal
@@ -1024,18 +1096,65 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.set_active_row(row_id)
             self._edit_target = (row_id, col)
             resnum = tab.design.resnum_for_col(col)
-            wt = tab.design.template_cells[col].aa if 0 <= col < len(tab.design.template_cells) else "?"
+            in_range = 0 <= col < len(tab.design.template_cells)
+            wt = tab.design.template_cells[col].aa if in_range else "?"
+            tmpl_gap = in_range and tab.design.template_cells[col].is_gap
             vv = tab.design.get_variant(row_id)
             deleted = vv is not None and col < len(vv.cells) and vv.cells[col].is_gap
-            if deleted:                                     # decision #3: keep selecting the
+            if tmpl_gap and not deleted:                    # decision #3: an INSERTED residue is
+                cur = vv.cells[col].aa if vv and col < len(vv.cells) else "?"
+                self._status.setText(                       # not on the crystal — nothing painted
+                    f"Inserted {cur} in {row_id} — not on the crystal backbone until the variant "
+                    f"is folded (no WT counterpart; excluded from deviation). Right-click → Remove "
+                    f"insertion to undo.")
+            elif deleted:                                   # decision #3: keep selecting the
                 self._status.setText(                       # crystal residue + surface the cue
                     f"Residue {resnum} — DELETED in {row_id} (the crystal residue is selected; "
                     f"right-click the gap → Restore to undo).")
             else:
-                self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
-                                     f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+                readout = self._residue_deviation_readout(tab, col)   # DIAGNOSTIC probe
+                base = (f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
+                        f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+                self._status.setText(f"{base}  [deviation] {readout}" if readout else base)
             self._apply_color_to(tab)                       # panel result-coloring FOLLOWS active
             self._push_3d_color(tab)
+
+    def _residue_deviation_readout(self, tab: _ChainDesignTab, col: int) -> str:
+        """DIAGNOSTIC probe: the clicked variant residue's per-residue dRMSD vs its floor (and
+        lDDT), so a 'white but visibly displaced' residue can be checked directly — is its raw
+        dRMSD genuinely low (the variant didn't change it vs the WT FOLD — note the metric
+        references the WT *fold*, while the 3D overlays on the *crystal*), or high-but-GATED by
+        the floor? Empty when not in deviation mode / no value for the residue."""
+        if self._mode_key != _RESULT_DEVIATION_MODE:
+            return ""
+        block = self._active_deviation(tab)
+        if not block:
+            return ""
+        v = tab.design.get_variant(tab.active_row_id)
+        if v is None or not (0 <= col < len(tab.design.template_cells)):
+            return ""
+        if tab.design.template_cells[col].is_gap:
+            return "inserted (no WT reference)"
+        var_pos = sum(1 for c in range(col + 1)
+                      if c < len(v.cells) and v.cells[c] is not None and not v.cells[c].is_gap)
+        if var_pos == 0:
+            return ""
+        ref = build_fold_column_map(v, tab.design.template_cells).get(var_pos)
+        ddm = block.get("ddm") or {}
+        if ref is None or str(ref) not in ddm:
+            return ""
+        dv = ddm[str(ref)]
+        df = (block.get("floor_ddm") or {}).get(str(ref), _DDM_FLOOR_MIN_A)
+        lv = (block.get("lddt") or {}).get(str(ref))
+        lf = (block.get("floor_lddt") or {}).get(str(ref), _LDDT_NEUTRAL_CAP)
+        confident = (dv > df) or (lv is not None and lv < lf)
+        verdict = ("CONFIDENT disruption" if confident
+                   else "distinct but within WT noise (grey)" if dv > _DDM_FLOOR_MIN_A
+                   else "aligned")
+        s = (f"ref{ref}: dRMSD {dv:.1f}/floor {df:.1f} Å"
+             + (f", lDDT {lv:.2f}/floor {lf:.2f}" if lv is not None else "")
+             + f" → {verdict}")
+        return s
 
     def _select_variant_row(self, tab: _ChainDesignTab, row_id) -> None:
         """Row-header NAME click → SELECT *row_id* as the active row and drive the 3D via the
@@ -1090,23 +1209,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         return sorted(dev, key=lambda k: int(k))
 
     def _deviation_panel_hex(self, tab: _ChainDesignTab) -> Dict[int, str]:
-        """{author_resnum: hex} for the active variant's floor-gated deviation, panel side.
-        The fold numbers residues 1..N over the ungapped sequence, so the rep chain's
-        deviation keys map POSITIONALLY onto the active row's ordered author resnums (the
-        same positional contract `fold_summary` uses for pLDDT). Floor-gated via
-        `deviation_color` (the ONE source shared with the 3D push)."""
+        """{author_resnum: hex} for the active variant's floor-gated dRMSD disruption, panel
+        side. The fold numbers residues 1..N over the ungapped sequence, so the rep chain's
+        dRMSD keys map POSITIONALLY onto the active row's ordered author resnums (the same
+        positional contract `fold_summary` uses for pLDDT). 3-tier via `combined_disruption_color`
+        (the ONE source shared with the 3D push). Inserted residues are absent from the dRMSD keys
+        (no WT counterpart) → they never land on an author resnum → neutral."""
         block = self._active_deviation(tab)
         if not block:
             return {}
-        dev, floor = block.get("deviation") or {}, block.get("floor") or {}
-        keys = self._dev_chain_keys(dev, bool(block.get("multichain")), tab.design.rep_chain)
+        ddm = block.get("ddm") or {}
+        floor_ddm = block.get("floor_ddm") or {}
+        lddt = block.get("lddt") or {}
+        floor_lddt = block.get("floor_lddt") or {}
+        keys = self._dev_chain_keys(ddm, bool(block.get("multichain")), tab.design.rep_chain)
         author = [c.resnum for c in tab.active_row_cells()
                   if not c.is_gap and c.resnum is not None]
         out: Dict[int, str] = {}
         for i, k in enumerate(keys):
             if i >= len(author):
                 break
-            hexc = deviation_color(dev[k], floor.get(k, _DEVIATION_FLOOR_MIN_A))
+            hexc = combined_disruption_color(ddm.get(k), floor_ddm.get(k, _DDM_FLOOR_MIN_A),
+                                             lddt.get(k), floor_lddt.get(k, _LDDT_NEUTRAL_CAP))
             if hexc:
                 out[author[i]] = hexc
         return out
@@ -1708,12 +1832,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._persist()
         self._select_result_mode(_RESULT_DEVIATION_MODE)   # AUTO-SURFACE the deviation mode
         self._rerender_results(cd, v)
-        ar = data.get("anchor_residual_rmsd")
         self._status.setText(
-            f"{v.id} deviation vs WT ({data.get('engine')}:{data.get('target')}): "
-            f"{data.get('n_cleared_floor')}/{data.get('n_residues')} residues clear the "
-            f"noise floor; max {data.get('max_deviation')} Å, anchor residual "
-            f"{ar if ar is not None else '?'} Å (floor-gated colour, auto).")
+            f"{v.id} disruption vs WT ({data.get('engine')}:{data.get('target')}) — dRMSD: "
+            f"{data.get('n_disrupted','?')}/{data.get('n_residues','?')} residues disrupted "
+            f"(above the cross-seed floor); max {data.get('max_ddm','?')} Å · local integrity "
+            f"(lDDT) min {data.get('min_lddt','?')}, mean {data.get('mean_lddt','?')}. "
+            f"Click a residue for its per-residue dRMSD/lDDT vs floor.")
 
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
     def _fold_models(self, design) -> Dict[str, str]:
@@ -1889,29 +2013,45 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             # reveal coloured atoms, not default-coloured ones).
             return [f"color byattribute bfactor #{mid} palette alphafold target acs"]
         if self._mode_key == _RESULT_DEVIATION_MODE:
-            # Deviation lives on the PREDICTED variant model's real atoms (like pLDDT),
-            # NOT the shared crystal backbone — colour #mid per chain in its OWN numbering,
-            # floor-gated via the SAME `deviation_color` the panel uses (panel↔3D sync).
+            # The disruption (dRMSD) lives on the PREDICTED variant model's real atoms (like
+            # pLDDT), NOT the shared crystal backbone — colour #mid per chain in its OWN
+            # numbering, 3-tier via the SAME `combined_disruption_color` the panel uses (sync).
             block = self._active_deviation(tab)
             if not block or not block.get("variant_model_id"):
                 return []
-            dev, floor = block.get("deviation") or {}, block.get("floor") or {}
+            ddm = block.get("ddm") or {}
+            floor_ddm = block.get("floor_ddm") or {}
+            lddt = block.get("lddt") or {}
+            floor_lddt = block.get("floor_lddt") or {}
             mid = block["variant_model_id"]
             multichain = bool(block.get("multichain"))
+            # the per-residue maps are keyed by REFERENCE-fold resnum (the router re-keyed the
+            # variant onto the WT numbering for an indel). The model #mid is numbered in the
+            # VARIANT fold's OWN order — so remap ref→variant here before painting, or an
+            # insertion's downstream residues get the wrong colour. Inserted residues have no
+            # reference counterpart → absent from the remap → neutral. None map → identity.
+            fmap = block.get("fold_column_map")
+            if fmap and not multichain:
+                ref_to_var = {int(r): int(j) for j, r in fmap.items()}
+                remap = lambda d: {str(ref_to_var[int(k)]): val for k, val in d.items()
+                                   if int(k) in ref_to_var}
+                ddm, floor_ddm = remap(ddm), remap(floor_ddm)
+                lddt, floor_lddt = remap(lddt), remap(floor_lddt)
             per_chain: Dict[str, List[int]] = {}
             if multichain:
-                for k in dev:
+                for k in ddm:
                     ch, rn = k.split(":", 1)
                     per_chain.setdefault(ch, []).append(int(rn))
             else:
                 ch = block.get("variant_chain", "A")
-                per_chain[ch] = [int(k) for k in dev]
+                per_chain[ch] = [int(k) for k in ddm]
             for c in per_chain:
                 per_chain[c].sort()
 
             def _val(chain: str, rn: int) -> Optional[str]:
                 k = f"{chain}:{rn}" if multichain else str(rn)
-                return deviation_color(dev.get(k), floor.get(k, _DEVIATION_FLOOR_MIN_A))
+                return combined_disruption_color(ddm.get(k), floor_ddm.get(k, _DDM_FLOOR_MIN_A),
+                                                 lddt.get(k), floor_lddt.get(k, _LDDT_NEUTRAL_CAP))
 
             # Visibility owned by fold_visibility_commands (see the pLDDT branch note) — do
             # NOT re-show #mid here or the "Variant fold"/"Hide folds" toggle would no-op.

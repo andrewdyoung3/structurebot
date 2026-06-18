@@ -255,10 +255,11 @@ class TestFoldOutputUsability:
         dev = {"tool_step_results": [{"tool": "variant_deviation", "data": {
             "engine": "esmfold", "target": "monomer", "multichain": False,
             "variant_chain": "A", "variant_model_id": "2", "reference_model_id": "7",
-            "deviation": {"1": 0.1}, "floor": {}, "anchor_residual_rmsd": 0.01,
-            "all_pairs_rmsd": 0.5, "n_residues": 1, "n_cleared_floor": 0,
-            "max_deviation": 0.1, "floor_kind": "deterministic",
-            "wt_ref": {"engine": "esmfold", "target": "monomer", "model_id": "7", "floor": {}}}}]}
+            "ddm": {"1": 0.3}, "floor_ddm": {}, "lddt": {"1": 0.95}, "floor_lddt": {},
+            "n_residues": 1, "n_disrupted": 0, "max_ddm": 0.3,
+            "min_lddt": 0.95, "mean_lddt": 0.95, "floor_kind": "deterministic",
+            "wt_ref": {"engine": "esmfold", "target": "monomer", "model_id": "7",
+                       "floor_ddm": {}, "floor_lddt": {}}}}]}
         p._mode_key = "none"
         p.apply_deviation_result(vid, dev)
         assert p._mode_key == _RESULT_DEVIATION_MODE
@@ -845,18 +846,23 @@ class TestStage4b:
     # ── Stage 4c: variant-vs-WT deviation launch + apply + floor-gated colour ────────
     @staticmethod
     def _dev_result(variant_mid="2", engine="esmfold", target="monomer", multichain=False,
-                    deviation=None, floor=None):
-        deviation = deviation or {"1": 0.1, "2": 1.5, "3": 0.2}
-        floor = floor or {}
+                    fold_column_map=None, lddt=None, floor_lddt=None, ddm=None, floor_ddm=None):
+        lddt = lddt if lddt is not None else {"1": 0.99, "2": 0.40, "3": 0.97}
+        floor_lddt = floor_lddt if floor_lddt is not None else {}
+        ddm = ddm if ddm is not None else {"1": 0.3, "2": 6.0, "3": 0.4}
+        floor_ddm = floor_ddm if floor_ddm is not None else {}
         wt_ref = {"engine": engine, "target": target, "model_id": "7",
-                  "floor": floor, "path": "/tmp/wtref"}
+                  "floor_lddt": floor_lddt, "floor_ddm": floor_ddm, "path": "/tmp/wtref"}
         return {"tool_step_results": [{"tool": "variant_deviation", "data": {
             "engine": engine, "target": target, "multichain": multichain,
             "variant_chain": "A", "variant_model_id": variant_mid, "reference_model_id": "7",
-            "deviation": deviation, "floor": floor, "anchor_residual_rmsd": 0.01,
-            "all_pairs_rmsd": 0.5, "n_residues": len(deviation), "n_cleared_floor": 1,
-            "max_deviation": max(deviation.values()), "floor_kind": "deterministic",
-            "wt_ref": wt_ref}}]}
+            "ddm": ddm, "floor_ddm": floor_ddm, "lddt": lddt, "floor_lddt": floor_lddt,
+            "n_residues": len(ddm),
+            "n_disrupted": sum(1 for k, x in ddm.items() if x > floor_ddm.get(k, 0.5)),
+            "max_ddm": max(ddm.values()),
+            "min_lddt": min(lddt.values()), "mean_lddt": round(sum(lddt.values())/len(lddt), 4),
+            "floor_kind": "deterministic",
+            "fold_column_map": fold_column_map, "wt_ref": wt_ref}}]}
 
     def test_deviation_launch_spec_uncached_low_confidence(self, _app):
         p, tab, (vid,) = self._variant_panel()
@@ -892,26 +898,85 @@ class TestStage4b:
         # the WT reference is cached on the design per combo (so the next variant reuses it)
         assert tab.design.wt_refs["esmfold:monomer"]["model_id"] == "7"
 
+    def test_panel_excludes_inserted_residue_and_pairs_shared(self, _app):
+        # LOAD-BEARING at the panel: after an insertion the inserted residue has no WT counterpart
+        # (resnum None → excluded from the painted author set, click readout flags it), while a
+        # post-insertion shared residue pairs to its CORRECT reference resnum and paints.
+        from variant_workbench import _RESULT_DEVIATION_MODE as _DEV
+        p, tab, (vid,) = self._variant_panel()
+        tab.design.insert_variant_residues(vid, 0, "G")     # MKV → M G K V; G at col 1 (inserted)
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        # ddm keyed by REFERENCE resnum; var2 (the inserted G) omitted from the map. var3 (K) → ref2.
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4},
+            floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5}, lddt={"1": 0.95, "2": 0.40, "3": 0.92},
+            fold_column_map={"1": 1, "3": 2, "4": 3}))      # var2 = the inserted G (no ref)
+        p._mode_key = _DEV
+        ins_cell = tab.design.get_variant(vid).cells[1]
+        assert ins_cell.aa == "G" and ins_cell.resnum is None            # inserted: no WT resnum
+        assert "inserted" in p._residue_deviation_readout(tab, 1).lower()  # col 1 flagged inserted
+        # col 2 (K = variant resnum 3 → REFERENCE resnum 2) reads its correct ref + is confident
+        r2 = p._residue_deviation_readout(tab, 2)
+        assert "ref2" in r2 and "CONFIDENT" in r2
+        # panel paint pairs by reference resnum onto the shared author resnums (insert excluded)
+        assert p._deviation_panel_hex(tab).get(2) is not None             # K (ref2, dRMSD 6.0) painted
+
     def test_deviation_panel_hex_is_floor_gated(self, _app):
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
         p.apply_deviation_result(vid, self._dev_result(
-            variant_mid="2", deviation={"1": 0.1, "2": 1.5, "3": 0.2}))
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4}))
         hexmap = p._deviation_panel_hex(tab)
-        # res 2 (1.5 Å > 0.25 global-min floor) coloured; res 1 & 3 (sub-floor) NEUTRAL
-        assert hexmap == {2: "#ffd166"}
+        # res 2 (dRMSD 6.0 > 0.5 floor; 5.0–8.0 band) → orange; res 1 & 3 (sub-floor) NEUTRAL
+        assert hexmap == {2: "#f3953b"}
 
     def test_deviation_3d_targets_predicted_model_per_chain(self, _app):
         p, tab, (vid,) = self._variant_panel()
         p.apply_fold_result(vid, self._fold_result(model_id="2"))
         p.apply_deviation_result(vid, self._dev_result(
-            variant_mid="2", deviation={"1": 0.1, "2": 1.5, "3": 0.2}))
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4}))
         p._mode_key = _RESULT_DEVIATION_MODE
         cmds = p.color_commands_for(tab)
         # colours the PREDICTED variant model #2 (its own numbering), not the crystal backbone.
         # No `show` — visibility is owned by fold_visibility_commands (else the Variant-fold
         # toggle would be re-defeated, the same bug as the pLDDT mode).
-        assert cmds == ["color #2/A #ffffff", "color #2/A:2 #ffd166"]
+        assert cmds == ["color #2/A #ffffff", "color #2/A:2 #f3953b"]
+
+    def test_deviation_3d_remaps_onto_variant_numbering_for_insertion(self, _app):
+        # Stage B 3D-paint fix (dRMSD): `ddm`/`floor_ddm` are keyed by REFERENCE-fold resnum,
+        # but the variant MODEL is numbered in its OWN fold order. With an insertion the painter
+        # must remap ref→variant so a disrupted shared residue paints at its VARIANT resnum and
+        # the INSERTED residue (no ref counterpart) stays neutral.
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        # inserted residue at variant resnum 2; shared variant 1→ref 1, variant 3→ref 2 (ref 2
+        # disrupted, dRMSD 6.0).
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0},
+            fold_column_map={"1": 1, "3": 2}))             # var 2 (insert) absent → neutral
+        p._mode_key = _RESULT_DEVIATION_MODE
+        cmds = p.color_commands_for(tab)
+        # ref 2 (dRMSD 6.0) repaints at VARIANT resnum 3, NOT ref-resnum 2 (which is the insert);
+        # the inserted residue (var 2) is never coloured → stays on the #ffffff baseline.
+        assert cmds == ["color #2/A #ffffff", "color #2/A:3 #f3953b"]
+
+    def test_residue_deviation_readout_probe(self, _app):
+        # diagnostic probe: clicking a residue in deviation mode reports its dRMSD vs floor.
+        from variant_workbench import _RESULT_DEVIATION_MODE as _DEV
+        p, tab, (vid,) = self._variant_panel()
+        p.apply_fold_result(vid, self._fold_result(model_id="2"))
+        p.apply_deviation_result(vid, self._dev_result(
+            variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4},
+            floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5}))
+        p._mode_key = _DEV
+        # col 1 (variant resnum 2) → ref 2, dRMSD 6.0 > floor 0.5 → CONFIDENT disruption
+        r = p._residue_deviation_readout(tab, 1)
+        assert "dRMSD 6.0/floor 0.5" in r and "CONFIDENT" in r
+        # col 0 (variant resnum 1) → ref 1, dRMSD 0.3 ≤ 0.5 AND lDDT 0.99 ≥ cap → aligned
+        assert "aligned" in p._residue_deviation_readout(tab, 0)
+        # not in deviation mode → empty
+        p._mode_key = "none"
+        assert p._residue_deviation_readout(tab, 1) == ""
 
     def test_deviation_color_mode_no_deviation_is_empty(self, _app):
         p, tab, (vid,) = self._variant_panel()
@@ -1185,3 +1250,218 @@ class TestIndelDeletionPanel:
         p._do_delete_residue(tab, vid, 2)
         p._on_deviation_clicked()
         assert len(emitted) == 1 and "fold_column_map" in emitted[0]["tool_inputs"]
+
+
+class TestIndelInsertionModel:
+    """Stage B pure model: variant residue INSERTION (new shared columns + IndelEvent),
+    remove-insertion, the fold-column map (inserts omitted), and persistence. No Qt."""
+
+    def _design(self, seq="MKVLW", n_var=1):
+        cd = ChainDesign(group_key="g", rep_model="1", rep_chain="A",
+                         members=[("1", "A")],
+                         template_cells=[AlignedCell(col=i, resnum=i + 1, aa=a)
+                                         for i, a in enumerate(seq)])
+        for i in range(n_var):
+            cd.add_variant(f"V{i + 1}")
+        return cd
+
+    def test_insert_grows_axis_and_records_event(self):
+        cd = self._design()                               # MKVLW, resnums 1..5
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")          # insert GG after col 1 (resnum 2)
+        n = len(cd.template_cells)
+        assert n == 7                                      # 5 + 2 new columns
+        # template + sibling rows gap at the inserted columns 2,3
+        assert cd.template_cells[2].is_gap and cd.template_cells[3].is_gap
+        v = cd.get_variant(vid)
+        assert v.cells[2].aa == "G" and v.cells[2].resnum is None
+        assert v.cells[3].aa == "G" and v.cells[3].resnum is None
+        assert v.sequence == "MKGGVLW"                     # GG inserted after K
+        assert [e.kind for e in v.indels] == ["insertion"]
+        assert v.indels[0].col == 2 and v.indels[0].resnum == 2 and v.indels[0].residues == "GG"
+        # every cell re-indexed to its list position
+        assert all(c.col == i for i, c in enumerate(cd.template_cells))
+        assert all(c.col == i for i, c in enumerate(v.cells))
+
+    def test_independent_per_variant_blocks(self):
+        cd = self._design(n_var=2)                         # V1, V2
+        v1, v2 = cd.variants[0].id, cd.variants[1].id
+        cd.insert_variant_residues(v1, 1, "AA")            # V1 inserts at locus
+        cd.insert_variant_residues(v2, 1, "C")            # V2 inserts at the SAME locus
+        # blocks do NOT coalesce: 3 new columns total (2 for V1 + 1 for V2)
+        assert len(cd.template_cells) == 8
+        assert cd.get_variant(v1).sequence == "MKAAVLW"
+        assert cd.get_variant(v2).sequence == "MKCVLW"
+        # each variant gaps in the OTHER's inserted columns
+        ins_v1 = [c.col for c in cd.get_variant(v1).cells if c.aa == "A"]
+        ins_v2 = [c.col for c in cd.get_variant(v2).cells if c.aa == "C"]
+        assert set(ins_v1).isdisjoint(ins_v2)
+
+    def test_insert_before_first_residue(self):
+        cd = self._design()
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, -1, "M")          # leading insertion (after_col=-1)
+        assert cd.template_cells[0].is_gap
+        assert cd.get_variant(vid).sequence == "MMKVLW"
+        assert cd.get_variant(vid).indels[0].resnum is None   # no preceding template resnum
+
+    def test_remove_insertion_restores_axis(self):
+        cd = self._design()
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")
+        cd.remove_variant_insertion(vid, 2)               # remove via any column of the block
+        assert len(cd.template_cells) == 5
+        v = cd.get_variant(vid)
+        assert v.sequence == "MKVLW" and v.indels == []
+        assert all(c.col == i for i, c in enumerate(cd.template_cells))
+
+    def test_insert_guards(self):
+        import pytest as _pt
+        cd = self._design()
+        vid = cd.variants[0].id
+        with _pt.raises(KeyError):
+            cd.insert_variant_residues("nope", 0, "G")
+        with _pt.raises(ValueError):                       # non-standard aa
+            cd.insert_variant_residues(vid, 0, "GXG")
+        with _pt.raises(ValueError):                       # position out of range
+            cd.insert_variant_residues(vid, 99, "G")
+        cd.insert_variant_residues(vid, 1, "GG")
+        with _pt.raises(ValueError):                       # not an inserted column for this variant
+            cd.remove_variant_insertion(vid, 0)
+
+    def test_to_from_dict_round_trips_insertion(self):
+        from variant_model import DesignSession
+        cd = self._design()
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")
+        sess = DesignSession(model_id="1", chains={"k": cd})
+        back = DesignSession.from_dict(sess.to_dict())
+        v = back.chains["k"].get_variant(vid)
+        assert v.sequence == "MKGGVLW"
+        assert [e.kind for e in v.indels] == ["insertion"] and v.indels[0].residues == "GG"
+
+    def test_fold_column_map_omits_inserted_residues(self):
+        cd = self._design()                               # MKVLW, resnums 1..5
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")          # variant fold has 7 residues
+        m = build_fold_column_map(cd.get_variant(vid), cd.template_cells)
+        # variant-fold residues 1,2 → ref 1,2; the inserts (fold 3,4) ABSENT; 5,6,7 → ref 3,4,5
+        assert m == {1: 1, 2: 2, 5: 3, 6: 4, 7: 5}
+        assert 3 not in m and 4 not in m                  # inserted residues omitted by design
+
+
+class TestIndelInsertionPanel:
+    """Stage B panel: the cell-menu insert/remove handlers, the inserted-column click cue, and
+    the deviation spec carrying the insertion-aware fold-column map."""
+
+    def _panel(self):
+        p, _ = _panel([_chainseq("1", "A", "MKVLW"), _chainseq("1", "B", "MKVLW")],
+                      session=MagicMock())
+        p.load_model("1")
+        p._add_variant()
+        return p, p._cur_tab(), p._cur_tab().design.variants[-1].id
+
+    def test_insert_then_remove_via_handlers(self, _app):
+        p, tab, vid = self._panel()
+        tab.design.insert_variant_residues(vid, 1, "GG")     # exercise handler-free path
+        assert tab.design.get_variant(vid).sequence == "MKGGVLW"
+        p._do_remove_insertion(tab, vid, 2)
+        assert tab.design.get_variant(vid).sequence == "MKVLW"
+
+    def test_insert_handler_via_dialog(self, _app, monkeypatch):
+        from PySide6 import QtWidgets
+        p, tab, vid = self._panel()
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("gg", True)))
+        p._do_insert_residues(tab, vid, 1)                 # dialog returns "gg" → upper-cased
+        assert tab.design.get_variant(vid).sequence == "MKGGVLW"
+
+    def test_insert_dialog_cancel_is_noop(self, _app, monkeypatch):
+        from PySide6 import QtWidgets
+        p, tab, vid = self._panel()
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("", False)))
+        p._do_insert_residues(tab, vid, 1)
+        assert tab.design.get_variant(vid).sequence == "MKVLW"
+
+    def test_inserted_column_click_cue(self, _app):
+        p, tab, vid = self._panel()
+        tab.design.insert_variant_residues(vid, 1, "GG")
+        tab.rebuild()
+        p._on_cell(tab, vid, 2)                            # click an inserted column
+        assert "Inserted" in p._status.text() and tab.active_row_id == vid
+
+    def test_deviation_spec_omits_inserted_residues(self, _app):
+        p, tab, vid = self._panel()
+        p.apply_fold_result(vid, {"tool_step_results": [{"tool": "esmfold", "data": {
+            "engine": "esmfold", "new_model_id": "2", "reference_model_id": "1",
+            "mean_plddt": 80.0, "length": 5, "source": "local_venv312",
+            "plddt": {1: 90.0}}}]})
+        tab.set_active_row(vid)
+        tab.design.insert_variant_residues(vid, 1, "GG")     # insertion → map omits the inserts
+        spec = p.deviation_launch_spec()
+        m = spec["tool_inputs"]["fold_column_map"]
+        assert m == {1: 1, 2: 2, 5: 3, 6: 4, 7: 5}
+
+
+class TestWorkbenchRehydrate:
+    """load_model rehydrates a persisted design (variants + indels + results) instead of
+    rebuilding empty — so a restored session / app restart keeps the workbench state (the
+    fold models survive in the still-open ChimeraX, so no re-fold is needed)."""
+
+    def test_load_model_rehydrates_persisted_design(self, _app):
+        from session_state import SessionState
+        sess = SessionState()
+        seqs = [_chainseq("1", "A", "MKVLW"), _chainseq("1", "B", "MKVLW")]
+        p1, _ = _panel(seqs, session=sess)
+        p1.load_model("1")
+        p1._add_variant()
+        tab = p1._cur_tab()
+        vid = tab.design.variants[-1].id
+        tab.design.insert_variant_residues(vid, 1, "GG")
+        p1._persist()                                         # save the design WITH the insertion
+        # a fresh panel on the SAME session + model rehydrates rather than building empty
+        p2, _ = _panel(seqs, session=sess)
+        p2.load_model("1")
+        cd = p2._cur_tab().design
+        assert len(cd.variants) == 1
+        v = cd.variants[0]
+        assert v.sequence == "MKGGVLW" and any(e.kind == "insertion" for e in v.indels)
+
+    def test_load_model_fresh_when_nothing_persisted(self, _app):
+        from session_state import SessionState
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=SessionState())
+        p.load_model("1")
+        assert p._cur_tab().design.variants == []            # nothing persisted -> fresh
+
+    def test_load_model_fresh_when_chain_set_mismatches(self, _app):
+        # a persisted design whose unique-chain set differs from the live model is NOT rehydrated
+        from session_state import SessionState
+        sess = SessionState()
+        p1, _ = _panel([_chainseq("1", "A", "MKVLW")], session=sess)
+        p1.load_model("1")
+        p1._add_variant()
+        p1._persist()
+        p2, _ = _panel([_chainseq("1", "B", "QQQQQ")], session=sess)   # same id, different chain
+        p2.load_model("1")
+        assert p2._cur_tab().design.variants == []            # mismatch -> fresh, persisted ignored
+
+    def test_attach_session_repoints_then_rehydrates(self, _app):
+        # the restore bug: a panel built with an EMPTY session must re-point at the restored
+        # (populated) session via attach_session, else load_model reads the wrong object.
+        from session_state import SessionState
+        seqs = [_chainseq("1", "A", "MKVLW")]
+        saved = SessionState()
+        p1, _ = _panel(seqs, session=saved)
+        p1.load_model("1")
+        p1._add_variant()
+        tab = p1._cur_tab()
+        tab.design.insert_variant_residues(tab.design.variants[-1].id, 1, "GG")
+        p1._persist()
+        # a NEW panel constructed with an EMPTY session (mirrors app restart) → attach the saved
+        # session, THEN load → rehydrates (without attach it would read the empty one).
+        p2, _ = _panel(seqs, session=SessionState())
+        p2.attach_session(saved)
+        p2.load_model("1")
+        cd = p2._cur_tab().design
+        assert len(cd.variants) == 1 and cd.variants[0].sequence == "MKGGVLW"
