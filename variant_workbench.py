@@ -38,7 +38,7 @@ from seq_library import (build_numbering_header_content,
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
                            build_model_color_commands, build_fold_column_map,
-                           build_design_session, column_tracks,
+                           build_design_session, column_tracks, DesignSession,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
                            suggestion_color)
@@ -648,6 +648,21 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText(f"Workbench: model #{model_id} has no chains.")
             return
         self._design = build_design_session(chain_seqs, str(model_id))
+        # REHYDRATE a persisted design for this model (variants + indels + fold/deviation
+        # results) instead of discarding it — the fresh build above is the template/validation
+        # baseline. Rehydrate only when the persisted design's unique-chain set matches the live
+        # model (same structure), else keep the fresh build. ChimeraX persists across an app
+        # restart, so the referenced fold model ids stay valid → 3D + the cached deviation come
+        # back with no re-fold. A corrupt/mismatched persisted blob falls back to fresh.
+        persisted = (self._session.get_design_session(str(model_id))
+                     if self._session is not None else None)
+        if persisted:
+            try:
+                restored = DesignSession.from_dict(persisted)
+                if set(restored.chains) == set(self._design.chains):
+                    self._design = restored
+            except Exception:
+                pass
         self._edit_target = None
         self._scan_cols.clear()
         self._update_scan_label()

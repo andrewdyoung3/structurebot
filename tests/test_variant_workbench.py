@@ -1404,3 +1404,46 @@ class TestIndelInsertionPanel:
         spec = p.deviation_launch_spec()
         m = spec["tool_inputs"]["fold_column_map"]
         assert m == {1: 1, 2: 2, 5: 3, 6: 4, 7: 5}
+
+
+class TestWorkbenchRehydrate:
+    """load_model rehydrates a persisted design (variants + indels + results) instead of
+    rebuilding empty — so a restored session / app restart keeps the workbench state (the
+    fold models survive in the still-open ChimeraX, so no re-fold is needed)."""
+
+    def test_load_model_rehydrates_persisted_design(self, _app):
+        from session_state import SessionState
+        sess = SessionState()
+        seqs = [_chainseq("1", "A", "MKVLW"), _chainseq("1", "B", "MKVLW")]
+        p1, _ = _panel(seqs, session=sess)
+        p1.load_model("1")
+        p1._add_variant()
+        tab = p1._cur_tab()
+        vid = tab.design.variants[-1].id
+        tab.design.insert_variant_residues(vid, 1, "GG")
+        p1._persist()                                         # save the design WITH the insertion
+        # a fresh panel on the SAME session + model rehydrates rather than building empty
+        p2, _ = _panel(seqs, session=sess)
+        p2.load_model("1")
+        cd = p2._cur_tab().design
+        assert len(cd.variants) == 1
+        v = cd.variants[0]
+        assert v.sequence == "MKGGVLW" and any(e.kind == "insertion" for e in v.indels)
+
+    def test_load_model_fresh_when_nothing_persisted(self, _app):
+        from session_state import SessionState
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=SessionState())
+        p.load_model("1")
+        assert p._cur_tab().design.variants == []            # nothing persisted -> fresh
+
+    def test_load_model_fresh_when_chain_set_mismatches(self, _app):
+        # a persisted design whose unique-chain set differs from the live model is NOT rehydrated
+        from session_state import SessionState
+        sess = SessionState()
+        p1, _ = _panel([_chainseq("1", "A", "MKVLW")], session=sess)
+        p1.load_model("1")
+        p1._add_variant()
+        p1._persist()
+        p2, _ = _panel([_chainseq("1", "B", "QQQQQ")], session=sess)   # same id, different chain
+        p2.load_model("1")
+        assert p2._cur_tab().design.variants == []            # mismatch -> fresh, persisted ignored
