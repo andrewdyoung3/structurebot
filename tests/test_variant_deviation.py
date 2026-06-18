@@ -75,6 +75,56 @@ class TestRunVariantDeviation:
         assert out.data["n_cleared_floor"] == 0          # 0.4 < 0.6 floor → suppressed
         assert out.data["floor_kind"] == "measured"
 
+    def test_fold_column_map_identity_is_byte_identical(self):
+        # additive guarantee: an identity map (substitution-only) == no map.
+        ref = _rigid(30)
+        var = _displace(ref, {10, 11, 12}, [2.0, 0.0, 0.0])
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        base = {"variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+                "variant_chain": "A", "multichain": False,
+                "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"}}
+        out_nomap = r._run_variant_deviation(dict(base))
+        out_id = r._run_variant_deviation({**base, "fold_column_map": {i: i for i in range(1, 31)}})
+        assert out_nomap.data["deviation"] == out_id.data["deviation"]
+        assert out_nomap.data["max_deviation"] == out_id.data["max_deviation"]
+
+    def test_fold_column_map_pairs_post_deletion_residues(self):
+        # the WHOLE point of the map: a deletion at template pos 15 → variant fold has 29
+        # residues numbered 1..29; residues AFTER the deletion must pair to template pos+1,
+        # NOT pos (the resnum==resnum mis-pair). Displace variant-fold residue 20 (→ ref 21).
+        ref = _rigid(30)
+        fold_map = {j: j for j in range(1, 15)}
+        fold_map.update({j: j + 1 for j in range(15, 30)})       # 15->16 … 29->30
+        var = {j: ref[fold_map[j]].copy() for j in range(1, 30)}  # overlay each on its ref pair
+        var[20] = var[20] + np.array([2.0, 0.0, 0.0])            # displace fold res 20 (→ ref 21)
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"},
+            "fold_column_map": fold_map})
+        assert out.success
+        d = out.data
+        assert d["anchor_residual_rmsd"] < 0.05                  # clean rigid-core fit
+        assert d["deviation"]["21"] > 1.5                        # pairs at REFERENCE resnum 21
+        assert d["deviation"].get("20", 0.0) < 0.1              # not the one-off-shifted bug
+        assert "15" not in d["deviation"]                        # the deleted position is absent
+
+    def test_fold_column_map_missing_entry_fails_loud(self):
+        # a variant-fold residue absent from a non-identity map → REFUSE (never mis-pair).
+        ref = _rigid(30)
+        var = _rigid(30)
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"},
+            "fold_column_map": {i: i for i in range(1, 30)}})    # omits resnum 30
+        assert out.success is False and "missing" in out.error.lower()
+
     def test_missing_variant_model_errors(self):
         out = _router()._run_variant_deviation({"engine": "esmfold"})
         assert not out.success and "model id" in out.error

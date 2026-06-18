@@ -36,7 +36,7 @@ from color_modes import (all_modes, ddg_color, deviation_color, get_mode,
 from seq_library import build_numbering_header_content
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
-                           build_model_color_commands,
+                           build_model_color_commands, build_fold_column_map,
                            build_design_session, column_tracks,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
@@ -733,12 +733,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._edit_target = (vid, col)
         resnum = tab.design.resnum_for_col(col)
         wt = tab.design.template_cells[col].aa
-        cur = v.cells[col].aa if col < len(v.cells) else None
+        cell = v.cells[col] if col < len(v.cells) else None
+        cur = cell.aa if cell is not None else None
+        is_gap = cell is not None and cell.is_gap
 
         menu = QtWidgets.QMenu(self)
-        header = menu.addAction(f"{vid} · residue {resnum} (WT {wt}, now {cur})")
+        header = menu.addAction(f"{vid} · residue {resnum} "
+                                + ("(DELETED)" if is_gap else f"(WT {wt}, now {cur})"))
         header.setEnabled(False)
         menu.addSeparator()
+        if is_gap:                                       # a deleted cell → offer Restore
+            menu.addAction(f"Restore residue (WT {wt})",
+                           lambda: self._do_restore_residue(tab, vid, col))
+            menu.exec(global_pos)
+            return
         sub = menu.addMenu("Substitute →")
         for aa in _AA_ORDER:
             act = sub.addAction(f"{aa}  (WT)" if aa == wt else aa)
@@ -748,7 +756,30 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if wt is not None and cur != wt:
             menu.addAction(f"Revert to WT ({wt})",
                            lambda: self._do_substitute(tab, vid, col, wt))
+        menu.addSeparator()
+        menu.addAction("Delete residue",
+                       lambda: self._do_delete_residue(tab, vid, col))
         menu.exec(global_pos)
+
+    def _do_delete_residue(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        try:
+            tab.design.delete_variant_residue(vid, col)
+        except Exception as exc:
+            self._status.setText(f"Delete failed: {type(exc).__name__}: {exc}")
+            return
+        resnum = tab.design.resnum_for_col(col)
+        self._after_variant_edit(
+            tab, vid, f"{vid}: residue {resnum} DELETED (cell → gap; a fold/deviation now "
+                      f"treats it as removed). Right-click the gap → Restore to undo.")
+
+    def _do_restore_residue(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        try:
+            tab.design.restore_variant_residue(vid, col)
+        except Exception as exc:
+            self._status.setText(f"Restore failed: {type(exc).__name__}: {exc}")
+            return
+        resnum = tab.design.resnum_for_col(col)
+        self._after_variant_edit(tab, vid, f"{vid}: residue {resnum} restored to WT.")
 
     def _on_row_menu(self, tab: _ChainDesignTab, vid: str, global_pos) -> None:
         """Right-click on a VARIANT row header → a 'Delete variant' menu. Row-level removal
@@ -994,8 +1025,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._edit_target = (row_id, col)
             resnum = tab.design.resnum_for_col(col)
             wt = tab.design.template_cells[col].aa if 0 <= col < len(tab.design.template_cells) else "?"
-            self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
-                                 f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
+            vv = tab.design.get_variant(row_id)
+            deleted = vv is not None and col < len(vv.cells) and vv.cells[col].is_gap
+            if deleted:                                     # decision #3: keep selecting the
+                self._status.setText(                       # crystal residue + surface the cue
+                    f"Residue {resnum} — DELETED in {row_id} (the crystal residue is selected; "
+                    f"right-click the gap → Restore to undo).")
+            else:
+                self._status.setText(f"Edit target: {row_id} col {col} (residue {resnum}, T={wt}). "
+                                     f"Pick an aa and Apply.  (Ctrl+click builds the scan set.)")
             self._apply_color_to(tab)                       # panel result-coloring FOLLOWS active
             self._push_3d_color(tab)
 
@@ -1073,7 +1111,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 out[author[i]] = hexc
         return out
 
+    def _refresh_color_mode_availability(self, tab: _ChainDesignTab) -> None:
+        """Grey out a RESULT colour mode (ddG / pLDDT / Deviation vs WT) when the ACTIVE
+        variant has no such result yet — so e.g. selecting 'Color: Deviation vs WT' can't be
+        a silent no-op before the 'Deviation vs WT' button has computed it. If the CURRENT
+        mode just became unavailable (e.g. switching to a row that hasn't been folded/scanned),
+        revert the combo to None so the displayed mode always matches what's painted."""
+        avail = {
+            _RESULT_DDG_MODE:       bool(self._active_ddg_map(tab)),
+            _RESULT_PLDDT_MODE:     bool(self._active_plddt_map(tab)),
+            _RESULT_DEVIATION_MODE: bool(self._active_deviation(tab)),
+        }
+        model = self._mode_combo.model()
+        for i in range(self._mode_combo.count()):
+            key = self._mode_combo.itemData(i)
+            if key in avail and (item := model.item(i)) is not None:
+                item.setEnabled(avail[key])
+        if self._mode_key in avail and not avail[self._mode_key]:
+            self._select_result_mode("none")          # current result has no data → revert
+            self._mode_key = "none"
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
+        self._refresh_color_mode_availability(tab)    # grey result modes lacking data
         if self._mode_key == _RESULT_DDG_MODE:
             hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
             tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
@@ -1584,6 +1643,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "wt_ref":           cd.wt_refs.get(combo),    # cached reference (skip folding) or None
             "local_only":       True,
         }
+        # INDEL-AWARE pairing (Stage A, monomer): carry the variant-fold→reference-fold
+        # column map so a deletion's downstream residues pair correctly. Identity for a
+        # substitution-only variant → byte-identical deviation (the additive guarantee).
+        if not multichain:
+            ti["fold_column_map"] = build_fold_column_map(v, cd.template_cells)
         have_ref = bool(cd.wt_refs.get(combo))
         return {
             "tool":        "variant_deviation",
@@ -1602,6 +1666,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         if not (v.results.fold and v.results.fold.get("model_id")):
             self._status.setText(f"Fold {v.id} first — deviation compares FOLDED models.")
+            return
+        # Stage A: indel-aware column pairing is MONOMER-only. Refuse an indel variant folded
+        # as an ASSEMBLY rather than silently mis-pair at the deletion (the §0 silent-wrong
+        # guard — multichain per-chain mapping is a later phase).
+        if v.indels and v.results.fold.get("target") == "assembly":
+            self._status.setText(
+                f"{v.id} has {len(v.indels)} indel(s) AND was folded as an ASSEMBLY — "
+                f"indel-aware deviation is monomer-only for now. Fold {v.id} as a MONOMER "
+                f"to compare (refusing to mis-pair the multimer deletion).")
             return
         spec = self.deviation_launch_spec()
         if spec is not None:
@@ -1653,6 +1726,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                     out[v.id] = str(fld["model_id"])
         return out
 
+    def _wt_ref_model_ids(self) -> List[str]:
+        """Model ids of the seed-pinned WT REFERENCE folds (the deviation comparison basis),
+        across all chains/combos — distinct from the loaded crystal and the variant folds.
+        Hidden by fold_visibility_commands (computation artifact, not the displayed result)."""
+        ids: List[str] = []
+        if self._design is None:
+            return ids
+        for cd in self._design.chains.values():
+            for ref in (cd.wt_refs or {}).values():
+                mid = (ref or {}).get("model_id")
+                if mid and str(mid) not in ids:
+                    ids.append(str(mid))
+        return ids
+
     def fold_visibility_commands(self, tab: _ChainDesignTab) -> List[str]:
         """Per-model 3D visibility coupled to the active row — the clean ≤2 overlay. Two
         INDEPENDENT toggles: show the WT REFERENCE (the loaded model) and/or the ACTIVE
@@ -1666,6 +1753,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         ref = str(self._design.model_id)                 # the WT reference (loaded crystal)
         cmds.append(f"show #{ref} models" if self._show_ref_cb.isChecked()
                     else f"hide #{ref} models")
+        # WT REFERENCE FOLDS (the deviation's seed-pinned comparison basis) are a computation
+        # artifact, NOT the displayed result — the deviation is read off the variant fold's
+        # floor-gated colouring. _fold_wt_reference opens + overlays them; hide them here so
+        # they don't clutter/occlude the variant fold (they previously persisted untoggleable).
+        for wt_mid in self._wt_ref_model_ids():
+            cmds.append(f"hide #{wt_mid} models")
         models = self._fold_models(self._design)
         if not models:
             return cmds
