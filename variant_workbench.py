@@ -635,6 +635,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status.setStyleSheet("color:#888;padding:2px 6px;")
         lay.addWidget(self._status)
 
+    def attach_session(self, session) -> None:
+        """Re-point the panel at a different SessionState — used on session RESTORE, where the
+        app swaps `self.session` for the loaded one. Without this the panel keeps writing to /
+        reading from the ORIGINAL (empty) session, so a restored design never rehydrates and new
+        edits never persist into the restored file."""
+        self._session = session
+
     # ── load + render ─────────────────────────────────────────────────────────────
     def load_model(self, model_id: str) -> None:
         """Read the model over REST, build + render the DesignSession, persist it.

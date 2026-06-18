@@ -931,6 +931,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if choice == "restore":
             self.session = state
             self.router = ToolRouter(self.bridge, self.session)
+            # Re-point the workbench at the RESTORED session — it was constructed with the old
+            # (empty) one, so without this its rehydrate reads the wrong object and edits never
+            # persist into the restored file.
+            self.workbench.attach_session(state)
             # Re-DISPLAY the workbench designs on the UI thread once preflight finishes (this
             # runs on the preflight worker). ChimeraX is left running across an app restart, so
             # the crystal + fold models are still open → show_model → workbench.load_model

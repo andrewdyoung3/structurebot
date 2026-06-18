@@ -1447,3 +1447,23 @@ class TestWorkbenchRehydrate:
         p2, _ = _panel([_chainseq("1", "B", "QQQQQ")], session=sess)   # same id, different chain
         p2.load_model("1")
         assert p2._cur_tab().design.variants == []            # mismatch -> fresh, persisted ignored
+
+    def test_attach_session_repoints_then_rehydrates(self, _app):
+        # the restore bug: a panel built with an EMPTY session must re-point at the restored
+        # (populated) session via attach_session, else load_model reads the wrong object.
+        from session_state import SessionState
+        seqs = [_chainseq("1", "A", "MKVLW")]
+        saved = SessionState()
+        p1, _ = _panel(seqs, session=saved)
+        p1.load_model("1")
+        p1._add_variant()
+        tab = p1._cur_tab()
+        tab.design.insert_variant_residues(tab.design.variants[-1].id, 1, "GG")
+        p1._persist()
+        # a NEW panel constructed with an EMPTY session (mirrors app restart) → attach the saved
+        # session, THEN load → rehydrates (without attach it would read the empty one).
+        p2, _ = _panel(seqs, session=SessionState())
+        p2.attach_session(saved)
+        p2.load_model("1")
+        cd = p2._cur_tab().design
+        assert len(cd.variants) == 1 and cd.variants[0].sequence == "MKGGVLW"
