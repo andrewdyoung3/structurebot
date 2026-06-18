@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from color_modes import (get_mode, all_modes, COLOR_MODES, plddt_color,
-                         deviation_color, lddt_disruption_color, ddm_color)
+                         deviation_color, lddt_disruption_color, ddm_color,
+                         combined_disruption_color)
 
 
 class TestDeviationColor:
@@ -69,6 +70,27 @@ class TestDdmColor:
         # exceeds THAT — the superposition-free analog of the deviation floor gate.
         assert ddm_color(2.0, 3.0) is None                 # 2.0 ≤ 3.0 floor → neutral
         assert ddm_color(4.0, 3.0) == "#ffd166"            # above the 3.0 floor → shown
+
+
+class TestCombinedDisruptionColor:
+    """The PAINTED gate: disrupted if dRMSD OR lDDT exceeds the WT's cross-seed noise; magnitude
+    by dRMSD displacement. Catches a melted/displaced loop whose bulk move is within a floppy
+    WT loop's positional floor but whose lDDT has dropped (the GIG/Ile case)."""
+
+    def test_neutral_when_within_both_floors(self):
+        assert combined_disruption_color(0.3, 0.5, 0.99, 0.9) is None
+
+    def test_shown_by_ddm_alone(self):
+        # dRMSD clears its floor; lDDT fine → coloured by dRMSD magnitude (5–8 → orange)
+        assert combined_disruption_color(6.0, 0.5, 0.95, 0.9) == "#f3953b"
+
+    def test_shown_by_lddt_when_ddm_floor_too_high(self):
+        # the GIG/Ile case: dRMSD 6.9 GATED by a floppy-WT floor 7.7, but lDDT 0.47 < floor 0.9
+        # → still shown, coloured by the dRMSD displacement magnitude (6.9 → orange)
+        assert combined_disruption_color(6.9, 7.7, 0.47, 0.9) == "#f3953b"
+
+    def test_lddt_only_no_ddm_falls_back_to_lddt_ramp(self):
+        assert combined_disruption_color(None, 0.5, 0.30, 0.9) == "#e23b3b"
 
 
 class TestLddtDisruptionColor:

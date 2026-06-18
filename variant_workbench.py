@@ -31,8 +31,8 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import (all_modes, ddg_color, ddm_color, deviation_color, get_mode,
-                         lddt_disruption_color, plddt_color)
+from color_modes import (all_modes, combined_disruption_color, ddg_color, ddm_color,
+                         deviation_color, get_mode, lddt_disruption_color, plddt_color)
 from seq_library import (build_numbering_header_content,
                          build_numbering_header_with_insertions)
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
@@ -1146,9 +1146,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         dv = ddm[str(ref)]
         df = (block.get("floor_ddm") or {}).get(str(ref), _DDM_FLOOR_MIN_A)
         lv = (block.get("lddt") or {}).get(str(ref))
-        state = "shown" if dv > df else "GATED→white"
-        s = f"ref{ref}: dRMSD {dv:.1f} vs floor {df:.1f} Å → {state}"
-        return s + (f"; lDDT {lv:.2f}" if lv is not None else "")
+        lf = (block.get("floor_lddt") or {}).get(str(ref), _LDDT_NEUTRAL_CAP)
+        shown = (dv > df) or (lv is not None and lv < lf)
+        s = (f"ref{ref}: dRMSD {dv:.1f}/floor {df:.1f} Å"
+             + (f", lDDT {lv:.2f}/floor {lf:.2f}" if lv is not None else "")
+             + f" → {'shown' if shown else 'neutral'}")
+        return s
 
     def _select_variant_row(self, tab: _ChainDesignTab, row_id) -> None:
         """Row-header NAME click → SELECT *row_id* as the active row and drive the 3D via the
@@ -1214,6 +1217,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return {}
         ddm = block.get("ddm") or {}
         floor_ddm = block.get("floor_ddm") or {}
+        lddt = block.get("lddt") or {}
+        floor_lddt = block.get("floor_lddt") or {}
         keys = self._dev_chain_keys(ddm, bool(block.get("multichain")), tab.design.rep_chain)
         author = [c.resnum for c in tab.active_row_cells()
                   if not c.is_gap and c.resnum is not None]
@@ -1221,7 +1226,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         for i, k in enumerate(keys):
             if i >= len(author):
                 break
-            hexc = ddm_color(ddm[k], floor_ddm.get(k, _DDM_FLOOR_MIN_A))
+            hexc = combined_disruption_color(ddm.get(k), floor_ddm.get(k, _DDM_FLOOR_MIN_A),
+                                             lddt.get(k), floor_lddt.get(k, _LDDT_NEUTRAL_CAP))
             if hexc:
                 out[author[i]] = hexc
         return out
@@ -2056,9 +2062,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 return []
             ddm = block.get("ddm") or {}
             floor_ddm = block.get("floor_ddm") or {}
+            lddt = block.get("lddt") or {}
+            floor_lddt = block.get("floor_lddt") or {}
             mid = block["variant_model_id"]
             multichain = bool(block.get("multichain"))
-            # `ddm`/`floor_ddm` are keyed by REFERENCE-fold resnum (the router re-keyed the
+            # the per-residue maps are keyed by REFERENCE-fold resnum (the router re-keyed the
             # variant onto the WT numbering for an indel). The model #mid is numbered in the
             # VARIANT fold's OWN order — so remap ref→variant here before painting, or an
             # insertion's downstream residues get the wrong colour. Inserted residues have no
@@ -2066,10 +2074,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             fmap = block.get("fold_column_map")
             if fmap and not multichain:
                 ref_to_var = {int(r): int(j) for j, r in fmap.items()}
-                ddm = {str(ref_to_var[int(k)]): val for k, val in ddm.items()
-                       if int(k) in ref_to_var}
-                floor_ddm = {str(ref_to_var[int(k)]): val for k, val in floor_ddm.items()
-                             if int(k) in ref_to_var}
+                remap = lambda d: {str(ref_to_var[int(k)]): val for k, val in d.items()
+                                   if int(k) in ref_to_var}
+                ddm, floor_ddm = remap(ddm), remap(floor_ddm)
+                lddt, floor_lddt = remap(lddt), remap(floor_lddt)
             per_chain: Dict[str, List[int]] = {}
             if multichain:
                 for k in ddm:
@@ -2083,7 +2091,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
             def _val(chain: str, rn: int) -> Optional[str]:
                 k = f"{chain}:{rn}" if multichain else str(rn)
-                return ddm_color(ddm.get(k), floor_ddm.get(k, _DDM_FLOOR_MIN_A))
+                return combined_disruption_color(ddm.get(k), floor_ddm.get(k, _DDM_FLOOR_MIN_A),
+                                                 lddt.get(k), floor_lddt.get(k, _LDDT_NEUTRAL_CAP))
 
             # Visibility owned by fold_visibility_commands (see the pLDDT branch note) — do
             # NOT re-show #mid here or the "Variant fold"/"Hide folds" toggle would no-op.

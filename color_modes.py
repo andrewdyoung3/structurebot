@@ -225,6 +225,24 @@ def lddt_disruption_color(lddt: Optional[float],
     return _LDDT_BANDS[-1][1]
 
 
+def combined_disruption_color(ddm: Optional[float], floor_ddm: float,
+                              lddt: Optional[float], floor_lddt: float) -> Optional[str]:
+    """The PAINTED 'deviation vs WT' colour. A residue is disrupted if it exceeds the WT's own
+    cross-seed noise in EITHER global position (dRMSD > floor_ddm) OR local structure
+    (lDDT < floor_lddt) — so a loop that is genuinely melted/displaced but whose bulk movement
+    falls within a very floppy WT loop's positional noise (high dRMSD floor) is still shown via
+    its lDDT drop, and vice-versa. Colour MAGNITUDE is the dRMSD displacement (one Å ramp); a
+    residue shown only by lDDT still colours by its dRMSD so the scale stays one thing. None when
+    within noise on BOTH. The single source for the panel cells and the 3D push."""
+    by_ddm  = ddm  is not None and ddm  > floor_ddm
+    by_lddt = lddt is not None and lddt < floor_lddt
+    if not (by_ddm or by_lddt):
+        return None
+    if ddm is not None:
+        return ddm_color(ddm, 0.0) or "#5b8def"      # magnitude by displacement (gate already passed)
+    return lddt_disruption_color(lddt, 1.0)          # dRMSD missing → fall back to lDDT severity
+
+
 @dataclass(frozen=True)
 class ColorMode:
     key:   str                              # stable id
