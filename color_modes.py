@@ -165,6 +165,37 @@ def deviation_color(deviation: Optional[float],
     return _DEV_BANDS[-1][1]
 
 
+# Cα-lDDT disruption ramp — by lDDT VALUE (1 = locally conserved … 0 = fully changed), so the
+# scale is INVERTED vs deviation: LOWER lDDT = MORE disrupted = warmer. Floor-gated like the
+# deviation ramp (lDDT ≥ floor → neutral: changed no more than the WT does across seeds).
+_LDDT_BANDS = (
+    (0.50, "#e23b3b"),   # < 0.50 — severe local change (red)
+    (0.65, "#f3953b"),   # orange
+    (0.80, "#ffd166"),   # yellow
+    (0.90, "#8fd0e8"),   # cyan — mild
+)
+
+
+def lddt_disruption_color(lddt: Optional[float],
+                          floor: float = 0.9) -> Optional[str]:
+    """Per-residue Cα-lDDT (variant-vs-WT, 1=locally conserved) → fixed hex, FLOOR-GATED.
+
+    None → no data (reset). ``lddt >= floor`` → None (NEUTRAL: the local structure changed no
+    more than the same-sequence WT changes across seeds → not distinguishable from sampling
+    noise). Below the floor → a warm-by-severity band (lower lDDT = redder). *floor* is the
+    residue's cross-seed lDDT noise floor (capped at the neutral cap; a deterministic engine
+    has no cross-seed spread so the cap alone gates). SUPERPOSITION-FREE → a re-orienting domain
+    stays conserved (high lDDT) instead of the lever-arm blow-up the Cα-RMSD ramp produced."""
+    if lddt is None:
+        return None
+    if lddt >= floor:
+        return None
+    for hi, hexc in _LDDT_BANDS:
+        if lddt < hi:
+            return hexc
+    return _LDDT_BANDS[-1][1]
+
+
 @dataclass(frozen=True)
 class ColorMode:
     key:   str                              # stable id

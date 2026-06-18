@@ -152,6 +152,22 @@ class TestRunVariantDeviation:
             "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"}})
         assert out.success and out.data["fold_column_map"] is None
 
+    def test_returns_lddt_primary_signal(self):
+        # the deviation tool now also computes the SUPERPOSITION-FREE Cα-lDDT (the paint signal).
+        ref = _rigid(30)
+        var = _displace(ref, {10, 11, 12}, [6.0, 0.0, 0.0])   # big local shove → lDDT drops there
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_ref": {"model_id": "7", "floor": {}, "floor_lddt": {}, "path": "/tmp/r.pdb"}})
+        assert out.success
+        d = out.data
+        assert "lddt" in d and "floor_lddt" in d
+        assert d["min_lddt"] < 1.0 and d["mean_lddt"] <= 1.0
+        assert d["n_disrupted"] >= 1                          # shoved residues fall below the cap
+
     def test_missing_variant_model_errors(self):
         out = _router()._run_variant_deviation({"engine": "esmfold"})
         assert not out.success and "model id" in out.error
@@ -183,6 +199,9 @@ class TestFoldWtReference:
         # deterministic → no cross-seed motion → every residue floored at the global minimum
         assert set(wt["floor"].values()) == {r._DEVIATION_FLOOR_MIN_A}
         assert len(wt["floor"]) == 20
+        # lDDT floor (no extra seeds) → the neutral cap everywhere
+        assert set(wt["floor_lddt"].values()) == {r._LDDT_NEUTRAL_CAP}
+        assert len(wt["floor_lddt"]) == 20
 
     def test_boltz_floor_is_cross_seed_max_plus_global_min(self):
         ref = _rigid(30)                          # ≥~25 res → the anchor prune isolates movers
@@ -206,3 +225,39 @@ class TestFoldWtReference:
         assert abs(fl["5"] - 1.5) < 0.1          # cross-seed MAX (1.5 > 1.0) at res 5
         assert abs(fl["8"] - 1.5) < 0.1          # res 8 moved 1.5 Å in seed 2
         assert abs(fl["1"] - r._DEVIATION_FLOOR_MIN_A) < 1e-9   # unmoved → global min
+        # lDDT floor = min cross-seed lDDT, capped at the neutral cap; an unmoved residue stays
+        # locally consistent across seeds → floored at the cap (0.9), never above.
+        fll = wt["floor_lddt"]
+        assert fll["1"] == r._LDDT_NEUTRAL_CAP
+        assert all(v <= r._LDDT_NEUTRAL_CAP for v in fll.values())
+
+
+class TestPerResidueLddt:
+    """The superposition-FREE per-residue Cα-lDDT kernel — invariant to rigid-body motion (the
+    whole reason for the metric), drops only where local geometry genuinely changes."""
+
+    def test_identical_is_one(self):
+        coords = _rigid(20)
+        m = ToolRouter._per_residue_lddt(coords, coords, sorted(coords))
+        assert m and all(abs(v - 1.0) < 1e-9 for v in m.values())
+
+    def test_rigid_body_transform_is_invariant(self):
+        # THE point: a global rotation + large translation does NOT lower lDDT (no superposition
+        # is performed), unlike the Kabsch deviation which a small anchor blows up to tens of Å.
+        ref = _rigid(30)
+        th = 0.7
+        R = np.array([[np.cos(th), -np.sin(th), 0.0],
+                      [np.sin(th),  np.cos(th), 0.0],
+                      [0.0, 0.0, 1.0]])
+        t = np.array([100.0, -50.0, 25.0])
+        moved = {k: R @ v + t for k, v in ref.items()}
+        m = ToolRouter._per_residue_lddt(ref, moved, sorted(ref))
+        assert all(abs(v - 1.0) < 1e-9 for v in m.values())
+
+    def test_local_distortion_drops_only_locally(self):
+        ref = _rigid(40)
+        var = {k: v.copy() for k, v in ref.items()}
+        var[21] = var[21] + np.array([8.0, 0.0, 0.0])    # displace ONE residue
+        m = ToolRouter._per_residue_lddt(ref, var, sorted(ref))
+        assert m[21] == min(m.values()) and m[21] < 0.9  # the moved residue is the most disrupted
+        assert sum(1 for v in m.values() if v > 0.9) >= 30   # the rest stay locally conserved

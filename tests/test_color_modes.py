@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from color_modes import (get_mode, all_modes, COLOR_MODES, plddt_color,
-                         deviation_color)
+                         deviation_color, lddt_disruption_color)
 
 
 class TestDeviationColor:
@@ -44,6 +44,29 @@ class TestDeviationColor:
 
     def test_default_floor_zero_still_gates_zero_shift(self):
         assert deviation_color(0.0, 0.0) is None           # no motion → neutral
+
+
+class TestLddtDisruptionColor:
+    """Superposition-free Cα-lDDT disruption ramp — INVERTED vs deviation (low lDDT = warm),
+    floor-gated by the cross-seed lDDT noise floor (one source for panel + 3D push)."""
+
+    def test_none_is_no_data(self):
+        assert lddt_disruption_color(None, 0.9) is None
+
+    def test_at_or_above_floor_is_neutral(self):
+        assert lddt_disruption_color(0.95, 0.9) is None    # ≥ floor → conserved (neutral)
+        assert lddt_disruption_color(0.90, 0.9) is None    # exactly on floor → neutral
+
+    def test_below_floor_warm_by_severity(self):
+        assert lddt_disruption_color(0.85, 0.9) == "#8fd0e8"   # 0.80–0.90 → cyan (mild)
+        assert lddt_disruption_color(0.70, 0.9) == "#ffd166"   # 0.65–0.80 → yellow
+        assert lddt_disruption_color(0.60, 0.9) == "#f3953b"   # 0.50–0.65 → orange
+        assert lddt_disruption_color(0.30, 0.9) == "#e23b3b"   # < 0.50 → severe (red)
+
+    def test_lower_floor_suppresses_flexible_region(self):
+        # a flexible WT region with a LOW cross-seed floor only paints when even more disrupted
+        assert lddt_disruption_color(0.70, 0.6) is None        # 0.70 ≥ 0.6 floor → neutral
+        assert lddt_disruption_color(0.50, 0.6) == "#f3953b"   # below the 0.6 floor → shown
 
 
 class TestPlddtColor:
