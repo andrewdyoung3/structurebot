@@ -225,22 +225,34 @@ def lddt_disruption_color(lddt: Optional[float],
     return _LDDT_BANDS[-1][1]
 
 
+# "diverges from the template but WITHIN the WT reference's own cross-seed noise" — a muted slate
+# grey, distinct from the white baseline (confident tight fit) AND the cool→hot disruption ramp.
+_UNCERTAIN_HEX = "#8a8f99"
+
+
 def combined_disruption_color(ddm: Optional[float], floor_ddm: float,
-                              lddt: Optional[float], floor_lddt: float) -> Optional[str]:
-    """The PAINTED 'deviation vs WT' colour. A residue is disrupted if it exceeds the WT's own
-    cross-seed noise in EITHER global position (dRMSD > floor_ddm) OR local structure
-    (lDDT < floor_lddt) — so a loop that is genuinely melted/displaced but whose bulk movement
-    falls within a very floppy WT loop's positional noise (high dRMSD floor) is still shown via
-    its lDDT drop, and vice-versa. Colour MAGNITUDE is the dRMSD displacement (one Å ramp); a
-    residue shown only by lDDT still colours by its dRMSD so the scale stays one thing. None when
-    within noise on BOTH. The single source for the panel cells and the 3D push."""
-    by_ddm  = ddm  is not None and ddm  > floor_ddm
-    by_lddt = lddt is not None and lddt < floor_lddt
-    if not (by_ddm or by_lddt):
-        return None
-    if ddm is not None:
-        return ddm_color(ddm, 0.0) or "#5b8def"      # magnitude by displacement (gate already passed)
-    return lddt_disruption_color(lddt, 1.0)          # dRMSD missing → fall back to lDDT severity
+                              lddt: Optional[float], floor_lddt: float,
+                              min_a: float = 0.5) -> Optional[str]:
+    """The PAINTED 'deviation vs WT' colour — a 3-TIER encoding of magnitude × confidence:
+
+      • CONFIDENT disruption — beyond the WT's cross-seed noise in EITHER global position
+        (dRMSD > floor_ddm) OR local structure (lDDT < floor_lddt) → the cool→hot ramp by dRMSD
+        magnitude (a residue shown only via lDDT still colours by its displacement so the scale
+        stays one thing). This is a real variant-driven change.
+      • DISTINCT-BUT-UNCERTAIN — diverges from the template (dRMSD > min_a) but within that noise
+        → a muted GREY: 'the variant differs here, but the WT reference is itself this variable —
+        not a confident effect.'
+      • ALIGNED — dRMSD ≤ min_a → None (white baseline: a tight, confident fit / rigid region).
+
+    The single source for the panel cells and the 3D push."""
+    confident = (ddm is not None and ddm > floor_ddm) or (lddt is not None and lddt < floor_lddt)
+    if confident:
+        if ddm is not None:
+            return ddm_color(ddm, 0.0) or "#5b8def"  # magnitude by displacement (gate passed)
+        return lddt_disruption_color(lddt, 1.0)      # dRMSD missing → lDDT severity
+    if ddm is not None and ddm > min_a:
+        return _UNCERTAIN_HEX                         # distinct from template, within WT noise
+    return None                                      # aligned / rigid → neutral (white)
 
 
 @dataclass(frozen=True)

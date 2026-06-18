@@ -73,21 +73,25 @@ class TestDdmColor:
 
 
 class TestCombinedDisruptionColor:
-    """The PAINTED gate: disrupted if dRMSD OR lDDT exceeds the WT's cross-seed noise; magnitude
-    by dRMSD displacement. Catches a melted/displaced loop whose bulk move is within a floppy
-    WT loop's positional floor but whose lDDT has dropped (the GIG/Ile case)."""
+    """The PAINTED 3-tier gate: CONFIDENT (warm ramp) if dRMSD OR lDDT beats the WT cross-seed
+    noise; DISTINCT-BUT-UNCERTAIN (grey) if it diverges but within that noise; ALIGNED (white)
+    otherwise. Encodes magnitude × confidence so a floppy-WT loop reads grey, not white/warm."""
 
-    def test_neutral_when_within_both_floors(self):
-        assert combined_disruption_color(0.3, 0.5, 0.99, 0.9) is None
+    def test_aligned_is_neutral(self):
+        assert combined_disruption_color(0.3, 0.5, 0.99, 0.9) is None     # ≤ min_a → white
 
-    def test_shown_by_ddm_alone(self):
+    def test_confident_by_ddm(self):
         # dRMSD clears its floor; lDDT fine → coloured by dRMSD magnitude (5–8 → orange)
         assert combined_disruption_color(6.0, 0.5, 0.95, 0.9) == "#f3953b"
 
-    def test_shown_by_lddt_when_ddm_floor_too_high(self):
-        # the GIG/Ile case: dRMSD 6.9 GATED by a floppy-WT floor 7.7, but lDDT 0.47 < floor 0.9
-        # → still shown, coloured by the dRMSD displacement magnitude (6.9 → orange)
+    def test_confident_by_lddt_when_ddm_floor_too_high(self):
+        # dRMSD 6.9 GATED by a floppy-WT floor 7.7, but lDDT 0.47 < floor 0.9 → confident, warm
         assert combined_disruption_color(6.9, 7.7, 0.47, 0.9) == "#f3953b"
+
+    def test_uncertain_is_grey(self):
+        # the yellow/Ile loop: diverges (dRMSD 6.9 > 0.5) but within the WT noise on BOTH
+        # (≤ floor 7.7, lDDT 0.60 ≥ floor 0.50) → muted grey, NOT white and NOT warm
+        assert combined_disruption_color(6.9, 7.7, 0.60, 0.50) == "#8a8f99"
 
     def test_lddt_only_no_ddm_falls_back_to_lddt_ramp(self):
         assert combined_disruption_color(None, 0.5, 0.30, 0.9) == "#e23b3b"

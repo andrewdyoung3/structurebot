@@ -1147,10 +1147,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         df = (block.get("floor_ddm") or {}).get(str(ref), _DDM_FLOOR_MIN_A)
         lv = (block.get("lddt") or {}).get(str(ref))
         lf = (block.get("floor_lddt") or {}).get(str(ref), _LDDT_NEUTRAL_CAP)
-        shown = (dv > df) or (lv is not None and lv < lf)
+        confident = (dv > df) or (lv is not None and lv < lf)
+        verdict = ("CONFIDENT disruption" if confident
+                   else "distinct but within WT noise (grey)" if dv > _DDM_FLOOR_MIN_A
+                   else "aligned")
         s = (f"ref{ref}: dRMSD {dv:.1f}/floor {df:.1f} Å"
              + (f", lDDT {lv:.2f}/floor {lf:.2f}" if lv is not None else "")
-             + f" → {'shown' if shown else 'neutral'}")
+             + f" → {verdict}")
         return s
 
     def _select_variant_row(self, tab: _ChainDesignTab, row_id) -> None:

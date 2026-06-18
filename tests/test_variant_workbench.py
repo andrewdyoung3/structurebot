@@ -971,11 +971,11 @@ class TestStage4b:
             variant_mid="2", ddm={"1": 0.3, "2": 6.0, "3": 0.4},
             floor_ddm={"1": 0.5, "2": 0.5, "3": 0.5}))
         p._mode_key = _DEV
-        # col 1 (variant resnum 2) → ref 2, dRMSD 6.0 > floor 0.5 → shown
+        # col 1 (variant resnum 2) → ref 2, dRMSD 6.0 > floor 0.5 → CONFIDENT disruption
         r = p._residue_deviation_readout(tab, 1)
-        assert "dRMSD 6.0/floor 0.5" in r and "shown" in r
-        # col 0 (variant resnum 1) → ref 1, dRMSD 0.3 ≤ floor 0.5 AND lDDT 0.99 ≥ cap → neutral
-        assert "neutral" in p._residue_deviation_readout(tab, 0)
+        assert "dRMSD 6.0/floor 0.5" in r and "CONFIDENT" in r
+        # col 0 (variant resnum 1) → ref 1, dRMSD 0.3 ≤ 0.5 AND lDDT 0.99 ≥ cap → aligned
+        assert "aligned" in p._residue_deviation_readout(tab, 0)
         # not in deviation mode → empty
         p._mode_key = "none"
         assert p._residue_deviation_readout(tab, 1) == ""
