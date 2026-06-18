@@ -112,18 +112,31 @@ class TestRunVariantDeviation:
         assert d["deviation"].get("20", 0.0) < 0.1              # not the one-off-shifted bug
         assert "15" not in d["deviation"]                        # the deleted position is absent
 
-    def test_fold_column_map_missing_entry_fails_loud(self):
-        # a variant-fold residue absent from a non-identity map → REFUSE (never mis-pair).
-        ref = _rigid(30)
-        var = _rigid(30)
+    def test_fold_column_map_drops_inserted_residues(self):
+        # Stage B: a variant-fold residue ABSENT from the map is an INSERTED residue (no WT
+        # counterpart — build_fold_column_map omits it by design). It is DROPPED from the
+        # deviation (excluded, rendered neutral), NOT failed-loud; the shared residues still
+        # pair correctly. Here fold res 16 is the insertion: cols 1..15 are identity, then the
+        # insertion at 16, then 17..30 map to ref 16..29.
+        ref = _rigid(30)                                        # WT reference: 29 residues used
+        fold_map = {j: j for j in range(1, 16)}                 # 1..15 identity
+        fold_map.update({j: j - 1 for j in range(17, 31)})      # 17->16 … 30->29  (16 = insertion)
+        var = {j: ref[fold_map[j]].copy() for j in fold_map}    # overlay shared on their ref pair
+        var[16] = ref[1] + np.array([50.0, 0.0, 0.0])          # the inserted residue, way off-axis
+        var[20] = var[20] + np.array([2.0, 0.0, 0.0])          # displace a SHARED residue (→ ref 19)
         r = _router()
         r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
         out = r._run_variant_deviation({
             "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
             "variant_chain": "A", "multichain": False,
             "wt_ref": {"model_id": "7", "floor": {}, "path": "/tmp/r.pdb"},
-            "fold_column_map": {i: i for i in range(1, 30)}})    # omits resnum 30
-        assert out.success is False and "missing" in out.error.lower()
+            "fold_column_map": fold_map})                        # omits fold resnum 16 (the insert)
+        assert out.success
+        d = out.data
+        assert d["anchor_residual_rmsd"] < 0.05                  # inserted res dropped → clean fit
+        assert d["deviation"]["19"] > 1.5                        # shared residue pairs at ref 19
+        # the inserted residue (way off-axis) was DROPPED — never appears at any ref resnum
+        assert all(dv < 1.0 for k, dv in d["deviation"].items() if k != "19")
 
     def test_missing_variant_model_errors(self):
         out = _router()._run_variant_deviation({"engine": "esmfold"})

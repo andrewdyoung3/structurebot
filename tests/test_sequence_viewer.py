@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sequence_viewer import (
     build_numbering_header_content,
+    build_numbering_header_with_insertions,
     lean_layout_commands,
     default_presentation_commands,
     apply_lean_layout,
@@ -84,6 +85,32 @@ def test_numbering_interval_and_first_last() -> None:
     _assert(60 in _ruler_labels(cg) and 51 not in _ruler_labels(cg),
             "gap-aware (real resnum 60, not naive 51)", f"got {_ruler_labels(cg)}")
     _assert(build_numbering_header_content([], 10) == "", "empty chain -> empty ruler")
+
+
+def test_numbering_with_insertions() -> None:
+    print("\n=== insertion-aware ruler ===")
+    # MKVLW with 2 inserted columns after resnum 2 (52A/52B-style codes, here 2A/2B):
+    # cols → [1, 2, ins, ins, 3, 4, 5]
+    cols = [1, 2, None, None, 3, 4, 5]
+    r = build_numbering_header_with_insertions(cols, interval=1)
+    _assert(len(r) == len(cols), "one column per axis column (length preserved)")
+    _assert(r[2] == "A" and r[3] == "B", "contiguous inserted columns get codes A,B",
+            f"got {r!r}")
+    _assert(r[0] == "1" and r[4] == "3", "real columns keep their resnum digits",
+            f"got {r!r}")
+    # gap-free axis must be byte-identical to the plain builder (additive guarantee)
+    plain = build_numbering_header_content(list(range(1, 26)), 10)
+    same = build_numbering_header_with_insertions(list(range(1, 26)), 10)
+    _assert(plain == same, "no-gap axis == plain ruler (additive)", f"{plain!r} vs {same!r}")
+    # leading insertion (before residue 1) still gets a code, not a blank
+    lead = build_numbering_header_with_insertions([None, 1, 2, 3], interval=1)
+    _assert(lead[0] == "A", "leading insertion column marked", f"got {lead!r}")
+    # a fresh run of codes restarts at A after a real residue
+    multi = build_numbering_header_with_insertions([1, None, 2, None, 3], interval=1)
+    _assert(multi[1] == "A" and multi[3] == "A", "each insertion run restarts at A",
+            f"got {multi!r}")
+    assert r[2] == "A" and r[3] == "B" and r[0] == "1" and r[4] == "3"
+    assert plain == same and lead[0] == "A" and multi[1] == "A" and multi[3] == "A"
 
 
 # -- layout + presentation command lists -----------------------------------------

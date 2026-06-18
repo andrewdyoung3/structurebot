@@ -5598,18 +5598,16 @@ class ToolRouter:
         # so a deletion's downstream residues pair to the correct template position (not the
         # one-off-shifted mis-pair resnum==resnum would produce). An identity map
         # (substitution-only) is a no-op → byte-identical; an ABSENT map → current behavior.
-        # FAIL LOUD if the fold carries a residue the map doesn't cover (never mis-pair).
+        # A variant-fold residue NOT in the map is an INSERTED residue (a variant residue at a
+        # template-gap column — build_fold_column_map omits it by design, no WT counterpart);
+        # it is DROPPED so the inserted residue is excluded from the deviation (rendered
+        # neutral), while the shared residues still pair correctly across the insertion. (For
+        # substitution/deletion variants the map covers every fold residue → nothing dropped →
+        # byte-identical.) The anchor-residual RMSD (≈0) is the readback quality check.
         fold_map = inputs.get("fold_column_map")
         if fold_map and not multichain:
             fold_map = {int(k): int(v) for k, v in fold_map.items()}
-            missing = [j for j in var_ca if j not in fold_map]
-            if missing:
-                return ToolStepResult(
-                    tool="variant_deviation", success=False,
-                    error=(f"Fold-column map is missing {len(missing)} variant-fold "
-                           f"residue(s) (e.g. {sorted(missing)[:5]}) — sequence/fold length "
-                           "mismatch; deviation not computed (refusing to mis-pair)."))
-            var_ca = {fold_map[j]: xyz for j, xyz in var_ca.items()}
+            var_ca = {fold_map[j]: xyz for j, xyz in var_ca.items() if j in fold_map}
         common = sorted(set(ref_ca) & set(var_ca))
         if len(common) < 3:
             return ToolStepResult(

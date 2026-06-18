@@ -1185,3 +1185,155 @@ class TestIndelDeletionPanel:
         p._do_delete_residue(tab, vid, 2)
         p._on_deviation_clicked()
         assert len(emitted) == 1 and "fold_column_map" in emitted[0]["tool_inputs"]
+
+
+class TestIndelInsertionModel:
+    """Stage B pure model: variant residue INSERTION (new shared columns + IndelEvent),
+    remove-insertion, the fold-column map (inserts omitted), and persistence. No Qt."""
+
+    def _design(self, seq="MKVLW", n_var=1):
+        cd = ChainDesign(group_key="g", rep_model="1", rep_chain="A",
+                         members=[("1", "A")],
+                         template_cells=[AlignedCell(col=i, resnum=i + 1, aa=a)
+                                         for i, a in enumerate(seq)])
+        for i in range(n_var):
+            cd.add_variant(f"V{i + 1}")
+        return cd
+
+    def test_insert_grows_axis_and_records_event(self):
+        cd = self._design()                               # MKVLW, resnums 1..5
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")          # insert GG after col 1 (resnum 2)
+        n = len(cd.template_cells)
+        assert n == 7                                      # 5 + 2 new columns
+        # template + sibling rows gap at the inserted columns 2,3
+        assert cd.template_cells[2].is_gap and cd.template_cells[3].is_gap
+        v = cd.get_variant(vid)
+        assert v.cells[2].aa == "G" and v.cells[2].resnum is None
+        assert v.cells[3].aa == "G" and v.cells[3].resnum is None
+        assert v.sequence == "MKGGVLW"                     # GG inserted after K
+        assert [e.kind for e in v.indels] == ["insertion"]
+        assert v.indels[0].col == 2 and v.indels[0].resnum == 2 and v.indels[0].residues == "GG"
+        # every cell re-indexed to its list position
+        assert all(c.col == i for i, c in enumerate(cd.template_cells))
+        assert all(c.col == i for i, c in enumerate(v.cells))
+
+    def test_independent_per_variant_blocks(self):
+        cd = self._design(n_var=2)                         # V1, V2
+        v1, v2 = cd.variants[0].id, cd.variants[1].id
+        cd.insert_variant_residues(v1, 1, "AA")            # V1 inserts at locus
+        cd.insert_variant_residues(v2, 1, "C")            # V2 inserts at the SAME locus
+        # blocks do NOT coalesce: 3 new columns total (2 for V1 + 1 for V2)
+        assert len(cd.template_cells) == 8
+        assert cd.get_variant(v1).sequence == "MKAAVLW"
+        assert cd.get_variant(v2).sequence == "MKCVLW"
+        # each variant gaps in the OTHER's inserted columns
+        ins_v1 = [c.col for c in cd.get_variant(v1).cells if c.aa == "A"]
+        ins_v2 = [c.col for c in cd.get_variant(v2).cells if c.aa == "C"]
+        assert set(ins_v1).isdisjoint(ins_v2)
+
+    def test_insert_before_first_residue(self):
+        cd = self._design()
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, -1, "M")          # leading insertion (after_col=-1)
+        assert cd.template_cells[0].is_gap
+        assert cd.get_variant(vid).sequence == "MMKVLW"
+        assert cd.get_variant(vid).indels[0].resnum is None   # no preceding template resnum
+
+    def test_remove_insertion_restores_axis(self):
+        cd = self._design()
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")
+        cd.remove_variant_insertion(vid, 2)               # remove via any column of the block
+        assert len(cd.template_cells) == 5
+        v = cd.get_variant(vid)
+        assert v.sequence == "MKVLW" and v.indels == []
+        assert all(c.col == i for i, c in enumerate(cd.template_cells))
+
+    def test_insert_guards(self):
+        import pytest as _pt
+        cd = self._design()
+        vid = cd.variants[0].id
+        with _pt.raises(KeyError):
+            cd.insert_variant_residues("nope", 0, "G")
+        with _pt.raises(ValueError):                       # non-standard aa
+            cd.insert_variant_residues(vid, 0, "GXG")
+        with _pt.raises(ValueError):                       # position out of range
+            cd.insert_variant_residues(vid, 99, "G")
+        cd.insert_variant_residues(vid, 1, "GG")
+        with _pt.raises(ValueError):                       # not an inserted column for this variant
+            cd.remove_variant_insertion(vid, 0)
+
+    def test_to_from_dict_round_trips_insertion(self):
+        from variant_model import DesignSession
+        cd = self._design()
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")
+        sess = DesignSession(model_id="1", chains={"k": cd})
+        back = DesignSession.from_dict(sess.to_dict())
+        v = back.chains["k"].get_variant(vid)
+        assert v.sequence == "MKGGVLW"
+        assert [e.kind for e in v.indels] == ["insertion"] and v.indels[0].residues == "GG"
+
+    def test_fold_column_map_omits_inserted_residues(self):
+        cd = self._design()                               # MKVLW, resnums 1..5
+        vid = cd.variants[0].id
+        cd.insert_variant_residues(vid, 1, "GG")          # variant fold has 7 residues
+        m = build_fold_column_map(cd.get_variant(vid), cd.template_cells)
+        # variant-fold residues 1,2 → ref 1,2; the inserts (fold 3,4) ABSENT; 5,6,7 → ref 3,4,5
+        assert m == {1: 1, 2: 2, 5: 3, 6: 4, 7: 5}
+        assert 3 not in m and 4 not in m                  # inserted residues omitted by design
+
+
+class TestIndelInsertionPanel:
+    """Stage B panel: the cell-menu insert/remove handlers, the inserted-column click cue, and
+    the deviation spec carrying the insertion-aware fold-column map."""
+
+    def _panel(self):
+        p, _ = _panel([_chainseq("1", "A", "MKVLW"), _chainseq("1", "B", "MKVLW")],
+                      session=MagicMock())
+        p.load_model("1")
+        p._add_variant()
+        return p, p._cur_tab(), p._cur_tab().design.variants[-1].id
+
+    def test_insert_then_remove_via_handlers(self, _app):
+        p, tab, vid = self._panel()
+        tab.design.insert_variant_residues(vid, 1, "GG")     # exercise handler-free path
+        assert tab.design.get_variant(vid).sequence == "MKGGVLW"
+        p._do_remove_insertion(tab, vid, 2)
+        assert tab.design.get_variant(vid).sequence == "MKVLW"
+
+    def test_insert_handler_via_dialog(self, _app, monkeypatch):
+        from PySide6 import QtWidgets
+        p, tab, vid = self._panel()
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("gg", True)))
+        p._do_insert_residues(tab, vid, 1)                 # dialog returns "gg" → upper-cased
+        assert tab.design.get_variant(vid).sequence == "MKGGVLW"
+
+    def test_insert_dialog_cancel_is_noop(self, _app, monkeypatch):
+        from PySide6 import QtWidgets
+        p, tab, vid = self._panel()
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("", False)))
+        p._do_insert_residues(tab, vid, 1)
+        assert tab.design.get_variant(vid).sequence == "MKVLW"
+
+    def test_inserted_column_click_cue(self, _app):
+        p, tab, vid = self._panel()
+        tab.design.insert_variant_residues(vid, 1, "GG")
+        tab.rebuild()
+        p._on_cell(tab, vid, 2)                            # click an inserted column
+        assert "Inserted" in p._status.text() and tab.active_row_id == vid
+
+    def test_deviation_spec_omits_inserted_residues(self, _app):
+        p, tab, vid = self._panel()
+        p.apply_fold_result(vid, {"tool_step_results": [{"tool": "esmfold", "data": {
+            "engine": "esmfold", "new_model_id": "2", "reference_model_id": "1",
+            "mean_plddt": 80.0, "length": 5, "source": "local_venv312",
+            "plddt": {1: 90.0}}}]})
+        tab.set_active_row(vid)
+        tab.design.insert_variant_residues(vid, 1, "GG")     # insertion → map omits the inserts
+        spec = p.deviation_launch_spec()
+        m = spec["tool_inputs"]["fold_column_map"]
+        assert m == {1: 1, 2: 2, 5: 3, 6: 4, 7: 5}

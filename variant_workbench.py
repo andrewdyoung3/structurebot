@@ -33,7 +33,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from color_modes import (all_modes, ddg_color, deviation_color, get_mode,
                          plddt_color)
-from seq_library import build_numbering_header_content
+from seq_library import (build_numbering_header_content,
+                         build_numbering_header_with_insertions)
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
                            build_model_color_commands, build_fold_column_map,
@@ -152,9 +153,10 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         design = self.design
         n = len(design.template_cells)
 
-        ruler = build_numbering_header_content(
-            [c.resnum for c in design.template_cells if c.resnum is not None], interval=10)
-        ruler = (ruler + " " * n)[:n]               # guard length (gap cells)
+        # Per-column ruler: real columns numbered, INSERTED (template-gap) columns get PDB
+        # insertion-code letters (52A, 52B…). Length == n by construction (one entry/column).
+        ruler = build_numbering_header_with_insertions(
+            [c.resnum for c in design.template_cells], interval=10)
         consensus, conservation = column_tracks(design)
         cons_pct = ["·▁▂▃▄▅▆▇█"[min(8, int(c * 8))] for c in conservation]
 
@@ -722,22 +724,34 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                       f"3D recolored by {vid} (preview on the shared backbone).")
 
     def _show_cell_menu(self, tab: _ChainDesignTab, vid: str, col: int, global_pos) -> None:
-        """Right-click cell menu for a VARIANT residue: substitute (any of the 20 aa) or
-        revert to the WT residue. The SAME `edit_variant` substitution as the toolbar Apply —
-        just reachable directly on the residue. (Deletion/indels are a later increment: they
-        shift residue numbering, which the resnum-keyed S4c deviation can't absorb yet.)"""
+        """Right-click cell menu for a VARIANT residue: substitute (any of the 20 aa), revert
+        to the WT residue, delete the residue, or insert residues after it. The substitution is
+        the SAME `edit_variant` as the toolbar Apply, just reachable on the residue. An INSERTED
+        column (template gap + this-variant residue) offers only Remove insertion; a DELETED cell
+        (template residue + this-variant gap) offers only Restore."""
         v = tab.design.get_variant(vid)
         if v is None or not (0 <= col < len(tab.design.template_cells)):
             return
         tab.set_active_row(vid)
         self._edit_target = (vid, col)
         resnum = tab.design.resnum_for_col(col)
+        tmpl_gap = tab.design.template_cells[col].is_gap
         wt = tab.design.template_cells[col].aa
         cell = v.cells[col] if col < len(v.cells) else None
         cur = cell.aa if cell is not None else None
         is_gap = cell is not None and cell.is_gap
 
         menu = QtWidgets.QMenu(self)
+        if tmpl_gap:                                     # an INSERTED column (no WT counterpart)
+            if is_gap or cell is None:                   # this variant doesn't share the insertion
+                return
+            header = menu.addAction(f"{vid} · inserted {cur} (no WT — column added by this variant)")
+            header.setEnabled(False)
+            menu.addSeparator()
+            menu.addAction("Remove insertion",
+                           lambda: self._do_remove_insertion(tab, vid, col))
+            menu.exec(global_pos)
+            return
         header = menu.addAction(f"{vid} · residue {resnum} "
                                 + ("(DELETED)" if is_gap else f"(WT {wt}, now {cur})"))
         header.setEnabled(False)
@@ -759,6 +773,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         menu.addSeparator()
         menu.addAction("Delete residue",
                        lambda: self._do_delete_residue(tab, vid, col))
+        menu.addAction("Insert residues after…",
+                       lambda: self._do_insert_residues(tab, vid, col))
         menu.exec(global_pos)
 
     def _do_delete_residue(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
@@ -780,6 +796,38 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         resnum = tab.design.resnum_for_col(col)
         self._after_variant_edit(tab, vid, f"{vid}: residue {resnum} restored to WT.")
+
+    def _do_insert_residues(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        """Insert one or more residues into THIS variant after the clicked column. Adds new
+        columns owned by this variant; the template and every sibling row gap there (PDB
+        insertion-code numbering, e.g. 52A/52B). Inserted residues have no WT counterpart →
+        they are excluded from the deviation, not on the crystal until the variant is folded."""
+        resnum = tab.design.resnum_for_col(col)
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Insert residues",
+            f"Residues to insert after residue {resnum} (1-letter, e.g. GGSGG):")
+        if not ok:
+            return
+        seq = "".join(text.split()).upper()
+        if not seq:
+            self._status.setText("Insert cancelled (no residues entered).")
+            return
+        try:
+            tab.design.insert_variant_residues(vid, col, seq)
+        except Exception as exc:
+            self._status.setText(f"Insert failed: {type(exc).__name__}: {exc}")
+            return
+        self._after_variant_edit(
+            tab, vid, f"{vid}: inserted {seq} after residue {resnum} ({len(seq)} new column(s); "
+                      f"template + siblings gap there). Re-fold the variant to build them.")
+
+    def _do_remove_insertion(self, tab: _ChainDesignTab, vid: str, col: int) -> None:
+        try:
+            tab.design.remove_variant_insertion(vid, col)
+        except Exception as exc:
+            self._status.setText(f"Remove insertion failed: {type(exc).__name__}: {exc}")
+            return
+        self._after_variant_edit(tab, vid, f"{vid}: insertion removed (axis restored).")
 
     def _on_row_menu(self, tab: _ChainDesignTab, vid: str, global_pos) -> None:
         """Right-click on a VARIANT row header → a 'Delete variant' menu. Row-level removal
@@ -1024,10 +1072,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.set_active_row(row_id)
             self._edit_target = (row_id, col)
             resnum = tab.design.resnum_for_col(col)
-            wt = tab.design.template_cells[col].aa if 0 <= col < len(tab.design.template_cells) else "?"
+            in_range = 0 <= col < len(tab.design.template_cells)
+            wt = tab.design.template_cells[col].aa if in_range else "?"
+            tmpl_gap = in_range and tab.design.template_cells[col].is_gap
             vv = tab.design.get_variant(row_id)
             deleted = vv is not None and col < len(vv.cells) and vv.cells[col].is_gap
-            if deleted:                                     # decision #3: keep selecting the
+            if tmpl_gap and not deleted:                    # decision #3: an INSERTED residue is
+                cur = vv.cells[col].aa if vv and col < len(vv.cells) else "?"
+                self._status.setText(                       # not on the crystal — nothing painted
+                    f"Inserted {cur} in {row_id} — not on the crystal backbone until the variant "
+                    f"is folded (no WT counterpart; excluded from deviation). Right-click → Remove "
+                    f"insertion to undo.")
+            elif deleted:                                   # decision #3: keep selecting the
                 self._status.setText(                       # crystal residue + surface the cue
                     f"Residue {resnum} — DELETED in {row_id} (the crystal residue is selected; "
                     f"right-click the gap → Restore to undo).")
