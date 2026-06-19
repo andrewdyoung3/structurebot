@@ -38,7 +38,8 @@ from seq_library import (build_numbering_header_content,
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            build_color_commands, build_color_commands_by_resnum,
                            build_model_color_commands, build_fold_column_map,
-                           build_design_session, column_tracks, DesignSession,
+                           build_design_session, build_design_session_from_sequence,
+                           column_tracks, DesignSession,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
                            suggestion_color)
@@ -456,6 +457,45 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         self.cellMenuRequested.emit(row_id, int(gcol), block.viewport().mapToGlobal(pos))
 
 
+class _AddSequenceDialog(QtWidgets.QDialog):
+    """De-novo construct input: a name + a typed/pasted sequence (standard-AA validated on
+    accept). Single sequence for Stage 1; the construct model is a chain LIST so hetero input
+    drops in later. Pure Qt — no ChimeraX."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add sequence (de-novo construct)")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(QtWidgets.QLabel("Name:"))
+        self._name = QtWidgets.QLineEdit()
+        self._name.setPlaceholderText("e.g. my_binder")
+        lay.addWidget(self._name)
+        lay.addWidget(QtWidgets.QLabel("Sequence (1-letter; spaces/newlines ignored):"))
+        self._seq = QtWidgets.QPlainTextEdit()
+        self._seq.setPlaceholderText("MKVLW…")
+        lay.addWidget(self._seq)
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_ok)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _on_ok(self) -> None:
+        seq = "".join(self.result_sequence().split()).upper()
+        if not seq or any(a not in _AA_ORDER for a in seq):
+            QtWidgets.QMessageBox.warning(self, "Invalid sequence",
+                                          "Enter a non-empty standard amino-acid sequence "
+                                          "(the 20 one-letter codes).")
+            return
+        self.accept()
+
+    def result_name(self) -> str:
+        return self._name.text().strip() or "construct"
+
+    def result_sequence(self) -> str:
+        return self._seq.toPlainText()
+
+
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 
 class VariantWorkbenchPanel(QtWidgets.QWidget):
@@ -504,6 +544,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._add_btn = QtWidgets.QPushButton("+ Add variant")
         self._add_btn.clicked.connect(self._add_variant)
         bar.addWidget(self._add_btn)
+        # DE-NOVO: seed a workbench design from a typed sequence — no crystal. Nothing renders
+        # until the construct is folded (Fold ▾ → Fold construct).
+        self._add_seq_btn = QtWidgets.QPushButton("Add sequence")
+        self._add_seq_btn.setToolTip("Start a de-novo construct from a typed/pasted sequence "
+                                     "(no loaded structure). Fold it as a mono/di/tri/tetramer.")
+        self._add_seq_btn.clicked.connect(self._on_add_sequence)
+        bar.addWidget(self._add_seq_btn)
         bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Substitute →"))
         self._aa_combo = QtWidgets.QComboBox()
@@ -575,6 +622,21 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._fold_btn.setToolTip("Fold the ACTIVE variant (you pick the engine; ESMFold runs "
                                   "LOCAL-ONLY) → a pLDDT-coloured model overlaid on the template.")
         self._fold_btn.triggered.connect(self._on_fold_clicked)
+        # DE-NOVO construct fold: fold T (the typed sequence) as a mono/di/tri/tetramer. No
+        # reference (nothing loaded) → matchmaker is EXPLICITLY skipped. ESMFold is monomer-only
+        # (N>1 disabled); Boltz takes N. Active only for a sequence-seeded design.
+        self._construct_fold_menu = fold_menu.addMenu("Fold construct (de novo)")
+        self._construct_fold_acts = []
+        _NMER = [(1, "monomer"), (2, "dimer"), (3, "trimer"), (4, "tetramer")]
+        for _eng in ("esmfold", "boltz"):
+            _sub = self._construct_fold_menu.addMenu(_eng)
+            for _n, _lbl in _NMER:
+                _a = _sub.addAction(f"{_lbl} (N={_n})")
+                if _eng == "esmfold" and _n > 1:
+                    _a.setEnabled(False)                  # ESMFold is monomer-only
+                _a.triggered.connect(
+                    lambda _checked=False, e=_eng, k=_n: self._on_construct_fold(e, k))
+                self._construct_fold_acts.append(_a)
         self._fold_vis_btn = fold_menu.addAction("Hide folds")
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
@@ -641,6 +703,27 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         reading from the ORIGINAL (empty) session, so a restored design never rehydrates and new
         edits never persist into the restored file."""
         self._session = session
+
+    def rehydrate_denovo(self, design_dict: Dict[str, Any]) -> None:
+        """DE-NOVO restore (no crystal): rehydrate the construct DIRECTLY from persisted data —
+        NOT via controller.load_model (the synthetic id isn't in ChimeraX, and the crystal
+        rehydrate's chain-set guard would fail against an empty fresh build). Re-displays the
+        construct fold if one was persisted: members already point at the fold model, which
+        survives the app restart in the still-open ChimeraX, so pLDDT recolours it with NO
+        re-fold. Reuses the session-restore re-display contract."""
+        self._design = DesignSession.from_dict(design_dict)
+        self._edit_target = None
+        self._scan_cols.clear()
+        self._update_scan_label()
+        self._render()
+        self._persist()
+        cd = next(iter(self._design.chains.values()), None)
+        if cd is not None and (cd.template_fold or {}).get("model_id"):
+            self._select_result_mode(_RESULT_PLDDT_MODE)
+            tab = self._cur_tab()
+            if tab is not None:
+                self._apply_color_to(tab)
+                self._push_3d_color(tab)      # recolour the still-open fold (no re-fold)
 
     # ── load + render ─────────────────────────────────────────────────────────────
     def load_model(self, model_id: str) -> None:
@@ -713,6 +796,122 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._push_3d_color(tab)               # active row changed → 3D follows (= T until edited)
         self._persist()
         self._status.setText(f"Added variant {vid} (aligned copy of T) — now the active row.")
+
+    # ── DE-NOVO "Add sequence" construct ─────────────────────────────────────────────
+    def _on_add_sequence(self) -> None:
+        """Dialog → name + sequence → seed a de-novo construct (no crystal). Single sequence
+        for now; the chain-list model leaves the seam for hetero input later."""
+        dlg = _AddSequenceDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        name, seq = dlg.result_name(), dlg.result_sequence()
+        try:
+            self._add_sequence_construct(name, seq)
+        except Exception as exc:
+            self._status.setText(f"Add sequence failed: {type(exc).__name__}: {exc}")
+
+    def _add_sequence_construct(self, name: str, sequence: str) -> None:
+        """Core (testable, no dialog): build the de-novo DesignSession from one typed sequence,
+        make it the active design, render the grid, persist. ChimeraX is untouched — nothing
+        renders until the construct is folded."""
+        design = build_design_session_from_sequence(name, [(sequence, 1)])
+        self._design = design
+        self._edit_target = None
+        self._scan_cols.clear()
+        self._update_scan_label()
+        self._render()
+        self._persist()
+        n = len(next(iter(design.chains.values())).template_cells)
+        self._status.setText(
+            f"Construct '{name}' added ({n} aa, de novo — no structure). "
+            f"Fold ▾ → Fold construct to build a mono/di/tri/tetramer; nothing renders until then.")
+
+    def construct_fold_launch_spec(self, engine: str, n_copies: int = 1) -> Optional[dict]:
+        """Deterministic fold spec for the DE-NOVO construct: fold T (the typed sequence) as an
+        N-mer (N identical chains synthesized from the one sequence), LOCAL-ONLY, with EXPLICIT
+        no-reference (the construct has no crystal — matchmaker is skipped, never falling back to
+        a loaded primary). None unless the active design is sequence-seeded. ESMFold is monomer-
+        only (caller disables N>1)."""
+        tab = self._cur_tab()
+        if (tab is None or self._design is None or self._design.source != "sequence"):
+            return None
+        cd = tab.design
+        seq = "".join(c.aa for c in cd.template_cells if c.aa is not None)
+        n = max(1, int(n_copies))
+        # find this chain's unique key (re-point target on fold completion)
+        ukey = next((k for k, c in self._design.chains.items() if c is cd), None)
+        ti: Dict[str, object] = {
+            "model_id":    self._design.model_id,     # synthetic (stable persistence key)
+            "engine":      engine,
+            "open_model":  True,
+            "local_only":  True,
+            "no_reference": True,                      # EXPLICIT skip-matchmaker (no crystal)
+        }
+        if n > 1:
+            fold_chains = [chr(ord("A") + i) for i in range(n)]
+            ti["chains"] = [{"id": ch, "sequence": seq} for ch in fold_chains]
+            target = f"{n}-chain assembly"
+        else:
+            fold_chains = ["A"]
+            ti["sequence"] = seq
+            target = "monomer"
+        return {
+            "tool":         engine,
+            "tool_inputs":  ti,
+            "user_input":   f"[Workbench] fold construct {cd.group_key} — {engine} {target}, "
+                            f"LOCAL-ONLY, no reference",
+            "confidence":   "low",
+            "refresh":      "construct_fold",
+            "_denovo_chain_key":   ukey,
+            "_denovo_fold_chains": fold_chains,        # the synthesized fold chain ids → members
+        }
+
+    def _on_construct_fold(self, engine: str, n_copies: int) -> None:
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Fold construct is for de-novo sequences — use Add sequence first.")
+            return
+        spec = self.construct_fold_launch_spec(engine, n_copies)
+        if spec is not None:
+            self.launchRequested.emit(spec)
+
+    def apply_construct_fold_result(self, spec: dict, result: dict) -> None:
+        """Consume the construct (T) fold: store it on `cd.template_fold`, RE-POINT the design's
+        members/model ids from the synthetic id to the FOLD model's chains (so column-click
+        selection + sequence-property colour come alive on the fold; homo-N-mer → all N chains),
+        auto-surface pLDDT, re-render. The synthetic `model_id` (persistence key) is unchanged."""
+        data = self._fold_from_result(result)
+        if not data or not (data.get("new_model_id") or data.get("model_id")):
+            self._status.setText("Construct fold produced no model.")
+            return
+        if self._design is None:
+            return
+        ukey = spec.get("_denovo_chain_key")
+        cd = self._design.chains.get(ukey) if ukey else next(iter(self._design.chains.values()), None)
+        if cd is None:
+            return
+        fold_mid = str(data.get("new_model_id", data.get("model_id")))
+        fold_chains = spec.get("_denovo_fold_chains") or ["A"]
+        author_resnums = [c.resnum for c in cd.template_cells
+                          if not c.is_gap and c.resnum is not None]
+        cd.template_fold = fold_summary(data, author_resnums, reference_model_id=None)
+        # THE re-point: the construct's "structure" is now its fold — selection/property-colour
+        # target the fold model's chains (all N copies for an N-mer, mirroring the homo collapse).
+        cd.members   = [(fold_mid, ch) for ch in fold_chains]
+        cd.rep_model = fold_mid
+        cd.rep_chain = fold_chains[0]
+        self._persist()
+        tab = self._cur_tab()
+        if tab is not None:
+            self._select_result_mode(_RESULT_PLDDT_MODE)   # auto-surface pLDDT on the fold
+            tab.rebuild()
+            self._apply_color_to(tab)
+            self._push_3d_color(tab)
+        mp = cd.template_fold.get("mean_plddt")
+        mp_txt = f", mean pLDDT {mp:.1f}" if isinstance(mp, (int, float)) else ""
+        self._status.setText(
+            f"Construct folded ({data.get('engine')}, {len(fold_chains)}-chain): model "
+            f"#{fold_mid}{mp_txt}, pLDDT-coloured. Selection + colour now act on the fold; "
+            f"no matchmaker (de novo, no reference).")
 
     def _apply_substitution(self) -> None:
         tab = self._cur_tab()
@@ -1185,12 +1384,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 if d is not None}
 
     def _active_plddt_map(self, tab: _ChainDesignTab) -> Dict[int, float]:
-        """{author_resnum: pLDDT} for the active variant's fold result (empty if none/T)."""
+        """{author_resnum: pLDDT} for the active row's fold. A variant → its `results.fold`; the
+        TEMPLATE row of a DE-NOVO construct → the construct's own fold on `cd.template_fold`
+        (T has no Variant object). Empty when nothing folded."""
         v = tab.design.get_variant(tab.active_row_id)
-        if v is None or not v.results.fold:
-            return {}
-        return {int(rn): float(p) for rn, p in (v.results.fold.get("plddt") or {}).items()
-                if p is not None}
+        if v is not None and v.results.fold:
+            return {int(rn): float(p) for rn, p in (v.results.fold.get("plddt") or {}).items()
+                    if p is not None}
+        if v is None and tab.design.template_fold:          # T of a folded de-novo construct
+            return {int(rn): float(p) for rn, p in (tab.design.template_fold.get("plddt") or {}).items()
+                    if p is not None}
+        return {}
 
     def _active_deviation(self, tab: _ChainDesignTab) -> Optional[Dict[str, Any]]:
         """The active variant's stored deviation block (None if not folded/no deviation)."""
@@ -1874,9 +2078,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if self._design is None:
             return []
         cmds: List[str] = []
-        ref = str(self._design.model_id)                 # the WT reference (loaded crystal)
-        cmds.append(f"show #{ref} models" if self._show_ref_cb.isChecked()
-                    else f"hide #{ref} models")
+        # The "Template/Reference" toggle shows/hides the loaded crystal. A DE-NOVO construct has
+        # no crystal (model_id is synthetic) — emitting `show #denovo-…` would error in ChimeraX,
+        # so skip it; the construct's fold is its own displayed structure (members point at it).
+        if self._design.source != "sequence":
+            ref = str(self._design.model_id)
+            cmds.append(f"show #{ref} models" if self._show_ref_cb.isChecked()
+                        else f"hide #{ref} models")
         # WT REFERENCE FOLDS (the deviation's seed-pinned comparison basis) are a computation
         # artifact, NOT the displayed result — the deviation is read off the variant fold's
         # floor-gated colouring. _fold_wt_reference opens + overlays them; hide them here so
@@ -2002,6 +2210,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             # Numbering-agnostic, and the banding matches the panel's plddt_color (sync).
             v = tab.design.get_variant(tab.active_row_id)
             fold = v.results.fold if v is not None else None
+            if fold is None and v is None:               # T of a de-novo construct → its own fold
+                fold = tab.design.template_fold or None
             if not fold or not fold.get("model_id"):
                 return []                                # active row has no fold → nothing
             mid = fold["model_id"]

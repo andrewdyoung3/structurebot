@@ -477,8 +477,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.cancel_action.setEnabled(True)
         refresh = spec.get("refresh")
         variant_id = spec.get("_variant_id")
+        self._launch_spec = spec                  # available on the UI thread in _on_tool_done
         on_result = None
-        if refresh in ("stability", "fold", "deviation"):
+        if refresh in ("stability", "fold", "deviation", "construct_fold"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -518,6 +519,13 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_deviation_result(variant_id, result)
                 else:
                     self.presenter.dim("Deviation run cancelled — no result to attach.")
+            elif refresh == "construct_fold":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_construct_fold_result(spec, result)
+                else:
+                    self.presenter.dim("Construct fold cancelled — no model to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None
@@ -703,9 +711,16 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # Re-display any restored workbench designs now that we're on the UI thread. show_model →
         # workbench.load_model rehydrates the persisted variants/results (the models are still
         # open in the surviving ChimeraX). No-op when nothing was restored.
+        designs = getattr(self.session, "design_sessions", {}) or {}
         for mid in getattr(self, "_restore_mids", []) or []:
             try:
-                self.show_model(mid)
+                dd = designs.get(mid) or {}
+                if dd.get("source") == "sequence":
+                    # DE-NOVO construct: no crystal to re-open — rehydrate directly (the
+                    # synthetic id isn't in ChimeraX; the fold survives the app restart).
+                    self.workbench.rehydrate_denovo(dd)
+                else:
+                    self.show_model(mid)
             except Exception as exc:
                 self.presenter.warn(f"Restore display #{mid} failed: {exc}")
         self._restore_mids = []

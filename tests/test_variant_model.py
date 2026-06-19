@@ -17,12 +17,54 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from variant_model import (
     AlignedCell, Mutation, Variant, ChainDesign, DesignSession,
-    build_design_session, import_mpnn_designs, column_tracks, build_color_commands,
+    build_design_session, build_design_session_from_sequence,
+    import_mpnn_designs, column_tracks, build_color_commands,
     build_color_commands_by_resnum, build_model_color_commands,
     candidate_ddg, stability_summary,
     filter_new_mpnn_variants, group_scan_suggestions, suggestion_color,
     fold_summary,
 )
+
+
+class TestDeNovoConstruct:
+    """Stage 1 de-novo: seed a design from typed sequence(s), no crystal — synthetic ids,
+    1..N numbering, grid renders purely (no ChimeraX), round-trips persistence."""
+
+    def test_seeds_single_chain_1_to_N(self):
+        sess = build_design_session_from_sequence("MyProt", [("MKVLW", 1)])
+        assert sess.source == "sequence" and sess.model_id.startswith("denovo-")
+        assert len(sess.chains) == 1
+        cd = next(iter(sess.chains.values()))
+        assert [c.resnum for c in cd.template_cells] == [1, 2, 3, 4, 5]
+        assert "".join(c.aa for c in cd.template_cells) == "MKVLW"
+        assert cd.members == [(sess.model_id, "A")] and cd.rep_model == sess.model_id
+
+    def test_grid_renders_with_no_chimerax(self):
+        # column_tracks (the grid's consensus/conservation) is pure over template_cells
+        sess = build_design_session_from_sequence("p", [("MKVLW", 1)])
+        cons, conserv = column_tracks(next(iter(sess.chains.values())))
+        assert cons == list("MKVLW") and conserv == [1.0] * 5
+
+    def test_hetero_chain_list_assigns_sequential_ids(self):
+        sess = build_design_session_from_sequence("cplx", [("MKV", 2), ("AAA", 1)])
+        assert len(sess.chains) == 2
+        cds = list(sess.chains.values())
+        assert cds[0].members == [(sess.model_id, "A"), (sess.model_id, "B")]   # 2 copies
+        assert cds[1].members == [(sess.model_id, "C")]                          # next id
+
+    def test_roundtrips_persistence(self):
+        sess = build_design_session_from_sequence("p", [("MKVLW", 1)])
+        back = DesignSession.from_dict(sess.to_dict())
+        assert back.source == "sequence" and back.model_id == sess.model_id
+        cd = next(iter(back.chains.values()))
+        assert "".join(c.aa for c in cd.template_cells) == "MKVLW"
+        assert cd.template_fold == {}
+
+    def test_rejects_nonstandard_sequence(self):
+        with pytest.raises(ValueError):
+            build_design_session_from_sequence("p", [("MKXLW", 1)])
+        with pytest.raises(ValueError):
+            build_design_session_from_sequence("p", [("", 1)])
 
 
 class TestFoldSummary:
