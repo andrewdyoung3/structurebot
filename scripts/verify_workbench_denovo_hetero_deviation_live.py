@@ -115,6 +115,19 @@ def disrupted_by_chain(block):
     return out
 
 
+def disrupted_fraction(block, chain_ids):
+    """Fraction of a chain-group's residues above the dRMSD floor — LENGTH-UNBIASED (a raw count
+    favours the long PCNA chains; the localization signal is the per-residue RATE). Returns the
+    fraction over the residues belonging to *chain_ids*."""
+    ddm = block.get("ddm") or {}
+    floor = block.get("floor_ddm") or {}
+    group = [(k, val) for k, val in ddm.items() if k.split(":")[0] in chain_ids]
+    if not group:
+        return 0.0
+    dis = sum(1 for k, val in group if val > floor.get(k, _DDM_FLOOR_MIN_A))
+    return dis / len(group)
+
+
 class ScriptedPresenter(Presenter):
     def __init__(self):
         self.warnings = []; self.confirm_calls = []; self.confirm_answer = "proceed"
@@ -233,7 +246,12 @@ panel._add_variant()
 cd_pcna = panel._cur_tab().design
 vp = cd_pcna.variants[-1]
 panel._cur_tab().set_active_row(vp.id)
-cd_pcna.edit_variant(vp.id, 0, "A" if vp.cells[0].aa != "A" else "S")
+# A DISRUPTIVE substitution-only variant: proline-scan an internal stretch so the change clears
+# the whole-complex cross-seed floor (a single conservative point mutation in a 249-aa chain reads
+# within noise). Still substitution-only (no indel) → in scope. Skip the termini.
+pcna_cols = [c.col for c in cd_pcna.template_cells if c.resnum is not None]
+for col in pcna_cols[10:25]:
+    cd_pcna.edit_variant(vp.id, col, "P")
 fspec = panel.fold_launch_spec("boltz")
 fchains = fspec["tool_inputs"].get("chains") or []
 pcna_ids = [c for _m, c in cd_pcna.members]
@@ -285,12 +303,14 @@ checks.append((f"(d) the floor folded the WHOLE complex N-1={DEVIATION_FLOOR_N-1
 checks.append(("(d) the floor wt_ref is distributed to BOTH cds (PCNA + p21 cached)",
                bool(cds[0].wt_refs.get("boltz:assembly"))
                and bool(cds[1].wt_refs.get("boltz:assembly"))))
-# (e) whole-complex: the PCNA chains carry the change, p21 siblings read mostly within floor
-pcna_dis = sum(dbc_pcna.get(c, 0) for c in pcna_ids)
-p21_dis = sum(dbc_pcna.get(c, 0) for c in p21_ids)
-print(f"[pcna-dev] (e) disrupted: PCNA chains={pcna_dis}, p21 siblings={p21_dis}")
-checks.append(("(e) the PCNA (varying) chains carry the change; p21 siblings carry less",
-               pcna_dis > 0 and pcna_dis > p21_dis))
+# (e) whole-complex: the PCNA chains carry the change at a HIGHER per-residue RATE than the WT
+# p21 siblings (length-unbiased — the long PCNA chains would win any raw count).
+pcna_frac = disrupted_fraction(bp, pcna_ids)
+p21_frac = disrupted_fraction(bp, p21_ids)
+print(f"[pcna-dev] (e) disrupted rate: PCNA chains={pcna_frac:.3f}, p21 siblings={p21_frac:.3f} "
+      f"(raw counts {dbc_pcna})")
+checks.append(("(e) the PCNA (varying) chains carry the change at a higher rate than p21 siblings",
+               pcna_frac > 0 and pcna_frac > p21_frac))
 
 # ── 4) p21 substitution variant → fold + deviation (reuses the floor: ZERO floor folds) ─
 panel._tabs.setCurrentIndex(1)                                   # p21 tab
@@ -328,11 +348,12 @@ dbc_p21 = disrupted_by_chain(bq)
 print(f"[p21-dev] floor seeds folded={seeds_p21} (expect none); disrupted/chain={dbc_p21}")
 checks.append(("(d) the second cd's deviation did ZERO extra floor folds (floor folded once total)",
                len([s for s in seeds_p21 if s is not None]) == 0))
-pcna_dis2 = sum(dbc_p21.get(c, 0) for c in pcna_ids)
-p21_dis2 = sum(dbc_p21.get(c, 0) for c in p21_ids)
-print(f"[p21-dev] (e) disrupted: p21 chains={p21_dis2}, PCNA siblings={pcna_dis2}")
-checks.append(("(e) symmetric — the p21 (varying) chains carry the change; PCNA siblings carry less",
-               p21_dis2 > 0 and p21_dis2 > pcna_dis2))
+pcna_frac2 = disrupted_fraction(bq, pcna_ids)
+p21_frac2 = disrupted_fraction(bq, p21_ids)
+print(f"[p21-dev] (e) disrupted rate: p21 chains={p21_frac2:.3f}, PCNA siblings={pcna_frac2:.3f} "
+      f"(raw counts {dbc_p21})")
+checks.append(("(e) symmetric — the p21 (varying) chains carry the change at a higher rate",
+               p21_frac2 > 0 and p21_frac2 > pcna_frac2))
 
 # ── 5) persist → restore ──────────────────────────────────────────────────────────────
 dd = session.get_design_session(panel._design.model_id)
