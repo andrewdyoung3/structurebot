@@ -1977,10 +1977,25 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "compare_to": compare_to,
         }
         if engine == "boltz" and assembly:
-            # the full homo-oligomer: every copy chain folded with the variant's sequence
-            # (variant sequence × the construct's copy count).
-            ti["chains"] = [{"id": c, "sequence": v.sequence} for (_m, c) in cd.members]
-            target = f"{len(cd.members)}-chain assembly"
+            if denovo:
+                # FULL-COMPLEX composition (Stage 2b): a hetero construct's variant folds the
+                # WHOLE declared assembly, not the active chain alone. The ACTIVE cd contributes
+                # the variant's sequence × its members; EVERY OTHER cd contributes its own
+                # template T sequence × its members. Chain ids come from each cd's members (already
+                # re-pointed to the construct T-fold's chains), so the variant complex lines up
+                # 1:1 with the T-fold (the deviation reference) — same ids, same order.
+                chains: List[Dict[str, str]] = []
+                for _uk, c in self._design.chains.items():
+                    seq = v.sequence if c is cd else "".join(
+                        cc.aa for cc in c.template_cells if cc.aa is not None)
+                    chains.extend({"id": ch, "sequence": seq} for (_m, ch) in c.members)
+                ti["chains"] = chains
+                target = f"{len(chains)}-chain assembly"
+            else:
+                # CRYSTAL homo-oligomer: every copy chain folded with the variant's sequence
+                # (variant sequence × the construct's copy count).
+                ti["chains"] = [{"id": c, "sequence": v.sequence} for (_m, c) in cd.members]
+                target = f"{len(cd.members)}-chain assembly"
         else:
             ti["sequence"] = v.sequence           # the VARIANT sequence (its mutations)
             target = "monomer"
@@ -2066,6 +2081,21 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not data or not (data.get("new_model_id") or data.get("model_id")):
             self._status.setText(f"{variant_id}: fold produced no model.")
             return
+        # DE-NOVO COMPLEX PARITY GUARD (Stage 2b): a variant ASSEMBLY fold must return the SAME
+        # chains as the construct T-fold (cd.members across all cds — the deviation reference's
+        # chains). Fail loud on id drift so it surfaces here rather than silently dropping
+        # residues from the deviation's `common` set later. Mirrors apply_construct_fold_result's
+        # read-back guard. (Crystal designs / monomer folds skip — gated on source + target.)
+        if self._design is not None and self._design.source == "sequence" \
+                and data.get("target") == "assembly":
+            observed = data.get("chain_ids")
+            expected = [ch for c in self._design.chains.values() for (_m, ch) in c.members]
+            if observed is not None and set(map(str, observed)) != set(map(str, expected)):
+                self._status.setText(
+                    f"{variant_id}: variant fold chain mismatch — expected "
+                    f"{sorted(set(map(str, expected)))}, got "
+                    f"{sorted(set(map(str, observed)))}. Refusing (fold not trusted).")
+                return
         prior_mid = (v.results.fold or {}).get("model_id")     # re-fold → replace this
         author_resnums = [c.resnum for c in v.cells if not c.is_gap and c.resnum is not None]
         v.results.fold = fold_summary(data, author_resnums,
@@ -2114,7 +2144,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         combo = f"{engine}:{target}"
         t_seq = "".join(c.aa for c in cd.template_cells if c.aa is not None)
         if multichain:
-            wt_chains = [{"id": c, "sequence": t_seq} for (_m, c) in cd.members]
+            if self._design.source == "sequence":
+                # FULL-COMPLEX WT reference (Stage 2b): the floor + reference are the WHOLE WT
+                # complex (= the construct T-fold), so EVERY cd contributes its own T sequence ×
+                # its members — the active cd included (the reference is all-WT; the variant's
+                # change lives only in the variant fold). 1:1 with the variant complex above.
+                wt_chains = []
+                for _uk, c in self._design.chains.items():
+                    cseq = "".join(cc.aa for cc in c.template_cells if cc.aa is not None)
+                    wt_chains.extend({"id": ch, "sequence": cseq} for (_m, ch) in c.members)
+            else:
+                wt_chains = [{"id": c, "sequence": t_seq} for (_m, c) in cd.members]
             variant_chain = cd.rep_chain
         else:
             variant_chain = "A" if engine == "esmfold" else cd.rep_chain
@@ -2202,7 +2242,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         v.results.fold["deviation"] = data
         wt_ref = data.get("wt_ref")
         if wt_ref:
-            cd.wt_refs[f"{data.get('engine')}:{data.get('target')}"] = wt_ref
+            combo = f"{data.get('engine')}:{data.get('target')}"
+            if self._design is not None and self._design.source == "sequence" \
+                    and data.get("target") == "assembly":
+                # FLOOR-ONCE (Stage 2b): the multichain floor folds the WHOLE complex once and its
+                # floor_ddm/floor_lddt span ALL chains, so the wt_ref is shared by every cd.
+                # Distribute it to EVERY cd's wt_refs[combo] (not just the active one) → a sibling
+                # cd's next deviation sees have_ref=True and does NO re-fold (floor folded once).
+                for c in self._design.chains.values():
+                    c.wt_refs[combo] = wt_ref
+            else:
+                cd.wt_refs[combo] = wt_ref
         self._persist()
         self._select_result_mode(_RESULT_DEVIATION_MODE)   # AUTO-SURFACE the deviation mode
         self._rerender_results(cd, v)
