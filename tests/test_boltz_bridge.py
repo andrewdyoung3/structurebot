@@ -166,6 +166,25 @@ class TestTemplateYaml:
         assert t["cif"].startswith("/wsl")            # path translated into WSL
         assert t["chain_id"] == "A" and t["force"] is True and t["threshold"] == 10.0
 
+    def test_template_field_indentation_is_4_not_6_spaces(self):
+        # THE live-verify regression guard. A template's keys are SIBLINGS of cif/pdb in a YAML
+        # sequence item → 4-space indent. The original bug emitted 6 (wrongly mirroring the
+        # `protein:` block, whose children nest UNDER a key): that made chain_id a child of pdb,
+        # so Boltz got a dict where it expected a path string and produced NO CIF. Pin the exact
+        # form. (PyYAML isn't a main-venv dep, so assert the indentation directly.)
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}],
+            [{"pdb": "/x/4hhb.pdb", "chain_id": "A", "force": True, "threshold": 10.0}])
+        lines = y.splitlines()
+        assert "  - pdb: /x/4hhb.pdb" in lines            # item key at the sequence-item indent
+        assert "    chain_id: A" in lines                 # SIBLING key → exactly 4 spaces
+        assert "    force: true" in lines
+        assert "    threshold: 10.0" in lines
+        # the bug, explicitly forbidden: NO template field may be indented 6 spaces (= nested
+        # under pdb). 6-space lines belong ONLY to the protein block (id/sequence/msa).
+        for fld in ("chain_id", "template_id", "force", "threshold"):
+            assert f"      {fld}:" not in y               # never 6 spaces
+
     def test_assert_local_only_passes_templates_yaml(self):
         # a templates-carrying YAML (still msa: empty everywhere) must PASS the fail-closed guard —
         # a template is not an MSA.

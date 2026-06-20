@@ -219,14 +219,18 @@ class BoltzBridge:
                 path_key = "cif" if t.get("cif") else ("pdb" if t.get("pdb") else None)
                 if not path_key:
                     continue                       # skip a malformed entry (no structure path)
+                # In a YAML sequence item the mapping keys are SIBLINGS — chain_id/force/etc.
+                # align with the path key at 4 spaces (the `- ` is the item indent), NOT 6.
+                # `protein:` nests its children at 6 because they sit UNDER a key; a template's
+                # fields are flat, so 6 is invalid YAML (it made chain_id a child of `pdb`).
                 lines.append(f"  - {path_key}: {t[path_key]}")
                 for k in ("chain_id", "template_id"):
                     if t.get(k) is not None:
-                        lines.append(f"      {k}: {_yaml_id(t[k])}")
+                        lines.append(f"    {k}: {_yaml_id(t[k])}")
                 if t.get("force"):
-                    lines.append("      force: true")
+                    lines.append("    force: true")
                     if t.get("threshold") is not None:
-                        lines.append(f"      threshold: {t['threshold']}")
+                        lines.append(f"    threshold: {t['threshold']}")
         return "\n".join(lines) + "\n"
 
     def _parse_outputs(self, out_dir: str, chains: List[Dict[str, str]]) -> Dict[str, Any]:
