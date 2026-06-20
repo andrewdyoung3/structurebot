@@ -110,6 +110,22 @@ TARGETS: Dict[str, dict] = {
             {"pdb": "4R80", "chain": "A", "tag": "sTM .49 / seq-id .18 (distant control)"},
         ],
     },
+    # SECOND crystal de-novo design (N→2) with a GAP-DENSIFIED ladder to PIN the de-novo threshold
+    # (6W3D left it bracketed (0.79, 1.0)). 4ORL = de-novo crystal, 108 aa, VERY hard (unguided
+    # TM-to-truth 0.464 → maximal headroom). foldseek gap rungs in (0.79, 1.0): 4OUQ .94 / 4Q53 .90
+    # (seq+struct, seq-id .66) — the DECISIVE discriminators (does a 0.90 template unlock a de-novo
+    # fold?); plus structure-only 6UAE .78 / 6W3G .75. If 0.90 fails → pins "needs >0.90 (near-
+    # identical)"; if 0.90 unlocks → de-novo threshold ~0.90 (still ≫ natural 0.65).
+    "crystal2_4orl": {
+        "pdb": "4ORL", "chain": "A",
+        "templates": [
+            {"pdb": "4ORL", "chain": "A", "tag": "identical control"},
+            {"pdb": "4OUQ", "chain": "A", "tag": "sTM .94 / seq-id .67 (near-identical gap rung)"},
+            {"pdb": "4Q53", "chain": "A", "tag": "sTM .90 / seq-id .66 (0.90 GAP RUNG, decisive)", "hard": True},
+            {"pdb": "6UAE", "chain": "A", "tag": "sTM .78 / seq-id .19 (structure-only)", "hard": True},
+            {"pdb": "6W3G", "chain": "A", "tag": "sTM .75 / seq-id .17 (structure-only)"},
+        ],
+    },
 }
 
 # HARD-candidate targets — FLAGGED for the user before committing the full titration. Criteria:
