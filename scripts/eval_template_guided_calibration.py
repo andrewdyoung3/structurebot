@@ -67,6 +67,24 @@ TARGETS: Dict[str, dict] = {
             {"pdb": "1LH1", "chain": "A", "tag": "distant ~15% id (leghemoglobin)"},
         ],
     },
+    # ORPHAN / DE-NOVO target (cross-fold-type generality, the purer "structure without sequence"
+    # test). 2KL8 = a de novo designed protein (Koga 2012), 85 aa, solved (NMR) — orphan BY
+    # CONSTRUCTION (no natural sequence family → every template is ~0 seq-id). Confirmed HARD:
+    # unguided mean TM-to-truth 0.771 (2 seeds), cross-seed flex 1.43 Å — headroom on both axes.
+    # KEY: its closest STRUCTURAL neighbor in a curated panel is only structTM 0.63 (2ACY) — a novel
+    # fold has no close natural neighbor, so the ladder spans the CLIFF region (0.63→0.40), testing
+    # whether the CspB ~0.6 rescue threshold generalizes to a different fold. Templates from US-align
+    # structural search (foldseek not installed), NOT sequence homologs. `hard` on the near-threshold
+    # rungs. The identical control (2KL8 itself) is the can-it-rescue-this-fold-at-all positive ctrl.
+    "orphan_2kl8": {
+        "pdb": "2KL8", "chain": "A",
+        "templates": [
+            {"pdb": "2KL8", "chain": "A", "tag": "identical (positive control), sTM 1.0"},
+            {"pdb": "2ACY", "chain": "A", "tag": "closest neighbor, sTM .63 (cliff edge)", "hard": True},
+            {"pdb": "1NTF", "chain": "A", "tag": "NTF2, sTM .50 (below threshold)", "hard": True},
+            {"pdb": "1OPY", "chain": "A", "tag": "KSI, sTM .40 (well below)"},
+        ],
+    },
 }
 
 # HARD-candidate targets — FLAGGED for the user before committing the full titration. Criteria:
