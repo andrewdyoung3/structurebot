@@ -3059,10 +3059,16 @@ class ToolRouter:
         self, templates: Optional[List[Dict[str, Any]]]
     ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
         """Resolve every template entry to a LOCAL on-disk structure path. An entry may carry an
-        explicit ``cif``/``pdb`` path (used as-is) OR a ``pdb_id`` (downloaded via RCSB →
-        ``_download_pdb_by_id``, a .pdb). Returns (resolved_list, None) or (None, error). The
-        per-template steering fields (chain_id/template_id/force/threshold) pass through verbatim;
-        ``pdb_id`` is stripped once resolved so only path + steering fields reach the bridge.
+        explicit ``cif``/``pdb`` path (used as-is) OR a ``pdb_id`` (downloaded via RCSB). Returns
+        (resolved_list, None) or (None, error). The per-template steering fields
+        (chain_id/template_id/force/threshold) pass through verbatim; ``pdb_id`` is stripped once
+        resolved so only path + steering fields reach the bridge.
+
+        TEMPLATE FORMAT: a ``pdb_id`` is resolved to the official RCSB **mmCIF** (not PDB) — Boltz's
+        parse_pdb (gemmi) raises a swallowed KeyError on the entity/subchain mapping for some
+        PDB-format files (ligand/entity-bearing, e.g. 1G6P/1SRO) and produces no model; the mmCIF
+        carries proper entity records and parses cleanly. Falls back to PDB only if the CIF is
+        unavailable.
 
         Fail-closed: an entry that resolves to no readable file returns an error (the caller fails
         the fold) rather than silently folding unguided — the §0 silent-wrong guard."""
@@ -3073,11 +3079,17 @@ class ToolRouter:
             t2 = {k: v for k, v in t.items() if k != "pdb_id"}
             path = t2.get("cif") or t2.get("pdb")
             if not path and t.get("pdb_id"):
-                path = self._download_pdb_by_id(str(t["pdb_id"]))
-                if not path:
-                    return None, (f"Could not obtain template PDB '{t['pdb_id']}' for the guided "
-                                  f"fold. Provide a valid 4-char PDB id or a local .cif/.pdb path.")
-                t2["pdb"] = path                        # RCSB download is .pdb
+                cif = self._download_cif_by_id(str(t["pdb_id"]))   # mmCIF preferred (gemmi-safe)
+                if cif:
+                    t2.pop("pdb", None)
+                    t2["cif"] = cif
+                    path = cif
+                else:
+                    path = self._download_pdb_by_id(str(t["pdb_id"]))   # fallback
+                    if not path:
+                        return None, (f"Could not obtain template '{t['pdb_id']}' for the guided "
+                                      f"fold. Provide a valid 4-char PDB id or a local .cif/.pdb path.")
+                    t2["pdb"] = path
             if not path or not Path(str(path)).is_file():
                 return None, (f"Template structure '{path or t.get('pdb_id')}' is not a readable "
                               f"local file — refusing the guided fold (would silently fold unguided).")
@@ -4632,17 +4644,29 @@ class ToolRouter:
 
     def _download_pdb_by_id(self, pdb_id: str) -> Optional[str]:
         """Download a 4-char PDB id from RCSB into cache/ and return the local path."""
+        return self._download_rcsb(pdb_id, "pdb")
+
+    def _download_cif_by_id(self, pdb_id: str) -> Optional[str]:
+        """Download a 4-char PDB id from RCSB as mmCIF. PREFERRED for Boltz TEMPLATES: Boltz's
+        parse_pdb (gemmi) raises a KeyError on the entity/subchain mapping for some PDB-format
+        files (those with ligands/entities the PDB→gemmi path maps to a subchain with no entity,
+        e.g. AXP in 1G6P/1SRO) and SWALLOWS it (exits 0, no model). The official mmCIF carries
+        proper entity records and parses cleanly."""
+        return self._download_rcsb(pdb_id, "cif")
+
+    @staticmethod
+    def _download_rcsb(pdb_id: str, fmt: str) -> Optional[str]:
         if not re.match(r"^[A-Za-z0-9]{4}$", pdb_id):
             return None
         cache_dir = Path("cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
-        local = cache_dir / f"{pdb_id.upper()}.pdb"
+        local = cache_dir / f"{pdb_id.upper()}.{fmt}"
         if local.is_file():
             return str(local)
         try:
             import requests
             resp = requests.get(
-                f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb", timeout=30
+                f"https://files.rcsb.org/download/{pdb_id.upper()}.{fmt}", timeout=30
             )
             resp.raise_for_status()
             local.write_bytes(resp.content)

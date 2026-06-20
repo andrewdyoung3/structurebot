@@ -97,6 +97,43 @@ class TestLocalOnlyGuardFailClosed:
         b._wsl.run_command.assert_not_called()       # the critical fail-closed assertion
 
 
+# ── Swallowed-error surfacing (Boltz exits 0 but writes no model) ─────────────────────
+
+class TestSwallowedError:
+    def test_extract_picks_final_exception_line(self):
+        stderr = ("  0%|          | 0/1 [00:00<?, ?it/s]\n"
+                  "Traceback (most recent call last):\n"
+                  '  File ".../schema.py", line 1691, in parse_boltz_schema\n'
+                  "    raise ValueError(msg)\n"
+                  "ValueError: Template chain A assigned for template4HHB is not one of the protein chains!\n"
+                  "100%|██████████| 1/1 [00:00<00:00,  6.70it/s]\n")
+        got = BoltzBridge._extract_boltz_error("", stderr)
+        assert "Template chain A" in got and got.startswith("ValueError")
+
+    def test_extract_keyerror(self):
+        got = BoltzBridge._extract_boltz_error("", "KeyError: 'Axp'\n")
+        assert got.startswith("KeyError")
+
+    def test_extract_empty_when_no_error(self):
+        assert BoltzBridge._extract_boltz_error("all good\n", "100%|████| 1/1 [00:00<00:00]\n") in (
+            "all good", "")          # no exception-shaped line → last meaningful or empty
+
+    def test_predict_surfaces_swallowed_error_on_no_cif(self, monkeypatch, tmp_path):
+        # Boltz exits 0 (ok=True) but writes no CIF + a swallowed ValueError in stderr → the
+        # returned error must include the REAL cause, not just "no predicted CIF".
+        b = _bridge()
+        b._wsl.run_command = MagicMock(return_value={
+            "ok": True, "stdout": "",
+            "stderr": "ValueError: Template chain A is not one of the protein chains!\n"})
+        monkeypatch.setattr(b, "_parse_outputs",
+                            lambda out_dir, chains: {"success": False,
+                                                     "error": "no predicted CIF in the Boltz output"})
+        res = b.predict([{"id": "A", "sequence": "MK"}])
+        assert res["success"] is False
+        assert "no predicted CIF" in res["error"]
+        assert "Boltz error:" in res["error"] and "Template chain A" in res["error"]
+
+
 # ── MSA-free YAML build ───────────────────────────────────────────────────────────────
 
 class TestYaml:

@@ -38,19 +38,30 @@ class TestResolveTemplates:
         assert err is None
         assert out[0]["cif"] == str(f) and out[0]["chain_id"] == "A"
 
-    def test_pdb_id_downloaded_and_stripped(self, tmp_path, monkeypatch):
-        f = tmp_path / "1MBN.pdb"; f.write_text("ATOM\n")
+    def test_pdb_id_resolves_to_mmCIF_preferred(self, tmp_path, monkeypatch):
+        # a pdb_id resolves to the official mmCIF (gemmi-safe), NOT the pdb — Boltz's parse_pdb
+        # raises a swallowed KeyError on some ligand/entity-bearing PDBs.
+        c = tmp_path / "1MBN.cif"; c.write_text("data_\n")
         r = _router()
-        monkeypatch.setattr(r, "_download_pdb_by_id", lambda pid: str(f))
+        monkeypatch.setattr(r, "_download_cif_by_id", lambda pid: str(c))
         out, err = r._resolve_boltz_templates(
             [{"pdb_id": "1MBN", "chain_id": "A", "force": True, "threshold": 10.0}])
         assert err is None
-        assert out[0]["pdb"] == str(f)                 # downloaded → pdb path
-        assert "pdb_id" not in out[0]                  # stripped once resolved
+        assert out[0]["cif"] == str(c) and "pdb" not in out[0]   # mmCIF, not pdb
+        assert "pdb_id" not in out[0]                            # stripped once resolved
         assert out[0]["force"] is True and out[0]["threshold"] == 10.0   # steering preserved
+
+    def test_pdb_id_falls_back_to_pdb_when_no_cif(self, tmp_path, monkeypatch):
+        f = tmp_path / "1MBN.pdb"; f.write_text("ATOM\n")
+        r = _router()
+        monkeypatch.setattr(r, "_download_cif_by_id", lambda pid: None)   # cif unavailable
+        monkeypatch.setattr(r, "_download_pdb_by_id", lambda pid: str(f))
+        out, err = r._resolve_boltz_templates([{"pdb_id": "1MBN", "chain_id": "A"}])
+        assert err is None and out[0]["pdb"] == str(f) and "cif" not in out[0]
 
     def test_failed_download_is_error_fail_closed(self, monkeypatch):
         r = _router()
+        monkeypatch.setattr(r, "_download_cif_by_id", lambda pid: None)
         monkeypatch.setattr(r, "_download_pdb_by_id", lambda pid: None)
         out, err = r._resolve_boltz_templates([{"pdb_id": "ZZZZ"}])
         assert out is None and "Could not obtain template" in err
