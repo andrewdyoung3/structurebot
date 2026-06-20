@@ -29,6 +29,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import tempfile
@@ -152,7 +153,12 @@ class BoltzBridge:
 
         parsed = self._parse_outputs(out_dir, chains)
         if not parsed.get("success"):
-            return self._err(label, parsed.get("error", "Boltz produced no parsable output"))
+            # Boltz can raise a per-input exception (e.g. a template parse KeyError/ValueError) yet
+            # still EXIT 0 — so r.ok is True but no model is written. Surface the SWALLOWED error
+            # from the logs instead of the opaque "no predicted CIF", so the real cause is visible.
+            swallowed = self._extract_boltz_error(r.get("stdout", ""), r.get("stderr", ""))
+            base = parsed.get("error", "Boltz produced no parsable output")
+            return self._err(label, f"{base}{(' — Boltz error: ' + swallowed) if swallowed else ''}")
         parsed.update(source=_SOURCE, seed=int(seed), label=label)
         return parsed
 
@@ -330,6 +336,29 @@ class BoltzBridge:
         except OSError:
             return {}, []
         return by_chain, order
+
+    @staticmethod
+    def _extract_boltz_error(stdout: str, stderr: str) -> str:
+        """Pull the real cause out of a Boltz run that exited 0 but wrote no model. Boltz catches a
+        per-input exception inside `process_input` and continues, so the traceback lands in the
+        logs while the process returns 0. Prefer the final exception line (e.g.
+        ``ValueError: Template chain A is not one of the protein chains`` / ``KeyError: 'Axp'``);
+        fall back to the last non-progress-bar stderr line. Empty if nothing error-shaped is found."""
+        text = ((stderr or "") + "\n" + (stdout or "")).replace("\r", "\n")
+        exc_lines = [
+            ln.strip() for ln in text.splitlines()
+            if re.match(r"^\s*[A-Za-z_][\w.]*(Error|Exception|Warning)\b\s*:", ln)
+            or ln.strip().startswith(("ValueError", "KeyError", "TypeError", "RuntimeError",
+                                      "FileNotFoundError", "AssertionError"))
+        ]
+        if exc_lines:
+            return exc_lines[-1][:300]
+        # else the last meaningful (non-tqdm/non-blank) line
+        for ln in reversed(text.splitlines()):
+            s = ln.strip()
+            if s and "%|" not in s and "it/s" not in s:
+                return s[:300]
+        return ""
 
     @staticmethod
     def _err(label: str, msg: str) -> Dict[str, Any]:
