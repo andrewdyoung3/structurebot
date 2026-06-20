@@ -39,6 +39,14 @@ import config as _cfg
 
 _SOURCE = "local_boltz_env"
 
+
+def _yaml_id(val: Any) -> str:
+    """Emit a chain id (or list of ids) as a YAML scalar or flow-list. A scalar `"A"` → `A`;
+    a list `["A", "B"]` → `[A, B]` (Boltz accepts either for chain_id/template_id)."""
+    if isinstance(val, (list, tuple)):
+        return "[" + ", ".join(str(v) for v in val) + "]"
+    return str(val)
+
 # Module-level availability cache (definitive verdict only), keyed by (distro, python).
 _AVAIL_CACHE: Dict[Tuple[str, str], bool] = {}
 
@@ -94,15 +102,28 @@ class BoltzBridge:
         seed:         Optional[int] = None,
         allow_remote: bool = False,
         label:        str = "boltz",
+        templates:    Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Fold *chains* (one `protein` block each, MSA-free) with Boltz via WSL. Returns the
         result contract (success/cif_path/mean_plddt/iptm/chains_ptm/plddt/source/seed/error).
-        Never raises for an expected failure — returns {success: False, error: ...}."""
+        Never raises for an expected failure — returns {success: False, error: ...}.
+
+        TEMPLATE-GUIDED (optional): *templates* is a per-template list of dicts — each
+        ``{cif|pdb: <WINDOWS path>, chain_id, template_id, force, threshold}`` (see `_build_yaml`).
+        The cif/pdb path is a LOCAL on-disk structure; it is `translate_path`'d into WSL and
+        emitted as Boltz's top-level `templates:` block. A template is NOT an MSA — it adds no
+        `msa:` line and no remote flag, so the fail-closed LOCAL-ONLY guard is unaffected
+        (chains still declare `msa: empty`). The list is per-template from day one so
+        multi-template / multimer (per-chain `chain_id`↔`template_id`) fold in with no schema
+        change; the first build passes a single monomer entry."""
         if not chains:
             return self._err(label, "no chains given to fold")
         seed = self._seed if seed is None else int(seed)
 
-        yaml_text = self._build_yaml(chains)
+        # Translate each template's on-disk structure path into WSL before it enters the YAML
+        # (Boltz reads the cif/pdb from inside WSL, like the YAML/out paths below).
+        tmpl_yaml = self._translate_template_paths(templates) if templates else None
+        yaml_text = self._build_yaml(chains, tmpl_yaml)
         # Workspace on the WINDOWS side so outputs are readable back without a copy roundtrip.
         work = tempfile.mkdtemp(prefix="boltz_")
         yaml_path = os.path.join(work, "boltz_in.yaml")
@@ -155,8 +176,35 @@ class BoltzBridge:
                 raise _RemoteBreach(f"YAML msa is '{val}', not 'empty' (would hit the remote server)")
 
     # ── YAML + output parsing ───────────────────────────────────────────────────
+    def _translate_template_paths(
+        self, templates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Return *templates* with each entry's `cif`/`pdb` value translated to a WSL path
+        (the only field that must change crossing the Windows→WSL seam). Other fields
+        (chain_id/template_id/force/threshold) pass through verbatim. Pure-ish (path xlate)."""
+        out: List[Dict[str, Any]] = []
+        for t in templates:
+            t2 = dict(t)
+            for key in ("cif", "pdb"):
+                if t2.get(key):
+                    t2[key] = self._wsl.translate_path(os.path.abspath(str(t2[key])))
+            out.append(t2)
+        return out
+
     @staticmethod
-    def _build_yaml(chains: List[Dict[str, str]]) -> str:
+    def _build_yaml(
+        chains:    List[Dict[str, str]],
+        templates: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Boltz input YAML. Chains fold MSA-free (`msa: empty`). When *templates* is given,
+        a top-level `templates:` block is appended — one entry per dict, emitting only the
+        fields present. Boltz 2.2.1 per-template schema (verified against the installed
+        source): `cif`|`pdb` (path), `chain_id` (query chain(s) the template steers; default
+        ALL protein chains), `template_id` (template chain(s); if BOTH given the counts must
+        match), `force` (bool, default False), `threshold` (REQUIRED when force is True — the
+        distance the template is forced toward; omitted otherwise). chain_id/template_id may be
+        a scalar or a list — emitted as a YAML flow list when a list. Paths are expected to be
+        WSL paths already (see `_translate_template_paths`)."""
         lines = ["version: 1", "sequences:"]
         for c in chains:
             lines += [
@@ -165,6 +213,20 @@ class BoltzBridge:
                 f"      sequence: {c['sequence']}",
                 "      msa: empty",
             ]
+        if templates:
+            lines.append("templates:")
+            for t in templates:
+                path_key = "cif" if t.get("cif") else ("pdb" if t.get("pdb") else None)
+                if not path_key:
+                    continue                       # skip a malformed entry (no structure path)
+                lines.append(f"  - {path_key}: {t[path_key]}")
+                for k in ("chain_id", "template_id"):
+                    if t.get(k) is not None:
+                        lines.append(f"      {k}: {_yaml_id(t[k])}")
+                if t.get("force"):
+                    lines.append("      force: true")
+                    if t.get("threshold") is not None:
+                        lines.append(f"      threshold: {t['threshold']}")
         return "\n".join(lines) + "\n"
 
     def _parse_outputs(self, out_dir: str, chains: List[Dict[str, str]]) -> Dict[str, Any]:

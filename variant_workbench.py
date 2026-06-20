@@ -57,6 +57,7 @@ _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOO
 _LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
 _DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
 _FOLD_ENGINES = ("esmfold", "boltz")        # S4b engine picker order (Boltz lands its own stage)
+_GUIDED_TEMPLATE_THRESHOLD_A = 10.0         # default Boltz template force-threshold (Å) for hard steering
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
 _AA_ROLE = QtCore.Qt.UserRole + 2           # cell → residue 1-letter ("-"/None for non-seq)
@@ -689,6 +690,33 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 _a.triggered.connect(
                     lambda _checked=False, e=_eng, k=_n: self._on_construct_fold(e, k))
                 self._construct_fold_acts.append(_a)
+        # TEMPLATE-GUIDED construct fold (Boltz primary): fold the de-novo construct STEERED by a
+        # chosen structural template (a homolog PDB). Sequence-first → the template biases the
+        # fold; the assist readout then measures whether it helped (ΔpLDDT + Δflexibility vs the
+        # unguided T-fold). Monomer first; the per-template list is multimer-ready. Reuses the
+        # Align dialog's PDB-id / loaded-model picker; pre-fills a shared-fold align reference.
+        self._guided_fold_btn = self._construct_fold_menu.addMenu("guided by template (Boltz)")
+        self._guided_fold_acts = []
+        for _n, _lbl in _NMER:
+            _g = self._guided_fold_btn.addAction(f"{_lbl} (N={_n})")
+            _g.triggered.connect(
+                lambda _checked=False, k=_n: self._on_construct_fold_guided("boltz", k))
+            self._guided_fold_acts.append(_g)
+        # Template assist: did the template actually help? ΔpLDDT + per-residue Δflexibility of
+        # the guided fold vs the unguided baseline (honest — surfaces both + the delta).
+        self._assist_btn = self._construct_fold_menu.addAction("Template assist (guided vs unguided)…")
+        self._assist_btn.setToolTip("Measure whether the template helped: ΔpLDDT + per-residue "
+                                    "Δflexibility of the guided fold vs the unguided baseline. "
+                                    "Needs BOTH a guided fold and an unguided construct fold.")
+        self._assist_btn.triggered.connect(self._on_template_assist_clicked)
+        # Validate the guided fold ADOPTED the template (US-align guided fold vs the guiding
+        # template → TM; reuses Stage 3, zero new alignment code).
+        self._validate_guided_btn = self._construct_fold_menu.addAction(
+            "Validate guided fold (US-align vs template)…")
+        self._validate_guided_btn.setToolTip("Structurally align the GUIDED fold to the guiding "
+                                             "template (US-align, sequence-independent) — TM>0.5 "
+                                             "means the fold adopted the template.")
+        self._validate_guided_btn.triggered.connect(self._on_validate_guided_clicked)
         self._fold_vis_btn = fold_menu.addAction("Hide folds")
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
@@ -965,6 +993,330 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "(ESMFold is monomer-only).")
             return
         self.launchRequested.emit(spec)
+
+    # ── TEMPLATE-GUIDED construct fold (Boltz primary) ───────────────────────────────
+    def construct_fold_guided_spec(self, engine: str, n_copies: int,
+                                   template_ref: Dict[str, Any]) -> Optional[dict]:
+        """Spec to fold the de-novo construct STEERED by a chosen structural template. Reuses
+        `construct_fold_launch_spec` (same chains/blocks → an apples-to-apples comparison with the
+        unguided T-fold) then attaches `ti["templates"]` — a PER-TEMPLATE list from day one, so
+        multi-template / multimer (per-chain `chain_id`↔`template_id`) fold in with no schema
+        change. *template_ref* carries `{path | pdb_id, label, force, threshold, chain_id?,
+        template_id?}`; the router resolves a `pdb_id`/path to a local file (the template is a
+        LOCAL on-disk structure — not an MSA). None unless the active design is sequence-seeded.
+
+        For the first build the template steers the active construct chain's OWN fold-chain block
+        (monomer → ["A"]); `chain_id` is overridable for the multimer extension. Boltz default-
+        searches the template chain when `template_id` is omitted."""
+        spec = self.construct_fold_launch_spec(engine, n_copies)
+        if spec is None or engine != "boltz":
+            return None                                    # template-guided is Boltz-only (first build)
+        if not (template_ref.get("path") or template_ref.get("pdb_id")):
+            return None
+        # Per-template entry: path/pdb_id resolved by the router; steering fields verbatim.
+        entry: Dict[str, Any] = {}
+        path = template_ref.get("path")
+        if path:
+            key = "cif" if str(path).lower().endswith((".cif", ".mmcif")) else "pdb"
+            entry[key] = str(path)
+        else:
+            entry["pdb_id"] = str(template_ref["pdb_id"]).upper()
+        # chain_id: which construct fold-chains the template steers (default = this cd's block).
+        chain_id = template_ref.get("chain_id")
+        if chain_id is None:
+            blocks = spec.get("_denovo_chain_blocks") or {}
+            block = blocks.get(self._cur_cd_ukey()) or []
+            chain_id = (block[0] if len(block) == 1 else block) or None
+        if chain_id is not None:
+            entry["chain_id"] = chain_id
+        if template_ref.get("template_id") is not None:
+            entry["template_id"] = template_ref["template_id"]
+        if template_ref.get("force"):
+            entry["force"] = True
+            entry["threshold"] = float(template_ref.get("threshold", _GUIDED_TEMPLATE_THRESHOLD_A))
+        ti = spec["tool_inputs"]
+        ti["templates"] = [entry]
+        label = template_ref.get("label") or template_ref.get("pdb_id") or "template"
+        mode = (f"hard force≤{entry['threshold']}Å" if entry.get("force") else "soft")
+        spec["user_input"] = (f"[Workbench] fold construct guided by {label} ({mode}) — "
+                              f"Boltz, LOCAL-ONLY template-guided")
+        spec["refresh"] = "construct_fold_guided"
+        spec["_guided_template"] = {
+            "label": label, "force": bool(entry.get("force")),
+            "threshold": entry.get("threshold"),
+            "pdb_id": template_ref.get("pdb_id"), "path": template_ref.get("path"),
+        }
+        return spec
+
+    @staticmethod
+    def _suggested_template_ref(cd) -> str:
+        """The headline structural-align→template feed: when this construct was aligned to a PDB
+        that SHARES its fold (TM>0.5), return that reference as the suggested guide-fold template;
+        else "". Pure (reads persisted `cd.structural_align`) — drives the dialog pre-fill."""
+        sa = (cd.structural_align if cd else None) or {}
+        if sa.get("shared_fold") and (sa.get("reference") or sa.get("ref_label")):
+            return str(sa.get("reference") or sa.get("ref_label"))
+        return ""
+
+    def _on_construct_fold_guided(self, engine: str, n_copies: int) -> None:
+        """Pick a structural template (reusing the Align dialog's PDB-id / loaded-model picker),
+        pre-filling a shared-fold structural-align reference when one exists, then launch the
+        guided fold. Offer soft (default) vs hard (force+threshold) steering."""
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Guided fold is for de-novo constructs — use Add sequence first.")
+            return
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        if cd is None:
+            return
+        # HEADLINE FEED: if this construct was aligned to a PDB that SHARES its fold, suggest it.
+        suggested = self._suggested_template_ref(cd)
+        prompt = "Template — a 4-char PDB id (downloaded) or a loaded model id (e.g. #3):"
+        if suggested:
+            prompt = (f"You aligned to {suggested} and it shares the construct's fold — guide-fold "
+                      f"against it?\n\n" + prompt)
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Fold construct guided by template", prompt, text=suggested)
+        ref = (text or "").strip()
+        if not ok or not ref:
+            return
+        # Hard vs soft steering (force+threshold). Soft = default (template biases, not forced).
+        hard = (QtWidgets.QMessageBox.question(
+            self, "Steering strength",
+            "Hard steering (force the fold toward the template, threshold "
+            f"{_GUIDED_TEMPLATE_THRESHOLD_A:.0f} Å)?\n\nNo = soft (template biases the fold).",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes)
+        template_ref: Dict[str, Any] = {"force": hard}
+        if hard:
+            template_ref["threshold"] = _GUIDED_TEMPLATE_THRESHOLD_A
+        # Resolve the reference the SAME way Align does: a loaded model → temp pdb; else a PDB id.
+        m = re.match(r"^#?(\d+(?:\.\d+)*)$", ref)
+        if m:
+            mid = m.group(1)
+            tmp = os.path.join(tempfile.gettempdir(), f"guided_tmpl_{mid.replace('.', '_')}.pdb")
+            try:
+                self._c._run(f'save "{Path(tmp).as_posix()}" models #{mid}')
+            except Exception as exc:
+                self._status.setText(f"Could not save model #{mid} as a template: {exc}")
+                return
+            if not os.path.isfile(tmp):
+                self._status.setText(f"Saving model #{mid} produced no file — is #{mid} open?")
+                return
+            template_ref.update(path=tmp, label=f"#{mid}")
+        else:
+            if not re.match(r"^[A-Za-z0-9]{4}$", ref):
+                self._status.setText("Enter a 4-character PDB id (e.g. 1MBN) or a loaded model "
+                                     "(e.g. #3).")
+                return
+            template_ref.update(pdb_id=ref.upper(), label=ref.upper())
+        spec = self.construct_fold_guided_spec(engine, n_copies, template_ref)
+        if spec is None:
+            self._status.setText("Could not build the guided-fold request (de-novo Boltz only).")
+            return
+        self._status.setText(
+            f"Folding the construct guided by {template_ref['label']} "
+            f"({'hard' if hard else 'soft'} steering) via Boltz (LOCAL-ONLY)…")
+        self.launchRequested.emit(spec)
+
+    def apply_construct_fold_guided_result(self, spec: dict, result: dict) -> None:
+        """Consume the GUIDED construct fold: store it on `cd.guided_fold` (SEPARATE from the
+        unguided `cd.template_fold` baseline, so the assist can compare the two) without
+        re-pointing members. The guided model is already opened + pLDDT-coloured live by the
+        router; here we persist its summary + the steering provenance and auto-run the assist
+        when an unguided baseline exists."""
+        data = self._fold_from_result(result)
+        if not data or not (data.get("new_model_id") or data.get("model_id")):
+            self._status.setText("Guided construct fold produced no model.")
+            return
+        if self._design is None:
+            return
+        blocks: Dict[str, List[str]] = dict(spec.get("_denovo_chain_blocks") or {})
+        gtmpl = dict(spec.get("_guided_template") or {})
+        fold_mid = str(data.get("new_model_id", data.get("model_id")))
+        plddt_by_chain = data.get("plddt_by_chain") or {}
+        for ukey, block in (blocks or {}).items():
+            cd = self._design.chains.get(ukey)
+            if cd is None:
+                continue
+            rep = block[0]
+            author_resnums = [c.resnum for c in cd.template_cells
+                              if not c.is_gap and c.resnum is not None]
+            chain_plddt = plddt_by_chain.get(rep) or (data.get("plddt") if not plddt_by_chain else {})
+            vals = list((chain_plddt or {}).values())
+            per_chain = {**data,
+                         "plddt":      chain_plddt or {},
+                         "mean_plddt": round(sum(vals) / len(vals), 2) if vals else data.get("mean_plddt"),
+                         "chain":      rep}
+            gf = fold_summary(per_chain, author_resnums, reference_model_id=None)
+            gf.update(templated=True, template_label=gtmpl.get("label"),
+                      force=bool(gtmpl.get("force")), threshold=gtmpl.get("threshold"),
+                      template_pdb_id=gtmpl.get("pdb_id"), template_path=gtmpl.get("path"),
+                      # the EXACT per-template list used → the assist re-folds the guided floor
+                      # seeds with the same steering (the router re-resolves pdb_id/path).
+                      templates=list((spec.get("tool_inputs") or {}).get("templates") or []))
+            cd.guided_fold = gf
+        self._persist()
+        cur = self._cur_tab()
+        cd = cur.design if cur is not None else next(iter(self._design.chains.values()), None)
+        mp = (cd.guided_fold.get("mean_plddt") if cd is not None else None)
+        mp_txt = f", chain pLDDT {mp:.1f}" if isinstance(mp, (int, float)) else ""
+        base = bool(cd and cd.template_fold.get("model_id"))
+        self._status.setText(
+            f"Guided fold ({gtmpl.get('label')}, {'hard' if gtmpl.get('force') else 'soft'}): "
+            f"model #{fold_mid}{mp_txt}. "
+            + ("Run 'Template assist' to measure ΔpLDDT + Δflexibility vs the unguided fold."
+               if base else
+               "No unguided baseline yet — fold the construct unguided (Fold construct) to "
+               "enable the assist comparison."))
+
+    # ── TEMPLATE ASSIST readout (guided vs unguided) ─────────────────────────────────
+    def template_assist_launch_spec(self) -> Optional[dict]:
+        """Spec to measure whether the template helped: compares the construct's GUIDED fold
+        against its UNGUIDED baseline T-fold (both on disk — neither re-folded). The router reuses
+        each as the seed-0 of its own cross-seed flexibility floor → ΔpLDDT + per-residue
+        Δflexibility. None unless BOTH folds exist. wt_chains = the WHOLE construct (every cd's
+        sequence × its members), mirroring the de-novo deviation reference."""
+        tab = self._cur_tab()
+        if tab is None or self._design is None or self._design.source != "sequence":
+            return None
+        cd = tab.design
+        gf, uf = cd.guided_fold or {}, cd.template_fold or {}
+        if not gf.get("model_id") or not uf.get("model_id"):
+            return None
+        target = gf.get("target", uf.get("target", "monomer"))
+        multichain = (target == "assembly")
+        # Full-construct chain set (same as the de-novo deviation reference) → apples-to-apples.
+        wt_chains = []
+        for _uk, c in self._design.chains.items():
+            cseq = "".join(cc.aa for cc in c.template_cells if cc.aa is not None)
+            wt_chains.extend({"id": ch, "sequence": cseq} for (_m, ch) in c.members)
+        variant_chain = cd.rep_chain
+        def _ref(d):
+            return {"engine": d.get("engine"), "target": d.get("target"), "seed": d.get("seed"),
+                    "model_id": d.get("model_id"), "path": d.get("cif_path") or d.get("pdb_path")}
+        ti: Dict[str, object] = {
+            "engine":              "boltz",
+            "target":              target,
+            "multichain":          multichain,
+            "variant_chain":       variant_chain,
+            "wt_chains":           wt_chains,
+            "model_id":            self._design.model_id,
+            "unguided_ref":        _ref(uf),
+            "guided_ref":          _ref(gf),
+            "templates":           list(gf.get("templates") or []),
+            "guided_mean_plddt":   gf.get("mean_plddt"),
+            "unguided_mean_plddt": uf.get("mean_plddt"),
+            "guided_plddt":        gf.get("plddt") or {},
+            "unguided_plddt":      uf.get("plddt") or {},
+            "template_label":      gf.get("template_label"),
+            "force":               bool(gf.get("force")),
+            "threshold":           gf.get("threshold"),
+        }
+        return {
+            "tool":        "template_assist",
+            "tool_inputs": ti,
+            "user_input":  f"[Workbench] template assist — guided ({gf.get('template_label')}) vs "
+                           f"unguided, ΔpLDDT + Δflexibility, LOCAL-ONLY",
+            "confidence":  "low",                        # folds ~2×(N−1) floor seeds → the gate
+            "refresh":     "template_assist",
+            "_assist_ukey": self._cur_cd_ukey(),
+        }
+
+    def _on_template_assist_clicked(self) -> None:
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Template assist is for de-novo constructs.")
+            return
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        if cd is None:
+            return
+        if not (cd.guided_fold or {}).get("model_id"):
+            self._status.setText("Fold the construct guided by a template first "
+                                 "(Fold ▾ → Fold construct → guided by template).")
+            return
+        if not (cd.template_fold or {}).get("model_id"):
+            self._status.setText("Fold the construct UNGUIDED first (Fold ▾ → Fold construct) — "
+                                 "the assist compares guided vs the unguided baseline.")
+            return
+        spec = self.template_assist_launch_spec()
+        if spec is None:
+            self._status.setText("Could not build the template-assist request.")
+            return
+        self._status.setText("Measuring template assist (folds cross-seed floors for both — this "
+                             "takes several Boltz folds)…")
+        self.launchRequested.emit(spec)
+
+    def _on_validate_guided_clicked(self) -> None:
+        """US-align the GUIDED fold against the guiding template → TM (did it adopt the template
+        fold?). Reuses the structural-align spec with use_guided=True and the stored template as
+        the reference. Zero new alignment code."""
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Validation is for de-novo constructs.")
+            return
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        gf = (cd.guided_fold if cd else None) or {}
+        if not gf.get("model_id"):
+            self._status.setText("Fold the construct guided by a template first.")
+            return
+        pdb_id, path = gf.get("template_pdb_id"), gf.get("template_path")
+        label = gf.get("template_label") or pdb_id or "template"
+        if pdb_id:
+            spec = self.structural_align_launch_spec(reference_pdb_id=str(pdb_id),
+                                                     ref_label=str(label), use_guided=True)
+        elif path and os.path.isfile(str(path)):
+            spec = self.structural_align_launch_spec(reference_path=str(path),
+                                                     ref_label=str(label), use_guided=True)
+        else:
+            self._status.setText("The guiding template is no longer on disk — re-fold guided.")
+            return
+        if spec is None:
+            self._status.setText("Could not build the validation request.")
+            return
+        self._status.setText(f"Validating the guided fold adopted {label} (US-align, "
+                             f"sequence-independent)…")
+        self.launchRequested.emit(spec)
+
+    @staticmethod
+    def _template_assist_from_result(result: dict) -> dict:
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "template_assist":
+                return step.get("data") or {}
+        return {}
+
+    def apply_template_assist_result(self, spec: dict, result: dict) -> None:
+        """Consume the assist: store it on `cd.template_assist`, persist, and report an HONEST
+        readout — guided AND unguided AND the delta, framed "the template stabilized/assisted; the
+        fold is accessible", never guided-pLDDT-alone-as-proof."""
+        data = self._template_assist_from_result(result)
+        if not data:
+            self._status.setText("Template assist produced no result.")
+            return
+        ukey = (spec or {}).get("_assist_ukey")
+        cd = self._design.chains.get(ukey) if (self._design and ukey) else None
+        if cd is None:
+            tab = self._cur_tab()
+            cd = tab.design if tab else None
+        if cd is None:
+            return
+        cd.template_assist = data
+        self._persist()
+        dp = data.get("d_plddt")
+        up, gp = data.get("unguided_mean_plddt"), data.get("guided_mean_plddt")
+        nstab, ntot = data.get("n_stabilized"), data.get("n_residues")
+        mdf = data.get("mean_d_flex")
+        steer = (f"hard force≤{data.get('threshold')}Å" if data.get("force") else "soft")
+        helped = (dp is not None and dp > 1.0) or (isinstance(mdf, (int, float)) and mdf > 0.1)
+        verdict = ("the template stabilized/assisted the fold — it is accessible"
+                   if helped else "the template's effect is negligible (honest null)")
+        plddt_txt = (f"pLDDT {up:.1f} (unguided) → {gp:.1f} (guided), Δ{dp:+.1f}"
+                     if dp is not None else "pLDDT n/a")
+        self._status.setText(
+            f"Template assist ({data.get('template_label')}, {steer}): {plddt_txt}; "
+            f"{nstab}/{ntot} residues stabilized (mean Δflex {mdf:+.2f} Å) — {verdict}. "
+            f"Guided confidence is template-biased, shown against the unguided baseline (not "
+            f"proof of native).")
 
     def apply_construct_fold_result(self, spec: dict, result: dict) -> None:
         """Consume the construct fold: for EACH ChainDesign, store its OWN chain's pLDDT on
@@ -2290,19 +2642,24 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     def structural_align_launch_spec(self, *, reference_pdb_id: Optional[str] = None,
                                      reference_path: Optional[str] = None,
                                      reference_model_id: Optional[str] = None,
-                                     ref_label: Optional[str] = None) -> Optional[dict]:
+                                     ref_label: Optional[str] = None,
+                                     use_guided: bool = False) -> Optional[dict]:
         """Spec to structurally align the ACTIVE de-novo construct's FOLD onto an EXPLICIT chosen
         reference via US-align (sequence-independent). Unlike the construct FOLD path (which forces
         `no_reference` so matchmaker never silently superposes onto a loaded primary), this carries
         the user's EXPLICIT reference and aligns to it. The query is the construct's T-fold on disk
         (`template_fold.cif_path`/`pdb_path`); the open fold model is moved onto the reference
         (option B). None unless the active construct is folded. Pure — no I/O (caller resolves a
-        loaded-model reference to a file first)."""
+        loaded-model reference to a file first).
+
+        *use_guided*: align the GUIDED fold (`cd.guided_fold`) instead of the unguided T-fold —
+        the template-adoption VALIDATION (did the guided fold adopt the guiding template? TM is
+        the metric). Zero new alignment code — same US-align path, different query."""
         tab = self._cur_tab()
         if tab is None or self._design is None or self._design.source != "sequence":
             return None
         cd = tab.design
-        tf = cd.template_fold
+        tf = cd.guided_fold if use_guided else cd.template_fold
         query_path = tf.get("cif_path") or tf.get("pdb_path")
         query_mid = tf.get("model_id")
         if not query_path or not query_mid:
@@ -2319,14 +2676,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if "reference_pdb_id" not in ti and "reference_path" not in ti:
             return None                                  # need a resolvable reference
         ti["ref_label"] = ref_label or "reference"
+        which = "guided fold" if use_guided else "construct fold"
         return {
             "tool":         "structural_align",
             "tool_inputs":  ti,
-            "user_input":   f"[Workbench] structural align construct fold → {ti['ref_label']} "
+            "user_input":   f"[Workbench] structural align {which} → {ti['ref_label']} "
                             f"(US-align, sequence-independent, LOCAL-ONLY)",
             "confidence":   "high",                      # fast + deterministic → no confirm gate
             "refresh":      "structural_align",
             "_align_ukey":  self._cur_cd_ukey(),
+            "_validate_guided": bool(use_guided),        # adoption-validation framing in apply
         }
 
     def _on_align_clicked(self) -> None:
@@ -2398,14 +2757,30 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if cd is None:
             return
         cd.structural_align = data
+        validating = bool((spec or {}).get("_validate_guided"))
+        if validating:
+            # Mirror the adoption TM into the assist slot so the assist readout can cite it.
+            cd.template_assist = {**(cd.template_assist or {}),
+                                  "tm_adopt": data.get("tm_ref"),
+                                  "tm_adopt_query": data.get("tm_query"),
+                                  "adopted": bool(data.get("shared_fold")),
+                                  "adopt_ref_label": data.get("ref_label")}
         self._persist()
         tier = ("shared fold ✓" if data.get("shared_fold")
                 else "NOT structurally similar (low TM)")
-        self._status.setText(
-            f"Aligned construct fold → {data.get('ref_label')}: TM-score {data.get('tm_ref')} "
-            f"(reference-normalized) / {data.get('tm_query')} (query-normalized), RMSD "
-            f"{data.get('rmsd')} Å over {data.get('n_aligned')} residues — {tier}. "
-            f"TM>0.5 = shared fold; lower = not structurally similar.")
+        if validating:
+            adopt = ("ADOPTED the template ✓" if data.get("shared_fold")
+                     else "did NOT adopt the template (low TM)")
+            self._status.setText(
+                f"Guided-fold validation vs {data.get('ref_label')}: TM-score {data.get('tm_ref')} "
+                f"(ref-norm) / {data.get('tm_query')} (query-norm), RMSD {data.get('rmsd')} Å over "
+                f"{data.get('n_aligned')} residues — the guided fold {adopt}. TM>0.5 = adopted.")
+        else:
+            self._status.setText(
+                f"Aligned construct fold → {data.get('ref_label')}: TM-score {data.get('tm_ref')} "
+                f"(reference-normalized) / {data.get('tm_query')} (query-normalized), RMSD "
+                f"{data.get('rmsd')} Å over {data.get('n_aligned')} residues — {tier}. "
+                f"TM>0.5 = shared fold; lower = not structurally similar.")
 
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
     def _fold_models(self, design) -> Dict[str, str]:

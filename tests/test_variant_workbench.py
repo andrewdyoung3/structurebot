@@ -1916,3 +1916,158 @@ class TestStructuralAlign:
         p.apply_structural_align_result(spec, result)
         assert cd.structural_align["shared_fold"] is False
         assert "not structurally similar" in p._status.text().lower()
+
+
+class TestTemplateGuided:
+    """Template-guided fold (first build) — panel side. The guided-fold spec populates a
+    per-template list, the guided fold lands on a SEPARATE slot (preserving the unguided
+    baseline), the assist spec compares two on-disk folds with NO baseline re-fold, the
+    validation reuses the align spec with the template as reference, and the structural-align→
+    template suggestion fires on shared_fold."""
+
+    def _denovo_panel(self):
+        from session_state import SessionState
+        return _panel([], session=SessionState())
+
+    def _fold_unguided_monomer(self, p, seq="MKVLWAACGT"):
+        """A de-novo construct folded UNGUIDED as a Boltz monomer → cd.template_fold (baseline)."""
+        p._add_sequence_construct("binder", seq)
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "monomer", "mean_plddt": 62.0,
+            "plddt": {i: 60.0 for i in range(1, len(seq) + 1)}, "cif_path": "/tmp/unguided.cif",
+            "seed": 0}}]})
+        return next(iter(p._design.chains.values()))
+
+    def _apply_guided(self, p, spec, mean=84.0, seq_len=10, mid="9"):
+        # per-residue pLDDT = the mean (the apply method recomputes mean_plddt from these).
+        plddt = {i: mean for i in range(1, seq_len + 1)}
+        p.apply_construct_fold_guided_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": mid, "target": "monomer", "mean_plddt": mean,
+            "plddt": plddt, "cif_path": "/tmp/guided.cif", "seed": 0, "templated": True}}]})
+
+    # ── guided-fold spec: per-template list from day one ─────────────────────────────
+    def test_guided_spec_soft_populates_templates_list(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1mbn", "label": "1MBN"})
+        ti = spec["tool_inputs"]
+        assert isinstance(ti["templates"], list) and len(ti["templates"]) == 1   # list day one
+        entry = ti["templates"][0]
+        assert entry["pdb_id"] == "1MBN"               # upper-cased; router resolves to a file
+        assert entry["chain_id"] == "A"                # defaults to this cd's fold-chain block
+        assert "force" not in entry                    # soft → no force/threshold
+        assert spec["refresh"] == "construct_fold_guided"
+        assert spec["_guided_template"]["label"] == "1MBN"
+
+    def test_guided_spec_hard_emits_force_and_threshold(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec(
+            "boltz", 1, {"pdb_id": "1MBN", "label": "1MBN", "force": True})
+        entry = spec["tool_inputs"]["templates"][0]
+        assert entry["force"] is True and entry["threshold"] == 10.0     # default hard threshold
+
+    def test_guided_spec_local_path_uses_cif_or_pdb_key(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"path": "/tmp/t.cif", "label": "t"})
+        assert spec["tool_inputs"]["templates"][0]["cif"] == "/tmp/t.cif"
+        spec2 = p.construct_fold_guided_spec("boltz", 1, {"path": "/tmp/t.pdb", "label": "t"})
+        assert spec2["tool_inputs"]["templates"][0]["pdb"] == "/tmp/t.pdb"
+
+    def test_guided_spec_none_for_esmfold(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        assert p.construct_fold_guided_spec("esmfold", 1, {"pdb_id": "1MBN"}) is None
+
+    def test_guided_spec_none_without_template_ref(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        assert p.construct_fold_guided_spec("boltz", 1, {"label": "x"}) is None
+
+    # ── guided result lands on a SEPARATE slot (baseline preserved) ──────────────────
+    def test_guided_result_separate_slot_preserves_baseline(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_unguided_monomer(p)
+        assert cd.template_fold["model_id"] == "7"             # unguided baseline
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN",
+                                                         "force": True})
+        self._apply_guided(p, spec, mid="9")
+        cd = next(iter(p._design.chains.values()))
+        assert cd.template_fold["model_id"] == "7"             # baseline UNTOUCHED
+        assert cd.guided_fold["model_id"] == "9"               # guided on its own slot
+        assert cd.guided_fold["templated"] is True and cd.guided_fold["template_label"] == "1MBN"
+        assert cd.guided_fold["force"] is True and cd.guided_fold["threshold"] == 10.0
+        assert cd.guided_fold["templates"]                     # the exact list for floor reuse
+
+    # ── assist spec: two on-disk folds, NO baseline re-fold ──────────────────────────
+    def test_assist_spec_from_two_folds_no_refold(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN"})
+        self._apply_guided(p, spec, mean=84.0)
+        aspec = p.template_assist_launch_spec()
+        ti = aspec["tool_inputs"]
+        assert ti["unguided_ref"]["model_id"] == "7" and ti["unguided_ref"]["path"] == "/tmp/unguided.cif"
+        assert ti["guided_ref"]["model_id"] == "9" and ti["guided_ref"]["path"] == "/tmp/guided.cif"
+        # means flow distinctly from each fold (recomputed from per-residue pLDDT: 84 vs 60)
+        assert ti["guided_mean_plddt"] == 84.0 and ti["unguided_mean_plddt"] == 60.0
+        assert ti["templates"]                                  # the guided floor reuses the list
+        assert aspec["refresh"] == "template_assist"
+
+    def test_assist_spec_none_without_guided(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)                          # only the baseline, no guided
+        assert p.template_assist_launch_spec() is None
+
+    def test_apply_assist_honest_readout(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_unguided_monomer(p)
+        spec = {"_assist_ukey": p._cur_cd_ukey()}
+        result = {"tool_step_results": [{"tool": "template_assist", "data": {
+            "template_label": "1MBN", "force": False, "guided_mean_plddt": 84.0,
+            "unguided_mean_plddt": 62.0, "d_plddt": 22.0, "mean_d_flex": 0.4,
+            "n_stabilized": 8, "n_residues": 10}}]}
+        p.apply_template_assist_result(spec, result)
+        assert cd.template_assist["d_plddt"] == 22.0
+        txt = p._status.text().lower()
+        assert "62.0" in txt and "84.0" in txt                  # BOTH surfaced, not guided-alone
+        assert "stabilized" in txt or "assisted" in txt
+
+    # ── validation reuses the align spec with the template as reference ──────────────
+    def test_validate_guided_spec_uses_guided_query(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN"})
+        self._apply_guided(p, spec)
+        vspec = p.structural_align_launch_spec(reference_pdb_id="1MBN", use_guided=True)
+        ti = vspec["tool_inputs"]
+        assert ti["query_path"] == "/tmp/guided.cif"            # GUIDED fold is the query
+        assert ti["query_model_id"] == "9"
+        assert ti["reference_pdb_id"] == "1MBN"
+        assert vspec["_validate_guided"] is True
+
+    def test_apply_validation_marks_adoption(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_unguided_monomer(p)
+        spec = {"_align_ukey": p._cur_cd_ukey(), "_validate_guided": True}
+        result = {"tool_step_results": [{"tool": "structural_align", "data": {
+            "ref_label": "1MBN", "tm_ref": 0.88, "tm_query": 0.85, "rmsd": 1.2,
+            "n_aligned": 140, "matrix": [0] * 12, "shared_fold": True}}]}
+        p.apply_structural_align_result(spec, result)
+        assert cd.template_assist["tm_adopt"] == 0.88 and cd.template_assist["adopted"] is True
+        assert "adopted" in p._status.text().lower()
+
+    # ── the headline structural-align→template suggestion ────────────────────────────
+    def test_suggestion_fires_on_shared_fold(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_unguided_monomer(p)
+        cd.structural_align = {"reference": "1MBN", "ref_label": "1MBN", "shared_fold": True}
+        assert p._suggested_template_ref(cd) == "1MBN"
+
+    def test_no_suggestion_when_not_shared(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_unguided_monomer(p)
+        cd.structural_align = {"reference": "1UBQ", "shared_fold": False}
+        assert p._suggested_template_ref(cd) == ""

@@ -2079,6 +2079,8 @@ class ToolRouter:
                 return self._run_variant_deviation(inputs)
             if tool == "structural_align":
                 return self._run_structural_align(inputs)
+            if tool == "template_assist":
+                return self._run_template_assist(inputs)
             if tool == "representation":
                 return self._run_representation(inputs, user_input=user_input)
             if tool == "color":
@@ -2981,8 +2983,17 @@ class ToolRouter:
             chains = [{"id": inputs.get("chain", "A"), "sequence": seq}]
 
         bridge = self._get_boltz_bridge()
+        # TEMPLATE-GUIDED (optional): resolve each template entry to a LOCAL on-disk structure
+        # path here (the router owns `_download_pdb_by_id`), then thread the list through to the
+        # bridge, which translate_path's the cif/pdb into WSL. A template is not an MSA → the
+        # fail-closed LOCAL-ONLY guard is unaffected. Absent → a plain de-novo fold. Fail-closed:
+        # an unresolvable template fails the fold (never silently folds unguided).
+        templates, terr = self._resolve_boltz_templates(inputs.get("templates"))
+        if terr:
+            return ToolStepResult(tool="boltz", success=False, error=terr)
         t0  = _time.perf_counter()
-        res = bridge.predict(chains, seed=inputs.get("seed"), allow_remote=not local_only)
+        res = bridge.predict(chains, seed=inputs.get("seed"), allow_remote=not local_only,
+                             templates=templates)
         elapsed_ms = (_time.perf_counter() - t0) * 1000
         if not res.get("success"):
             return ToolStepResult(
@@ -3014,11 +3025,13 @@ class ToolRouter:
                 else "low" if mean_plddt > 50 else "very low")
         nch   = len(chains)
         shape = "monomer" if nch <= 1 else f"{nch}-chain assembly"
+        templated = bool(inputs.get("templates"))
         return ToolStepResult(
             tool="boltz", success=True,
             data={
                 "engine":             "boltz",
                 "target":             ("monomer" if nch <= 1 else "assembly"),
+                "templated":          templated,
                 "new_model_id":       new_id,
                 "reference_model_id": str(ref_id),
                 "mean_plddt":         mean_plddt,
@@ -3035,12 +3048,41 @@ class ToolRouter:
             },
             viz_commands=[],          # already executed live against the REAL id
             viz_explanations=[],
-            summary=(f"Boltz-2 ({shape}, local): model #{new_id} — mean pLDDT "
-                     f"{mean_plddt:.1f} ({conf})"
+            summary=(f"Boltz-2 ({shape}{', template-guided' if templated else ''}, local): "
+                     f"model #{new_id} — mean pLDDT {mean_plddt:.1f} ({conf})"
                      + (f", ipTM {iptm:.3f}" if isinstance(iptm, (int, float)) else "")
                      + f", superposed on #{ref_id}. seed={res.get('seed')}."),
             elapsed_ms=elapsed_ms,
         )
+
+    def _resolve_boltz_templates(
+        self, templates: Optional[List[Dict[str, Any]]]
+    ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        """Resolve every template entry to a LOCAL on-disk structure path. An entry may carry an
+        explicit ``cif``/``pdb`` path (used as-is) OR a ``pdb_id`` (downloaded via RCSB →
+        ``_download_pdb_by_id``, a .pdb). Returns (resolved_list, None) or (None, error). The
+        per-template steering fields (chain_id/template_id/force/threshold) pass through verbatim;
+        ``pdb_id`` is stripped once resolved so only path + steering fields reach the bridge.
+
+        Fail-closed: an entry that resolves to no readable file returns an error (the caller fails
+        the fold) rather than silently folding unguided — the §0 silent-wrong guard."""
+        if not templates:
+            return None, None
+        out: List[Dict[str, Any]] = []
+        for t in templates:
+            t2 = {k: v for k, v in t.items() if k != "pdb_id"}
+            path = t2.get("cif") or t2.get("pdb")
+            if not path and t.get("pdb_id"):
+                path = self._download_pdb_by_id(str(t["pdb_id"]))
+                if not path:
+                    return None, (f"Could not obtain template PDB '{t['pdb_id']}' for the guided "
+                                  f"fold. Provide a valid 4-char PDB id or a local .cif/.pdb path.")
+                t2["pdb"] = path                        # RCSB download is .pdb
+            if not path or not Path(str(path)).is_file():
+                return None, (f"Template structure '{path or t.get('pdb_id')}' is not a readable "
+                              f"local file — refusing the guided fold (would silently fold unguided).")
+            out.append(t2)
+        return out, None
 
     def _read_selected_residues(self, model_id: str, chain_id: str) -> List[int]:
         """
@@ -5555,6 +5597,10 @@ class ToolRouter:
         compare_to = inputs.get("compare_to")
         model_id   = inputs.get("model_id")
         seeds      = list(inputs.get("seeds") or [])
+        # TEMPLATE-GUIDED floor (assist): when given, the cross-seed floor folds carry the SAME
+        # template steering as the seed-0 reference, so the "guided flexibility floor" measures
+        # the steered ensemble's wiggle. None for the unguided floor (the normal path).
+        fold_templates, _terr = self._resolve_boltz_templates(inputs.get("fold_templates"))
         if engine == "boltz" and not seeds:
             import config as _cfg
             base = int(getattr(_cfg, "BOLTZ_SEED", 0))
@@ -5598,7 +5644,8 @@ class ToolRouter:
                 if not wt_chains:
                     return None
                 rres = self._get_boltz_bridge().predict(
-                    wt_chains, seed=(seeds[0] if seeds else None), allow_remote=False)
+                    wt_chains, seed=(seeds[0] if seeds else None), allow_remote=False,
+                    templates=fold_templates)
                 ref_path = rres.get("cif_path")
                 ref_seed = rres.get("seed")
             if not rres.get("success") or not ref_path:
@@ -5629,7 +5676,8 @@ class ToolRouter:
         if engine == "boltz" and len(seeds) > 1:
             bridge = self._get_boltz_bridge()
             for s in seeds[1:]:
-                fr = bridge.predict(wt_chains, seed=s, allow_remote=False)
+                fr = bridge.predict(wt_chains, seed=s, allow_remote=False,
+                                    templates=fold_templates)
                 fpath = fr.get("cif_path") if fr.get("success") else None
                 if not fpath:
                     continue
@@ -5937,6 +5985,124 @@ class ToolRouter:
         return ToolStepResult(tool="structural_align", success=True, data=data,
                               viz_commands=overlay_cmds, summary=summary,
                               elapsed_ms=(_time.perf_counter() - t0) * 1000)
+
+    def _run_template_assist(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """TEMPLATE-ASSIST readout — did the structural template actually help the fold? Compares
+        the GUIDED fold against the construct's existing UNGUIDED T-fold (both already on disk —
+        NEITHER is re-folded; we reuse them as the seed-0 of their own cross-seed ensembles):
+
+          • ΔpLDDT          = guided.mean_plddt − unguided.mean_plddt (confidence shift).
+          • Δflexibility[k] = unguided_floor[k] − guided_floor[k] (per-residue cross-seed dRMSD;
+            POSITIVE = the template made residue k MORE rigid seed↔seed = stabilized).
+
+        Reuses `_fold_wt_reference` (its de-novo REUSE path) for BOTH floors — the only new wiring
+        is threading the template list into the GUIDED floor's seed folds (`fold_templates`), so
+        the guided ensemble wiggles WITH the template. No new floor math (`_per_residue_ddm`
+        inside `_fold_wt_reference`). HONEST: guided pLDDT↑ is template bias, never proof of
+        native — the readout surfaces guided AND unguided AND the delta. Cost: the guided +
+        unguided floors fold ~2×(N−1) extra Boltz seeds.
+
+        Inputs: engine/target/multichain/variant_chain, wt_chains, unguided_ref/guided_ref
+        ({model_id,path,seed}), guided_mean_plddt/unguided_mean_plddt, templates, optional
+        guided_plddt/unguided_plddt (author-resnum-keyed → per-residue ΔpLDDT), template_label,
+        force, threshold, seeds."""
+        import time as _time
+        t0 = _time.perf_counter()
+        engine = inputs.get("engine", "boltz")
+        if engine != "boltz":
+            return ToolStepResult(tool="template_assist", success=False,
+                error="Template-assist is Boltz-only (the cross-seed flexibility floor needs "
+                      "Boltz's seed sampling; ESMFold is deterministic).")
+        unguided_ref = inputs.get("unguided_ref") or {}
+        guided_ref   = inputs.get("guided_ref") or {}
+        if not unguided_ref.get("model_id") or not guided_ref.get("model_id"):
+            return ToolStepResult(tool="template_assist", success=False,
+                error="Template-assist needs BOTH the unguided baseline fold and the guided fold "
+                      "(fold the construct unguided AND guided first).")
+        base = {
+            "engine":        "boltz",
+            "target":        inputs.get("target", "monomer"),
+            "multichain":    bool(inputs.get("multichain")),
+            "variant_chain": inputs.get("variant_chain", "A"),
+            "wt_chains":     inputs.get("wt_chains") or [],
+            "model_id":      inputs.get("model_id"),
+            "compare_to":    inputs.get("compare_to"),
+            "seeds":         list(inputs.get("seeds") or []),
+        }
+        # UNGUIDED floor (no templates) — REUSE the on-disk T-fold as seed-0.
+        ung = self._fold_wt_reference({**base, "wt_ref": unguided_ref, "fold_templates": None})
+        # GUIDED floor (same templates as the guided fold) — REUSE the on-disk guided fold.
+        gud = self._fold_wt_reference({**base, "wt_ref": guided_ref,
+                                       "fold_templates": inputs.get("templates")})
+        if ung is None or gud is None:
+            return ToolStepResult(tool="template_assist", success=False,
+                error="Template-assist could not establish a flexibility floor for one of the "
+                      "folds (a floor-seed fold failed). See the Boltz log.")
+        unguided_floor = ung.get("floor_ddm") or {}
+        guided_floor   = gud.get("floor_ddm") or {}
+        common = sorted(set(unguided_floor) & set(guided_floor), key=self._dev_sort_key)
+        d_flex = {k: round(unguided_floor[k] - guided_floor[k], 3) for k in common}
+        n_stab = sum(1 for v in d_flex.values() if v > 0)        # template made it MORE rigid
+        n_loose = sum(1 for v in d_flex.values() if v < 0)       # template made it LESS rigid
+        mean_dflex = round(sum(d_flex.values()) / len(d_flex), 3) if d_flex else 0.0
+        g_plddt = inputs.get("guided_mean_plddt")
+        u_plddt = inputs.get("unguided_mean_plddt")
+        d_plddt = (round(float(g_plddt) - float(u_plddt), 2)
+                   if isinstance(g_plddt, (int, float)) and isinstance(u_plddt, (int, float)) else None)
+        # Optional per-residue ΔpLDDT (author-resnum-keyed; both maps must be present).
+        gp, up = inputs.get("guided_plddt") or {}, inputs.get("unguided_plddt") or {}
+        d_plddt_by_res: Dict[str, float] = {}
+        for rn in sorted(set(gp) & set(up), key=lambda x: int(x)):
+            try:
+                d_plddt_by_res[str(rn)] = round(float(gp[rn]) - float(up[rn]), 2)
+            except (TypeError, ValueError):
+                pass
+        data = {
+            "template_label":       inputs.get("template_label"),
+            "force":                bool(inputs.get("force")),
+            "threshold":            inputs.get("threshold"),
+            "guided_mean_plddt":    g_plddt,
+            "unguided_mean_plddt":  u_plddt,
+            "d_plddt":              d_plddt,
+            "d_plddt_by_res":       d_plddt_by_res,
+            "d_flex":               d_flex,                       # per-residue (unguided − guided) Å
+            "mean_d_flex":          mean_dflex,
+            "n_stabilized":         n_stab,
+            "n_loosened":           n_loose,
+            "n_residues":           len(d_flex),
+            "guided_model_id":      str(guided_ref.get("model_id")),
+            "unguided_model_id":    str(unguided_ref.get("model_id")),
+            "n_floor_seeds":        ung.get("n_floor_seeds"),
+        }
+        # HONEST framing — surface guided + unguided + delta; never guided-pLDDT-alone-as-proof.
+        plddt_txt = (f"pLDDT {u_plddt:.1f}→{g_plddt:.1f} (Δ{d_plddt:+.1f})"
+                     if d_plddt is not None else "pLDDT n/a")
+        flex_txt = (f"{n_stab}/{len(d_flex)} residues stabilized (mean Δflex {mean_dflex:+.2f} Å; "
+                    f"+ = more rigid with the template)" if d_flex else "no residue overlap")
+        steer = (f"hard force≤{inputs.get('threshold')}Å" if inputs.get("force") else "soft")
+        verdict = ("the template measurably stabilized the fold"
+                   if (d_plddt or 0) > 1.0 or mean_dflex > 0.1 else
+                   "the template's effect is negligible (honest null)")
+        summary = (f"Template assist ({inputs.get('template_label')}, {steer}): {plddt_txt}; "
+                   f"{flex_txt} — {verdict}. Guided confidence is template-biased, not proof of "
+                   f"native; shown against the unguided baseline.")
+        return ToolStepResult(tool="template_assist", success=True, data=data, summary=summary,
+                              elapsed_ms=(_time.perf_counter() - t0) * 1000)
+
+    @staticmethod
+    def _dev_sort_key(k: "Any"):
+        """Sort a deviation key — ``"123"`` (monomer resno) or ``"A:123"`` (chain:resno)."""
+        s = str(k)
+        if ":" in s:
+            ch, rn = s.split(":", 1)
+            try:
+                return (ch, int(rn))
+            except ValueError:
+                return (ch, 0)
+        try:
+            return ("", int(s))
+        except ValueError:
+            return ("", 0)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)
