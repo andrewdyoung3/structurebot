@@ -250,6 +250,91 @@ class TestFoldWtReference:
         assert "floor" not in wt                  # legacy displacement floor stripped
 
 
+class TestDeNovoReferenceReuse:
+    """Stage 2a: a de-novo construct's T-fold is REUSED as the deviation WT reference (no fresh
+    fold of T) and as seed-0 of the cross-seed floor — only the N-1 extra seeds are folded."""
+
+    def test_reuse_tfold_no_refold_floor_from_n_minus_1_seeds(self):
+        # REUSED reference (model_id present, NO floor yet) → the router reads the reference Cα
+        # from the open T-fold and folds ONLY seeds[1:] for the floor; T is NEVER re-folded.
+        ref = _rigid(30)
+        var = _displace(ref, {10, 11}, [3.0, 0, 0])
+        f1 = _displace(ref, {5}, [3.0, 0, 0])     # seed 1: res5 moves
+        f2 = _displace(ref, {5, 8}, [4.0, 0, 0])  # seed 2: res5 + res8 move
+        f3 = dict(ref)                            # seed 3: identical
+        floor_reads = iter([f1, f2, f3])
+        def read_ca(mid, mc, ch):
+            if mid == "7": return ref             # the REUSED T-fold (reference)
+            if mid == "9": return var             # the variant fold
+            return next(floor_reads)              # the N-1 floor-seed folds (open as #6)
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=read_ca)
+        boltz = MagicMock(predict=MagicMock(return_value={"success": True,
+                                                          "cif_path": "/tmp/x.cif", "seed": 0}))
+        r._get_boltz_bridge = MagicMock(return_value=boltz)
+        r._open_and_viz_fold_live = MagicMock()   # MUST NOT be called — no fresh fold of T
+        r.bridge.run_command = MagicMock(return_value={"value": "#6"})
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "boltz", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_chains": [{"id": "A", "sequence": "MKV"}],
+            "wt_ref": {"model_id": "7", "engine": "boltz", "target": "monomer", "seed": 0,
+                       "path": "/tmp/t.cif"}})        # reused T-fold, no floor → establish floor only
+        assert out.success
+        # (a) NO re-fold of T — the fresh-reference live-open path never ran
+        r._open_and_viz_fold_live.assert_not_called()
+        # (b) the floor folded ONLY the N-1 extra seeds (DEVIATION_FLOOR_N=4 → 3); T reused as seed-0
+        assert boltz.predict.call_count == 3
+        assert sorted(c.kwargs.get("seed") for c in boltz.predict.call_args_list) == [1, 2, 3]
+        assert out.data["reference_model_id"] == "7"   # the reused T-fold is the reference
+        # the floor is the measured cross-seed spread (res 5 elevated above the global min)
+        assert out.data["floor_ddm"]["5"] > r._DDM_FLOOR_MIN_A
+        assert out.data["floor_kind"] == "measured"
+
+    def test_reuse_tfold_esmfold_caps_no_floor_folds(self):
+        # ESMFold is deterministic → the reused reference needs NO floor folds; the floor collapses
+        # to the global-min / neutral caps. No bridge is touched (reference reused, no seeds).
+        ref = _rigid(20)
+        var = _displace(ref, {5}, [3.0, 0, 0])
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        r._get_esmfold_bridge = MagicMock()       # reference reused → never folded
+        r._get_boltz_bridge = MagicMock()         # deterministic → no floor seeds
+        r._open_and_viz_fold_live = MagicMock()
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_chains": [{"id": "A", "sequence": "MKV"}],
+            "wt_ref": {"model_id": "7", "engine": "esmfold", "target": "monomer", "path": "/tmp/t.pdb"}})
+        assert out.success
+        r._open_and_viz_fold_live.assert_not_called()    # no fresh T fold
+        r._get_esmfold_bridge.assert_not_called()        # reference reused (deterministic)
+        r._get_boltz_bridge.assert_not_called()          # zero floor folds
+        assert out.data["floor_kind"] == "deterministic"
+        assert set(out.data["floor_ddm"].values()) == {r._DDM_FLOOR_MIN_A}   # caps everywhere
+
+    def test_reuse_reopens_reference_if_closed_midsession(self):
+        # the reused T-fold model was closed (read returns {}) → reopen from the stored path, then
+        # read its Cα. Still no fresh fold of T.
+        ref = _rigid(20)
+        var = _displace(ref, {5}, [3.0, 0, 0])
+        reads = {"7": {}, "8": ref, "9": var}     # #7 closed; reopened as #8
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: reads.get(mid, {}))
+        r._parse_model_spec = MagicMock(return_value="#8")
+        r._open_and_viz_fold_live = MagicMock()
+        r._get_esmfold_bridge = MagicMock()
+        r.bridge.run_command = MagicMock(return_value={"value": "#8"})
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "esmfold", "target": "monomer",
+            "variant_chain": "A", "multichain": False,
+            "wt_chains": [{"id": "A", "sequence": "MKV"}],
+            "wt_ref": {"model_id": "7", "engine": "esmfold", "target": "monomer", "path": "/tmp/t.pdb"}})
+        assert out.success
+        r._open_and_viz_fold_live.assert_not_called()    # reopened, not re-folded
+        assert out.data["reference_model_id"] == "8"     # the reopened id
+
+
 class TestPerResidueLddt:
     """The superposition-FREE per-residue Cα-lDDT kernel — invariant to rigid-body motion (the
     whole reason for the metric), drops only where local geometry genuinely changes."""

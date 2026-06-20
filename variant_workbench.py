@@ -1954,16 +1954,31 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if v is None or self._design is None:
             return None
         cd = tab.design
+        # DE-NOVO (sequence-seeded): the variant folds at the CONSTRUCT's engine + oligomer (GAP C)
+        # and superposes onto the construct's T-FOLD, not the synthetic design id (GAP A). The
+        # T-fold IS the de-novo analog of the crystal reference; engine/target are pinned from it,
+        # not the picker, so the variant, the WT reference, and the floor seeds all fold the same.
+        denovo = self._design.source == "sequence"
+        tf = cd.template_fold if denovo else {}
+        if denovo:
+            if not tf.get("model_id"):
+                return None                       # construct not folded yet → no reference to fold against
+            engine     = tf.get("engine", engine)             # PIN engine from the construct fold
+            assembly   = (tf.get("target") == "assembly")     # PIN oligomer from the construct fold
+            compare_to = tf.get("model_id")                   # superpose onto the T-fold (GAP A)
+        else:
+            compare_to = self._design.model_id    # crystal design: matchmaker onto the loaded WT
         ti: Dict[str, object] = {
             "model_id":   self._design.model_id,
             "chain":      cd.rep_chain,
             "engine":     engine,
             "open_model": True,
             "local_only": True,                   # LOCAL-ONLY: no remote Atlas/MSA server
-            "compare_to": self._design.model_id,  # matchmaker onto the loaded WT (oligomer)
+            "compare_to": compare_to,
         }
         if engine == "boltz" and assembly:
-            # the full homo-oligomer: every copy chain folded with the variant's sequence.
+            # the full homo-oligomer: every copy chain folded with the variant's sequence
+            # (variant sequence × the construct's copy count).
             ti["chains"] = [{"id": c, "sequence": v.sequence} for (_m, c) in cd.members]
             target = f"{len(cd.members)}-chain assembly"
         else:
@@ -1986,6 +2001,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText("Select a VARIANT row first (T is the template baseline).")
             return
         cd = self._cur_tab().design
+        # DE-NOVO: no engine picker — the variant folds at the CONSTRUCT's engine + oligomer
+        # (pinned in fold_launch_spec from cd.template_fold). Requires the construct be folded first.
+        if self._design is not None and self._design.source == "sequence":
+            tf = cd.template_fold
+            if not tf.get("model_id"):
+                self._status.setText("Fold the construct first (Fold ▾ → Fold construct) — a "
+                                     "variant folds at the construct's engine + oligomer.")
+                return
+            spec = self.fold_launch_spec(tf.get("engine", "boltz"))   # engine/target pinned inside
+            if spec is not None:
+                self.launchRequested.emit(spec)
+            return
         n_copies = len(cd.members)
         avail = self._fold_engine_availability()
         box = QtWidgets.QMessageBox(self)
@@ -2092,6 +2119,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         else:
             variant_chain = "A" if engine == "esmfold" else cd.rep_chain
             wt_chains = [{"id": variant_chain, "sequence": t_seq}]
+        # WT reference: a cached one wins; else for a DE-NOVO construct REUSE the displayed T-fold
+        # (no fresh fold of T) — its model_id is seed-0 of the floor and the deviation reference.
+        # The router reads ref Cα from this open model and, finding no floor yet, folds only the
+        # N-1 extra seeds. A crystal design passes None → the router folds the reference + floor.
+        wt_ref = cd.wt_refs.get(combo)
+        if not wt_ref and self._design.source == "sequence" and cd.template_fold.get("model_id"):
+            tf = cd.template_fold
+            wt_ref = {"engine":   tf.get("engine"),  "target": tf.get("target"),
+                      "seed":     tf.get("seed"),    "model_id": tf.get("model_id"),
+                      "path":     tf.get("cif_path") or tf.get("pdb_path")}
         ti: Dict[str, object] = {
             "variant_model_id": fold["model_id"],
             "engine":           engine,
@@ -2101,7 +2138,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "wt_chains":        wt_chains,
             "compare_to":       self._design.model_id,   # reference matchmaker onto crystal WT
             "model_id":         self._design.model_id,
-            "wt_ref":           cd.wt_refs.get(combo),    # cached reference (skip folding) or None
+            "wt_ref":           wt_ref,                   # cached/reused reference (skip T fold) or None
             "local_only":       True,
         }
         # INDEL-AWARE pairing (Stage A, monomer): carry the variant-fold→reference-fold

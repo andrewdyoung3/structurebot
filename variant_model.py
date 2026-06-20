@@ -755,6 +755,12 @@ def fold_summary(step_data: Dict[str, Any],
         out["chains_ptm"] = d["chains_ptm"]                # per-chain pTM, {chain_idx: ptm}
     if d.get("seed") is not None:
         out["seed"] = d["seed"]                            # seed-pinned provenance (reproducibility)
+    # Predicted-structure file path — ADDITIVE: lets a reused fold (e.g. a de-novo construct's
+    # T-fold serving as the deviation WT reference) be REOPENED if its model is closed mid-session.
+    if d.get("cif_path") is not None:
+        out["cif_path"] = d["cif_path"]
+    if d.get("pdb_path") is not None:
+        out["pdb_path"] = d["pdb_path"]
     return out
 
 

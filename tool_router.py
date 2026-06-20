@@ -5554,44 +5554,63 @@ class ToolRouter:
             n    = int(getattr(_cfg, "DEVIATION_FLOOR_N", 4))   # N=4: 1 reference + 3 floor
             seeds = list(range(base, base + max(1, n)))
 
-        # ── reference fold at the pinned seed, via the engine's own bridge ────────
-        if engine == "esmfold":
-            seq = (wt_chains[0]["sequence"] if wt_chains else inputs.get("wt_sequence"))
-            if not seq:
+        # ── reference: REUSE an existing fold (de-novo T-fold) OR fold T fresh ────
+        reuse = inputs.get("wt_ref") or {}
+        if reuse.get("model_id"):
+            # REUSE PATH (de-novo): the construct's T-fold IS the reference (folded at the pinned
+            # seed already). Skip the reference fold entirely — read its Cα as the seed-0 baseline;
+            # only the floor seeds below are folded. Reopen from path if it was closed mid-session.
+            ref_mid  = str(reuse["model_id"])
+            ref_path = reuse.get("path")
+            ref_seed = reuse.get("seed")
+            ref_ca   = self._read_fold_ca(ref_mid, multichain, chain)
+            if not ref_ca and ref_path:
+                ro = self.bridge.run_command(f'open "{Path(ref_path).as_posix()}"')
+                spec = self._parse_model_spec(ro, None)
+                if spec:
+                    ref_mid = spec.lstrip("#")
+                    ref_ca = self._read_fold_ca(ref_mid, multichain, chain)
+            if not ref_ca:
                 return None
-            rres = self._get_esmfold_bridge().predict(seq, label="WTref", allow_remote=False)
-            ref_path = None
-            if rres.get("success"):
-                import tempfile as _tf
-                _t = _tf.NamedTemporaryFile(mode="w", suffix=".pdb",
-                                            prefix="wtref_esmfold_", delete=False)
-                _t.write(rres.get("pdb_str", "")); _t.close()
-                ref_path = _t.name
-            ref_seed = None
         else:
-            if not wt_chains:
+            # FRESH-FOLD PATH (crystal design): fold the template T at the pinned seed.
+            if engine == "esmfold":
+                seq = (wt_chains[0]["sequence"] if wt_chains else inputs.get("wt_sequence"))
+                if not seq:
+                    return None
+                rres = self._get_esmfold_bridge().predict(seq, label="WTref", allow_remote=False)
+                ref_path = None
+                if rres.get("success"):
+                    import tempfile as _tf
+                    _t = _tf.NamedTemporaryFile(mode="w", suffix=".pdb",
+                                                prefix="wtref_esmfold_", delete=False)
+                    _t.write(rres.get("pdb_str", "")); _t.close()
+                    ref_path = _t.name
+                ref_seed = None
+            else:
+                if not wt_chains:
+                    return None
+                rres = self._get_boltz_bridge().predict(
+                    wt_chains, seed=(seeds[0] if seeds else None), allow_remote=False)
+                ref_path = rres.get("cif_path")
+                ref_seed = rres.get("seed")
+            if not rres.get("success") or not ref_path:
                 return None
-            rres = self._get_boltz_bridge().predict(
-                wt_chains, seed=(seeds[0] if seeds else None), allow_remote=False)
-            ref_path = rres.get("cif_path")
-            ref_seed = rres.get("seed")
-        if not rres.get("success") or not ref_path:
-            return None
 
-        # Open LIVE + read the REAL id back (V3 fix — a guessed id would mis-target the viz
-        # AND the CA read below, silently corrupting the deviation against this reference).
-        ref_mid, _cmds, _exps = self._open_and_viz_fold_live(
-            Path(ref_path).as_posix(), {**inputs, "compare_to": compare_to})
-        try:                                  # consume the id so it isn't reused
-            self.session.add_structure(
-                ref_mid, f"wtref_{engine}_{model_id}", path=ref_path,
-                metadata={"predicted": True, "engine": engine, "wt_reference": True})
-        except Exception:
-            pass
+            # Open LIVE + read the REAL id back (V3 fix — a guessed id would mis-target the viz
+            # AND the CA read below, silently corrupting the deviation against this reference).
+            ref_mid, _cmds, _exps = self._open_and_viz_fold_live(
+                Path(ref_path).as_posix(), {**inputs, "compare_to": compare_to})
+            try:                                  # consume the id so it isn't reused
+                self.session.add_structure(
+                    ref_mid, f"wtref_{engine}_{model_id}", path=ref_path,
+                    metadata={"predicted": True, "engine": engine, "wt_reference": True})
+            except Exception:
+                pass
 
-        ref_ca = self._read_fold_ca(ref_mid, multichain, chain)
-        if not ref_ca:
-            return None
+            ref_ca = self._read_fold_ca(ref_mid, multichain, chain)
+            if not ref_ca:
+                return None
 
         # ── per-residue noise floors: cross-seed WT variation (Boltz only) ────────
         # Both SUPERPOSITION-FREE, from the extra-seed WT folds — how much the WT's OWN structure
@@ -5669,12 +5688,20 @@ class ToolRouter:
         ref_ca: Dict["Any", "Any"] = {}
         if wt_ref and wt_ref.get("model_id"):
             ref_ca = self._read_fold_ca(wt_ref["model_id"], multichain, chain)
-            if not ref_ca and wt_ref.get("path"):     # cached but not open → reopen
+            if not ref_ca and wt_ref.get("path"):     # cached/reused but not open → reopen
                 ro = self.bridge.run_command(f'open "{Path(wt_ref["path"]).as_posix()}"')
                 spec = self._parse_model_spec(ro, None)
                 if spec:
                     wt_ref = {**wt_ref, "model_id": spec.lstrip("#")}
                     ref_ca = self._read_fold_ca(wt_ref["model_id"], multichain, chain)
+            # REUSED reference (a de-novo construct's T-fold) WITHOUT a floor yet → establish the
+            # cross-seed floor ONLY (fold the N-1 extra seeds against this model as seed-0; NO fresh
+            # fold of T). The result carries the floor so the workbench caches the full wt_ref.
+            if ref_ca and not wt_ref.get("floor_ddm"):
+                established = self._fold_wt_reference({**inputs, "wt_ref": wt_ref})
+                if established:
+                    wt_ref = established
+                    ref_ca = self._read_fold_ca(wt_ref["model_id"], multichain, chain) or ref_ca
         if not ref_ca:
             wt_ref = self._fold_wt_reference(inputs)
             if not wt_ref:
