@@ -1720,3 +1720,124 @@ class TestDeNovoHetero:
         assert cds[1].template_fold["chains_ptm"] == {"C": 0.20}
         assert cds[0].template_fold["mean_plddt"] > 80.0            # A's pLDDT (id-keyed, robust)
         assert cds[1].template_fold["mean_plddt"] < 50.0
+
+
+class TestDeNovoHeteroDeviation:
+    """Stage 2b: HETERO construct VARIANTS + DEVIATION. A variant of one chain folds the WHOLE
+    declared complex (variant × its members + WT siblings), with a read-back parity guard, and
+    the full-complex floor is folded ONCE and shared by every cd (no second-cd re-fold)."""
+
+    def _denovo_panel(self):
+        from session_state import SessionState
+        p, c = _panel([], session=SessionState())
+        return p, c
+
+    def _fold_hetero(self, p, seqs=(("MKVLWPQ", 3), ("AAAGST", 3))):
+        """Add a 2-chain de-novo construct (PCNA-like ×3 + p21-like ×3) and fold it as one
+        Boltz 6-chain assembly (cd0 → A,B,C ; cd1 → D,E,F). Returns the two cds."""
+        p._add_sequence_construct("cplx", list(seqs))
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        plddt0 = {i: 90.0 for i in range(1, len(seqs[0][0]) + 1)}
+        plddt1 = {i: 40.0 for i in range(1, len(seqs[1][0]) + 1)}
+        pbc = {c: plddt0 for c in ("A", "B", "C")}
+        pbc.update({c: plddt1 for c in ("D", "E", "F")})
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "chain_ids": ["A", "B", "C", "D", "E", "F"], "plddt_by_chain": pbc,
+            "cif_path": "/tmp/cplx.cif"}}]})
+        return list(p._design.chains.values())
+
+    def _active_variant_on(self, p, tab_index):
+        """Add + select a substitution variant on the cd at *tab_index*; return (cd, variant)."""
+        p._tabs.setCurrentIndex(tab_index)
+        p._add_variant()
+        cd = p._cur_tab().design
+        v = cd.variants[-1]
+        p._cur_tab().set_active_row(v.id)
+        cd.edit_variant(v.id, 0, "A" if v.cells[0].aa != "A" else "S")
+        return cd, v
+
+    def test_variant_fold_composes_full_complex(self, _app):
+        # A PCNA variant folds the WHOLE complex: PCNA-variant × 3 + p21-WT × 3 (NOT PCNA alone),
+        # chain ids 1:1 with the construct T-fold (A-F).
+        p, _ = self._denovo_panel()
+        cds = self._fold_hetero(p)
+        cd0, v = self._active_variant_on(p, 0)
+        chains = p.fold_launch_spec("boltz")["tool_inputs"]["chains"]
+        assert [c["id"] for c in chains] == ["A", "B", "C", "D", "E", "F"]
+        p21_t = "".join(x.aa for x in cds[1].template_cells)
+        assert [c["sequence"] for c in chains if c["id"] in ("A", "B", "C")] == [v.sequence] * 3
+        assert [c["sequence"] for c in chains if c["id"] in ("D", "E", "F")] == [p21_t] * 3
+        assert v.sequence != p21_t                               # the active chain actually varies
+
+    def test_deviation_wt_chains_compose_full_complex(self, _app):
+        # The floor's WT reference is the WHOLE complex, ALL-WT — the active cd contributes its
+        # template T sequence (NOT the variant); the variant's change lives only in the variant fold.
+        p, _ = self._denovo_panel()
+        cds = self._fold_hetero(p)
+        cd0, v = self._active_variant_on(p, 0)
+        v.results.fold = {"engine": "boltz", "target": "assembly", "model_id": "8"}
+        wtc = p.deviation_launch_spec()["tool_inputs"]["wt_chains"]
+        assert [c["id"] for c in wtc] == ["A", "B", "C", "D", "E", "F"]
+        pcna_t = "".join(x.aa for x in cds[0].template_cells)
+        p21_t = "".join(x.aa for x in cds[1].template_cells)
+        assert [c["sequence"] for c in wtc if c["id"] in ("A", "B", "C")] == [pcna_t] * 3
+        assert [c["sequence"] for c in wtc if c["id"] in ("D", "E", "F")] == [p21_t] * 3
+        assert all(c["sequence"] != v.sequence for c in wtc if c["id"] in ("A", "B", "C"))
+
+    def test_variant_fold_parity_guard_fails_loud(self, _app):
+        # The variant-complex fold must return the SAME chains as the T-fold; a relabel/missing
+        # chain is refused (no fold stored) — id drift surfaces loudly, not by dropping residues.
+        p, _ = self._denovo_panel()
+        self._fold_hetero(p)
+        cd0, v = self._active_variant_on(p, 0)
+        rns = [c.resnum for c in v.cells if not c.is_gap and c.resnum is not None]
+        plddt = {i: 80.0 for i in range(1, len(rns) + 1)}
+
+        def result(ids):
+            return {"tool_step_results": [{"tool": "boltz", "data": {
+                "engine": "boltz", "new_model_id": "8", "target": "assembly", "mean_plddt": 75.0,
+                "chain_ids": ids, "plddt": plddt}}]}
+        p.apply_fold_result(v.id, result(["A", "B", "C", "D", "Z", "F"]))   # E → Z drift
+        assert v.results.fold is None                            # refused, nothing stored
+        assert "mismatch" in p._status.text().lower()
+        p.apply_fold_result(v.id, result(["A", "B", "C", "D", "E", "F"]))   # parity holds
+        assert v.results.fold and v.results.fold.get("model_id") == "8"
+
+    def test_floor_once_distributed_to_all_cds_no_sibling_refold(self, _app):
+        # The full-complex floor is folded ONCE → its wt_ref is distributed to EVERY cd, so a
+        # sibling cd's deviation sees a CACHED ref (floor present) → high-confidence, no re-fold.
+        p, _ = self._denovo_panel()
+        cds = self._fold_hetero(p)
+        cd0, v = self._active_variant_on(p, 0)
+        v.results.fold = {"engine": "boltz", "target": "assembly", "model_id": "8"}
+        wt_ref = {"model_id": "7", "engine": "boltz", "target": "assembly",
+                  "floor_ddm": {"A:1": 1.0}, "floor_lddt": {"A:1": 0.9}, "path": "/tmp/cplx.cif"}
+        p.apply_deviation_result(v.id, {"tool_step_results": [{"tool": "variant_deviation", "data": {
+            "engine": "boltz", "target": "assembly", "wt_ref": wt_ref,
+            "ddm": {}, "n_disrupted": 0, "n_residues": 0}}]})
+        combo = "boltz:assembly"
+        assert cds[0].wt_refs[combo] is wt_ref and cds[1].wt_refs[combo] is wt_ref  # shared
+        # the p21 cd's deviation now reuses the shared floor — confirm-gate skipped, no floor fold
+        cd1, v1 = self._active_variant_on(p, 1)
+        v1.results.fold = {"engine": "boltz", "target": "assembly", "model_id": "9"}
+        spec1 = p.deviation_launch_spec()
+        assert spec1["confidence"] == "high"
+        assert spec1["tool_inputs"]["wt_ref"].get("floor_ddm")     # the already-established floor
+
+    def test_hetero_indel_deviation_refused(self, _app):
+        # Scope: hetero + indel stays refused (monomer-only column pairing). The assembly-target
+        # guard fires for de-novo too — no launch, honest message.
+        p, _ = self._denovo_panel()
+        self._fold_hetero(p)
+        cd0, v = self._active_variant_on(p, 0)
+        emitted = []
+        p.launchRequested.connect(lambda spec: emitted.append(spec))
+        p.apply_fold_result(v.id, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "8", "target": "assembly", "mean_plddt": 75.0,
+            "chain_ids": ["A", "B", "C", "D", "E", "F"], "plddt": {1: 80.0}}}]})
+        p._cur_tab().set_active_row(v.id)
+        p._do_delete_residue(p._cur_tab(), v.id, 2)              # make it an indel variant
+        p._on_deviation_clicked()
+        assert emitted == []                                    # refused, not launched
+        assert "monomer" in p._status.text().lower()

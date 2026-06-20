@@ -39,6 +39,18 @@ def _displace(coords, resnums, delta) -> Dict[int, np.ndarray]:
     return {rn: (c + d if rn in resnums else c.copy()) for rn, c in coords.items()}
 
 
+def _multichain(chains, n: int = 8, seed: int = 11):
+    """A multichain Cα cloud keyed by (chain, resno) — the shape `_read_fold_ca` returns for an
+    assembly fold (the Stage 2b whole-complex deviation input)."""
+    rng = np.random.default_rng(seed)
+    return {(ch, i + 1): rng.standard_normal(3) * 10 for ch in chains for i in range(n)}
+
+
+def _displace_mc(coords, keys, delta):
+    d = np.array(delta, dtype=float)
+    return {k: (c + d if k in keys else c.copy()) for k, c in coords.items()}
+
+
 class TestRunVariantDeviation:
     def test_floor_gated_disruption(self):
         # FLOOR-GATING (migrated to dRMSD): a block of residues moved 2 Å clears the global-min
@@ -333,6 +345,66 @@ class TestDeNovoReferenceReuse:
         assert out.success
         r._open_and_viz_fold_live.assert_not_called()    # reopened, not re-folded
         assert out.data["reference_model_id"] == "8"     # the reopened id
+
+    # ── Stage 2b: hetero whole-complex deviation ──────────────────────────────
+    def test_multichain_floor_folds_whole_complex_once(self):
+        # REUSED multichain T-fold (no floor yet) → the floor is established by folding the N-1
+        # extra seeds over the FULL 6-chain complex (ONE fold per seed, the whole assembly — NOT
+        # per chain); T itself is never re-folded.
+        chains = ["A", "B", "C", "D", "E", "F"]
+        ref = _multichain(chains, n=6)
+        var = _displace_mc(ref, {(ch, 3) for ch in ("D", "E", "F")}, [4.0, 0, 0])
+        f1 = _displace_mc(ref, {("A", 2)}, [3.0, 0, 0])
+        f2 = _displace_mc(ref, {("A", 2), ("B", 4)}, [4.0, 0, 0])
+        f3 = dict(ref)
+        floor_reads = iter([f1, f2, f3])
+        def read_ca(mid, mc, ch):
+            if mid == "7": return ref         # the REUSED T-complex-fold (reference)
+            if mid == "9": return var         # the variant complex fold
+            return next(floor_reads)          # the N-1 floor-seed folds of the WHOLE complex
+        wt_chains = [{"id": c, "sequence": "MKV" if c in ("A", "B", "C") else "AAA"}
+                     for c in chains]
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=read_ca)
+        boltz = MagicMock(predict=MagicMock(return_value={"success": True,
+                                                          "cif_path": "/tmp/x.cif", "seed": 0}))
+        r._get_boltz_bridge = MagicMock(return_value=boltz)
+        r._open_and_viz_fold_live = MagicMock()
+        r.bridge.run_command = MagicMock(return_value={"value": "#6"})
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "boltz", "target": "assembly",
+            "variant_chain": "D", "multichain": True, "wt_chains": wt_chains,
+            "wt_ref": {"model_id": "7", "engine": "boltz", "target": "assembly", "seed": 0,
+                       "path": "/tmp/t.cif"}})
+        assert out.success
+        r._open_and_viz_fold_live.assert_not_called()           # no re-fold of T
+        assert boltz.predict.call_count == 3                     # ONE fold per floor seed
+        assert all(c.args[0] == wt_chains for c in boltz.predict.call_args_list)   # whole complex
+        assert sorted(c.kwargs.get("seed") for c in boltz.predict.call_args_list) == [1, 2, 3]
+        assert out.data["floor_kind"] == "measured"
+
+    def test_multichain_pairing_is_per_chain_not_collapsed_by_resno(self):
+        # WHOLE-COMPLEX pairing keys by (chain, resno): chain A residue 4 and chain D residue 4 are
+        # DISTINCT entries (no collapse / cross-pair by bare resno). A perturbation localized to
+        # the p21-like chains carries its STRONGEST signal at ITS OWN chains' keys — paired to
+        # their own counterparts, far above the same-resno PCNA-like sibling.
+        chains = ["A", "B", "C", "D", "E", "F"]
+        ref = _multichain(chains, n=8)
+        var = _displace_mc(ref, {("D", 4), ("E", 4), ("F", 4)}, [8.0, 0, 0])
+        r = _router()
+        r._read_fold_ca = MagicMock(side_effect=lambda mid, mc, ch: ref if mid == "7" else var)
+        out = r._run_variant_deviation({
+            "variant_model_id": "9", "engine": "boltz", "target": "assembly",
+            "variant_chain": "D", "multichain": True,
+            "wt_ref": {"model_id": "7", "floor_ddm": {"A:1": 0.5}, "floor_lddt": {"A:1": 0.9},
+                       "path": "/tmp/c.cif"}})       # populated floor → no establishment fold
+        assert out.success
+        ddm = out.data["ddm"]
+        assert {k.split(":")[0] for k in ddm} == set(chains)    # all six chains keyed independently
+        # the three moved p21-like residues are the top-3 dRMSD, each at its OWN (chain,resno) key
+        top3 = sorted(ddm, key=ddm.get, reverse=True)[:3]
+        assert set(top3) == {"D:4", "E:4", "F:4"}
+        assert ddm["D:4"] > 2 * ddm["A:4"]                      # not cross-paired onto the sibling
 
 
 class TestPerResidueLddt:
