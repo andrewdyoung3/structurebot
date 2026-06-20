@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import shlex
 import sys
 import time
@@ -76,13 +77,20 @@ TARGETS: Dict[str, dict] = {
     # whether the CspB ~0.6 rescue threshold generalizes to a different fold. Templates from US-align
     # structural search (foldseek not installed), NOT sequence homologs. `hard` on the near-threshold
     # rungs. The identical control (2KL8 itself) is the can-it-rescue-this-fold-at-all positive ctrl.
+    # RE-LADDERED via foldseek (the curated 16-panel was a SEARCH ARTIFACT — it missed 2KL8's real
+    # neighbors). foldseek finds 2KL8 has many close neighbors; the HIGH-structTM ones (5CW9 .87,
+    # 2MTL) are SEQUENCE homologs (its design-series relatives — so 2KL8 isn't a clean seq-orphan),
+    # the STRUCTURE-ONLY neighbors (low seq-id) top out at 6MRS .72 (ABOVE the CspB ~0.6 threshold).
+    # This ladder separates: can a close template rescue 2KL8 at all (5CW9, high seq+struct)? does a
+    # STRUCTURE-ONLY neighbor above the threshold rescue (6MRS .72/.26, 4D3G .67/.24 — the key test)?
     "orphan_2kl8": {
         "pdb": "2KL8", "chain": "A",
         "templates": [
-            {"pdb": "2KL8", "chain": "A", "tag": "identical (positive control), sTM 1.0"},
-            {"pdb": "2ACY", "chain": "A", "tag": "closest neighbor, sTM .63 (cliff edge)", "hard": True},
-            {"pdb": "1NTF", "chain": "A", "tag": "NTF2, sTM .50 (below threshold)", "hard": True},
-            {"pdb": "1OPY", "chain": "A", "tag": "KSI, sTM .40 (well below)"},
+            {"pdb": "2KL8", "chain": "A", "tag": "identical control, sTM 1.0"},
+            {"pdb": "5CW9", "chain": "A", "tag": "sTM .87 / seq-id .90 (seq+struct homolog)"},
+            {"pdb": "6MRS", "chain": "A", "tag": "sTM .72 / seq-id .26 (STRUCTURE-ONLY, above thresh)", "hard": True},
+            {"pdb": "4D3G", "chain": "A", "tag": "sTM .67 / seq-id .24 (structure-only)", "hard": True},
+            {"pdb": "2LN3", "chain": "A", "tag": "sTM .49 / seq-id .30 (distant control)"},
         ],
     },
 }
@@ -199,6 +207,57 @@ def usalign_tm(query_path: str, ref_path: str) -> Optional[dict]:
     if not res.get("ok"):
         return None
     return ToolRouter._parse_usalign_output(res.get("stdout", ""))
+
+
+def foldseek_neighbors(query_path: str, max_results: int = 60,
+                       min_tm: float = 0.3) -> List[Tuple[str, str, float]]:
+    """SYSTEMATIC structural-neighbor search (replaces the curated US-align panel): foldseek
+    `easy-search` of *query_path* against the LOCAL PDB DB (TM-align mode), returns
+    [(pdb_id, chain, structTM-to-query)] sorted desc, TM ≥ *min_tm*. LOCAL-ONLY — no remote
+    search API at query time (the DB was downloaded once). Empty list if foldseek/DB absent.
+
+    Used to build an ORPHAN's structural-neighbor ladder honestly (does a closer neighbor than
+    the curated panel exist?) — every hit is ~0 seq-id to a de-novo target by construction."""
+    exe = getattr(_cfg, "FOLDSEEK_EXE", "/home/andre/foldseek/bin/foldseek")
+    db = getattr(_cfg, "FOLDSEEK_DB", "/home/andre/foldseek_db/pdb")
+    if not (query_path and os.path.isfile(query_path)):
+        return []
+    import tempfile as _tf
+    q = _wsl.translate_path(os.path.abspath(query_path))
+    out_wsl = f"/tmp/fs_out_{os.getpid()}.m8"
+    tmp_wsl = f"/tmp/fs_tmp_{os.getpid()}"
+    fmt = "target,alntmscore,qtmscore,ttmscore,evalue"
+    cmd = (f"{shlex.quote(exe)} easy-search {shlex.quote(q)} {shlex.quote(db)} "
+           f"{shlex.quote(out_wsl)} {shlex.quote(tmp_wsl)} --alignment-type 1 "
+           f"--format-output {shlex.quote(fmt)} --max-seqs 2000 -e 10 "
+           f"&& cat {shlex.quote(out_wsl)}")
+    res = _wsl.run_command(cmd, timeout=getattr(_cfg, "FOLDSEEK_TIMEOUT", 600))
+    if not res.get("ok"):
+        return []
+    hits: List[Tuple[str, str, float]] = []
+    seen = set()
+    for ln in (res.get("stdout", "") or "").splitlines():
+        parts = ln.split("\t")
+        if len(parts) < 2:
+            continue
+        tgt = parts[0]                          # e.g. "1ABC_A" or "pdb_1abc.cif_A"
+        try:
+            tm = float(parts[1])                # alntmscore (query-normalized structural TM)
+        except ValueError:
+            continue
+        # extract a 4-char PDB id + chain from the foldseek target id
+        mobj = re.search(r"([0-9][A-Za-z0-9]{3})[_\.-]?([A-Za-z0-9])?", tgt)
+        if not mobj:
+            continue
+        pid = mobj.group(1).upper()
+        ch = (mobj.group(2) or "A")
+        key = (pid, ch)
+        if key in seen or tm < min_tm:
+            continue
+        seen.add(key)
+        hits.append((pid, ch, round(tm, 3)))
+    hits.sort(key=lambda h: -h[2])
+    return hits[:max_results]
 
 
 def ca_xyz_from_cif(cif_path: str) -> Dict[int, Tuple[float, float, float]]:
