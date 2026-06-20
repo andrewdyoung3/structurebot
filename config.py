@@ -464,6 +464,15 @@ BOLTZ_TIMEOUT: int = int(os.environ.get("BOLTZ_TIMEOUT", "1800"))
 # ignore this — their floor is the global minimum (DEVIATION_FLOOR_MIN_A in tool_router).
 DEVIATION_FLOOR_N: int = int(os.environ.get("DEVIATION_FLOOR_N", "4"))
 
+# ── US-align (LOCAL-ONLY sequence-independent structural alignment, WSL C++ binary) ──
+# Built from github.com/pylelab/USalign (g++ -O3). Reads CIF/PDB directly; no network.
+# Used by the Variant Workbench "Align to PDB" action to structurally superpose a de-novo
+# construct's fold onto a chosen reference REGARDLESS of sequence (the case ChimeraX
+# matchmaker can't reach — it is sequence-guided and fails closed at zero homology).
+USALIGN_EXE: str = os.environ.get("USALIGN_EXE", "/home/andre/USalign/USalign")
+USALIGN_WSL_DISTRO: str = os.environ.get("USALIGN_WSL_DISTRO", "Ubuntu-24.04")
+USALIGN_TIMEOUT: int = int(os.environ.get("USALIGN_TIMEOUT", "120"))
+
 # Controls whether ESM-2 uses the venv312 GPU backend.
 #   "auto"      — use venv312 if it exists and passes a CUDA smoke-test (default)
 #   "true"/"1"  — always use venv312; raise if unavailable

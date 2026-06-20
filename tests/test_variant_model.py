@@ -287,6 +287,21 @@ class TestStage4cDeviation:
         ds2 = DesignSession.from_dict(ds.to_dict())
         assert ds2.chains["k|1/A"].wt_refs == {}
 
+    def test_structural_align_roundtrip(self):
+        # Stage 3: the US-align structural alignment slot survives persistence.
+        ds = DesignSession("denovo-x", source="sequence", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        ds.chains["k|1/A"].structural_align = {
+            "ref_label": "1MBN", "tm_ref": 0.771, "tm_query": 0.721, "rmsd": 2.46,
+            "n_aligned": 136, "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0], "shared_fold": True}
+        ds2 = DesignSession.from_dict(ds.to_dict())
+        sa = ds2.chains["k|1/A"].structural_align
+        assert sa["tm_ref"] == 0.771 and sa["n_aligned"] == 136 and len(sa["matrix"]) == 12
+        # absent → defaults empty
+        ds3 = DesignSession("1", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        assert DesignSession.from_dict(ds3.to_dict()).chains["k|1/A"].structural_align == {}
+
     def test_model_color_targets_predicted_model_per_chain(self):
         # red only above-floor residues; run-grouped, reset baseline per chain, #mid spec
         val = lambda ch, rn: ("#e23b3b" if rn in (5, 6) else None)

@@ -1841,3 +1841,78 @@ class TestDeNovoHeteroDeviation:
         p._on_deviation_clicked()
         assert emitted == []                                    # refused, not launched
         assert "monomer" in p._status.text().lower()
+
+
+class TestStructuralAlign:
+    """Stage 3: sequence-independent structural alignment (US-align) — panel side. The
+    EXPLICIT-reference align path (distinct from the construct fold's no_reference default),
+    capture into the structural_align slot, and the honest TM readout."""
+
+    def _denovo_panel(self):
+        from session_state import SessionState
+        p, c = _panel([], session=SessionState())
+        return p, c
+
+    def _fold_monomer_construct(self, p, seq="MKVLWAACGT"):
+        """A de-novo construct folded as a Boltz monomer (T-fold on disk = US-align query)."""
+        p._add_sequence_construct("binder", seq)
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "monomer", "mean_plddt": 80.0,
+            "plddt": {i: 90.0 for i in range(1, len(seq) + 1)}, "cif_path": "/tmp/binder.cif"}}]})
+        return next(iter(p._design.chains.values()))
+
+    def test_align_spec_uses_explicit_reference_not_no_reference(self, _app):
+        # The align path carries the EXPLICIT chosen reference + the construct fold on disk +
+        # the open fold model (option-B target) — it is NOT a no_reference fold spec.
+        p, _ = self._denovo_panel()
+        self._fold_monomer_construct(p)
+        spec = p.structural_align_launch_spec(reference_pdb_id="1mbn")
+        assert spec["tool"] == "structural_align" and spec["refresh"] == "structural_align"
+        ti = spec["tool_inputs"]
+        assert ti["reference_pdb_id"] == "1MBN"             # explicit reference (upper-cased)
+        assert ti["query_path"] == "/tmp/binder.cif"        # the construct T-fold on disk
+        assert ti["query_model_id"] == "7"                  # the OPEN fold model (view-matrix target)
+        assert "no_reference" not in ti                     # distinct from the fold path's default
+        assert spec["_align_ukey"] is not None
+
+    def test_align_spec_none_until_construct_folded(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("b", "MKVLW")             # not folded → no fold on disk
+        assert p.structural_align_launch_spec(reference_pdb_id="1mbn") is None
+
+    def test_align_spec_none_for_crystal_design(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
+        p.load_model("1")
+        assert p.structural_align_launch_spec(reference_pdb_id="1mbn") is None   # de-novo only
+
+    def test_align_spec_loaded_model_reference(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_monomer_construct(p)
+        spec = p.structural_align_launch_spec(reference_path="/tmp/ref.pdb",
+                                              reference_model_id="3", ref_label="#3")
+        ti = spec["tool_inputs"]
+        assert ti["reference_path"] == "/tmp/ref.pdb" and ti["reference_model_id"] == "3"
+        assert ti["ref_label"] == "#3" and "reference_pdb_id" not in ti
+
+    def test_apply_stores_slot_and_honest_shared_fold(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_monomer_construct(p)
+        spec = {"_align_ukey": p._cur_cd_ukey()}
+        result = {"tool_step_results": [{"tool": "structural_align", "data": {
+            "ref_label": "1MBN", "tm_ref": 0.771, "tm_query": 0.721, "rmsd": 2.46,
+            "n_aligned": 136, "matrix": [0] * 12, "shared_fold": True}}]}
+        p.apply_structural_align_result(spec, result)
+        assert cd.structural_align["tm_ref"] == 0.771 and cd.structural_align["n_aligned"] == 136
+        assert "shared fold" in p._status.text().lower()
+
+    def test_apply_low_tm_honest_not_similar(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_monomer_construct(p)
+        spec = {"_align_ukey": p._cur_cd_ukey()}
+        result = {"tool_step_results": [{"tool": "structural_align", "data": {
+            "ref_label": "1UBQ", "tm_ref": 0.225, "tm_query": 0.329, "rmsd": 4.46,
+            "n_aligned": 51, "matrix": [0] * 12, "shared_fold": False}}]}
+        p.apply_structural_align_result(spec, result)
+        assert cd.structural_align["shared_fold"] is False
+        assert "not structurally similar" in p._status.text().lower()

@@ -114,6 +114,11 @@ class ChainDesign:
     # the synthetic ids to the fold model's chains so selection + property-colour come alive.
     # Empty for a crystal-seeded design (its reference IS the loaded structure).
     template_fold:  Dict[str, Any] = field(default_factory=dict)
+    # Stage 3: the latest US-align STRUCTURAL alignment of this construct's fold onto a chosen
+    # reference PDB (sequence-independent). Distinct from `wt_refs`/deviation — this captures a
+    # superposition + scores (matchmaker's output is fired-and-ignored; US-align's is captured).
+    # Shape: {reference, ref_label, tm_ref, tm_query, rmsd, n_aligned, matrix:[12], norm, ...}.
+    structural_align: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -348,6 +353,7 @@ class DesignSession:
                 variants       = [_variant_from_dict(v) for v in cd.get("variants", [])],
                 wt_refs        = dict(cd.get("wt_refs") or {}),
                 template_fold  = dict(cd.get("template_fold") or {}),
+                structural_align = dict(cd.get("structural_align") or {}),
             )
         return cls(model_id=d["model_id"], chains=chains, next_id=int(d.get("next_id", 1)),
                    source=d.get("source", "structure"))
