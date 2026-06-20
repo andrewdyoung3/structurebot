@@ -1547,6 +1547,79 @@ class TestDeNovoPanel:
         assert "".join(x.aa for x in cd.template_cells) == "MKVLW"
         assert cd.members == [("7", "A"), ("7", "B")]            # fold re-point survived restore
 
+    def _fold_dimer_construct(self, p, seq="MKVLW"):
+        """Add a de-novo construct and fold it as a Boltz dimer (T-fold = the displayed reference)."""
+        p._add_sequence_construct("dimer", seq)
+        spec = p.construct_fold_launch_spec("boltz", 2)
+        plddt = {i: 90.0 - i for i in range(1, len(seq) + 1)}
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "chain_ids": ["A", "B"], "plddt_by_chain": {"A": plddt, "B": plddt},
+            "cif_path": "/tmp/dimer.cif"}}]})
+        return next(iter(p._design.chains.values()))
+
+    def test_denovo_variant_fold_pins_engine_oligomer_and_compares_to_tfold(self, _app):
+        # GAP C + GAP A: a de-novo variant folds at the CONSTRUCT's engine + oligomer (pinned from
+        # template_fold, not the picker) and superposes onto the T-FOLD, not the synthetic id.
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)
+        assert cd.template_fold["engine"] == "boltz" and cd.template_fold["target"] == "assembly"
+        p._add_variant()
+        v = cd.variants[-1]
+        tab = p._cur_tab(); tab.set_active_row(v.id)
+        cd.edit_variant(v.id, 0, "A" if v.cells[0].aa != "A" else "S")    # a substitution
+        # ask for esmfold/monomer — the spec OVERRIDES to the construct's boltz dimer
+        fs = p.fold_launch_spec("esmfold", assembly=False)
+        assert fs["tool"] == "boltz" and fs["tool_inputs"]["engine"] == "boltz"
+        assert [c["id"] for c in fs["tool_inputs"]["chains"]] == ["A", "B"]   # the construct's dimer
+        assert all(c["sequence"] == v.sequence for c in fs["tool_inputs"]["chains"])
+        assert fs["tool_inputs"]["compare_to"] == "7"                        # the T-fold (GAP A)
+        assert fs["tool_inputs"]["compare_to"] != p._design.model_id         # NOT the synthetic id
+
+    def test_denovo_variant_fold_none_until_construct_folded(self, _app):
+        # a variant can't fold against a construct that hasn't been folded yet (no reference)
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("c", "MKVLW")
+        cd = next(iter(p._design.chains.values()))
+        p._add_variant()
+        p._cur_tab().set_active_row(cd.variants[-1].id)
+        assert p.fold_launch_spec("boltz") is None     # construct unfolded → no T-fold to pin/compare
+
+    def test_denovo_deviation_reuses_tfold_as_wt_reference(self, _app):
+        # Layer 1: deviation pre-seeds wt_ref from the T-fold (model_id + path), NOT None — so the
+        # router reuses the displayed reference and (finding no floor) folds only the N-1 seeds.
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)
+        p._add_variant()
+        v = cd.variants[-1]
+        tab = p._cur_tab(); tab.set_active_row(v.id)
+        v.results.fold = {"engine": "boltz", "target": "assembly", "model_id": "8"}   # variant folded
+        spec = p.deviation_launch_spec()
+        ti = spec["tool_inputs"]
+        assert ti["wt_ref"]["model_id"] == "7"               # REUSE the T-fold (no fresh fold of T)
+        assert ti["wt_ref"].get("floor_ddm") is None         # no floor yet → router establishes it
+        assert ti["wt_ref"]["path"] == "/tmp/dimer.cif"      # reopen path carried from template_fold
+        assert spec["confidence"] == "low"                   # first deviation → gate (the floor folds)
+
+    def test_denovo_monomer_deviation_has_identity_column_map(self, _app):
+        # column-pairing holds for a de-novo monomer: substitution-only → identity map; reference
+        # reused from the monomer T-fold.
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("mono", "MKVLW")
+        spec = p.construct_fold_launch_spec("boltz", 1)      # monomer
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "monomer", "mean_plddt": 80.0,
+            "plddt": {1: 90.0, 2: 85.0, 3: 80.0, 4: 75.0, 5: 70.0}, "cif_path": "/tmp/m.cif"}}]})
+        cd = next(iter(p._design.chains.values()))
+        p._add_variant()
+        v = cd.variants[-1]
+        tab = p._cur_tab(); tab.set_active_row(v.id)
+        v.results.fold = {"engine": "boltz", "target": "monomer", "model_id": "8"}
+        ti = p.deviation_launch_spec()["tool_inputs"]
+        assert ti["multichain"] is False
+        assert ti["fold_column_map"] == {i: i for i in range(1, 6)}   # identity (substitution-only)
+        assert ti["wt_ref"]["model_id"] == "7"                        # monomer T-fold reused
+
     def test_denovo_fold_visibility_skips_synthetic_reference(self, _app):
         # the Template/Reference toggle must NOT emit show/hide on the synthetic id (no such model
         # in ChimeraX → error); the construct's own fold is the displayed structure.
