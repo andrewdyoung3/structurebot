@@ -479,7 +479,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         variant_id = spec.get("_variant_id")
         self._launch_spec = spec                  # available on the UI thread in _on_tool_done
         on_result = None
-        if refresh in ("stability", "fold", "deviation", "construct_fold", "structural_align"):
+        if refresh in ("stability", "fold", "deviation", "construct_fold", "structural_align",
+                       "construct_fold_guided", "template_assist"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -533,6 +534,20 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_structural_align_result(spec, result)
                 else:
                     self.presenter.dim("Structural alignment cancelled — no result to attach.")
+            elif refresh == "construct_fold_guided":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_construct_fold_guided_result(spec, result)
+                else:
+                    self.presenter.dim("Guided construct fold cancelled — no model to attach.")
+            elif refresh == "template_assist":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_template_assist_result(spec, result)
+                else:
+                    self.presenter.dim("Template-assist comparison cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None

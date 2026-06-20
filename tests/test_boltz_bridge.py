@@ -89,7 +89,8 @@ class TestLocalOnlyGuardFailClosed:
         b = _bridge()
         # force a breach: YAML build emits a non-empty msa
         monkeypatch.setattr(b, "_build_yaml",
-                            lambda chains: "version: 1\nsequences:\n  - protein:\n      msa: remote\n")
+                            lambda chains, templates=None:
+                            "version: 1\nsequences:\n  - protein:\n      msa: remote\n")
         res = b.predict([{"id": "A", "sequence": "MK"}])
         assert res["success"] is False
         assert "LOCAL-ONLY breach refused" in res["error"]
@@ -104,6 +105,94 @@ class TestYaml:
         assert y.count("- protein:") == 2
         assert y.count("msa: empty") == 2            # every chain MSA-free
         assert "id: A" in y and "id: B" in y and "sequence: MK" in y
+
+    def test_no_templates_block_when_absent(self):
+        y = BoltzBridge._build_yaml([{"id": "A", "sequence": "MK"}])
+        assert "templates:" not in y                 # plain de-novo fold unchanged
+
+
+# ── TEMPLATE-GUIDED YAML injection ────────────────────────────────────────────────────
+
+class TestTemplateYaml:
+    def test_soft_template_block_fields(self):
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}],
+            [{"cif": "/wsl/path/t.cif", "chain_id": "A"}])
+        assert "templates:" in y
+        assert "- cif: /wsl/path/t.cif" in y
+        assert "chain_id: A" in y
+        assert "force:" not in y                      # soft = no force/threshold
+        assert "threshold:" not in y
+        # every chain still MSA-free → the LOCAL-ONLY guard is unaffected
+        assert y.count("msa: empty") == 1
+
+    def test_hard_template_emits_force_and_threshold(self):
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}],
+            [{"pdb": "/wsl/t.pdb", "chain_id": "A", "force": True, "threshold": 10.0}])
+        assert "- pdb: /wsl/t.pdb" in y
+        assert "force: true" in y
+        assert "threshold: 10.0" in y
+
+    def test_force_false_omits_threshold(self):
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}],
+            [{"cif": "/x.cif", "force": False, "threshold": 8.0}])
+        assert "force:" not in y                      # force False → no force/threshold lines
+        assert "threshold:" not in y
+
+    def test_template_id_and_list_chain_ids_flow_list(self):
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}, {"id": "B", "sequence": "MK"}],
+            [{"cif": "/x.cif", "chain_id": ["A", "B"], "template_id": ["A", "B"]}])
+        assert "chain_id: [A, B]" in y                # list → YAML flow list
+        assert "template_id: [A, B]" in y
+
+    def test_predict_forwards_translated_template_paths(self, monkeypatch):
+        # predict() → _translate_template_paths → _build_yaml; the cif path is translate_path'd.
+        b = _bridge()
+        b._wsl.translate_path = lambda p: "/wsl" + str(p).replace("\\", "/")
+        captured = {}
+        def fake_build(chains, templates=None):
+            captured["templates"] = templates
+            return "version: 1\nsequences:\n  - protein:\n      msa: empty\n"
+        monkeypatch.setattr(b, "_build_yaml", fake_build)
+        # short-circuit the run so we only exercise the build path
+        b._wsl.run_command = MagicMock(return_value={"ok": False, "error": "stop"})
+        b.predict([{"id": "A", "sequence": "MK"}],
+                  templates=[{"cif": "C:/local/t.cif", "chain_id": "A", "force": True,
+                              "threshold": 10.0}])
+        t = captured["templates"][0]
+        assert t["cif"].startswith("/wsl")            # path translated into WSL
+        assert t["chain_id"] == "A" and t["force"] is True and t["threshold"] == 10.0
+
+    def test_template_field_indentation_is_4_not_6_spaces(self):
+        # THE live-verify regression guard. A template's keys are SIBLINGS of cif/pdb in a YAML
+        # sequence item → 4-space indent. The original bug emitted 6 (wrongly mirroring the
+        # `protein:` block, whose children nest UNDER a key): that made chain_id a child of pdb,
+        # so Boltz got a dict where it expected a path string and produced NO CIF. Pin the exact
+        # form. (PyYAML isn't a main-venv dep, so assert the indentation directly.)
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}],
+            [{"pdb": "/x/4hhb.pdb", "chain_id": "A", "force": True, "threshold": 10.0}])
+        lines = y.splitlines()
+        assert "  - pdb: /x/4hhb.pdb" in lines            # item key at the sequence-item indent
+        assert "    chain_id: A" in lines                 # SIBLING key → exactly 4 spaces
+        assert "    force: true" in lines
+        assert "    threshold: 10.0" in lines
+        # the bug, explicitly forbidden: NO template field may be indented 6 spaces (= nested
+        # under pdb). 6-space lines belong ONLY to the protein block (id/sequence/msa).
+        for fld in ("chain_id", "template_id", "force", "threshold"):
+            assert f"      {fld}:" not in y               # never 6 spaces
+
+    def test_assert_local_only_passes_templates_yaml(self):
+        # a templates-carrying YAML (still msa: empty everywhere) must PASS the fail-closed guard —
+        # a template is not an MSA.
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MK"}],
+            [{"cif": "/x.cif", "chain_id": "A", "force": True, "threshold": 10.0}])
+        BoltzBridge._assert_local_only(
+            "boltz predict in.yaml --accelerator gpu --seed 0", y, False)   # no raise
 
 
 # ── confidence/CIF parse ──────────────────────────────────────────────────────────────

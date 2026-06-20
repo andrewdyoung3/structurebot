@@ -119,6 +119,15 @@ class ChainDesign:
     # superposition + scores (matchmaker's output is fired-and-ignored; US-align's is captured).
     # Shape: {reference, ref_label, tm_ref, tm_query, rmsd, n_aligned, matrix:[12], norm, ...}.
     structural_align: Dict[str, Any] = field(default_factory=dict)
+    # Template-guided fold: the construct's fold STEERED by a chosen structural template (a
+    # homolog PDB), kept SEPARATE from `template_fold` (the unguided baseline) so the assist can
+    # compare the two. fold_summary shape + {templated:True, template_label, force, threshold}.
+    guided_fold:    Dict[str, Any] = field(default_factory=dict)
+    # The "template assist" readout: guided-vs-unguided ΔpLDDT + per-residue Δflexibility (the
+    # honest measurement of whether the template actually helped). Shape: {template_label,
+    # guided_mean_plddt, unguided_mean_plddt, d_plddt, d_flex:{resno->Å}, n_stabilized, tm_adopt,
+    # force, threshold, ...}. Distinct from a fold — this is the comparison.
+    template_assist: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -354,6 +363,8 @@ class DesignSession:
                 wt_refs        = dict(cd.get("wt_refs") or {}),
                 template_fold  = dict(cd.get("template_fold") or {}),
                 structural_align = dict(cd.get("structural_align") or {}),
+                guided_fold    = dict(cd.get("guided_fold") or {}),
+                template_assist = dict(cd.get("template_assist") or {}),
             )
         return cls(model_id=d["model_id"], chains=chains, next_id=int(d.get("next_id", 1)),
                    source=d.get("source", "structure"))
