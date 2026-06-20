@@ -1881,6 +1881,11 @@ class ToolRouter:
             target = inp.get("target", "monomer")
             return (f"Variant-vs-WT Cα deviation ({engine}:{target}) — folds the WT "
                     "reference if absent, then per-residue floor-gated deviation")
+        if tool == "structural_align":
+            inp = tool_inputs.get("structural_align", {})
+            ref = inp.get("ref_label") or inp.get("reference_pdb_id") or "reference"
+            return (f"Structural alignment vs {ref} — US-align sequence-independent "
+                    "superposition (TM-score + RMSD), LOCAL-ONLY")
         return f"Unknown tool: {tool}"
 
     # ── Phase 2: Execute (non-chimerax tools) ─────────────────────────────────
@@ -2072,6 +2077,8 @@ class ToolRouter:
                 return self._run_conformer_comparison(inputs, user_input=user_input)
             if tool == "variant_deviation":
                 return self._run_variant_deviation(inputs)
+            if tool == "structural_align":
+                return self._run_structural_align(inputs)
             if tool == "representation":
                 return self._run_representation(inputs, user_input=user_input)
             if tool == "color":
@@ -5789,6 +5796,147 @@ class ToolRouter:
                      f"{len(disrupted)}/{len(ddm)} residues disrupted (above the cross-seed "
                      f"floor); max {max_ddm:.2f} Å · local integrity (lDDT) min "
                      f"{min_lddt:.3f}, mean {mean_lddt:.3f}."))
+
+    # ── Stage 3: US-align sequence-INDEPENDENT structural alignment ────────────────────
+    @staticmethod
+    def _parse_usalign_output(stdout: str) -> Optional[Dict[str, Any]]:
+        """Parse US-align `-outfmt 2 -m -` stdout: the tab DATA line + the 3×4 rotation
+        matrix. The tab columns are
+            PDBchain1  PDBchain2  TM1  TM2  RMSD  ID1  ID2  IDali  L1  L2  Lali
+        (TM1 normalized by structure-1 = the query/construct fold; TM2 by structure-2 = the
+        reference). The matrix rows are `m  t[m]  u[m][0]  u[m][1]  u[m][2]`; we return it
+        ROW-MAJOR as [u00,u01,u02,t0, u10,u11,u12,t1, u20,u21,u22,t2] — exactly ChimeraX's
+        `view matrix models #N,<12>` order (live-verified to reproduce US-align's superposition,
+        no transpose/sign flip). Returns None if neither scores nor the full matrix parse."""
+        if not stdout:
+            return None
+        lines = stdout.splitlines()
+        data: Optional[List[str]] = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("#PDBchain1") and i + 1 < len(lines):
+                parts = lines[i + 1].split("\t")
+                if len(parts) >= 11:
+                    data = parts
+                break
+        if data is None:
+            return None
+        try:
+            out: Dict[str, Any] = {
+                "tm1": float(data[2]), "tm2": float(data[3]), "rmsd": float(data[4]),
+                "id1": float(data[5]), "id2": float(data[6]), "idali": float(data[7]),
+                "l1": int(data[8]), "l2": int(data[9]), "lali": int(data[10]),
+            }
+        except (ValueError, IndexError):
+            return None
+        rows: Dict[int, tuple] = {}
+        for ln in lines:
+            s = ln.split()
+            if len(s) == 5 and s[0] in ("0", "1", "2"):
+                try:
+                    m = int(s[0]); t = float(s[1])
+                    u0, u1, u2 = float(s[2]), float(s[3]), float(s[4])
+                except ValueError:
+                    continue
+                rows[m] = (u0, u1, u2, t)                  # row-major: r0,r1,r2,tx
+        out["matrix"] = ([v for m in (0, 1, 2) for v in rows[m]]
+                         if all(m in rows for m in (0, 1, 2)) else None)
+        return out
+
+    @staticmethod
+    def _view_matrix_command(model_id: str, matrix12: List[float]) -> str:
+        """ChimeraX command to place model *model_id* at the US-align transform (option B):
+        `view matrix models #N,m00,…,m23` (row-major 3×4). Pure/testable — the one new
+        ChimeraX seam, its convention live-confirmed against US-align's own superposition."""
+        nums = ",".join(f"{float(v):.10g}" for v in matrix12)
+        mid = str(model_id).lstrip("#")
+        return f"view matrix models #{mid},{nums}"
+
+    def _run_structural_align(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """Sequence-INDEPENDENT structural alignment of a de-novo construct's FOLD onto a chosen
+        reference PDB via US-align (LOCAL-ONLY WSL C++ binary) — the case ChimeraX matchmaker
+        can't reach (matchmaker is sequence-guided and fails closed at zero homology).
+
+        Captures BOTH TM-scores (default-surfaced: reference-normalized = TM2), RMSD, # aligned,
+        and the 3×4 transform; then OVERLAYS by opening the reference and placing the construct
+        fold model onto it with `view matrix` (option B — preserves the fold's pLDDT colour, no
+        extra model). Data-captured (matchmaker's RMSD is fired-and-ignored; this one is kept)."""
+        import os as _os
+        import shlex as _shlex
+        import time as _time
+        import config as _cfg
+        t0 = _time.perf_counter()
+        query_path     = inputs.get("query_path")
+        query_model_id = inputs.get("query_model_id")
+        ref_path       = inputs.get("reference_path")
+        ref_id         = inputs.get("reference_pdb_id")
+        ref_model_id   = inputs.get("reference_model_id")     # a loaded model (panel saved its file)
+        ref_label      = inputs.get("ref_label") or ref_id or "reference"
+        if not query_path or not _os.path.isfile(query_path):
+            return ToolStepResult(tool="structural_align", success=False,
+                                  error="structural_align needs the construct fold file on disk.")
+        if not ref_path and ref_id:
+            ref_path = self._download_pdb_by_id(ref_id)
+        if not ref_path or not _os.path.isfile(ref_path):
+            return ToolStepResult(tool="structural_align", success=False,
+                                  error=f"Could not resolve the reference structure ({ref_label}).")
+        # ── US-align in WSL (LOCAL-ONLY; reads CIF/PDB directly) ──────────────────
+        from wsl_bridge import WSLBridge
+        wsl = WSLBridge(distribution=getattr(_cfg, "USALIGN_WSL_DISTRO", "Ubuntu-24.04"))
+        if not wsl.is_available():
+            return ToolStepResult(tool="structural_align", success=False,
+                                  error="WSL2 unavailable — US-align runs in WSL.")
+        q = wsl.translate_path(_os.path.abspath(query_path))
+        r = wsl.translate_path(_os.path.abspath(ref_path))
+        exe = getattr(_cfg, "USALIGN_EXE", "/home/andre/USalign/USalign")
+        cmd = f"{_shlex.quote(exe)} {_shlex.quote(q)} {_shlex.quote(r)} -outfmt 2 -m -"
+        res = wsl.run_command(cmd, timeout=getattr(_cfg, "USALIGN_TIMEOUT", 120))
+        if not res.get("ok"):
+            return ToolStepResult(tool="structural_align", success=False,
+                                  error=f"US-align failed: {res.get('error') or res.get('stderr','')[:200]}")
+        parsed = self._parse_usalign_output(res.get("stdout", ""))
+        if not parsed or parsed.get("matrix") is None:
+            return ToolStepResult(tool="structural_align", success=False,
+                                  error="Could not parse US-align output (no scores/transform).")
+        # ── LIVE overlay (option B): open the reference, place the fold onto it ────
+        overlay_cmds: List[str] = []
+        if query_model_id:
+            if not ref_model_id:                       # PDB-id reference → open it live
+                ro = self.bridge.run_command(f'open "{Path(ref_path).as_posix()}"')
+                spec = self._parse_model_spec(ro, None)
+                ref_model_id = spec.lstrip("#") if spec else None
+            vm = self._view_matrix_command(query_model_id, parsed["matrix"])
+            self.bridge.run_command(vm); overlay_cmds.append(vm)
+            if ref_model_id:                           # neutral grey ref under the pLDDT fold
+                for c in (f"cartoon #{ref_model_id}",
+                          f"color #{ref_model_id} gray target c"):
+                    self.bridge.run_command(c); overlay_cmds.append(c)
+            self.bridge.run_command("view"); overlay_cmds.append("view")
+        shared = parsed["tm2"] >= 0.5
+        data = {
+            "reference":          ref_id or ref_label,
+            "ref_label":          ref_label,
+            "reference_path":     ref_path,
+            "reference_model_id": str(ref_model_id) if ref_model_id else None,
+            "query_model_id":     str(query_model_id) if query_model_id else None,
+            "tm_ref":             round(parsed["tm2"], 4),   # reference-normalized (US-align default)
+            "tm_query":           round(parsed["tm1"], 4),   # query (construct fold) normalized
+            "rmsd":               round(parsed["rmsd"], 3),
+            "n_aligned":          parsed["lali"],
+            "seq_id_ali":         round(parsed["idali"], 4),
+            "query_len":          parsed["l1"],
+            "ref_len":            parsed["l2"],
+            "matrix":             parsed["matrix"],          # 12 row-major (ChimeraX view-matrix order)
+            "norm_default":       "reference",
+            "shared_fold":        bool(shared),
+            "overlay_commands":   overlay_cmds,
+        }
+        tier = "shared fold" if shared else "NOT structurally similar"
+        summary = (f"Structural alignment vs {ref_label}: TM-score {parsed['tm2']:.3f} (ref-norm) "
+                   f"/ {parsed['tm1']:.3f} (query-norm), RMSD {parsed['rmsd']:.2f} Å over "
+                   f"{parsed['lali']} residues — {tier} (TM>0.5 = shared fold).")
+        return ToolStepResult(tool="structural_align", success=True, data=data,
+                              viz_commands=overlay_cmds, summary=summary,
+                              elapsed_ms=(_time.perf_counter() - t0) * 1000)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Validate-design meta-tool (thin orchestrator — NOT a new bridge)

@@ -27,6 +27,10 @@ select gets chatty.
 """
 from __future__ import annotations
 
+import os
+import re
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -725,6 +729,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "an engine folds the WT reference + its noise floor (cached).")
         self._dev_btn.clicked.connect(self._on_deviation_clicked)
         bar.addWidget(self._dev_btn)
+        bar.addSpacing(12)
+
+        # Stage 3: structurally align the DE-NOVO construct's fold onto a chosen PDB,
+        # SEQUENCE-INDEPENDENTLY (US-align, LOCAL-ONLY) — the case ChimeraX matchmaker can't
+        # reach. Captures TM-score/RMSD and overlays the pLDDT-coloured fold on the reference.
+        self._align_btn = QtWidgets.QPushButton("Align to PDB")
+        self._align_btn.setToolTip("Structurally align the construct's FOLD onto a chosen PDB "
+                                   "(sequence-independent, US-align LOCAL-ONLY). Captures TM-score "
+                                   "+ RMSD and overlays the fold on the reference. De-novo only; "
+                                   "fold the construct first.")
+        self._align_btn.clicked.connect(self._on_align_clicked)
+        bar.addWidget(self._align_btn)
         bar.addSpacing(12)
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
@@ -2262,6 +2278,134 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"(above the cross-seed floor); max {data.get('max_ddm','?')} Å · local integrity "
             f"(lDDT) min {data.get('min_lddt','?')}, mean {data.get('mean_lddt','?')}. "
             f"Click a residue for its per-residue dRMSD/lDDT vs floor.")
+
+    # ── Stage 3: structural alignment of the construct fold onto a chosen PDB ─────────
+    def _cur_cd_ukey(self) -> Optional[str]:
+        """The unique-chain key of the active tab's ChainDesign (for routing the result back)."""
+        tab = self._cur_tab()
+        if tab is None or self._design is None:
+            return None
+        return next((k for k, c in self._design.chains.items() if c is tab.design), None)
+
+    def structural_align_launch_spec(self, *, reference_pdb_id: Optional[str] = None,
+                                     reference_path: Optional[str] = None,
+                                     reference_model_id: Optional[str] = None,
+                                     ref_label: Optional[str] = None) -> Optional[dict]:
+        """Spec to structurally align the ACTIVE de-novo construct's FOLD onto an EXPLICIT chosen
+        reference via US-align (sequence-independent). Unlike the construct FOLD path (which forces
+        `no_reference` so matchmaker never silently superposes onto a loaded primary), this carries
+        the user's EXPLICIT reference and aligns to it. The query is the construct's T-fold on disk
+        (`template_fold.cif_path`/`pdb_path`); the open fold model is moved onto the reference
+        (option B). None unless the active construct is folded. Pure — no I/O (caller resolves a
+        loaded-model reference to a file first)."""
+        tab = self._cur_tab()
+        if tab is None or self._design is None or self._design.source != "sequence":
+            return None
+        cd = tab.design
+        tf = cd.template_fold
+        query_path = tf.get("cif_path") or tf.get("pdb_path")
+        query_mid = tf.get("model_id")
+        if not query_path or not query_mid:
+            return None
+        ti: Dict[str, object] = {"query_path": query_path, "query_model_id": query_mid}
+        if reference_pdb_id:
+            ti["reference_pdb_id"] = reference_pdb_id.upper()
+            ref_label = ref_label or reference_pdb_id.upper()
+        if reference_path:
+            ti["reference_path"] = reference_path
+        if reference_model_id:
+            ti["reference_model_id"] = str(reference_model_id)
+            ref_label = ref_label or f"#{reference_model_id}"
+        if "reference_pdb_id" not in ti and "reference_path" not in ti:
+            return None                                  # need a resolvable reference
+        ti["ref_label"] = ref_label or "reference"
+        return {
+            "tool":         "structural_align",
+            "tool_inputs":  ti,
+            "user_input":   f"[Workbench] structural align construct fold → {ti['ref_label']} "
+                            f"(US-align, sequence-independent, LOCAL-ONLY)",
+            "confidence":   "high",                      # fast + deterministic → no confirm gate
+            "refresh":      "structural_align",
+            "_align_ukey":  self._cur_cd_ukey(),
+        }
+
+    def _on_align_clicked(self) -> None:
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Align to PDB is for de-novo constructs — Add sequence → Fold "
+                                 "construct first.")
+            return
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        tf = cd.template_fold if cd else {}
+        if not tf.get("model_id") or not (tf.get("cif_path") or tf.get("pdb_path")):
+            self._status.setText("Fold the construct first (Fold ▾ → Fold construct) — Align needs "
+                                 "the construct's fold on disk.")
+            return
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Align to PDB",
+            "Reference — a 4-char PDB id (downloaded) or a loaded model id (e.g. #3):")
+        ref = (text or "").strip()
+        if not ok or not ref:
+            return
+        m = re.match(r"^#?(\d+(?:\.\d+)*)$", ref)
+        if m:
+            # LOADED model → save it to a temp PDB so US-align can read it; reuse it for the overlay
+            mid = m.group(1)
+            tmp = os.path.join(tempfile.gettempdir(), f"usalign_ref_{mid.replace('.', '_')}.pdb")
+            try:
+                self._c._run(f'save "{Path(tmp).as_posix()}" models #{mid}')
+            except Exception as exc:
+                self._status.setText(f"Could not save model #{mid} for alignment: {exc}")
+                return
+            if not os.path.isfile(tmp):
+                self._status.setText(f"Saving model #{mid} produced no file — is #{mid} open?")
+                return
+            spec = self.structural_align_launch_spec(reference_path=tmp, reference_model_id=mid,
+                                                     ref_label=f"#{mid}")
+        else:
+            if not re.match(r"^[A-Za-z0-9]{4}$", ref):
+                self._status.setText("Enter a 4-character PDB id (e.g. 1MBN) or a loaded model "
+                                     "(e.g. #3).")
+                return
+            spec = self.structural_align_launch_spec(reference_pdb_id=ref)
+        if spec is not None:
+            self._status.setText(f"Aligning the construct fold to {spec['tool_inputs']['ref_label']} "
+                                 f"via US-align (sequence-independent)…")
+            self.launchRequested.emit(spec)
+
+    @staticmethod
+    def _structural_align_from_result(result: dict) -> dict:
+        """The structural_align step data from the executed pipeline result."""
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "structural_align":
+                return step.get("data") or {}
+        return {}
+
+    def apply_structural_align_result(self, spec: dict, result: dict) -> None:
+        """Consume the executed structural-alignment result: store it on the construct's
+        `structural_align` slot, persist, and report an HONEST readout (TM>0.5 = shared fold;
+        lower = not structurally similar — no overclaiming). The 3D overlay (view matrix on the
+        fold model + the reference) already ran live in the router. UI thread."""
+        data = self._structural_align_from_result(result)
+        if not data:
+            self._status.setText("Structural alignment produced no result.")
+            return
+        ukey = (spec or {}).get("_align_ukey")
+        cd = self._design.chains.get(ukey) if (self._design and ukey) else None
+        if cd is None:
+            tab = self._cur_tab()
+            cd = tab.design if tab else None
+        if cd is None:
+            return
+        cd.structural_align = data
+        self._persist()
+        tier = ("shared fold ✓" if data.get("shared_fold")
+                else "NOT structurally similar (low TM)")
+        self._status.setText(
+            f"Aligned construct fold → {data.get('ref_label')}: TM-score {data.get('tm_ref')} "
+            f"(reference-normalized) / {data.get('tm_query')} (query-normalized), RMSD "
+            f"{data.get('rmsd')} Å over {data.get('n_aligned')} residues — {tier}. "
+            f"TM>0.5 = shared fold; lower = not structurally similar.")
 
     # ── Stage 4b: per-model fold visibility (active-row coupling + global toggle) ─────
     def _fold_models(self, design) -> Dict[str, str]:
