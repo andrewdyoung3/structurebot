@@ -74,9 +74,18 @@ TARGETS: Dict[str, dict] = {
 # fold (β-rich / large divergent families tend to be MSA-dependent). Whether each is ACTUALLY hard
 # for THIS Boltz is verified by --prescreen (measure, don't guess — §0). NOT run until approved.
 HARD_CANDIDATES: Dict[str, dict] = {
-    "cspb":  {"pdb": "1MJC", "chain": "A",   # cold-shock protein B, ~69 aa OB-fold β-barrel; CSD superfamily
-              "templates": [{"pdb": "1MJC", "chain": "A", "tag": "identical"},
-                            {"pdb": "1C9O", "chain": "A", "tag": "homolog (Bc-Csp)"}]},
+    # CONFIRMED HARD (unguided TM-to-truth 0.733, pLDDT 73.75) — real rescue headroom. SPREAD
+    # ladder (structTM-to-truth measured, no-fold): 1.0 → 0.87 → 0.69 → 0.65 → 0.50. The 1G6P/1SRO
+    # pair is MATCHED in structTM (.69/.65) but very different seq-id (.56/.28) → the cleanest test
+    # of "does ΔAcc follow structTM not seq-id". `hard`: also run guided-HARD at the divergent rungs.
+    "cspb":  {"pdb": "1MJC", "chain": "A",   # cold-shock protein, ~69 aa OB-fold β-barrel; CSD superfamily
+              "templates": [
+                  {"pdb": "1MJC", "chain": "A", "tag": "identical (control), sTM 1.0"},
+                  {"pdb": "1C9O", "chain": "A", "tag": "close CSD homolog, id .59 / sTM .87"},
+                  {"pdb": "1G6P", "chain": "A", "tag": "id .56 / sTM .69", "hard": True},
+                  {"pdb": "1SRO", "chain": "A", "tag": "S1 OB-fold, id .28 / sTM .65 (struct>seq)", "hard": True},
+                  {"pdb": "1BOV", "chain": "A", "tag": "twilight struct, id .22 / sTM .50", "hard": True},
+              ]},
     "sh3":   {"pdb": "1SHG", "chain": "A",   # α-spectrin SH3, ~62 aa β-barrel; huge divergent SH3 family
               "templates": [{"pdb": "1SHG", "chain": "A", "tag": "identical"},
                             {"pdb": "1SEM", "chain": "A", "tag": "homolog SH3"}]},
@@ -235,6 +244,27 @@ def fold(seq: str, *, templates: Optional[list] = None, seed: int = 0,
     return res
 
 
+def download_cif(pdb_id: str) -> Optional[str]:
+    """Download the official RCSB mmCIF. Boltz's parse_pdb (via gemmi) raises `KeyError` on the
+    entity/subchain mapping for some PDB-format files (it loses the entity records → orphan
+    subchains like 'Axp') and SWALLOWS it (exits 0, no CIF). The official mmCIF carries proper
+    entity records and parses cleanly — so we hand Boltz the CIF, not the PDB. (NOTE: the shipped
+    template-guided feature resolves templates as .pdb via `_download_pdb_by_id` and hits exactly
+    this gap — a real follow-up fix for the feature: prefer mmCIF for templates.)"""
+    import requests
+    cache_dir = Path("cache"); cache_dir.mkdir(parents=True, exist_ok=True)
+    local = cache_dir / f"{pdb_id.upper()}.cif"
+    if local.is_file():
+        return str(local)
+    try:
+        r = requests.get(f"https://files.rcsb.org/download/{pdb_id.upper()}.cif", timeout=30)
+        r.raise_for_status()
+        local.write_bytes(r.content)
+        return str(local)
+    except Exception:
+        return None
+
+
 def make_template(tmpl: dict, force: bool = False, threshold: float = 10.0) -> Optional[dict]:
     """Build a per-template entry for the monomer construct chain. chain_id ONLY (the SEARCH
     path) — do NOT set template_id: Boltz checks template_id against the template's chains as IT
@@ -243,10 +273,10 @@ def make_template(tmpl: dict, force: bool = False, threshold: float = 10.0) -> O
     and still exits 0 → the bridge only sees 'no predicted CIF'. The search path lets Boltz pick
     the template chain itself (works); explicit template_id is deferred to the multimer extension
     (which must map to Boltz's internal chain naming)."""
-    path = download(tmpl["pdb"])
-    if not path:
+    cif = download_cif(tmpl["pdb"])                                    # mmCIF → Boltz-parseable
+    if not cif:
         return None
-    entry = {"pdb": path, "chain_id": "A"}
+    entry = {"cif": cif, "chain_id": "A"}
     if force:
         entry["force"] = True
         entry["threshold"] = threshold
@@ -325,7 +355,12 @@ def titrate(target_names: List[str], do_hard: bool, flex_seeds: int, seed: int,
             print(f"  -- template {tmpl['pdb']} [{tmpl['tag']}]  seq-id={seqid}  "
                   f"structTM(tmpl,S_P)={t_tm_to_sp}")
 
-            for mode, force in ([("soft", False), ("hard", True)] if do_hard else [("soft", False)]):
+            # soft always; hard when the global --hard OR this rung is flagged hard (the divergent
+            # rungs, where the soft-helps/hard-hurts contrast with headroom present is the signal).
+            modes = [("soft", False)]
+            if do_hard or tmpl.get("hard"):
+                modes.append(("hard", True))
+            for mode, force in modes:
                 tentry = make_template(tmpl, force=force)
                 g_cifs = []
                 g = fold(tseq, templates=[tentry], seed=seed, label=f"{name}_{tmpl['pdb']}_{mode}")
