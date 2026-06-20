@@ -236,12 +236,17 @@ def fold(seq: str, *, templates: Optional[list] = None, seed: int = 0,
 
 
 def make_template(tmpl: dict, force: bool = False, threshold: float = 10.0) -> Optional[dict]:
+    """Build a per-template entry for the monomer construct chain. chain_id ONLY (the SEARCH
+    path) — do NOT set template_id: Boltz checks template_id against the template's chains as IT
+    parses/renames them (NOT the PDB author chain), so a scalar author id ('A') raises
+    'Template chain A is not one of the protein chains'. Boltz SWALLOWS that per-input ValueError
+    and still exits 0 → the bridge only sees 'no predicted CIF'. The search path lets Boltz pick
+    the template chain itself (works); explicit template_id is deferred to the multimer extension
+    (which must map to Boltz's internal chain naming)."""
     path = download(tmpl["pdb"])
     if not path:
         return None
     entry = {"pdb": path, "chain_id": "A"}
-    if tmpl.get("chain"):
-        entry["template_id"] = tmpl["chain"]
     if force:
         entry["force"] = True
         entry["threshold"] = threshold
@@ -249,10 +254,11 @@ def make_template(tmpl: dict, force: bool = False, threshold: float = 10.0) -> O
 
 
 # ── prescreen (flag hard targets) ──────────────────────────────────────────────────────
-def prescreen(flex_seeds: int) -> None:
+def prescreen(flex_seeds: int, names: Optional[List[str]] = None) -> None:
     print("=== PRESCREEN — unguided fold of HARD candidates (flag which are genuinely hard) ===")
     rows = []
-    for name, tgt in HARD_CANDIDATES.items():
+    items = [(n, HARD_CANDIDATES[n]) for n in (names or HARD_CANDIDATES) if n in HARD_CANDIDATES]
+    for name, tgt in items:
         pdb_path = download(tgt["pdb"])
         if not pdb_path:
             print(f"[{name}] could not download {tgt['pdb']} — skipping"); continue
@@ -379,7 +385,7 @@ def main() -> None:
         print("[abort] Boltz env unavailable — the calibration folds need it."); sys.exit(2)
 
     if args.prescreen:
-        prescreen(args.flex_seeds)
+        prescreen(args.flex_seeds, args.target)
         return
     if args.titrate:
         names = args.target or list(TARGETS.keys())
