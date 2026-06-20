@@ -126,6 +126,22 @@ TARGETS: Dict[str, dict] = {
             {"pdb": "6W3G", "chain": "A", "tag": "sTM .75 / seq-id .17 (structure-only)"},
         ],
     },
+    # THIRD crystal de-novo (closes the ONE decision-relevant empty cell: STRUCTURE-ONLY at HIGH
+    # structTM on a de-novo design — the arc's exact scenario, a designed sequence + a structurally-
+    # close but sequence-UNRELATED template). 6W3W = de-novo crystal, 107 aa, very hard (unguided
+    # TM 0.491). UNLIKE 4ORL, ALL its foldseek neighbors are STRUCTURE-ONLY (seq-id ~0.2): 5IEP
+    # .83 (the KEY high-structTM structure-only rung), 6P7L .80, 8USO .78. Prediction: copies (no
+    # unlock) like the lower structure-only rungs — if so the bound is airtight on the arc's real
+    # use case; if it surprisingly UNLOCKS (TM_G ≫ template), the de-novo arc has a path.
+    "crystal3_6w3w": {
+        "pdb": "6W3W", "chain": "A",
+        "templates": [
+            {"pdb": "6W3W", "chain": "A", "tag": "identical control"},
+            {"pdb": "5IEP", "chain": "A", "tag": "sTM .83 / seq-id .25 (STRUCTURE-ONLY high-sTM, KEY cell)", "hard": True},
+            {"pdb": "6P7L", "chain": "A", "tag": "sTM .80 / seq-id .16 (structure-only)", "hard": True},
+            {"pdb": "8USO", "chain": "A", "tag": "sTM .78 / seq-id .36 (structure-only)"},
+        ],
+    },
 }
 
 # HARD-candidate targets — FLAGGED for the user before committing the full titration. Criteria:
