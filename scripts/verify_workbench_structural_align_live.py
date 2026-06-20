@@ -75,16 +75,22 @@ def chain_sequences(model):
     return seqs
 
 
-def com_distance(m1, m2):
-    """Distance between the CA centroids of two models (Å) — superposition proximity proxy."""
+def com_distance(m1, m2, chain2=None):
+    """Distance between the CA centroids of two models (Å) — superposition proximity proxy.
+    *chain2* restricts the reference centroid to one chain (US-align aligns the FIRST chain of a
+    multi-chain reference, so comparing against the whole tetramer's centre would be wrong)."""
+    flt = f"and a.residue.chain_id=='{chain2}'" if chain2 else ""
     script = (
         "from chimerax.atomic import all_atomic_structures\n"
         "import numpy as np\n"
         "c={}\n"
         "for m in all_atomic_structures(session):\n"
-        f"    if m.id_string in ('{m1}','{m2}'):\n"
+        f"    if m.id_string=='{m1}':\n"
         "        cas=[a.scene_coord for a in m.atoms if a.name=='CA']\n"
-        "        if cas: c[m.id_string]=np.mean(np.array(cas),axis=0)\n"
+        f"        if cas: c['{m1}']=np.mean(np.array(cas),axis=0)\n"
+        f"    if m.id_string=='{m2}':\n"
+        f"        cas=[a.scene_coord for a in m.atoms if a.name=='CA' {flt}]\n"
+        f"        if cas: c['{m2}']=np.mean(np.array(cas),axis=0)\n"
         f"if '{m1}' in c and '{m2}' in c: print('COM:', float(np.linalg.norm(c['{m1}']-c['{m2}'])))\n")
     for line in _runscript(script).splitlines():
         if line.strip().startswith("COM:"):
@@ -187,29 +193,38 @@ def do_align(pdb_id):
 
 
 def matchmaker_headtohead(ref_id, ref_model_id):
-    """Run ChimeraX matchmaker: the construct fold → the reference. Capture its summary line."""
+    """Run ChimeraX matchmaker: the construct fold → the reference. Return
+    {score, pruned_n, line} — matchmaker's sequence-alignment score + # aligned pairs (its
+    confidence signals), so the head-to-head can show WHERE it degenerates vs US-align."""
+    import re as _re
     out = run(f"matchmaker #{fold_mid} to #{ref_model_id}").get("value") or ""
-    line = ""
+    score = None; pruned_n = None; line = ""
     for ln in out.splitlines():
         low = ln.lower()
-        if "rmsd between" in low or "cannot match" in low or "fewer than" in low \
-                or "alignment score" in low:
+        if "alignment score" in low or "rmsd between" in low or "cannot match" in low \
+                or "fewer than" in low:
             line += ln.strip() + " | "
-    return line or out[:160]
+        ms = _re.search(r"alignment score\s*=\s*([\d.]+)", ln)
+        if ms: score = float(ms.group(1))
+        mp = _re.search(r"RMSD between\s+(\d+)\s+(?:pruned\s+)?atom pairs", ln)
+        if mp: pruned_n = int(mp.group(1))
+    if "cannot match" in out.lower() or "fewer than" in out.lower():
+        pruned_n = pruned_n or 0
+    return {"score": score, "pruned_n": pruned_n, "line": line or out[:160]}
 
 
 # ── 1) HOMOLOG: 4HHB (hemoglobin α) ───────────────────────────────────────────────────
 print("[align] HOMOLOG → 4HHB (hemoglobin α) …")
 a1 = do_align("4HHB")
 ref1 = a1.get("reference_model_id")
-com1 = com_distance(fold_mid, ref1) if ref1 else None
+com1 = com_distance(fold_mid, ref1, chain2="A") if ref1 else None   # 4HHB tetramer → chain A only
 print(f"[align] 4HHB: TM_ref={a1.get('tm_ref')} TM_query={a1.get('tm_query')} RMSD={a1.get('rmsd')} "
       f"n_aligned={a1.get('n_aligned')} shared={a1.get('shared_fold')} | overlay COM dist={com1}")
 checks.append(("(1) homolog 4HHB → TM_ref > 0.5 (shared fold)", (a1.get("tm_ref") or 0) > 0.5))
 checks.append(("(1) US-align RMSD + n_aligned captured", a1.get("rmsd") is not None and (a1.get("n_aligned") or 0) > 50))
 checks.append(("(1) option-B overlay applied (view matrix on the fold model)",
                any(c.startswith(f"view matrix models #{fold_mid},") for c in a1.get("overlay_commands", []))))
-checks.append(("(1) the fold OVERLAYS the reference (CA centroids within 8 Å)",
+checks.append(("(1) the fold OVERLAYS the reference chain A (CA centroids within 8 Å)",
                com1 is not None and com1 < 8.0))
 
 # ── 2) DISTANT, sequence-divergent: 1LH1 (leghemoglobin) ──────────────────────────────
@@ -231,16 +246,24 @@ checks.append(("(3) unrelated 1UBQ → low TM_ref < 0.5, honest NOT-similar",
 
 # ── 4) HEAD-TO-HEAD: matchmaker vs US-align on the distant + unrelated refs ────────────
 ref2 = a2.get("reference_model_id"); ref3 = a3.get("reference_model_id")
-mm2 = matchmaker_headtohead("1LH1", ref2) if ref2 else "(no ref model)"
-mm3 = matchmaker_headtohead("1UBQ", ref3) if ref3 else "(no ref model)"
+mm2 = matchmaker_headtohead("1LH1", ref2) if ref2 else {"score": None, "pruned_n": None, "line": "(no ref)"}
+mm3 = matchmaker_headtohead("1UBQ", ref3) if ref3 else {"score": None, "pruned_n": None, "line": "(no ref)"}
 print("\n── HEAD-TO-HEAD (matchmaker vs US-align) ──")
-print(f"  1LH1 (distant):  US-align TM_ref={a2.get('tm_ref')} (confident)  |  matchmaker: {mm2}")
-print(f"  1UBQ (unrelated): US-align TM_ref={a3.get('tm_ref')} (honest low) |  matchmaker: {mm3}")
-# US-align gives a quantitative TM on BOTH; matchmaker fails-closed on the unrelated pair.
-checks.append(("(4) matchmaker FAILS-CLOSED on the unrelated pair (cannot match / fewer than 3)",
-               ("cannot match" in mm3.lower()) or ("fewer than" in mm3.lower())))
-checks.append(("(4) US-align stayed quantitative on BOTH (a number where matchmaker gave none)",
-               a3.get("tm_ref") is not None and a2.get("tm_ref") is not None))
+print(f"  1LH1 (distant):   US-align TM_ref={a2.get('tm_ref')} over {a2.get('n_aligned')} res "
+      f"|  matchmaker score={mm2['score']} pruned_n={mm2['pruned_n']}  → {mm2['line']}")
+print(f"  1UBQ (unrelated): US-align TM_ref={a3.get('tm_ref')} over {a3.get('n_aligned')} res "
+      f"|  matchmaker score={mm3['score']} pruned_n={mm3['pruned_n']}  → {mm3['line']}")
+# The premise: matchmaker (sequence-guided) DEGENERATES on the unrelated pair — a near-zero
+# alignment score + a tiny spurious aligned set (no honest "not similar"), DRAMATICALLY worse
+# than its distant-pair alignment — while US-align stays quantitative (a real TM) on BOTH.
+checks.append(("(4) matchmaker DEGENERATES on the unrelated pair (score ≪ the distant pair's)",
+               mm3["score"] is not None and mm2["score"] is not None
+               and mm3["score"] < 20 and mm3["score"] < 0.2 * mm2["score"]))
+checks.append(("(4) matchmaker aligns only a spurious few residues on the unrelated pair (<15)",
+               mm3["pruned_n"] is not None and mm3["pruned_n"] < 15))
+checks.append(("(4) US-align stayed QUANTITATIVE on BOTH (a real TM where matchmaker degenerated)",
+               a3.get("tm_ref") is not None and a2.get("tm_ref") is not None
+               and a3.get("n_aligned", 0) > mm3["pruned_n"]))
 
 QtCore.QThreadPool.globalInstance().waitForDone(5000)
 print("[cleanup] leaving models open for inspection")
