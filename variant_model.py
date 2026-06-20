@@ -108,6 +108,12 @@ class ChainDesign:
     # established lazily, cached once per design (not per variant). Value:
     # {engine, target, seed, model_id, path, floor:{"resno"|"chain:resno" -> Å}}.
     wt_refs:        Dict[str, Any] = field(default_factory=dict)
+    # DE-NOVO constructs: T has no crystal — the "reference structure" is the FOLD of T itself.
+    # `template_fold` holds that fold (fold_summary shape: {model_id, plddt, chains, target,
+    # engine, …}) once the construct is folded; `members`/`rep_model` are then re-pointed from
+    # the synthetic ids to the fold model's chains so selection + property-colour come alive.
+    # Empty for a crystal-seeded design (its reference IS the loaded structure).
+    template_fold:  Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -315,6 +321,10 @@ class DesignSession:
     model_id: str
     chains:   Dict[str, ChainDesign] = field(default_factory=dict)   # unique_key -> ChainDesign
     next_id:  int = 1
+    # "structure" = seeded from a loaded crystal (model_id is a real ChimeraX id);
+    # "sequence"  = DE-NOVO construct (model_id is synthetic "denovo-…"; nothing in ChimeraX
+    # until the construct is folded). Drives the no-crystal restore + fold-as-N-mer paths.
+    source:   str = "structure"
 
     def new_variant_id(self) -> str:
         vid = f"V{self.next_id}"
@@ -337,8 +347,10 @@ class DesignSession:
                 template_cells = [AlignedCell(**c) for c in cd.get("template_cells", [])],
                 variants       = [_variant_from_dict(v) for v in cd.get("variants", [])],
                 wt_refs        = dict(cd.get("wt_refs") or {}),
+                template_fold  = dict(cd.get("template_fold") or {}),
             )
-        return cls(model_id=d["model_id"], chains=chains, next_id=int(d.get("next_id", 1)))
+        return cls(model_id=d["model_id"], chains=chains, next_id=int(d.get("next_id", 1)),
+                   source=d.get("source", "structure"))
 
 
 def _variant_from_dict(v: Dict[str, Any]) -> Variant:
@@ -372,6 +384,42 @@ def build_design_session(chain_seqs, model_id: str) -> DesignSession:
             rep_model      = rep_cs.model,
             rep_chain      = rep_cs.chain,
             members        = list(grp.members),
+            template_cells = cells,
+        )
+    return session
+
+
+_DENOVO_AA = set("ACDEFGHIKLMNPQRSTVWY")
+
+
+def build_design_session_from_sequence(name: str, chains, model_id: Optional[str] = None
+                                       ) -> "DesignSession":
+    """Seed a DE-NOVO `DesignSession` from typed sequence(s) — NO crystal. `chains` is a list of
+    `(sequence, copy_count)`: each DISTINCT sequence → one `ChainDesign` (the unique chain), with
+    `copy_count` member chains (the known stoichiometry — a homo-monomer construct is one chain;
+    the N-MER is a FOLD-TIME choice, not design-time). Template T is numbered 1..N
+    (`AlignedCell(col=i, resnum=i+1, aa=aa)`); `model_id` is a synthetic, session-unique
+    `denovo-…` id (the stable persistence key — nothing is in ChimeraX until the construct is
+    folded). Modelled as a chain LIST so hetero-complexes drop in later without rework. Pure / no
+    ChimeraX — the grid renders entirely off `template_cells`. Raises on empty / non-standard aa."""
+    import uuid
+    mid = model_id or f"denovo-{uuid.uuid4().hex[:8]}"
+    session = DesignSession(model_id=mid, source="sequence")
+    chain_ids = (chr(c) for c in range(ord("A"), ord("Z") + 1))   # A, B, C… across all copies
+    for ci, (seq, copies) in enumerate(chains):
+        s = "".join((seq or "").split()).upper()
+        if not s or any(a not in _DENOVO_AA for a in s):
+            raise ValueError(f"not a standard amino-acid sequence: {seq!r}")
+        n = max(1, int(copies))
+        members = [(mid, next(chain_ids)) for _ in range(n)]
+        rep_chain = members[0][1]
+        cells = [AlignedCell(col=i, resnum=i + 1, aa=a) for i, a in enumerate(s)]
+        ukey = f"{name}:{ci}|{mid}/{rep_chain}"        # stable unique-chain key
+        session.chains[ukey] = ChainDesign(
+            group_key      = f"{name}:{ci}" if len(chains) > 1 else name,
+            rep_model      = mid,
+            rep_chain      = rep_chain,
+            members        = members,
             template_cells = cells,
         )
     return session

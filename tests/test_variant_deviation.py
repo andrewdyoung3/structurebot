@@ -172,6 +172,16 @@ class TestRunVariantDeviation:
         assert d["max_ddm"] > 0.0 and d["min_lddt"] < 1.0
         assert d["n_disrupted"] >= 1                          # shoved residues above the dRMSD floor
 
+    def test_no_reference_skips_matchmaker_even_with_a_loaded_primary(self):
+        # DE-NOVO: the explicit no_reference flag forces NO matchmaker target and must NOT fall
+        # back to a loaded primary (which would silently superpose onto an unrelated model).
+        r = _router()
+        r._primary_model_id = MagicMock(return_value="1")
+        r.session.get_structure = MagicMock(return_value={"id": "1"})
+        assert r._resolve_colabfold_compare_to({"no_reference": True}, exclude_model="9") is None
+        # control: WITHOUT the flag it would fall back to the loaded primary
+        assert r._resolve_colabfold_compare_to({}, exclude_model="9") == "#1"
+
     def test_missing_variant_model_errors(self):
         out = _router()._run_variant_deviation({"engine": "esmfold"})
         assert not out.success and "model id" in out.error

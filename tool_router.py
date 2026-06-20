@@ -2831,7 +2831,7 @@ class ToolRouter:
             _tmp.write(res.get("pdb_str", ""))
             _tmp.close()
             pdb_path = _tmp.name
-            ref_id = inputs.get("compare_to") or model_id
+            ref_id = None if inputs.get("no_reference") else (inputs.get("compare_to") or model_id)
             # Open LIVE + read the REAL model id back (V3 fix — no next_model_id() guess).
             new_id, cmds, exps = self._open_and_viz_fold_live(
                 Path(pdb_path).as_posix(), {**inputs, "compare_to": ref_id})
@@ -2990,7 +2990,7 @@ class ToolRouter:
                 elapsed_ms=elapsed_ms)
 
         cif_path = res.get("cif_path")
-        ref_id   = inputs.get("compare_to") or model_id
+        ref_id   = None if inputs.get("no_reference") else (inputs.get("compare_to") or model_id)
         # Open LIVE + read the REAL model id back (V3 fix — no next_model_id() guess).
         new_id, cmds, exps = self._open_and_viz_fold_live(
             Path(cif_path).as_posix(), {**inputs, "compare_to": ref_id})
@@ -4556,7 +4556,14 @@ class ToolRouter:
         with optional chain. Overridable via inputs['compare_to'] = a ``#id``/
         ``#id/chain`` spec or a model id. Returns None when nothing to compare to
         (e.g. the predicted model is the only structure).
+
+        ``inputs['no_reference']`` (DE-NOVO constructs) FORCES None — the fold has no
+        reference structure, so matchmaker is skipped explicitly and NEVER falls back to
+        whatever primary happens to be loaded (which would silently superpose the de-novo
+        fold onto an unrelated model).
         """
+        if inputs.get("no_reference"):
+            return None
         compare_to = inputs.get("compare_to")
         if compare_to:
             spec = str(compare_to).strip()

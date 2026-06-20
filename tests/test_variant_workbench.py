@@ -1465,3 +1465,91 @@ class TestWorkbenchRehydrate:
         p2.load_model("1")
         cd = p2._cur_tab().design
         assert len(cd.variants) == 1 and cd.variants[0].sequence == "MKGGVLW"
+
+
+class TestDeNovoPanel:
+    """Stage 1 de-novo at the panel: Add sequence seeds a construct, fold-as-N-mer synthesizes
+    chains with an explicit no-reference, members re-point to the fold, restore without load_model."""
+
+    def _denovo_panel(self):
+        from session_state import SessionState
+        p, c = _panel([], session=SessionState())     # nothing loaded
+        return p, c
+
+    def test_add_sequence_construct_seeds_design(self, _app):
+        p, c = self._denovo_panel()
+        p._add_sequence_construct("binder", "MKVLW")
+        assert p._design is not None and p._design.source == "sequence"
+        cd = next(iter(p._design.chains.values()))
+        assert "".join(x.aa for x in cd.template_cells) == "MKVLW"
+        assert p._tabs.count() >= 1                    # grid rendered, no ChimeraX
+        c.load_model.assert_not_called()               # never touched the controller/crystal path
+
+    def test_construct_fold_spec_homo_nmer_synthesizes_chains(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("binder", "MKVLW")
+        spec = p.construct_fold_launch_spec("boltz", 2)
+        ti = spec["tool_inputs"]
+        assert ti["no_reference"] is True              # EXPLICIT no-reference (not empty compare_to)
+        assert ti["chains"] == [{"id": "A", "sequence": "MKVLW"},
+                                {"id": "B", "sequence": "MKVLW"}]
+        assert spec["refresh"] == "construct_fold" and spec["_denovo_fold_chains"] == ["A", "B"]
+
+    def test_construct_fold_spec_monomer(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("b", "MKV")
+        spec = p.construct_fold_launch_spec("esmfold", 1)
+        assert spec["tool_inputs"]["sequence"] == "MKV" and "chains" not in spec["tool_inputs"]
+        assert spec["tool_inputs"]["no_reference"] is True
+
+    def test_construct_fold_spec_none_for_crystal_design(self, _app):
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
+        p.load_model("1")
+        assert p.construct_fold_launch_spec("boltz", 2) is None   # not a de-novo design
+
+    def test_members_repoint_on_fold_selection_comes_alive(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("b", "MKV")
+        cd = next(iter(p._design.chains.values()))
+        syn = p._design.model_id
+        assert cd.members == [(syn, "A")]                         # pre-fold: synthetic, inert
+        assert p.select_specs_for_column(cd, 0) == [(syn, "A", [1])]
+        spec = p.construct_fold_launch_spec("boltz", 2)
+        result = {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "plddt": {1: 90.0, 2: 80.0, 3: 70.0}}}]}
+        p.apply_construct_fold_result(spec, result)
+        cd = next(iter(p._design.chains.values()))
+        assert cd.members == [("7", "A"), ("7", "B")] and cd.rep_model == "7"   # re-pointed to fold
+        assert p.select_specs_for_column(cd, 0) == [("7", "A", [1]), ("7", "B", [1])]
+        assert cd.template_fold.get("model_id") == "7"
+        assert p._active_plddt_map(p._cur_tab())                  # T's pLDDT now live (construct fold)
+
+    def test_denovo_restore_without_load_model(self, _app):
+        from session_state import SessionState
+        sess = SessionState()
+        p, _ = _panel([], session=sess)
+        p._add_sequence_construct("b", "MKVLW")
+        # fold it so a template_fold is persisted
+        spec = p.construct_fold_launch_spec("boltz", 2)
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "plddt": {1: 90.0}}}]})
+        dd = sess.get_design_session(p._design.model_id)
+        # a NEW panel rehydrates the construct directly — NOT via controller.load_model
+        p2, c2 = _panel([], session=sess)
+        p2.rehydrate_denovo(dd)
+        c2.load_model.assert_not_called()
+        assert p2._design.source == "sequence"
+        cd = next(iter(p2._design.chains.values()))
+        assert "".join(x.aa for x in cd.template_cells) == "MKVLW"
+        assert cd.members == [("7", "A"), ("7", "B")]            # fold re-point survived restore
+
+    def test_denovo_fold_visibility_skips_synthetic_reference(self, _app):
+        # the Template/Reference toggle must NOT emit show/hide on the synthetic id (no such model
+        # in ChimeraX → error); the construct's own fold is the displayed structure.
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("b", "MKV")
+        tab = p._cur_tab()
+        cmds = p.fold_visibility_commands(tab)
+        assert not any(p._design.model_id in c for c in cmds)   # no `show/hide #denovo-…`
