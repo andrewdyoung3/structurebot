@@ -131,6 +131,14 @@ class TestParse:
         # rep chain A only, keyed 1..N over its CA residues; chain B excluded
         assert out["plddt"] == {1: 90.0, 2: 80.0, 3: 40.0}
 
+    def test_parse_per_chain_plddt_and_observed_chain_ids(self, tmp_path):
+        b = _bridge()
+        out = b._parse_outputs(self._outdir(tmp_path), [{"id": "A", "sequence": "MKV"}])
+        # EACH chain keyed 1..N over its OWN CA residues (hetero re-point needs this)
+        assert out["plddt_by_chain"] == {"A": {1: 90.0, 2: 80.0, 3: 40.0}, "B": {1: 70.0}}
+        # observed chain ids in CIF first-appearance order (the read-back / ptm-alignment key)
+        assert out["chain_ids"] == ["A", "B"]
+
     def test_missing_cif_is_error(self, tmp_path):
         b = _bridge()
         (tmp_path / "out").mkdir()

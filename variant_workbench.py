@@ -27,7 +27,7 @@ select gets chatty.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -458,9 +458,11 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
 
 
 class _AddSequenceDialog(QtWidgets.QDialog):
-    """De-novo construct input: a name + a typed/pasted sequence (standard-AA validated on
-    accept). Single sequence for Stage 1; the construct model is a chain LIST so hetero input
-    drops in later. Pure Qt — no ChimeraX."""
+    """De-novo construct input: a name + ONE-OR-MORE distinct chain sequences, each with a
+    copy-count (the known stoichiometry, e.g. PCNA×3 + p21×3). Each row is a sequence box +
+    a copies spinner; rows add/remove dynamically. Every sequence is standard-AA validated on
+    accept. `result_chains()` returns [(sequence, copies), …] — the chain LIST the model seeds
+    one ChainDesign per distinct sequence from. Pure Qt — no ChimeraX."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -468,32 +470,78 @@ class _AddSequenceDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(QtWidgets.QLabel("Name:"))
         self._name = QtWidgets.QLineEdit()
-        self._name.setPlaceholderText("e.g. my_binder")
+        self._name.setPlaceholderText("e.g. PCNA_p21_complex")
         lay.addWidget(self._name)
-        lay.addWidget(QtWidgets.QLabel("Sequence (1-letter; spaces/newlines ignored):"))
-        self._seq = QtWidgets.QPlainTextEdit()
-        self._seq.setPlaceholderText("MKVLW…")
-        lay.addWidget(self._seq)
+        lay.addWidget(QtWidgets.QLabel(
+            "Chains (1-letter; spaces/newlines ignored) — one row per DISTINCT sequence, "
+            "with its copy count:"))
+        # Dynamic chain rows live in their own VBox so add/remove just edits this layout.
+        self._rows: List[Tuple[QtWidgets.QPlainTextEdit, QtWidgets.QSpinBox, QtWidgets.QWidget]] = []
+        self._rows_box = QtWidgets.QVBoxLayout()
+        lay.addLayout(self._rows_box)
+        self._add_row_btn = QtWidgets.QPushButton("+ Add chain")
+        self._add_row_btn.clicked.connect(lambda: self._add_row())
+        lay.addWidget(self._add_row_btn)
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btns.accepted.connect(self._on_ok)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
+        self._add_row()                          # start with one chain row
+
+    def _add_row(self) -> None:
+        row = QtWidgets.QWidget()
+        rl = QtWidgets.QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        seq = QtWidgets.QPlainTextEdit()
+        seq.setPlaceholderText("MKVLW…")
+        seq.setMaximumHeight(64)
+        rl.addWidget(seq, 1)
+        spin = QtWidgets.QSpinBox()
+        spin.setRange(1, 26)                      # A..Z is the chain-id ceiling
+        spin.setValue(1)
+        spin.setPrefix("×")
+        spin.setToolTip("Number of identical copies of this chain (stoichiometry).")
+        rl.addWidget(spin)
+        rm = QtWidgets.QPushButton("–")
+        rm.setFixedWidth(28)
+        rm.setToolTip("Remove this chain")
+        rm.clicked.connect(lambda _checked=False, w=row: self._remove_row(w))
+        rl.addWidget(rm)
+        self._rows.append((seq, spin, row))
+        self._rows_box.addWidget(row)
+
+    def _remove_row(self, row: QtWidgets.QWidget) -> None:
+        if len(self._rows) <= 1:                  # always keep at least one chain row
+            return
+        self._rows = [r for r in self._rows if r[2] is not row]
+        self._rows_box.removeWidget(row)
+        row.deleteLater()
 
     def _on_ok(self) -> None:
-        seq = "".join(self.result_sequence().split()).upper()
-        if not seq or any(a not in _AA_ORDER for a in seq):
-            QtWidgets.QMessageBox.warning(self, "Invalid sequence",
-                                          "Enter a non-empty standard amino-acid sequence "
-                                          "(the 20 one-letter codes).")
+        total = 0
+        for seq_w, spin, _row in self._rows:
+            seq = "".join(seq_w.toPlainText().split()).upper()
+            if not seq or any(a not in _AA_ORDER for a in seq):
+                QtWidgets.QMessageBox.warning(self, "Invalid sequence",
+                                              "Each chain must be a non-empty standard amino-acid "
+                                              "sequence (the 20 one-letter codes).")
+                return
+            total += spin.value()
+        if total > 26:
+            QtWidgets.QMessageBox.warning(self, "Too many chains",
+                                          "Total copies across all chains exceed 26 (the A–Z "
+                                          "chain-id ceiling). Reduce the copy counts.")
             return
         self.accept()
 
     def result_name(self) -> str:
         return self._name.text().strip() or "construct"
 
-    def result_sequence(self) -> str:
-        return self._seq.toPlainText()
+    def result_chains(self) -> List[Tuple[str, int]]:
+        """[(sequence, copies), …] in row order — distinct chains for the construct."""
+        return [("".join(seq_w.toPlainText().split()).upper(), int(spin.value()))
+                for seq_w, spin, _row in self._rows]
 
 
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
@@ -799,71 +847,95 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     # ── DE-NOVO "Add sequence" construct ─────────────────────────────────────────────
     def _on_add_sequence(self) -> None:
-        """Dialog → name + sequence → seed a de-novo construct (no crystal). Single sequence
-        for now; the chain-list model leaves the seam for hetero input later."""
+        """Dialog → name + one-or-more chain sequences (each with a copy count) → seed a de-novo
+        construct (no crystal). Hetero complexes (distinct sequences) become one ChainDesign each,
+        folded together as one assembly."""
         dlg = _AddSequenceDialog(self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
-        name, seq = dlg.result_name(), dlg.result_sequence()
+        name, chains = dlg.result_name(), dlg.result_chains()
         try:
-            self._add_sequence_construct(name, seq)
+            self._add_sequence_construct(name, chains)
         except Exception as exc:
             self._status.setText(f"Add sequence failed: {type(exc).__name__}: {exc}")
 
-    def _add_sequence_construct(self, name: str, sequence: str) -> None:
-        """Core (testable, no dialog): build the de-novo DesignSession from one typed sequence,
-        make it the active design, render the grid, persist. ChimeraX is untouched — nothing
-        renders until the construct is folded."""
-        design = build_design_session_from_sequence(name, [(sequence, 1)])
+    def _add_sequence_construct(self, name: str, chains) -> None:
+        """Core (testable, no dialog): build the de-novo DesignSession from a chain LIST, make it
+        the active design, render the grid, persist. ChimeraX is untouched — nothing renders until
+        the construct is folded. *chains* is a list of (sequence, copies) OR a bare sequence string
+        (single-chain, copies=1 — back-compat)."""
+        if isinstance(chains, str):
+            chains = [(chains, 1)]
+        design = build_design_session_from_sequence(name, list(chains))
         self._design = design
         self._edit_target = None
         self._scan_cols.clear()
         self._update_scan_label()
         self._render()
         self._persist()
-        n = len(next(iter(design.chains.values())).template_cells)
+        n_chains = len(design.chains)
+        n_copies = sum(len(cd.members) for cd in design.chains.values())
+        shape = (f"{n_chains} distinct chains, {n_copies} copies"
+                 if n_chains > 1 else
+                 f"{len(next(iter(design.chains.values())).template_cells)} aa")
         self._status.setText(
-            f"Construct '{name}' added ({n} aa, de novo — no structure). "
-            f"Fold ▾ → Fold construct to build a mono/di/tri/tetramer; nothing renders until then.")
+            f"Construct '{name}' added ({shape}, de novo — no structure). "
+            f"Fold ▾ → Fold construct (Boltz for a multi-chain assembly); nothing renders until then.")
 
     def construct_fold_launch_spec(self, engine: str, n_copies: int = 1) -> Optional[dict]:
-        """Deterministic fold spec for the DE-NOVO construct: fold T (the typed sequence) as an
-        N-mer (N identical chains synthesized from the one sequence), LOCAL-ONLY, with EXPLICIT
-        no-reference (the construct has no crystal — matchmaker is skipped, never falling back to
-        a loaded primary). None unless the active design is sequence-seeded. ESMFold is monomer-
-        only (caller disables N>1)."""
+        """Deterministic fold spec for the DE-NOVO construct: fold the WHOLE declared assembly —
+        EVERY ChainDesign contributes its own copies as a GROUPED, contiguous block of chain ids
+        (cd0 → A,B,C; cd1 → D,E,F; …), one Boltz assembly. LOCAL-ONLY with the EXPLICIT no-reference
+        flag (no crystal → matchmaker skipped, never falling back to a loaded primary). None unless
+        the active design is sequence-seeded.
+
+        Copy counts are the DESIGN-TIME stoichiometry baked into each cd's `members` (the dialog's
+        per-chain spinner). The mono/di/tri/tetramer menu (*n_copies*) only applies to the simple
+        SINGLE-chain / single-member Stage-1 case (one typed sequence → fold as an N-mer).
+
+        Hetero (>1 fold chain) is BOLTZ-ONLY — ESMFold is monomer-only; returns None (with the
+        caller reporting) for esmfold + a multi-chain assembly."""
         tab = self._cur_tab()
         if (tab is None or self._design is None or self._design.source != "sequence"):
             return None
-        cd = tab.design
-        seq = "".join(c.aa for c in cd.template_cells if c.aa is not None)
-        n = max(1, int(n_copies))
-        # find this chain's unique key (re-point target on fold completion)
-        ukey = next((k for k, c in self._design.chains.items() if c is cd), None)
+        cds = list(self._design.chains.items())            # [(ukey, cd), …] (insertion = grouped order)
+        # Single typed sequence (one cd, one member) → the menu's N-mer multiplier still drives it;
+        # any declared stoichiometry (multi-copy or multi-chain) folds exactly as declared.
+        single = len(cds) == 1 and len(cds[0][1].members) <= 1
+        letters = (chr(c) for c in range(ord("A"), ord("Z") + 1))   # grouped, contiguous across cds
+        blocks: Dict[str, List[str]] = {}                  # ukey -> [chain ids] (this cd's block)
+        fold_chains: List[Dict[str, str]] = []             # ordered [{id, sequence}] for the YAML
+        for ukey, cd in cds:
+            seq = "".join(c.aa for c in cd.template_cells if c.aa is not None)
+            n = max(1, int(n_copies)) if single else max(1, len(cd.members))
+            block = [next(letters) for _ in range(n)]
+            blocks[ukey] = block
+            fold_chains.extend({"id": ch, "sequence": seq} for ch in block)
+        n_total = len(fold_chains)
+        if n_total > 1 and engine != "boltz":
+            return None                                    # ESMFold can't fold an assembly
         ti: Dict[str, object] = {
-            "model_id":    self._design.model_id,     # synthetic (stable persistence key)
+            "model_id":    self._design.model_id,          # synthetic (stable persistence key)
             "engine":      engine,
             "open_model":  True,
             "local_only":  True,
-            "no_reference": True,                      # EXPLICIT skip-matchmaker (no crystal)
+            "no_reference": True,                          # EXPLICIT skip-matchmaker (no crystal)
         }
-        if n > 1:
-            fold_chains = [chr(ord("A") + i) for i in range(n)]
-            ti["chains"] = [{"id": ch, "sequence": seq} for ch in fold_chains]
-            target = f"{n}-chain assembly"
+        if n_total > 1:
+            ti["chains"] = fold_chains
+            target = f"{n_total}-chain assembly"
         else:
-            fold_chains = ["A"]
-            ti["sequence"] = seq
+            ti["sequence"] = fold_chains[0]["sequence"]
             target = "monomer"
+        label = (self._design.model_id if len(cds) > 1 else cds[0][1].group_key)
         return {
             "tool":         engine,
             "tool_inputs":  ti,
-            "user_input":   f"[Workbench] fold construct {cd.group_key} — {engine} {target}, "
+            "user_input":   f"[Workbench] fold construct {label} — {engine} {target}, "
                             f"LOCAL-ONLY, no reference",
             "confidence":   "low",
             "refresh":      "construct_fold",
-            "_denovo_chain_key":   ukey,
-            "_denovo_fold_chains": fold_chains,        # the synthesized fold chain ids → members
+            "_denovo_chain_blocks": blocks,                # ukey -> its grouped fold-chain block
         }
 
     def _on_construct_fold(self, engine: str, n_copies: int) -> None:
@@ -871,34 +943,70 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText("Fold construct is for de-novo sequences — use Add sequence first.")
             return
         spec = self.construct_fold_launch_spec(engine, n_copies)
-        if spec is not None:
-            self.launchRequested.emit(spec)
+        if spec is None:
+            if len(self._design.chains) > 1 and engine != "boltz":
+                self._status.setText("A multi-chain construct must be folded with Boltz "
+                                     "(ESMFold is monomer-only).")
+            return
+        self.launchRequested.emit(spec)
 
     def apply_construct_fold_result(self, spec: dict, result: dict) -> None:
-        """Consume the construct (T) fold: store it on `cd.template_fold`, RE-POINT the design's
-        members/model ids from the synthetic id to the FOLD model's chains (so column-click
-        selection + sequence-property colour come alive on the fold; homo-N-mer → all N chains),
-        auto-surface pLDDT, re-render. The synthetic `model_id` (persistence key) is unchanged."""
+        """Consume the construct fold: for EACH ChainDesign, store its OWN chain's pLDDT on
+        `cd.template_fold` and RE-POINT its members/model ids from the synthetic id to that cd's
+        block of FOLD chains (so column-click selection + sequence-property colour come alive on
+        the right chains — a PCNA click selects the three PCNA chains, a p21 click the three p21).
+        The synthetic `model_id` (persistence key) is unchanged.
+
+        READ-BACK GUARD: the bridge returns the OBSERVED chain ids (CIF order); we fail loud if
+        sent != observed (a relabel/missing chain → no silent mis-point). The index-keyed
+        `chains_ptm` is paired to chain ids THROUGH the observed CIF order (reorder-robust), then
+        mapped to each cd by id."""
         data = self._fold_from_result(result)
         if not data or not (data.get("new_model_id") or data.get("model_id")):
             self._status.setText("Construct fold produced no model.")
             return
         if self._design is None:
             return
-        ukey = spec.get("_denovo_chain_key")
-        cd = self._design.chains.get(ukey) if ukey else next(iter(self._design.chains.values()), None)
-        if cd is None:
+        # Per-cd chain blocks (new shape); fall back to the flat single-cd shape for old specs.
+        blocks: Dict[str, List[str]] = dict(spec.get("_denovo_chain_blocks") or {})
+        if not blocks:
+            ukey = spec.get("_denovo_chain_key") or next(iter(self._design.chains), None)
+            if ukey is not None:
+                blocks = {ukey: list(spec.get("_denovo_fold_chains") or ["A"])}
+        if not blocks:
             return
         fold_mid = str(data.get("new_model_id", data.get("model_id")))
-        fold_chains = spec.get("_denovo_fold_chains") or ["A"]
-        author_resnums = [c.resnum for c in cd.template_cells
-                          if not c.is_gap and c.resnum is not None]
-        cd.template_fold = fold_summary(data, author_resnums, reference_model_id=None)
-        # THE re-point: the construct's "structure" is now its fold — selection/property-colour
-        # target the fold model's chains (all N copies for an N-mer, mirroring the homo collapse).
-        cd.members   = [(fold_mid, ch) for ch in fold_chains]
-        cd.rep_model = fold_mid
-        cd.rep_chain = fold_chains[0]
+        sent_ids = [ch for blk in blocks.values() for ch in blk]
+        observed = data.get("chain_ids")
+        # READ-BACK GUARD — sent must equal observed (as a set), else refuse the re-point.
+        if observed is not None and set(observed) != set(sent_ids):
+            self._status.setText(
+                f"Construct fold chain mismatch — sent {sorted(set(sent_ids))}, got "
+                f"{sorted(set(map(str, observed)))}. Refusing to re-point (fold not trusted).")
+            return
+        plddt_by_chain = data.get("plddt_by_chain") or {}
+        ptm_by_chain = self._chains_ptm_by_id(data.get("chains_ptm"), observed or sent_ids)
+        for ukey, block in blocks.items():
+            cd = self._design.chains.get(ukey)
+            if cd is None:
+                continue
+            rep = block[0]
+            author_resnums = [c.resnum for c in cd.template_cells
+                              if not c.is_gap and c.resnum is not None]
+            chain_plddt = plddt_by_chain.get(rep) or (data.get("plddt") if not plddt_by_chain else {})
+            vals = list((chain_plddt or {}).values())
+            per_chain = {**data,
+                         "plddt":      chain_plddt or {},
+                         "mean_plddt": round(sum(vals) / len(vals), 2) if vals else data.get("mean_plddt"),
+                         "chain":      rep}
+            if rep in ptm_by_chain:
+                per_chain["chains_ptm"] = {rep: ptm_by_chain[rep]}   # THIS cd's own chain pTM
+            cd.template_fold = fold_summary(per_chain, author_resnums, reference_model_id=None)
+            # THE re-point: the construct's "structure" is now its fold — this cd targets its OWN
+            # block of fold chains (N copies for an N-mer; one block per distinct chain for hetero).
+            cd.members   = [(fold_mid, ch) for ch in block]
+            cd.rep_model = fold_mid
+            cd.rep_chain = rep
         self._persist()
         tab = self._cur_tab()
         if tab is not None:
@@ -906,12 +1014,37 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.rebuild()
             self._apply_color_to(tab)
             self._push_3d_color(tab)
-        mp = cd.template_fold.get("mean_plddt")
-        mp_txt = f", mean pLDDT {mp:.1f}" if isinstance(mp, (int, float)) else ""
+        cur = (tab.design if tab is not None else next(iter(self._design.chains.values()), None))
+        mp = (cur.template_fold.get("mean_plddt") if cur is not None else None)
+        mp_txt = f", chain pLDDT {mp:.1f}" if isinstance(mp, (int, float)) else ""
         self._status.setText(
-            f"Construct folded ({data.get('engine')}, {len(fold_chains)}-chain): model "
+            f"Construct folded ({data.get('engine')}, {len(sent_ids)}-chain): model "
             f"#{fold_mid}{mp_txt}, pLDDT-coloured. Selection + colour now act on the fold; "
             f"no matchmaker (de novo, no reference).")
+
+    @staticmethod
+    def _chains_ptm_by_id(chains_ptm, observed) -> Dict[str, Any]:
+        """Map Boltz's per-chain pTM to chain ids THROUGH the observed CIF order (reorder-robust).
+        `chains_ptm` is index-keyed ({"0": .., "1": ..} or a list); `observed[i]` is the chain id
+        at fold position i, so ptm index i → that id. An already-id-keyed dict passes through."""
+        if not chains_ptm or not observed:
+            return {}
+        if isinstance(chains_ptm, dict):
+            # id-keyed already? (keys match observed) → pass through.
+            if set(map(str, chains_ptm)) & set(map(str, observed)):
+                return {str(k): v for k, v in chains_ptm.items()}
+            out: Dict[str, Any] = {}
+            for k, v in chains_ptm.items():
+                try:
+                    i = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= i < len(observed):
+                    out[str(observed[i])] = v
+            return out
+        if isinstance(chains_ptm, (list, tuple)):
+            return {str(observed[i]): v for i, v in enumerate(chains_ptm) if i < len(observed)}
+        return {}
 
     def _apply_substitution(self) -> None:
         tab = self._cur_tab()

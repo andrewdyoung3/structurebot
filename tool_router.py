@@ -3018,6 +3018,8 @@ class ToolRouter:
                 "iptm":               iptm,
                 "chains_ptm":         res.get("chains_ptm"),
                 "plddt":              res.get("plddt", {}),
+                "plddt_by_chain":     res.get("plddt_by_chain"),   # {chain: {idx: pLDDT}} (hetero re-point)
+                "chain_ids":          res.get("chain_ids"),        # observed CIF order (read-back guard)
                 "length":             res.get("length"),
                 "source":             res.get("source"),
                 "seed":               res.get("seed"),
