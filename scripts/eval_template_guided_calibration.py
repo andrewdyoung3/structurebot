@@ -94,6 +94,19 @@ HARD_CANDIDATES: Dict[str, dict] = {
                             {"pdb": "1FNF", "chain": "A", "tag": "homolog (fibronectin FN3)"}]},
 }
 
+# CLIFF-DENSIFICATION (expansion): de-risk the 2-point CspB rescue cliff with rungs across
+# structTM-to-truth 0.69→0.50 (measured no-fold: 1G6P .69, 1SRO .65, 1STN .57, 1BOV .50). Soft
+# only (the rescue cliff is a soft-ΔAccuracy question). Reuses the CspB unguided baseline.
+TARGETS["cspb_cliff"] = {
+    "pdb": "1MJC", "chain": "A",
+    "templates": [
+        {"pdb": "1G6P", "chain": "A", "tag": "sTM .69 (upper anchor, helpful)"},
+        {"pdb": "1SRO", "chain": "A", "tag": "sTM .65 (helpful)"},
+        {"pdb": "1STN", "chain": "A", "tag": "staph nuclease OB, sTM .57 (NEW cliff point)"},
+        {"pdb": "1BOV", "chain": "A", "tag": "sTM .50 (no help)"},
+    ],
+}
+
 _3TO1 = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E",
     "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F",
@@ -304,14 +317,20 @@ def prescreen(flex_seeds: int, names: Optional[List[str]] = None) -> None:
             cifs.append(r["cif_path"]); plddts.append(r["mean_plddt"])
         mp = round(sum(plddts) / len(plddts), 2) if plddts else None
         flex = cross_seed_flex(cifs) if flex_seeds >= 2 else None
-        hard = (mp is not None and mp < 80)
-        rows.append((name, tgt["pdb"], len(seq), mp, flex, hard))
-        print(f"  → mean pLDDT {mp}  cross-seed flex {flex}  {'HARD ✓' if hard else 'folds OK'}")
-    print("\n--- PRESCREEN SUMMARY (HARD = unguided mean pLDDT < 80) ---")
-    print(f"  {'target':10} {'pdb':6} {'len':>4} {'pLDDT':>7} {'flex':>6}  hard?")
-    for name, pdb, n, mp, flex, hard in rows:
-        print(f"  {name:10} {pdb:6} {n:>4} {str(mp):>7} {str(flex):>6}  {'YES' if hard else 'no'}")
-    print("\nFlag the HARD ones to include in the titration.")
+        # The HEADROOM gate is accuracy-toward-truth (TM-to-S_P), NOT pLDDT (self-confidence):
+        # US-align the unguided fold(s) to the ground truth and report the mean.
+        tms = [usalign_tm(c, pdb_path) for c in cifs]
+        tms = [t["tm2"] for t in tms if t]
+        mean_tm = round(sum(tms) / len(tms), 4) if tms else None
+        hard = (mean_tm is not None and mean_tm < 0.8)   # TM-to-truth < 0.8 = real accuracy headroom
+        rows.append((name, tgt["pdb"], len(seq), mp, mean_tm, flex, hard))
+        print(f"  → mean pLDDT {mp}  TM-to-truth {mean_tm}  flex {flex}  "
+              f"{'HARD ✓ (accuracy headroom)' if hard else 'near ceiling — folds OK'}")
+    print("\n--- PRESCREEN SUMMARY (HARD = unguided mean TM-to-truth < 0.8) ---")
+    print(f"  {'target':10} {'pdb':6} {'len':>4} {'pLDDT':>7} {'TM-truth':>9} {'flex':>6}  hard?")
+    for name, pdb, n, mp, tm, flex, hard in rows:
+        print(f"  {name:10} {pdb:6} {n:>4} {str(mp):>7} {str(tm):>9} {str(flex):>6}  {'YES' if hard else 'no'}")
+    print("\nFlag the HARD ones (real accuracy headroom) to include in the titration.")
 
 
 # ── titration ──────────────────────────────────────────────────────────────────────────
