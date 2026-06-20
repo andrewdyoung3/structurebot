@@ -21,7 +21,8 @@ Design (mirrors rasp_bridge's WSL-subprocess pattern + esmfold_bridge's LOCAL-ON
   - CAPABILITY FLAG (Unit-B): is_available() probes the ~/boltz_env import chain WHERE IT RUNS
     (dep_probe.wsl_import_probe), B2 3-state, definitive-only cache — enables the picker's Boltz.
   - RESULT contract: {success, cif_path, mean_plddt, iptm, chains_ptm, plddt(rep-chain per
-    author-index), source:"local_boltz_env", seed, error}. ERROR-FIRST + GRACEFUL throughout.
+    author-index), plddt_by_chain({chain: {idx: pLDDT}}), chain_ids(observed CIF order),
+    source:"local_boltz_env", seed, error}. ERROR-FIRST + GRACEFUL throughout.
 """
 from __future__ import annotations
 
@@ -188,31 +189,43 @@ class BoltzBridge:
                 conf = {}
         # complex_plddt is 0–1 in the JSON; the CIF B-factor is already 0–100.
         cplx = conf.get("complex_plddt")
+        # PER-CHAIN pLDDT (each auth_asym_id keyed 1..N) + the OBSERVED chain ids in CIF order.
+        # Hetero assemblies need each ChainDesign's OWN chain pLDDT (not a shared rep), and the
+        # observed-id list is the read-back the consumer guards sent==got + aligns index-keyed
+        # chains_ptm against. `plddt` (rep chain) is retained for the monomer/back-compat path.
+        plddt_by_chain, chain_ids = self._per_chain_bfactor(cif_src)
         rep_chain = chains[0]["id"]
-        plddt = self._cif_bfactor_by_index(cif_src, rep_chain)   # {1-based author index: pLDDT}
+        plddt = plddt_by_chain.get(rep_chain, {})                # rep chain (1-based author index)
+        all_vals = [v for d in plddt_by_chain.values() for v in d.values()]
         mean_plddt = (float(cplx) * 100.0 if isinstance(cplx, (int, float))
-                      else (round(sum(plddt.values()) / len(plddt), 2) if plddt else 0.0))
+                      else (round(sum(all_vals) / len(all_vals), 2) if all_vals else 0.0))
         return {
-            "success":    True,
-            "cif_path":   cif_dst.name,
-            "mean_plddt": round(mean_plddt, 2),
-            "iptm":       conf.get("iptm"),
-            "ptm":        conf.get("ptm"),
-            "chains_ptm": conf.get("chains_ptm"),
-            "plddt":      plddt,
-            "length":     len(plddt),
+            "success":        True,
+            "cif_path":       cif_dst.name,
+            "mean_plddt":     round(mean_plddt, 2),
+            "iptm":           conf.get("iptm"),
+            "ptm":            conf.get("ptm"),
+            "chains_ptm":     conf.get("chains_ptm"),
+            "plddt":          plddt,                             # rep chain (back-compat)
+            "plddt_by_chain": plddt_by_chain,                    # {chain: {1-based idx: pLDDT}}
+            "chain_ids":      chain_ids,                         # observed, CIF order
+            "length":         len(plddt),
         }
 
     @staticmethod
-    def _cif_bfactor_by_index(cif_path: str, chain: str) -> Dict[int, float]:
-        """Per-residue pLDDT (CIF B-factor, 0–100) for *chain*'s CA atoms, keyed 1..N over the
-        chain's residue order — matches `fold_summary`'s 1-based→author-resnum remap. Parses the
-        `_atom_site` loop header for robust column lookup (mmCIF column order is not fixed)."""
+    def _per_chain_bfactor(cif_path: str) -> Tuple[Dict[str, Dict[int, float]], List[str]]:
+        """Per-CHAIN per-residue pLDDT in ONE pass: returns ({auth_asym_id: {1-based idx: pLDDT}},
+        [chain ids in CIF first-appearance order]). Each chain's CA B-factors (0–100) are keyed
+        1..N over that chain's own residue order — matches `fold_summary`'s 1-based→author-resnum
+        remap, now per chain. The id list is the read-back the consumer aligns the index-keyed
+        `chains_ptm` against and guards sent==observed. Parses the `_atom_site` loop header for
+        robust column lookup (mmCIF column order is not fixed)."""
         cols: List[str] = []
         in_loop = False
-        out: Dict[int, float] = {}
-        seen: set = set()
-        idx = 0
+        by_chain: Dict[str, Dict[int, float]] = {}
+        order: List[str] = []
+        seen: Dict[str, set] = {}
+        idx: Dict[str, int] = {}
         try:
             with open(cif_path) as fh:
                 for line in fh:
@@ -229,23 +242,28 @@ class BoltzBridge:
                         if col.get("label_atom_id") not in ("CA",):
                             continue
                         ch = col.get("auth_asym_id") or col.get("label_asym_id")
-                        if ch != chain:
+                        if ch is None:
                             continue
+                        if ch not in by_chain:
+                            by_chain[ch] = {}
+                            order.append(ch)
+                            seen[ch] = set()
+                            idx[ch] = 0
                         rid = col.get("auth_seq_id") or col.get("label_seq_id")
-                        if rid in seen:
+                        if rid in seen[ch]:
                             continue
-                        seen.add(rid)
-                        idx += 1
+                        seen[ch].add(rid)
+                        idx[ch] += 1
                         try:
-                            out[idx] = float(col.get("B_iso_or_equiv"))
+                            by_chain[ch][idx[ch]] = float(col.get("B_iso_or_equiv"))
                         except (TypeError, ValueError):
                             pass
                     elif in_loop and s and not s.startswith(("ATOM", "HETATM", "_atom_site.")):
-                        if out:                 # left the atom_site loop after collecting atoms
+                        if by_chain:            # left the atom_site loop after collecting atoms
                             break
         except OSError:
-            return {}
-        return out
+            return {}, []
+        return by_chain, order
 
     @staticmethod
     def _err(label: str, msg: str) -> Dict[str, Any]:

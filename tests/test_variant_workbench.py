@@ -1493,7 +1493,9 @@ class TestDeNovoPanel:
         assert ti["no_reference"] is True              # EXPLICIT no-reference (not empty compare_to)
         assert ti["chains"] == [{"id": "A", "sequence": "MKVLW"},
                                 {"id": "B", "sequence": "MKVLW"}]
-        assert spec["refresh"] == "construct_fold" and spec["_denovo_fold_chains"] == ["A", "B"]
+        ukey = next(iter(p._design.chains))
+        assert spec["refresh"] == "construct_fold"
+        assert spec["_denovo_chain_blocks"] == {ukey: ["A", "B"]}      # grouped per-cd block
 
     def test_construct_fold_spec_monomer(self, _app):
         p, _ = self._denovo_panel()
@@ -1553,3 +1555,95 @@ class TestDeNovoPanel:
         tab = p._cur_tab()
         cmds = p.fold_visibility_commands(tab)
         assert not any(p._design.model_id in c for c in cmds)   # no `show/hide #denovo-…`
+
+
+class TestDeNovoHetero:
+    """Hetero multi-chain de-novo: distinct sequences → one ChainDesign each, folded as one
+    Boltz assembly; grouped contiguous fold-chain blocks; per-cd re-point + per-chain pLDDT;
+    read-back guard; reorder-robust ptm/pLDDT mapping."""
+
+    def _denovo_panel(self):
+        from session_state import SessionState
+        p, c = _panel([], session=SessionState())
+        return p, c
+
+    def test_multi_entry_input_seeds_multiple_grouped_chaindesigns(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("cplx", [("MKVLW", 2), ("AAA", 1)])
+        cds = list(p._design.chains.values())
+        assert len(cds) == 2                                       # one ChainDesign per distinct seq
+        syn = p._design.model_id
+        # grouped contiguous ids across copies: chain0 → A,B ; chain1 → C
+        assert [ch for _m, ch in cds[0].members] == ["A", "B"]
+        assert [ch for _m, ch in cds[1].members] == ["C"]
+        assert "".join(x.aa for x in cds[1].template_cells) == "AAA"
+        assert all(m == syn for cd in cds for m, _c in cd.members)  # synthetic, inert pre-fold
+
+    def test_spec_emits_grouped_per_cd_blocks_boltz_only(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("cplx", [("MKVLW", 2), ("AAA", 1)])
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        ti = spec["tool_inputs"]
+        assert ti["no_reference"] is True
+        assert ti["chains"] == [{"id": "A", "sequence": "MKVLW"},
+                                {"id": "B", "sequence": "MKVLW"},
+                                {"id": "C", "sequence": "AAA"}]
+        ukeys = list(p._design.chains)
+        assert spec["_denovo_chain_blocks"] == {ukeys[0]: ["A", "B"], ukeys[1]: ["C"]}
+        # ESMFold can't fold a multi-chain assembly → no spec
+        assert p.construct_fold_launch_spec("esmfold", 1) is None
+
+    def _hetero_result(self, chain_ids, *, relabel=None):
+        # per-chain pLDDT keyed by id (robust); chains_ptm INDEX-keyed (CIF order).
+        plddt_by_chain = {"A": {1: 90.0, 2: 88.0, 3: 86.0, 4: 84.0, 5: 82.0},
+                          "B": {1: 91.0, 2: 89.0, 3: 87.0, 4: 85.0, 5: 83.0},
+                          "C": {1: 40.0, 2: 42.0, 3: 41.0}}
+        ptm_by_pos = {"A": 0.95, "B": 0.95, "C": 0.20}
+        observed = list(chain_ids)
+        chains_ptm = {str(i): ptm_by_pos.get(ch, 0.0) for i, ch in enumerate(observed)}
+        return {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "iptm": 0.5, "chain_ids": observed, "plddt_by_chain": plddt_by_chain,
+            "chains_ptm": chains_ptm}}]}
+
+    def test_apply_loops_cds_repoints_each_block_distinct_plddt(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("cplx", [("MKVLW", 2), ("AAA", 1)])
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        p.apply_construct_fold_result(spec, self._hetero_result(["A", "B", "C"]))
+        cds = list(p._design.chains.values())
+        # each cd re-pointed to its OWN block on the fold model
+        assert [m for m in cds[0].members] == [("7", "A"), ("7", "B")]
+        assert [m for m in cds[1].members] == [("7", "C")]
+        # per-chain pLDDT distinct (PCNA-like ≠ p21-like), each cd reads ITS chain
+        mp0 = cds[0].template_fold["mean_plddt"]
+        mp1 = cds[1].template_fold["mean_plddt"]
+        assert mp0 > 80.0 and mp1 < 50.0 and mp0 != mp1
+        # this cd's own chain pTM (rep A for cd0, C for cd1)
+        assert cds[0].template_fold["chains_ptm"] == {"A": 0.95}
+        assert cds[1].template_fold["chains_ptm"] == {"C": 0.20}
+
+    def test_readback_guard_fails_loud_on_relabel(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("cplx", [("MKVLW", 2), ("AAA", 1)])
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        syn = p._design.model_id
+        # Boltz reports an UNEXPECTED chain id (C relabeled to X) → refuse the re-point
+        p.apply_construct_fold_result(spec, self._hetero_result(["A", "B", "X"]))
+        cds = list(p._design.chains.values())
+        assert all(m == syn for cd in cds for m, _c in cd.members)   # NOT re-pointed
+        assert not cds[0].template_fold                              # no fold stored
+        assert "mismatch" in p._status.text().lower()
+
+    def test_reorder_robust_ptm_plddt_mapping(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("cplx", [("MKVLW", 2), ("AAA", 1)])
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        # SAME ids, SHUFFLED CIF order → ptm (index-keyed) must still land on the right cd
+        p.apply_construct_fold_result(spec, self._hetero_result(["C", "B", "A"]))
+        cds = list(p._design.chains.values())
+        assert cds[0].members == [("7", "A"), ("7", "B")]           # re-point still correct
+        assert cds[0].template_fold["chains_ptm"] == {"A": 0.95}    # A's ptm, not C's
+        assert cds[1].template_fold["chains_ptm"] == {"C": 0.20}
+        assert cds[0].template_fold["mean_plddt"] > 80.0            # A's pLDDT (id-keyed, robust)
+        assert cds[1].template_fold["mean_plddt"] < 50.0
