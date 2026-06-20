@@ -93,6 +93,23 @@ TARGETS: Dict[str, dict] = {
             {"pdb": "2LN3", "chain": "A", "tag": "sTM .49 / seq-id .30 (distant control)"},
         ],
     },
+    # CRYSTAL de-novo design (the decisive NMR-de-risk). 6W3D = "RD1NTF2_05", a Rosetta de-novo
+    # NTF2-like design, 116 aa, X-RAY. Gate (prescreen): unguided mean TM-to-truth 0.782 (hard) /
+    # flex 1.35; IDENTICAL-CONTROL CEILING 0.950 (vs 2KL8 NMR's 0.858 → uncompressed range
+    # confirmed). foldseek STRUCTURE-ONLY ladder (US-align structTM / seq-id): 5IEP .74/.13 (purest,
+    # above thresh), 6W3G .72/.35, 5TPH .67/.21; 6W3F .79/.93 = seq+struct homolog; 4R80 .49 distant.
+    # Decisive test: does a >0.7 structure-only neighbor rescue with LARGE (uncompressed) magnitude?
+    "crystal_6w3d": {
+        "pdb": "6W3D", "chain": "A",
+        "templates": [
+            {"pdb": "6W3D", "chain": "A", "tag": "identical control, ceiling 0.95"},
+            {"pdb": "6W3F", "chain": "A", "tag": "sTM .79 / seq-id .93 (seq+struct homolog)"},
+            {"pdb": "5IEP", "chain": "A", "tag": "sTM .74 / seq-id .13 (STRUCTURE-ONLY, purest)", "hard": True},
+            {"pdb": "6W3G", "chain": "A", "tag": "sTM .72 / seq-id .35 (structure-only)", "hard": True},
+            {"pdb": "5TPH", "chain": "A", "tag": "sTM .67 / seq-id .21 (structure-only, at thresh)"},
+            {"pdb": "4R80", "chain": "A", "tag": "sTM .49 / seq-id .18 (distant control)"},
+        ],
+    },
 }
 
 # HARD-candidate targets — FLAGGED for the user before committing the full titration. Criteria:
