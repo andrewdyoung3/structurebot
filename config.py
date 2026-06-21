@@ -473,11 +473,12 @@ USALIGN_EXE: str = os.environ.get("USALIGN_EXE", "/home/andre/USalign/USalign")
 USALIGN_WSL_DISTRO: str = os.environ.get("USALIGN_WSL_DISTRO", "Ubuntu-24.04")
 USALIGN_TIMEOUT: int = int(os.environ.get("USALIGN_TIMEOUT", "120"))
 
-# foldseek — LOCAL-ONLY structural search (eval-only, for the template-guidance calibration's
-# structural-neighbor ladder). Static AVX2 binary at ~/foldseek/bin/foldseek + a LOCAL PDB
-# database at ~/foldseek_db/pdb (downloaded ONCE via `foldseek databases PDB`; the SEARCH runs
-# fully local — `foldseek easy-search query localDB out tmp`, no remote search API at query
-# time, same invariant as Boltz's msa:empty). NOT used by the shipped app.
+# foldseek — LOCAL-ONLY structural search. Static AVX2 binary at ~/foldseek/bin/foldseek + a LOCAL
+# PDB database at ~/foldseek_db/pdb (downloaded ONCE via `foldseek databases PDB`; the SEARCH runs
+# fully local — `foldseek easy-search query localDB out tmp`, no remote search API at query time,
+# same invariant as Boltz's msa:empty; verified offline under `unshare -rn`). SHIPPED (2026-06-21):
+# `foldseek_bridge.FoldseekBridge` drives the Workbench "Find templates" auto-discovery (Stage 2);
+# `scripts/eval_template_guided_calibration.foldseek_neighbors` delegates to the same bridge.
 FOLDSEEK_EXE: str = os.environ.get("FOLDSEEK_EXE", "/home/andre/foldseek/bin/foldseek")
 FOLDSEEK_DB: str = os.environ.get("FOLDSEEK_DB", "/home/andre/foldseek_db/pdb")
 FOLDSEEK_WSL_DISTRO: str = os.environ.get("FOLDSEEK_WSL_DISTRO", "Ubuntu-24.04")
