@@ -1166,6 +1166,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         gtmpl = dict(spec.get("_guided_template") or {})
         fold_mid = str(data.get("new_model_id", data.get("model_id")))
         plddt_by_chain = data.get("plddt_by_chain") or {}
+        # REPLACE-ON-REFOLD: a de-novo construct holds ONE guided fold; capture the PRIOR guided
+        # model id(s) so re-folding (e.g. soft → hard) doesn't accumulate overlaid, untoggleable
+        # models in ChimeraX (mirrors the variant refold-replace). Closed after the slot is set.
+        prior_guided = {str((self._design.chains[u].guided_fold or {}).get("model_id"))
+                        for u in blocks if (self._design.chains.get(u)
+                        and (self._design.chains[u].guided_fold or {}).get("model_id"))}
         for ukey, block in (blocks or {}).items():
             cd = self._design.chains.get(ukey)
             if cd is None:
@@ -1183,20 +1189,32 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             gf.update(templated=True, template_label=gtmpl.get("label"),
                       force=bool(gtmpl.get("force")), threshold=gtmpl.get("threshold"),
                       template_pdb_id=gtmpl.get("pdb_id"), template_path=gtmpl.get("path"),
+                      adoption=data.get("adoption"),                 # immediate use-time readout
+                      per_template_adoption=data.get("per_template_adoption"),
                       # the EXACT per-template list used → the assist re-folds the guided floor
                       # seeds with the same steering (the router re-resolves pdb_id/path).
                       templates=list((spec.get("tool_inputs") or {}).get("templates") or []))
             cd.guided_fold = gf
         self._persist()
+        # close the prior guided model(s) now that the new one is stored (replace-on-refold).
+        stale = [m for m in prior_guided if m and m not in ("None", fold_mid)]
+        if stale:
+            self._run_commands_bg([f"close #{m}" for m in stale])
         cur = self._cur_tab()
         cd = cur.design if cur is not None else next(iter(self._design.chains.values()), None)
         mp = (cd.guided_fold.get("mean_plddt") if cd is not None else None)
         mp_txt = f", chain pLDDT {mp:.1f}" if isinstance(mp, (int, float)) else ""
+        adopt = (cd.guided_fold.get("adoption") if cd is not None else None)
+        # IMMEDIATE "did it reflect the template" readout — structTM(guided fold, template). High
+        # adoption = the fold FOLLOWS the template (not proof of correctness — use-time signal).
+        adopt_txt = (f" Adopted the template at {adopt:.0%} (structTM; use 'Align to PDB' to overlay "
+                     f"the fold on the template)." if isinstance(adopt, (int, float))
+                     else " (adoption n/a — 'Align to PDB' to check the fold vs the template).")
         base = bool(cd and cd.template_fold.get("model_id"))
         self._status.setText(
             f"Guided fold ({gtmpl.get('label')}, {'hard' if gtmpl.get('force') else 'soft'}): "
-            f"model #{fold_mid}{mp_txt}. "
-            + ("Run 'Template assist' to measure ΔpLDDT + Δflexibility vs the unguided fold."
+            f"model #{fold_mid}{mp_txt}.{adopt_txt} "
+            + ("Run 'Template assist' for ΔpLDDT + Δflexibility vs the unguided fold."
                if base else
                "No unguided baseline yet — fold the construct unguided (Fold construct) to "
                "enable the assist comparison."))
@@ -2862,10 +2880,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # they don't clutter/occlude the variant fold (they previously persisted untoggleable).
         for wt_mid in self._wt_ref_model_ids():
             cmds.append(f"hide #{wt_mid} models")
+        hide_all = self._fold_vis_btn.isChecked() or not self._show_fold_cb.isChecked()
+        # DE-NOVO construct GUIDED fold(s): an analysis OVERLAY on the construct's base (unguided)
+        # structure — toggle it with Hide-folds / the Fold toggle so it is hide-able and replaced
+        # on re-fold, not a stuck untoggleable accumulation. (Computed before the no-variants early
+        # return below, since a de-novo construct typically has a guided fold but no variants.)
+        for gmid in sorted({str((cd.guided_fold or {}).get("model_id"))
+                            for cd in self._design.chains.values()
+                            if (cd.guided_fold or {}).get("model_id")}):
+            cmds.append(f"hide #{gmid} models" if hide_all else f"show #{gmid} models")
         models = self._fold_models(self._design)
         if not models:
             return cmds
-        hide_all = self._fold_vis_btn.isChecked() or not self._show_fold_cb.isChecked()
         active = tab.active_row_id
         for vid, mid in models.items():
             show = (not hide_all) and (vid == active)    # only the ACTIVE variant's fold shows

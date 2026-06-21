@@ -1939,12 +1939,13 @@ class TestTemplateGuided:
             "seed": 0}}]})
         return next(iter(p._design.chains.values()))
 
-    def _apply_guided(self, p, spec, mean=84.0, seq_len=10, mid="9"):
+    def _apply_guided(self, p, spec, mean=84.0, seq_len=10, mid="9", adoption=None):
         # per-residue pLDDT = the mean (the apply method recomputes mean_plddt from these).
         plddt = {i: mean for i in range(1, seq_len + 1)}
         p.apply_construct_fold_guided_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
             "engine": "boltz", "new_model_id": mid, "target": "monomer", "mean_plddt": mean,
-            "plddt": plddt, "cif_path": "/tmp/guided.cif", "seed": 0, "templated": True}}]})
+            "plddt": plddt, "cif_path": "/tmp/guided.cif", "seed": 0, "templated": True,
+            "adoption": adoption}}]})
 
     # ── guided-fold spec: per-template list from day one ─────────────────────────────
     def test_guided_spec_soft_populates_templates_list(self, _app):
@@ -2024,6 +2025,43 @@ class TestTemplateGuided:
         assert cd.guided_fold["templated"] is True and cd.guided_fold["template_label"] == "1MBN"
         assert cd.guided_fold["force"] is True and cd.guided_fold["threshold"] == 10.0
         assert cd.guided_fold["templates"]                     # the exact list for floor reuse
+
+    def test_guided_refold_closes_prior_model(self, _app, monkeypatch):
+        # REPLACE-ON-REFOLD: re-folding guided (e.g. soft → hard) must CLOSE the prior guided
+        # model, not accumulate overlaid untoggleable models in ChimeraX (the reported bug).
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN"})
+        self._apply_guided(p, spec, mid="9")                   # first guided fold → #9
+        cmds = []
+        monkeypatch.setattr(p, "_run_commands_bg", lambda c: cmds.extend(c))
+        self._apply_guided(p, spec, mid="11")                  # re-fold → #11, must close #9
+        assert any("close #9" in c for c in cmds)
+        assert next(iter(p._design.chains.values())).guided_fold["model_id"] == "11"
+
+    def test_guided_fold_immediate_adoption_readout(self, _app):
+        # the guided fold reports IMMEDIATE adoption (structTM guided-vs-template) so the user gets
+        # "did it reflect the template" feedback at fold time (no unguided baseline needed).
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN"})
+        self._apply_guided(p, spec, mid="9", adoption=0.88)
+        cd = next(iter(p._design.chains.values()))
+        assert cd.guided_fold["adoption"] == 0.88
+        assert "adopted the template at 88%" in p._status.text().lower()
+
+    def test_guided_fold_obeys_visibility_toggle(self, _app):
+        # the guided fold (overlay) must be reachable by Hide-folds / the Fold toggle — the
+        # reported "can't toggle off" bug (it was absent from fold_visibility_commands).
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN"})
+        self._apply_guided(p, spec, mid="9")
+        tab = p._cur_tab()
+        p._fold_vis_btn.setChecked(False); p._show_fold_cb.setChecked(True)
+        assert any("show #9 models" in c for c in p.fold_visibility_commands(tab))   # shown by default
+        p._fold_vis_btn.setChecked(True)                       # "Hide folds"
+        assert any("hide #9 models" in c for c in p.fold_visibility_commands(tab))   # now hidden
 
     # ── assist spec: two on-disk folds, NO baseline re-fold ──────────────────────────
     def test_assist_spec_from_two_folds_no_refold(self, _app):

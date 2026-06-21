@@ -3026,12 +3026,27 @@ class ToolRouter:
         nch   = len(chains)
         shape = "monomer" if nch <= 1 else f"{nch}-chain assembly"
         templated = bool(inputs.get("templates"))
+        # IMMEDIATE ADOPTION readout (use-time, no ground truth): how much the guided fold
+        # resembles each template — structTM(guided fold, template). Gives instant "did it
+        # reflect the template" feedback at fold time (the assist's full ΔpLDDT/Δflex needs an
+        # unguided baseline; adoption does not). HIGH adoption ⇒ the fold FOLLOWS the template
+        # (possible copying — not proof of correctness). Off-thread (this runs on the worker).
+        adoption = None
+        per_template_adopt: List[Dict[str, Any]] = []
+        if templated and cif_path:
+            for t in (templates or []):
+                tpath = t.get("cif") or t.get("pdb")
+                per_template_adopt.append({"template": tpath, "adoption": self._usalign_tm2(cif_path, tpath)})
+            _av = [d["adoption"] for d in per_template_adopt if d["adoption"] is not None]
+            adoption = max(_av) if _av else None
         return ToolStepResult(
             tool="boltz", success=True,
             data={
                 "engine":             "boltz",
                 "target":             ("monomer" if nch <= 1 else "assembly"),
                 "templated":          templated,
+                "adoption":           adoption,            # max structTM(guided, template) — use-time
+                "per_template_adoption": per_template_adopt,
                 "new_model_id":       new_id,
                 "reference_model_id": str(ref_id),
                 "mean_plddt":         mean_plddt,
@@ -3051,7 +3066,8 @@ class ToolRouter:
             summary=(f"Boltz-2 ({shape}{', template-guided' if templated else ''}, local): "
                      f"model #{new_id} — mean pLDDT {mean_plddt:.1f} ({conf})"
                      + (f", ipTM {iptm:.3f}" if isinstance(iptm, (int, float)) else "")
-                     + f", superposed on #{ref_id}. seed={res.get('seed')}."),
+                     + (f", adopted template at {adoption:.0%}" if adoption is not None else "")
+                     + f", seed={res.get('seed')}."),
             elapsed_ms=elapsed_ms,
         )
 
