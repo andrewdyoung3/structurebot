@@ -97,6 +97,8 @@ class TestRunTemplateAssist:
                 return {"floor_ddm": {"1": 2.0, "2": 1.5, "3": 0.8}, "n_floor_seeds": 4}
             return {"floor_ddm": {"1": 0.7, "2": 1.6, "3": 0.5}, "n_floor_seeds": 4}   # guided
         monkeypatch.setattr(r, "_fold_wt_reference", fake_ref)
+        monkeypatch.setattr(r, "_resolve_boltz_templates", lambda t: ([], None))  # hermetic (no DL)
+        monkeypatch.setattr(r, "_usalign_tm2", lambda a, b: None)
         res = r._run_template_assist(self._inputs())
         assert res.success
         d = res.data
@@ -113,19 +115,42 @@ class TestRunTemplateAssist:
         r = _router()
         monkeypatch.setattr(r, "_fold_wt_reference",
                             lambda inp: {"floor_ddm": {"1": 1.0}, "n_floor_seeds": 4})
+        monkeypatch.setattr(r, "_resolve_boltz_templates", lambda t: ([], None))
+        monkeypatch.setattr(r, "_usalign_tm2", lambda a, b: None)
         res = r._run_template_assist(self._inputs())
         s = res.summary.lower()
         assert "62.0" in s and "84.0" in s             # unguided AND guided shown
-        assert "not proof of native" in s              # the honest caveat
+        assert "not a confirmation of correctness" in s          # never "rescue confirmed" (truth-dependent)
+        assert "template-biased" in s
 
     def test_negligible_effect_honest_null(self, monkeypatch):
         r = _router()
         monkeypatch.setattr(r, "_fold_wt_reference",
                             lambda inp: {"floor_ddm": {"1": 1.0, "2": 1.0}, "n_floor_seeds": 4})
+        monkeypatch.setattr(r, "_resolve_boltz_templates", lambda t: ([], None))
+        monkeypatch.setattr(r, "_usalign_tm2", lambda a, b: None)
         inp = self._inputs()
         inp["guided_mean_plddt"] = 62.3                 # ~no pLDDT change; floors identical
         res = r._run_template_assist(inp)
-        assert "negligible" in res.summary.lower()
+        # honest null = tiny delta + zero stabilized, with NO correctness/rescue claim (descriptive)
+        assert res.data["d_plddt"] == 0.3 and res.data["n_stabilized"] == 0
+        assert "not a confirmation of correctness" in res.summary.lower()
+
+    def test_adoption_and_high_adoption_caveat(self, monkeypatch):
+        # use-time adoption (structTM guided-vs-template) is reported per-template; a high value
+        # raises the possible-copying caveat (truth-free signal, the honest layer's job).
+        r = _router()
+        monkeypatch.setattr(r, "_fold_wt_reference",
+                            lambda inp: {"floor_ddm": {"1": 1.0}, "n_floor_seeds": 4})
+        # resolved templates carry cif paths; _usalign_tm2 returns a HIGH adoption
+        monkeypatch.setattr(r, "_resolve_boltz_templates",
+                            lambda t: ([{"cif": "/x/1mbn.cif", "chain_id": "A"}], None))
+        monkeypatch.setattr(r, "_usalign_tm2", lambda a, b: 0.91)   # high adoption
+        res = r._run_template_assist(self._inputs())
+        d = res.data
+        assert d["max_adoption"] == 0.91 and d["high_adoption_caveat"] is True
+        assert d["per_template"][0]["adoption"] == 0.91
+        assert "high adoption" in res.summary.lower() and "following the template" in res.summary.lower()
 
     def test_requires_both_folds(self):
         r = _router()
