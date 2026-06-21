@@ -124,6 +124,30 @@ class _ColorWorker(QtCore.QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class _FsSignals(QtCore.QObject):
+    done = QtCore.Signal(list)                          # [(pdb_id, chain, structTM), …]
+    failed = QtCore.Signal(str)
+
+
+class _FoldseekWorker(QtCore.QRunnable):
+    """Runs the LOCAL-ONLY foldseek structural-neighbour search off the UI thread (Stage 2
+    template auto-discovery). The search is seconds-fast but WSL-bound, so it never blocks Qt."""
+
+    def __init__(self, bridge, query_path, max_results=30, min_tm=0.3):
+        super().__init__()
+        self._b, self._q = bridge, query_path
+        self._n, self._t = max_results, min_tm
+        self.signals = _FsSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            hits = self._b.search_neighbors(self._q, self._n, self._t)
+            self.signals.done.emit(list(hits))
+        except Exception as exc:                       # error-first: never crash the pool
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # ── one unique-chain tab: T + variants in wrapped column blocks ────────────────────
 
 class _ChainDesignTab(QtWidgets.QScrollArea):
@@ -702,6 +726,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             _g.triggered.connect(
                 lambda _checked=False, k=_n: self._on_construct_fold_guided("boltz", k))
             self._guided_fold_acts.append(_g)
+        # STAGE 2 — AUTO template discovery: foldseek the construct's UNGUIDED MONOMER fold against
+        # the LOCAL PDB DB → ranked structural neighbours → the SAME picker as manual selection →
+        # guided re-fold. Closes the orphan case (a designed sequence with no known family to type
+        # in). LOCAL-ONLY (foldseek easy-search vs a pre-downloaded DB; no network at query time).
+        self._find_tmpl_btn = self._construct_fold_menu.addMenu("Find templates (foldseek)")
+        self._find_tmpl_acts = []
+        for _n, _lbl in _NMER:
+            _f = self._find_tmpl_btn.addAction(f"{_lbl} (N={_n})")
+            _f.setToolTip("Search the LOCAL PDB DB for structural neighbours of the construct's "
+                          "unguided fold, then guide a re-fold by the ones you pick. Needs an "
+                          "unguided construct fold first.")
+            _f.triggered.connect(
+                lambda _checked=False, k=_n: self._on_find_templates("boltz", k))
+            self._find_tmpl_acts.append(_f)
         # Template assist: did the template actually help? ΔpLDDT + per-residue Δflexibility of
         # the guided fold vs the unguided baseline (honest — surfaces both + the delta).
         self._assist_btn = self._construct_fold_menu.addAction("Template assist (guided vs unguided)…")
@@ -1149,6 +1187,152 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
               f"{refs[0]['label']} ({'hard' if hard else 'soft'})"
         self._status.setText(f"Folding the construct guided by {fam} via Boltz (LOCAL-ONLY)…")
         self.launchRequested.emit(spec)
+
+    # ── STAGE 2: foldseek auto template discovery → the same picker → guided re-fold ──
+    @staticmethod
+    def _foldseek_refs(picked: List[str]) -> List[Dict[str, Any]]:
+        """Selected PDB ids → guided-fold template refs (all-SOFT consensus). The SAME `{pdb_id,
+        label, force}` shape manual selection produces, so auto- and manual-discovery converge on
+        `construct_fold_guided_spec` (one path). Pure / testable."""
+        return [{"pdb_id": str(p).upper(), "label": str(p).upper(), "force": False}
+                for p in picked if p]
+
+    def _foldseek_query_path(self, src: str) -> str:
+        """Monomer query for foldseek: the FIRST chain of *src* (the construct's unguided fold).
+        A monomer fold passes through unchanged; an N-mer fold is reduced to one chain so the search
+        finds FOLD homologs (quaternary geometry comes from each hit PDB's OWN assembly at re-fold).
+        Falls back to *src* unchanged if it is not a parseable mmCIF."""
+        if not src.lower().endswith((".cif", ".mmcif")):
+            return src                                  # PDB etc. — foldseek reads it directly
+        try:
+            lines = open(src, encoding="utf-8", errors="replace").read().splitlines()
+        except OSError:
+            return src
+        hdr: List[str] = []; kept: List[str] = []; first = None; i, n = 0, len(lines)
+        while i < n:
+            if lines[i].startswith("_atom_site."):
+                while i < n and lines[i].startswith("_atom_site."):
+                    hdr.append(lines[i].strip()); i += 1
+                ci = next((k for k, c in enumerate(hdr) if c.endswith("auth_asym_id")), None)
+                if ci is None:
+                    ci = next((k for k, c in enumerate(hdr) if c.endswith("label_asym_id")), None)
+                while i < n and lines[i].startswith(("ATOM", "HETATM")):
+                    p = lines[i].split()
+                    if ci is not None and ci < len(p):
+                        if first is None:
+                            first = p[ci]
+                        if p[ci] == first:
+                            kept.append(lines[i])
+                    i += 1
+                break
+            i += 1
+        if not kept:
+            return src
+        dst = os.path.join(tempfile.gettempdir(),
+                           f"fs_query_{os.getpid()}_{abs(hash(src)) % 100000}.cif")
+        open(dst, "w", encoding="utf-8").write(
+            "data_query\nloop_\n" + "\n".join(hdr) + "\n" + "\n".join(kept) + "\n")
+        return dst
+
+    def _on_find_templates(self, engine: str, n_copies: int) -> None:
+        """Run the LOCAL-ONLY foldseek search on the construct's unguided fold off-thread; on
+        results, open the picker. Fail-loud: de-novo only; needs an unguided fold; feature disabled
+        (with reason) if foldseek/DB absent — never silently empty."""
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Find templates is for de-novo constructs — use Add sequence first.")
+            return
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        if cd is None:
+            return
+        tf = cd.template_fold or {}
+        query_src = tf.get("cif_path") or tf.get("pdb_path")
+        if not (query_src and os.path.isfile(query_src)):
+            self._status.setText("Find templates needs an unguided construct fold first "
+                                 "(Fold ▾ → Fold construct (de novo) → boltz → monomer).")
+            return
+        try:
+            from foldseek_bridge import FoldseekBridge
+            fb = FoldseekBridge()
+        except Exception as exc:
+            self._status.setText(f"Template discovery unavailable: {exc}")
+            return
+        if not fb.is_available():
+            self._status.setText("Template discovery unavailable — foldseek binary or local PDB DB "
+                                 "not found in WSL (set FOLDSEEK_EXE / FOLDSEEK_DB).")
+            return
+        qpath = self._foldseek_query_path(query_src)
+        self._status.setText("Searching the local PDB DB for structural neighbours…")
+        w = _FoldseekWorker(fb, qpath)
+        qplddt = tf.get("mean_plddt")
+        dbl = fb.db_label()
+        w.signals.done.connect(
+            lambda hits, c=cd, e=engine, k=n_copies, qp=qplddt, dl=dbl:
+                self._on_foldseek_hits(hits, c, e, k, qp, dl))
+        w.signals.failed.connect(lambda msg: self._status.setText(f"Template search failed: {msg}"))
+        self._pool.start(w)
+
+    def _on_foldseek_hits(self, hits, cd, engine: str, n_copies: int,
+                          query_plddt, db_label: str) -> None:
+        """Pick from ranked neighbours → guided re-fold via the SAME `construct_fold_guided_spec`
+        path. 0 hits = a real answer (searched, nothing ≥ TM 0.3), stated as such — never silent."""
+        if not hits:
+            self._status.setText(f"No structural neighbours found ≥ TM 0.3 in the {db_label}. "
+                                 "(A miss is a false negative — a good template may not be in this "
+                                 "snapshot.)")
+            return
+        picked = self._foldseek_pick_dialog(hits, query_plddt, db_label)
+        if not picked:
+            self._status.setText("Template discovery cancelled — no templates selected.")
+            return
+        refs = self._foldseek_refs(picked)
+        spec = self.construct_fold_guided_spec(engine, n_copies, refs)
+        if spec is None:
+            self._status.setText("Could not build the guided-fold request (de-novo Boltz only).")
+            return
+        self._status.setText(f"Folding the construct guided by {len(refs)} foldseek template(s) "
+                             f"(soft-consensus) via Boltz (LOCAL-ONLY)…")
+        self.launchRequested.emit(spec)
+
+    def _foldseek_pick_dialog(self, hits, query_plddt, db_label: str) -> Optional[List[str]]:
+        """Rich ranked selection: a checkable list of (PDB id, foldseek-TM), a query-pLDDT caution
+        when the unguided fold was low-confidence (already-computed, non-circular use-time signal),
+        the weak-prior framing, and the DB-scope label. Returns the checked PDB ids (or None)."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Find templates — structural neighbours (foldseek, LOCAL-ONLY)")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        if isinstance(query_plddt, (int, float)) and query_plddt < 70:
+            warn = QtWidgets.QLabel(
+                f"⚠ The unguided query fold is low-confidence (mean pLDDT {query_plddt:.0f}). "
+                "The query structure — and therefore these neighbours — may be unreliable; treat "
+                "with extra caution.")
+            warn.setWordWrap(True); warn.setStyleSheet("color: #b36b00;")
+            lay.addWidget(warn)
+        lay.addWidget(QtWidgets.QLabel(
+            "Structural neighbours ranked by foldseek TM (structTM to the query fold — a WEAK "
+            "pre-hoc prior, NOT proof the template is correct). Check the ones to guide a re-fold:"))
+        lst = QtWidgets.QListWidget()
+        for pid, ch, tm in hits:
+            it = QtWidgets.QListWidgetItem(f"{pid}_{ch}    TM={tm:.3f}")
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Unchecked)
+            it.setData(QtCore.Qt.UserRole, pid)
+            lst.addItem(it)
+        lay.addWidget(lst)
+        scope = QtWidgets.QLabel(
+            f"Searched: {db_label}. A miss is a false negative — not an exhaustive search; a good "
+            "template may simply not be in this snapshot.")
+        scope.setWordWrap(True); scope.setStyleSheet("color: #666;")
+        lay.addWidget(scope)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        picked = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
+                  if lst.item(i).checkState() == QtCore.Qt.Checked]
+        return picked or None
 
     def apply_construct_fold_guided_result(self, spec: dict, result: dict) -> None:
         """Consume the GUIDED construct fold: store it on `cd.guided_fold` (SEPARATE from the

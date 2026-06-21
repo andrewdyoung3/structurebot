@@ -266,47 +266,13 @@ def foldseek_neighbors(query_path: str, max_results: int = 60,
     search API at query time (the DB was downloaded once). Empty list if foldseek/DB absent.
 
     Used to build an ORPHAN's structural-neighbor ladder honestly (does a closer neighbor than
-    the curated panel exist?) — every hit is ~0 seq-id to a de-novo target by construction."""
-    exe = getattr(_cfg, "FOLDSEEK_EXE", "/home/andre/foldseek/bin/foldseek")
-    db = getattr(_cfg, "FOLDSEEK_DB", "/home/andre/foldseek_db/pdb")
-    if not (query_path and os.path.isfile(query_path)):
-        return []
-    import tempfile as _tf
-    q = _wsl.translate_path(os.path.abspath(query_path))
-    out_wsl = f"/tmp/fs_out_{os.getpid()}.m8"
-    tmp_wsl = f"/tmp/fs_tmp_{os.getpid()}"
-    fmt = "target,alntmscore,qtmscore,ttmscore,evalue"
-    cmd = (f"{shlex.quote(exe)} easy-search {shlex.quote(q)} {shlex.quote(db)} "
-           f"{shlex.quote(out_wsl)} {shlex.quote(tmp_wsl)} --alignment-type 1 "
-           f"--format-output {shlex.quote(fmt)} --max-seqs 2000 -e 10 "
-           f"&& cat {shlex.quote(out_wsl)}")
-    res = _wsl.run_command(cmd, timeout=getattr(_cfg, "FOLDSEEK_TIMEOUT", 600))
-    if not res.get("ok"):
-        return []
-    hits: List[Tuple[str, str, float]] = []
-    seen = set()
-    for ln in (res.get("stdout", "") or "").splitlines():
-        parts = ln.split("\t")
-        if len(parts) < 2:
-            continue
-        tgt = parts[0]                          # e.g. "1ABC_A" or "pdb_1abc.cif_A"
-        try:
-            tm = float(parts[1])                # alntmscore (query-normalized structural TM)
-        except ValueError:
-            continue
-        # extract a 4-char PDB id + chain from the foldseek target id
-        mobj = re.search(r"([0-9][A-Za-z0-9]{3})[_\.-]?([A-Za-z0-9])?", tgt)
-        if not mobj:
-            continue
-        pid = mobj.group(1).upper()
-        ch = (mobj.group(2) or "A")
-        key = (pid, ch)
-        if key in seen or tm < min_tm:
-            continue
-        seen.add(key)
-        hits.append((pid, ch, round(tm, 3)))
-    hits.sort(key=lambda h: -h[2])
-    return hits[:max_results]
+    the curated panel exist?) — every hit is ~0 seq-id to a de-novo target by construction.
+
+    DELEGATES to the SHIPPED `foldseek_bridge.FoldseekBridge` (single source of truth — the search
+    is now a productised app feature, Stage 2 template auto-discovery; this eval entry-point is a
+    thin back-compat wrapper)."""
+    from foldseek_bridge import FoldseekBridge
+    return FoldseekBridge().search_neighbors(query_path, max_results=max_results, min_tm=min_tm)
 
 
 def ca_xyz_from_cif(cif_path: str) -> Dict[int, Tuple[float, float, float]]:
