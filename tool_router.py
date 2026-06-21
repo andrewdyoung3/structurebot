@@ -6081,8 +6081,32 @@ class ToolRouter:
                 d_plddt_by_res[str(rn)] = round(float(gp[rn]) - float(up[rn]), 2)
             except (TypeError, ValueError):
                 pass
+        # ── ADOPTION + pre-hoc PROXY (per-template, USE-TIME-knowable — no ground truth) ──────
+        # ADOPTION = structTM(guided fold, template): how much the fold FOLLOWS each template.
+        #   HIGH adoption is a COPYING caveat — without an experimental structure we cannot tell
+        #   independent convergence from the fold tracing the template. (The eval-only "unlocking
+        #   test" TM_G≫template needs structTM-to-TRUTH, which does NOT exist at use time, so it is
+        #   NOT computed here — the honesty layer ships only truth-free signals.)
+        # PRE-HOC PROXY = structTM(template, UNGUIDED fold): a WEAK prior on whether the template
+        #   is in-family. CIRCULAR — it is similarity to a fold we don't trust, and it diverges
+        #   from structTM-to-truth exactly when the unguided fold is bad (the case guidance is for).
+        guided_path   = guided_ref.get("path")
+        unguided_path = unguided_ref.get("path")
+        resolved, _terr = self._resolve_boltz_templates(inputs.get("templates"))
+        per_template: List[Dict[str, Any]] = []
+        for ti_t, src in zip(resolved or [], inputs.get("templates") or []):
+            tpath = ti_t.get("cif") or ti_t.get("pdb")
+            per_template.append({
+                "label":     src.get("label") or src.get("pdb_id") or src.get("cif") or src.get("pdb"),
+                "adoption":  self._usalign_tm2(guided_path, tpath),       # guided FOLLOWS template
+                "prehoc_structTM_to_unguided": self._usalign_tm2(tpath, unguided_path),  # weak prior
+            })
+        adoptions = [p["adoption"] for p in per_template if p["adoption"] is not None]
+        max_adoption = max(adoptions) if adoptions else None
+        high_adopt = (max_adoption is not None and max_adoption >= 0.8)
         data = {
             "template_label":       inputs.get("template_label"),
+            "n_templates":          len(inputs.get("templates") or []),
             "force":                bool(inputs.get("force")),
             "threshold":            inputs.get("threshold"),
             "guided_mean_plddt":    g_plddt,
@@ -6094,24 +6118,54 @@ class ToolRouter:
             "n_stabilized":         n_stab,
             "n_loosened":           n_loose,
             "n_residues":           len(d_flex),
+            "per_template":         per_template,                 # adoption + pre-hoc proxy each
+            "max_adoption":         max_adoption,
+            "high_adoption_caveat": high_adopt,
             "guided_model_id":      str(guided_ref.get("model_id")),
             "unguided_model_id":    str(unguided_ref.get("model_id")),
             "n_floor_seeds":        ung.get("n_floor_seeds"),
         }
-        # HONEST framing — surface guided + unguided + delta; never guided-pLDDT-alone-as-proof.
-        plddt_txt = (f"pLDDT {u_plddt:.1f}→{g_plddt:.1f} (Δ{d_plddt:+.1f})"
+        # ── HONEST readout — only USE-TIME-knowable signals; NEVER "rescue confirmed" ──────────
+        plddt_txt = (f"confidence pLDDT {u_plddt:.1f}→{g_plddt:.1f} (Δ{d_plddt:+.1f})"
                      if d_plddt is not None else "pLDDT n/a")
-        flex_txt = (f"{n_stab}/{len(d_flex)} residues stabilized (mean Δflex {mean_dflex:+.2f} Å; "
-                    f"+ = more rigid with the template)" if d_flex else "no residue overlap")
-        steer = (f"hard force≤{inputs.get('threshold')}Å" if inputs.get("force") else "soft")
-        verdict = ("the template measurably stabilized the fold"
-                   if (d_plddt or 0) > 1.0 or mean_dflex > 0.1 else
-                   "the template's effect is negligible (honest null)")
-        summary = (f"Template assist ({inputs.get('template_label')}, {steer}): {plddt_txt}; "
-                   f"{flex_txt} — {verdict}. Guided confidence is template-biased, not proof of "
-                   f"native; shown against the unguided baseline.")
+        flex_txt = (f"cross-seed variation {n_stab}/{len(d_flex)} residues tightened "
+                    f"(mean Δ {mean_dflex:+.2f} Å)" if d_flex else "no residue overlap")
+        adopt_txt = (f"fold adopted the template(s) at {max_adoption:.0%}" if max_adoption is not None
+                     else "adoption n/a")
+        nlab = inputs.get("template_label") or f"{len(inputs.get('templates') or [])} template(s)"
+        caveat = ("  ⚠ HIGH adoption — the fold may be FOLLOWING the template rather than "
+                  "independently converging; without an experimental structure this cannot be "
+                  "ruled out (copying vs unlocking is truth-dependent)." if high_adopt else "")
+        summary = (f"Template assist ({nlab}): {plddt_txt}; {flex_txt}; {adopt_txt}. "
+                   f"These are the USE-TIME-knowable effects — NOT a confirmation of correctness "
+                   f"(that needs an experimental structure). Guided confidence is template-biased; "
+                   f"shown against the unguided baseline.{caveat}")
         return ToolStepResult(tool="template_assist", success=True, data=data, summary=summary,
                               elapsed_ms=(_time.perf_counter() - t0) * 1000)
+
+    def _usalign_tm2(self, query_path: Optional[str], ref_path: Optional[str]) -> Optional[float]:
+        """US-align *query* onto *ref* (LOCAL-ONLY WSL binary) → the reference-normalized TM
+        (tm2), or None. Reused by the honesty layer for adoption (guided-vs-template) and the
+        pre-hoc proxy (template-vs-unguided). Same engine as `_run_structural_align`."""
+        import os as _os, shlex as _shlex, config as _cfg
+        if not (query_path and ref_path and _os.path.isfile(query_path) and _os.path.isfile(ref_path)):
+            return None
+        try:
+            from wsl_bridge import WSLBridge
+            wsl = WSLBridge(distribution=getattr(_cfg, "USALIGN_WSL_DISTRO", "Ubuntu-24.04"))
+            if not wsl.is_available():
+                return None
+            q = wsl.translate_path(_os.path.abspath(query_path))
+            r = wsl.translate_path(_os.path.abspath(ref_path))
+            exe = getattr(_cfg, "USALIGN_EXE", "/home/andre/USalign/USalign")
+            cmd = f"{_shlex.quote(exe)} {_shlex.quote(q)} {_shlex.quote(r)} -outfmt 2 -m -"
+            res = wsl.run_command(cmd, timeout=getattr(_cfg, "USALIGN_TIMEOUT", 120))
+            if not res.get("ok"):
+                return None
+            parsed = self._parse_usalign_output(res.get("stdout", ""))
+            return round(parsed["tm2"], 4) if parsed and parsed.get("tm2") is not None else None
+        except Exception:
+            return None
 
     @staticmethod
     def _dev_sort_key(k: "Any"):

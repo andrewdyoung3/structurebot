@@ -1976,6 +1976,30 @@ class TestTemplateGuided:
         spec2 = p.construct_fold_guided_spec("boltz", 1, {"path": "/tmp/t.pdb", "label": "t"})
         assert spec2["tool_inputs"]["templates"][0]["pdb"] == "/tmp/t.pdb"
 
+    def test_guided_spec_multi_template_family(self, _app):
+        # STAGE 1 multi-template: a LIST of refs → N soft entries (the bridge already carries N).
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        refs = [{"pdb_id": "1MBN", "label": "1MBN", "force": False},
+                {"pdb_id": "4HHB", "label": "4HHB", "force": False},
+                {"pdb_id": "1LH1", "label": "1LH1", "force": False}]
+        spec = p.construct_fold_guided_spec("boltz", 1, refs)
+        ti = spec["tool_inputs"]
+        assert len(ti["templates"]) == 3                       # all N carried
+        assert [e["pdb_id"] for e in ti["templates"]] == ["1MBN", "4HHB", "1LH1"]
+        assert all("force" not in e for e in ti["templates"])  # family is all-soft (no force)
+        assert spec["_guided_template"]["n_templates"] == 3
+        assert spec["_guided_template"]["labels"] == ["1MBN", "4HHB", "1LH1"]
+        assert "3 templates" in spec["user_input"]
+
+    def test_guided_spec_single_dict_still_works(self, _app):
+        # back-compat: a single dict is normalized to a one-element family.
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = p.construct_fold_guided_spec("boltz", 1, {"pdb_id": "1MBN", "label": "1MBN"})
+        assert len(spec["tool_inputs"]["templates"]) == 1
+        assert spec["_guided_template"]["n_templates"] == 1
+
     def test_guided_spec_none_for_esmfold(self, _app):
         p, _ = self._denovo_panel()
         self._fold_unguided_monomer(p)
@@ -2028,12 +2052,25 @@ class TestTemplateGuided:
         result = {"tool_step_results": [{"tool": "template_assist", "data": {
             "template_label": "1MBN", "force": False, "guided_mean_plddt": 84.0,
             "unguided_mean_plddt": 62.0, "d_plddt": 22.0, "mean_d_flex": 0.4,
-            "n_stabilized": 8, "n_residues": 10}}]}
+            "n_stabilized": 8, "n_residues": 10, "max_adoption": 0.62}}]}
         p.apply_template_assist_result(spec, result)
         assert cd.template_assist["d_plddt"] == 22.0
         txt = p._status.text().lower()
         assert "62.0" in txt and "84.0" in txt                  # BOTH surfaced, not guided-alone
-        assert "stabilized" in txt or "assisted" in txt
+        assert "tightened" in txt and "adopted at" in txt       # use-time signals
+        assert "not a correctness claim" in txt                 # never "rescue confirmed"
+
+    def test_apply_assist_high_adoption_caveat(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = {"_assist_ukey": p._cur_cd_ukey()}
+        result = {"tool_step_results": [{"tool": "template_assist", "data": {
+            "template_label": "1MBN", "guided_mean_plddt": 84.0, "unguided_mean_plddt": 62.0,
+            "d_plddt": 22.0, "mean_d_flex": 0.4, "n_stabilized": 8, "n_residues": 10,
+            "max_adoption": 0.9, "high_adoption_caveat": True}}]}
+        p.apply_template_assist_result(spec, result)
+        txt = p._status.text().lower()
+        assert "high adoption" in txt and "following the template" in txt
 
     # ── validation reuses the align spec with the template as reference ──────────────
     def test_validate_guided_spec_uses_guided_query(self, _app):
