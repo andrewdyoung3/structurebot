@@ -2108,7 +2108,8 @@ class TestTemplateGuided:
             "max_adoption": 0.9, "high_adoption_caveat": True}}]}
         p.apply_template_assist_result(spec, result)
         txt = p._status.text().lower()
-        assert "high adoption" in txt and "following the template" in txt
+        assert ("high adoption" in txt and "did not already resemble" in txt
+                and "imposing the template" in txt)
 
     # ── validation reuses the align spec with the template as reference ──────────────
     def test_validate_guided_spec_uses_guided_query(self, _app):

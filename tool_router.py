@@ -6119,7 +6119,21 @@ class ToolRouter:
             })
         adoptions = [p["adoption"] for p in per_template if p["adoption"] is not None]
         max_adoption = max(adoptions) if adoptions else None
-        high_adopt = (max_adoption is not None and max_adoption >= 0.8)
+        # The possible-COPYING caveat fires ONLY when the fold strongly adopts (≥0.8) a template
+        # it did NOT already resemble — i.e. the pre-hoc proxy structTM(template, unguided) is LOW
+        # (< 0.5 ≈ a different fold). When the template was already same-fold-close (prehoc ≥ 0.5)
+        # high adoption is the NATURAL-success case (convergence within a fold the unguided model
+        # already found), not copying, so it is NOT flagged. A None prehoc (US-align unavailable)
+        # is treated as not-known-close → still fires (conservative; never suppress on a missing
+        # proxy). Conditioning on adoption ALONE false-fired on natural successes (see §9).
+        ADOPT_HI, PREHOC_ALREADY_CLOSE = 0.8, 0.5
+        def _suspicious_copy(p: Dict[str, Any]) -> bool:
+            a = p.get("adoption")
+            if a is None or a < ADOPT_HI:
+                return False
+            ph = p.get("prehoc_structTM_to_unguided")
+            return ph is None or ph < PREHOC_ALREADY_CLOSE
+        high_adopt = any(_suspicious_copy(p) for p in per_template)
         data = {
             "template_label":       inputs.get("template_label"),
             "n_templates":          len(inputs.get("templates") or []),
@@ -6149,7 +6163,8 @@ class ToolRouter:
         adopt_txt = (f"fold adopted the template(s) at {max_adoption:.0%}" if max_adoption is not None
                      else "adoption n/a")
         nlab = inputs.get("template_label") or f"{len(inputs.get('templates') or [])} template(s)"
-        caveat = ("  ⚠ HIGH adoption — the fold may be FOLLOWING the template rather than "
+        caveat = ("  ⚠ HIGH adoption of a template the unguided fold did NOT already resemble — "
+                  "guidance may be IMPOSING the template fold rather than the construct "
                   "independently converging; without an experimental structure this cannot be "
                   "ruled out (copying vs unlocking is truth-dependent)." if high_adopt else "")
         summary = (f"Template assist ({nlab}): {plddt_txt}; {flex_txt}; {adopt_txt}. "

@@ -1543,8 +1543,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         madopt = data.get("max_adoption")
         plddt_txt = (f"confidence {up:.1f}→{gp:.1f} (Δ{dp:+.1f})" if dp is not None else "pLDDT n/a")
         adopt_txt = (f"adopted at {madopt:.0%}" if isinstance(madopt, (int, float)) else "adoption n/a")
-        caveat = ("  ⚠ HIGH adoption — the fold may be FOLLOWING the template, not independently "
-                  "converging; can't be ruled out without an experimental structure."
+        caveat = ("  ⚠ HIGH adoption of a template the unguided fold did NOT already resemble — "
+                  "guidance may be IMPOSING the template fold, not independently converging; "
+                  "can't be ruled out without an experimental structure."
                   if data.get("high_adoption_caveat") else "")
         self._status.setText(
             f"Template assist ({data.get('template_label')}): {plddt_txt}; cross-seed variation "
