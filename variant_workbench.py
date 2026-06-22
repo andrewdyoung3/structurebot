@@ -1543,10 +1543,22 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         madopt = data.get("max_adoption")
         plddt_txt = (f"confidence {up:.1f}→{gp:.1f} (Δ{dp:+.1f})" if dp is not None else "pLDDT n/a")
         adopt_txt = (f"adopted at {madopt:.0%}" if isinstance(madopt, (int, float)) else "adoption n/a")
-        caveat = ("  ⚠ HIGH adoption of a template the unguided fold did NOT already resemble — "
-                  "guidance may be IMPOSING the template fold, not independently converging; "
-                  "can't be ruled out without an experimental structure."
-                  if data.get("high_adoption_caveat") else "")
+        # Wording mirrors the router's three-state routing: the REFINED "did not already resemble"
+        # claim only when the pre-hoc proxy MEASURED the template as distant ("distant"); the GENERIC
+        # wording when it fired conservatively on a missing proxy ("unmeasured"); else no caveat.
+        # Fall back to "distant" if the reason field is absent but the bool is set (old result dicts).
+        reason = data.get("high_adoption_caveat_reason")
+        if reason is None and data.get("high_adoption_caveat"):
+            reason = "distant"
+        if reason == "distant":
+            caveat = ("  ⚠ HIGH adoption of a template the unguided fold did NOT already resemble — "
+                      "guidance may be IMPOSING the template fold, not independently converging; "
+                      "can't be ruled out without an experimental structure.")
+        elif reason == "unmeasured":
+            caveat = ("  ⚠ HIGH adoption — the fold may be FOLLOWING the template, not independently "
+                      "converging; can't be ruled out without an experimental structure.")
+        else:
+            caveat = ""
         self._status.setText(
             f"Template assist ({data.get('template_label')}): {plddt_txt}; cross-seed variation "
             f"{nstab}/{ntot} residues tightened (mean Δ {mdf:+.2f} Å); {adopt_txt}. "

@@ -2098,18 +2098,41 @@ class TestTemplateGuided:
         assert "tightened" in txt and "adopted at" in txt       # use-time signals
         assert "not a correctness claim" in txt                 # never "rescue confirmed"
 
-    def test_apply_assist_high_adoption_caveat(self, _app):
+    def _assist_result(self, **data):
+        base = {"template_label": "1MBN", "guided_mean_plddt": 84.0, "unguided_mean_plddt": 62.0,
+                "d_plddt": 22.0, "mean_d_flex": 0.4, "n_stabilized": 8, "n_residues": 10,
+                "max_adoption": 0.9, "high_adoption_caveat": True}
+        base.update(data)
+        return {"tool_step_results": [{"tool": "template_assist", "data": base}]}
+
+    def test_apply_assist_high_adoption_caveat_distant(self, _app):
         p, _ = self._denovo_panel()
         self._fold_unguided_monomer(p)
         spec = {"_assist_ukey": p._cur_cd_ukey()}
-        result = {"tool_step_results": [{"tool": "template_assist", "data": {
-            "template_label": "1MBN", "guided_mean_plddt": 84.0, "unguided_mean_plddt": 62.0,
-            "d_plddt": 22.0, "mean_d_flex": 0.4, "n_stabilized": 8, "n_residues": 10,
-            "max_adoption": 0.9, "high_adoption_caveat": True}}]}
-        p.apply_template_assist_result(spec, result)
+        p.apply_template_assist_result(spec, self._assist_result(high_adoption_caveat_reason="distant"))
         txt = p._status.text().lower()
         assert ("high adoption" in txt and "did not already resemble" in txt
                 and "imposing the template" in txt)
+
+    def test_apply_assist_high_adoption_caveat_unmeasured_uses_generic(self, _app):
+        # prehoc unavailable → GENERIC wording on the GUI surface too; the refined "distant" claim
+        # must be ABSENT (mirrors the router's three-state routing).
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = {"_assist_ukey": p._cur_cd_ukey()}
+        p.apply_template_assist_result(spec, self._assist_result(high_adoption_caveat_reason="unmeasured"))
+        txt = p._status.text().lower()
+        assert "high adoption" in txt
+        assert "did not already resemble" not in txt and "imposing the template" not in txt
+
+    def test_apply_assist_high_adoption_caveat_legacy_bool_falls_back_to_distant(self, _app):
+        # Old result dicts carry only the bool (no reason field) → fall back to the refined wording.
+        p, _ = self._denovo_panel()
+        self._fold_unguided_monomer(p)
+        spec = {"_assist_ukey": p._cur_cd_ukey()}
+        p.apply_template_assist_result(spec, self._assist_result())   # no reason key
+        txt = p._status.text().lower()
+        assert "did not already resemble" in txt
 
     # ── validation reuses the align spec with the template as reference ──────────────
     def test_validate_guided_spec_uses_guided_query(self, _app):

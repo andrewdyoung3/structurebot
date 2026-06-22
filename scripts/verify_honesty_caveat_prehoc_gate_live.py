@@ -60,31 +60,51 @@ def main():
 
     ok = True
 
-    print("-- CASE 1: FIRE (template NOT already close to unguided) --")
+    print("-- CASE 1: FIRE / distant (template NOT already close to unguided) --")
     d, pt, summary = _run(guided="1PLQ", template="1AXC", unguided="1MBN")
     print(f"   adoption(guided 1PLQ vs template 1AXC) = {pt['adoption']}")
     print(f"   prehoc  (template 1AXC vs unguided 1MBN) = {pt['prehoc_structTM_to_unguided']}")
-    print(f"   high_adoption_caveat = {d['high_adoption_caveat']}")
+    print(f"   high_adoption_caveat = {d['high_adoption_caveat']}  reason = {d['high_adoption_caveat_reason']}")
     fire_ok = (d["high_adoption_caveat"] is True
+               and d["high_adoption_caveat_reason"] == "distant"
                and pt["adoption"] is not None and pt["adoption"] >= 0.8
                and pt["prehoc_structTM_to_unguided"] is not None
-               and pt["prehoc_structTM_to_unguided"] < 0.5)
-    print(f"   EXPECT fire -> {'PASS' if fire_ok else 'FAIL'}")
-    print(f"   caveat in summary: {'imposing the template' in summary.lower()}\n")
+               and pt["prehoc_structTM_to_unguided"] < 0.5
+               and "did not already resemble" in summary.lower()        # REFINED wording (measured)
+               and "imposing the template" in summary.lower())
+    print(f"   EXPECT fire+refined wording -> {'PASS' if fire_ok else 'FAIL'}\n")
     ok = ok and fire_ok
 
     print("-- CASE 2: SUPPRESS (template already close to unguided) --")
     d, pt, summary = _run(guided="1PLQ", template="1AXC", unguided="1VYM")
     print(f"   adoption(guided 1PLQ vs template 1AXC) = {pt['adoption']}")
     print(f"   prehoc  (template 1AXC vs unguided 1VYM) = {pt['prehoc_structTM_to_unguided']}")
-    print(f"   high_adoption_caveat = {d['high_adoption_caveat']}")
+    print(f"   high_adoption_caveat = {d['high_adoption_caveat']}  reason = {d['high_adoption_caveat_reason']}")
     suppress_ok = (d["high_adoption_caveat"] is False
+                   and d["high_adoption_caveat_reason"] is None
                    and pt["adoption"] is not None and pt["adoption"] >= 0.8
                    and pt["prehoc_structTM_to_unguided"] is not None
-                   and pt["prehoc_structTM_to_unguided"] >= 0.5)
-    print(f"   EXPECT suppress -> {'PASS' if suppress_ok else 'FAIL'}")
-    print(f"   caveat absent from summary: {'imposing the template' not in summary.lower()}\n")
+                   and pt["prehoc_structTM_to_unguided"] >= 0.5
+                   and "imposing the template" not in summary.lower())
+    print(f"   EXPECT suppress -> {'PASS' if suppress_ok else 'FAIL'}\n")
     ok = ok and suppress_ok
+
+    print("-- CASE 3: FIRE / unmeasured (prehoc proxy unavailable -> GENERIC wording) --")
+    # Real None prehoc: point the unguided ref at a missing file so the REAL _usalign_tm2 returns
+    # None for the template->unguided direction (adoption guided->template stays real).
+    d, pt, summary = _run(guided="1PLQ", template="1AXC", unguided="__nonexistent__")
+    print(f"   adoption(guided 1PLQ vs template 1AXC) = {pt['adoption']}")
+    print(f"   prehoc  (template 1AXC vs MISSING unguided) = {pt['prehoc_structTM_to_unguided']}")
+    print(f"   high_adoption_caveat = {d['high_adoption_caveat']}  reason = {d['high_adoption_caveat_reason']}")
+    unmeasured_ok = (d["high_adoption_caveat"] is True
+                     and d["high_adoption_caveat_reason"] == "unmeasured"
+                     and pt["adoption"] is not None and pt["adoption"] >= 0.8
+                     and pt["prehoc_structTM_to_unguided"] is None
+                     and "high adoption" in summary.lower()
+                     and "did not already resemble" not in summary.lower()   # NOT over-asserted
+                     and "imposing the template" not in summary.lower())
+    print(f"   EXPECT fire+GENERIC wording -> {'PASS' if unmeasured_ok else 'FAIL'}\n")
+    ok = ok and unmeasured_ok
 
     print("== RESULT:", "ALL PASS" if ok else "FAILED", "==")
     sys.exit(0 if ok else 1)
