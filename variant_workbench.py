@@ -125,25 +125,28 @@ class _ColorWorker(QtCore.QRunnable):
 
 
 class _FsSignals(QtCore.QObject):
-    done = QtCore.Signal(list)                          # [(pdb_id, chain, structTM), …]
+    done = QtCore.Signal(list, list)                    # (primary [(pid,ch,TM)…], low-bucket [(…)…])
     failed = QtCore.Signal(str)
 
 
 class _FoldseekWorker(QtCore.QRunnable):
     """Runs the LOCAL-ONLY foldseek structural-neighbour search off the UI thread (Stage 2
-    template auto-discovery). The search is seconds-fast but WSL-bound, so it never blocks Qt."""
+    template auto-discovery). The search is seconds-fast but WSL-bound, so it never blocks Qt.
+    Requests the two-bucket return: the primary list (TM≥min_tm) + the low-confidence bucket
+    ([low_bound, min_tm)) for the "show lower-confidence hits" expander — both from ONE search."""
 
-    def __init__(self, bridge, query_path, max_results=30, min_tm=0.3):
+    def __init__(self, bridge, query_path, max_results=30, min_tm=0.3, low_bound=0.2):
         super().__init__()
         self._b, self._q = bridge, query_path
-        self._n, self._t = max_results, min_tm
+        self._n, self._t, self._low = max_results, min_tm, low_bound
         self.signals = _FsSignals()
 
     @QtCore.Slot()
     def run(self):
         try:
-            hits = self._b.search_neighbors(self._q, self._n, self._t)
-            self.signals.done.emit(list(hits))
+            primary, low = self._b.search_neighbors(
+                self._q, self._n, self._t, with_low_bucket=True, low_bound=self._low)
+            self.signals.done.emit(list(primary), list(low))
         except Exception as exc:                       # error-first: never crash the pool
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
@@ -1267,21 +1270,22 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         qplddt = tf.get("mean_plddt")
         dbl = fb.db_label()
         w.signals.done.connect(
-            lambda hits, c=cd, e=engine, k=n_copies, qp=qplddt, dl=dbl:
-                self._on_foldseek_hits(hits, c, e, k, qp, dl))
+            lambda hits, low, c=cd, e=engine, k=n_copies, qp=qplddt, dl=dbl:
+                self._on_foldseek_hits(hits, low, c, e, k, qp, dl))
         w.signals.failed.connect(lambda msg: self._status.setText(f"Template search failed: {msg}"))
         self._pool.start(w)
 
-    def _on_foldseek_hits(self, hits, cd, engine: str, n_copies: int,
+    def _on_foldseek_hits(self, hits, low_hits, cd, engine: str, n_copies: int,
                           query_plddt, db_label: str) -> None:
         """Pick from ranked neighbours → guided re-fold via the SAME `construct_fold_guided_spec`
-        path. 0 hits = a real answer (searched, nothing ≥ TM 0.3), stated as such — never silent."""
-        if not hits:
+        path. 0 hits = a real answer (searched, nothing ≥ TM 0.3), stated as such — never silent.
+        `low_hits` ([0.20, 0.30)) populate the collapsed 'lower-confidence' expander (often empty)."""
+        if not hits and not low_hits:
             self._status.setText(f"No structural neighbours found ≥ TM 0.3 in the {db_label}. "
                                  "(A miss is a false negative — a good template may not be in this "
                                  "snapshot.)")
             return
-        picked = self._foldseek_pick_dialog(hits, query_plddt, db_label)
+        picked = self._foldseek_pick_dialog(hits, low_hits, query_plddt, db_label)
         if not picked:
             self._status.setText("Template discovery cancelled — no templates selected.")
             return
@@ -1294,10 +1298,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                              f"(soft-consensus) via Boltz (LOCAL-ONLY)…")
         self.launchRequested.emit(spec)
 
-    def _foldseek_pick_dialog(self, hits, query_plddt, db_label: str) -> Optional[List[str]]:
+    @staticmethod
+    def _fill_hit_list(lst, hits) -> None:
+        """Populate a checkable list widget with foldseek hits (PDB id carried on UserRole)."""
+        for pid, ch, tm in hits:
+            it = QtWidgets.QListWidgetItem(f"{pid}_{ch}    TM={tm:.3f}")
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Unchecked)
+            it.setData(QtCore.Qt.UserRole, pid)
+            lst.addItem(it)
+
+    @staticmethod
+    def _checked_ids(lst) -> List[str]:
+        return [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
+                if lst.item(i).checkState() == QtCore.Qt.Checked]
+
+    def _foldseek_pick_dialog(self, hits, low_hits, query_plddt, db_label: str) -> Optional[List[str]]:
         """Rich ranked selection: a checkable list of (PDB id, foldseek-TM), a query-pLDDT caution
         when the unguided fold was low-confidence (already-computed, non-circular use-time signal),
-        the weak-prior framing, and the DB-scope label. Returns the checked PDB ids (or None)."""
+        the weak-prior framing, an ALWAYS-shown assembly-variant caveat (foldseek ranks monomer fold
+        only — quaternary assembly comes from the picked hit), a collapsed 'lower-confidence' expander
+        (TM [0.20, 0.30); shown only when that bucket is non-empty), and the DB-scope label. Returns
+        the checked PDB ids from BOTH lists (or None)."""
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Find templates — structural neighbours (foldseek, LOCAL-ONLY)")
         lay = QtWidgets.QVBoxLayout(dlg)
@@ -1311,14 +1333,43 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         lay.addWidget(QtWidgets.QLabel(
             "Structural neighbours ranked by foldseek TM (structTM to the query fold — a WEAK "
             "pre-hoc prior, NOT proof the template is correct). Check the ones to guide a re-fold:"))
+        # Assembly-variant caveat — ALWAYS shown (foldseek ranks monomer fold, not quaternary state).
+        asm = QtWidgets.QLabel(
+            "These are single-chain fold homologs: foldseek ranks by monomer structural similarity "
+            "and does NOT distinguish quaternary-assembly variants (domain-swap direction, oligomer "
+            "size, ring vs sheet). You are choosing a fold FAMILY — the quaternary geometry that gets "
+            "imposed comes from the hit you pick (its own biological assembly), so choose the assembly "
+            "variant deliberately.")
+        asm.setWordWrap(True); asm.setStyleSheet("color: #666;")
+        lay.addWidget(asm)
         lst = QtWidgets.QListWidget()
-        for pid, ch, tm in hits:
-            it = QtWidgets.QListWidgetItem(f"{pid}_{ch}    TM={tm:.3f}")
-            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.Unchecked)
-            it.setData(QtCore.Qt.UserRole, pid)
-            lst.addItem(it)
+        self._fill_hit_list(lst, hits)
         lay.addWidget(lst)
+        # "Show lower-confidence hits" expander — collapsed by default; ONLY when the bucket exists.
+        low_lst = None
+        if low_hits:
+            toggle = QtWidgets.QToolButton()
+            toggle.setStyleSheet("QToolButton { border: none; }")
+            toggle.setCheckable(True); toggle.setChecked(False)
+            toggle.setText("▸ Show lower-confidence hits (TM 0.20–0.30)")
+            box = QtWidgets.QWidget()
+            box_lay = QtWidgets.QVBoxLayout(box); box_lay.setContentsMargins(12, 0, 0, 0)
+            note = QtWidgets.QLabel(
+                "Lower-similarity neighbours (TM 0.20–0.30) — usually NOT useful (low structural "
+                "similarity). Rarely, a sequence-unrelated low-similarity neighbour has unlocked a "
+                "de-novo fold; WHICH ones will is uncharacterised. Look here only if you're hunting "
+                "an orphan template for a de-novo design — this is not a recommendation.")
+            note.setWordWrap(True); note.setStyleSheet("color: #b36b00;")
+            box_lay.addWidget(note)
+            low_lst = QtWidgets.QListWidget()
+            self._fill_hit_list(low_lst, low_hits)
+            box_lay.addWidget(low_lst)
+            box.setVisible(False)
+            def _toggle(checked, b=box, t=toggle):
+                b.setVisible(checked)
+                t.setText(("▾ Hide" if checked else "▸ Show") + " lower-confidence hits (TM 0.20–0.30)")
+            toggle.toggled.connect(_toggle)
+            lay.addWidget(toggle); lay.addWidget(box)
         scope = QtWidgets.QLabel(
             f"Searched: {db_label}. A miss is a false negative — not an exhaustive search; a good "
             "template may simply not be in this snapshot.")
@@ -1330,8 +1381,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         lay.addWidget(bb)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return None
-        picked = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
-                  if lst.item(i).checkState() == QtCore.Qt.Checked]
+        picked = self._checked_ids(lst) + (self._checked_ids(low_lst) if low_lst is not None else [])
         return picked or None
 
     def apply_construct_fold_guided_result(self, spec: dict, result: dict) -> None:
