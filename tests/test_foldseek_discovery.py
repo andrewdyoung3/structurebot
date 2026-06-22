@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 pytest.importorskip("PySide6")
-from PySide6 import QtWidgets
+from PySide6 import QtWidgets, QtCore
 
 import foldseek_bridge
 from variant_workbench import VariantWorkbenchPanel
@@ -121,7 +121,8 @@ class TestHitsSeam:
         p = _panel()
         p._add_sequence_construct("x", SEQ)
         cd = next(iter(p._design.chains.values()))
-        p._on_foldseek_hits([], cd, "boltz", 1, 90.0, "PDB snapshot 2025-01 (local foldseek DB)")
+        # BOTH buckets empty = a real "searched, nothing found" answer.
+        p._on_foldseek_hits([], [], cd, "boltz", 1, 90.0, "PDB snapshot 2025-01 (local foldseek DB)")
         assert "no structural neighbours" in p._status.text().lower()
 
     def test_hits_build_guided_spec_and_launch(self, _app, monkeypatch):
@@ -129,21 +130,83 @@ class TestHitsSeam:
         p._add_sequence_construct("x", SEQ)
         cd = next(iter(p._design.chains.values()))
         # user picks one neighbour (skip the real Qt dialog)
-        monkeypatch.setattr(p, "_foldseek_pick_dialog", lambda hits, qp, dl: ["1ABC"])
+        monkeypatch.setattr(p, "_foldseek_pick_dialog", lambda hits, low, qp, dl: ["1ABC"])
         emitted = []
         p.launchRequested.connect(lambda spec: emitted.append(spec))
-        p._on_foldseek_hits([("1ABC", "A", 0.91)], cd, "boltz", 1, 90.0, "local DB")
+        p._on_foldseek_hits([("1ABC", "A", 0.91)], [], cd, "boltz", 1, 90.0, "local DB")
         assert len(emitted) == 1
         templates = emitted[0]["tool_inputs"].get("templates")
         assert templates and any(t.get("pdb_id") == "1ABC" for t in templates)
+
+    def test_low_bucket_only_still_opens_picker(self, _app, monkeypatch):
+        # primary empty but the low bucket has hits → still a real answer; the dialog opens with the
+        # low-bucket hits available (NOT the "no neighbours" message).
+        p = _panel()
+        p._add_sequence_construct("x", SEQ)
+        cd = next(iter(p._design.chains.values()))
+        seen = {}
+        def fake_dialog(hits, low, qp, dl):
+            seen["hits"], seen["low"] = hits, low
+            return ["9LOW"]
+        monkeypatch.setattr(p, "_foldseek_pick_dialog", fake_dialog)
+        emitted = []
+        p.launchRequested.connect(lambda spec: emitted.append(spec))
+        p._on_foldseek_hits([], [("9LOW", "A", 0.22)], cd, "boltz", 1, 90.0, "local DB")
+        assert seen["hits"] == [] and seen["low"] == [("9LOW", "A", 0.22)]
+        assert len(emitted) == 1
+        assert any(t.get("pdb_id") == "9LOW" for t in emitted[0]["tool_inputs"]["templates"])
 
     def test_hits_cancel_no_launch(self, _app, monkeypatch):
         p = _panel()
         p._add_sequence_construct("x", SEQ)
         cd = next(iter(p._design.chains.values()))
-        monkeypatch.setattr(p, "_foldseek_pick_dialog", lambda hits, qp, dl: None)
+        monkeypatch.setattr(p, "_foldseek_pick_dialog", lambda hits, low, qp, dl: None)
         emitted = []
         p.launchRequested.connect(lambda spec: emitted.append(spec))
-        p._on_foldseek_hits([("1ABC", "A", 0.91)], cd, "boltz", 1, 90.0, "local DB")
+        p._on_foldseek_hits([("1ABC", "A", 0.91)], [], cd, "boltz", 1, 90.0, "local DB")
         assert not emitted
         assert "cancelled" in p._status.text().lower()
+
+
+class TestPickDialog:
+    """The real Qt dialog (offscreen) — caveat always shown, expander only when the low bucket is
+    non-empty, and low-bucket picks harvested. Auto-accept by stubbing exec() + checking items."""
+
+    def _open(self, p, monkeypatch, hits, low, check_pids):
+        captured = {}
+        def fake_exec(self_dlg):
+            # find the checkable list widgets, tick the requested pids, then accept
+            lists = self_dlg.findChildren(QtWidgets.QListWidget)
+            captured["lists"] = lists
+            captured["labels"] = [w.text() for w in self_dlg.findChildren(QtWidgets.QLabel)]
+            captured["toggles"] = [w.text() for w in self_dlg.findChildren(QtWidgets.QToolButton)]
+            for lw in lists:
+                for i in range(lw.count()):
+                    if lw.item(i).data(QtCore.Qt.UserRole) in check_pids:
+                        lw.item(i).setCheckState(QtCore.Qt.Checked)
+            return QtWidgets.QDialog.Accepted
+        monkeypatch.setattr(QtWidgets.QDialog, "exec", fake_exec, raising=True)
+        picked = p._foldseek_pick_dialog(hits, low, 90.0, "PDB snapshot 2025-01 (local foldseek DB)")
+        return picked, captured
+
+    def test_caveat_always_shown_and_no_expander_when_low_empty(self, _app, monkeypatch):
+        p = _panel()
+        picked, cap = self._open(p, monkeypatch, [("1ABC", "A", 0.91)], [], check_pids=set())
+        joined = " ".join(cap["labels"]).lower()
+        assert "single-chain fold homologs" in joined and "fold family" in joined  # assembly caveat
+        assert cap["toggles"] == []                                                # NO expander
+        assert "lower-similarity neighbours" not in joined                         # no low-bucket note
+
+    def test_expander_present_when_low_nonempty(self, _app, monkeypatch):
+        p = _panel()
+        picked, cap = self._open(p, monkeypatch, [("1ABC", "A", 0.91)],
+                                 [("9LOW", "A", 0.22)], check_pids=set())
+        assert any("lower-confidence hits" in t.lower() for t in cap["toggles"])   # expander toggle
+        joined = " ".join(cap["labels"]).lower()
+        assert "lower-similarity neighbours" in joined and "not a recommendation" in joined
+
+    def test_low_bucket_pick_is_harvested(self, _app, monkeypatch):
+        p = _panel()
+        picked, cap = self._open(p, monkeypatch, [("1ABC", "A", 0.91)],
+                                 [("9LOW", "A", 0.22)], check_pids={"9LOW"})
+        assert picked == ["9LOW"]                                                  # low-bucket pick flows out

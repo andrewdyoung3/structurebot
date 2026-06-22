@@ -84,9 +84,13 @@ class FoldseekBridge:
 
     # ── Search ────────────────────────────────────────────────────────────────────
     @staticmethod
-    def _parse_hits(stdout: str, min_tm: float, max_results: int) -> List[Tuple[str, str, float]]:
+    def _parse_hits(stdout: str, min_tm: float, max_results: int,
+                    max_tm: Optional[float] = None) -> List[Tuple[str, str, float]]:
         """Parse foldseek m8 (target<TAB>alntmscore<TAB>…) → [(pdb_id, chain, TM)] sorted desc,
-        TM≥min_tm, deduped on (pdb_id, chain). Pure / unit-testable."""
+        deduped on (pdb_id, chain), keeping the BAND min_tm ≤ TM < max_tm (max_tm=None → no upper
+        bound). The band filter is applied BEFORE the *max_results* cap, so a narrow band (e.g. the
+        low-confidence [0.20, 0.30) bucket) is NOT truncated away by higher-TM hits outside it. Pure
+        / unit-testable."""
         hits: List[Tuple[str, str, float]] = []
         seen = set()
         for ln in (stdout or "").splitlines():
@@ -104,7 +108,7 @@ class FoldseekBridge:
             pid = mobj.group(1).upper()
             ch = (mobj.group(2) or "A")
             key = (pid, ch)
-            if key in seen or tm < min_tm:
+            if key in seen or tm < min_tm or (max_tm is not None and tm >= max_tm):
                 continue
             seen.add(key)
             hits.append((pid, ch, round(tm, 3)))
@@ -120,21 +124,41 @@ class FoldseekBridge:
                 f"&& cat {shlex.quote(out_wsl)}")
 
     def search_neighbors(self, query_path: str, max_results: int = 30,
-                         min_tm: float = 0.3) -> List[Tuple[str, str, float]]:
+                         min_tm: float = 0.3, with_low_bucket: bool = False,
+                         low_bound: float = 0.2, low_max_results: int = 15):
         """foldseek easy-search of *query_path* (a structure file) against the LOCAL PDB DB.
-        Returns [(pdb_id, chain, structTM-to-query)] ranked desc, TM≥*min_tm*. LOCAL-ONLY — no
-        remote API at query time. Empty list = NO hits ≥ min_tm (a real answer; the caller must
-        already have checked `is_available()` to distinguish unavailable from no-hits)."""
+
+        Default (``with_low_bucket=False``) — returns ``[(pdb_id, chain, structTM-to-query)]`` ranked
+        desc, TM≥*min_tm*. THIS IS THE UNCHANGED CONTRACT: the eval (`foldseek_neighbors`) and every
+        existing caller get exactly the list they got before (single source of truth, byte-for-byte).
+
+        Opt-in (``with_low_bucket=True``, requested ONLY by the in-app picker) — returns the tuple
+        ``(primary, low)`` from the SAME single search (no second foldseek run; the below-floor hits
+        are already retrieved — the ``-e 10`` cutoff has no TM filter). ``primary`` = TM≥*min_tm*
+        (capped at *max_results*); ``low`` = TM in ``[low_bound, min_tm)`` (its OWN cap *low_max_results*
+        so it isn't crowded out of the primary top-N). ``low`` is the "show lower-confidence hits"
+        expander bucket — usually noise, occasionally an orphan-template unlocker.
+
+        LOCAL-ONLY — no remote API at query time. Empty (list, or both tuple members) = NO hits in
+        range (a real answer; the caller must already have checked `is_available()`)."""
+        empty = ([], []) if with_low_bucket else []
         if not (query_path and os.path.isfile(query_path)):
-            return []
+            return empty
         q = self._wsl.translate_path(os.path.abspath(query_path))
         n = next(_COUNTER)
         out_wsl = f"/tmp/fs_out_{os.getpid()}_{n}.m8"
         tmp_wsl = f"/tmp/fs_tmp_{os.getpid()}_{n}"
         res = self._wsl.run_command(self._search_command(q, out_wsl, tmp_wsl), timeout=self._timeout)
         if not res.get("ok"):
-            return []
-        return self._parse_hits(res.get("stdout", "") or "", min_tm, max_results)
+            return empty
+        stdout = res.get("stdout", "") or ""
+        primary = self._parse_hits(stdout, min_tm, max_results)
+        if not with_low_bucket:
+            return primary
+        # Re-filter the SAME stdout for the [low_bound, min_tm) band (no second search). The band
+        # filter runs BEFORE the cap inside _parse_hits, so high-TM hits never crowd it out.
+        low = self._parse_hits(stdout, low_bound, low_max_results, max_tm=min_tm)
+        return primary, low
 
 
 def foldseek_available() -> bool:
