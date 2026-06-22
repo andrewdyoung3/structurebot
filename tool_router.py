@@ -6119,7 +6119,31 @@ class ToolRouter:
             })
         adoptions = [p["adoption"] for p in per_template if p["adoption"] is not None]
         max_adoption = max(adoptions) if adoptions else None
-        high_adopt = (max_adoption is not None and max_adoption >= 0.8)
+        # The possible-COPYING caveat has THREE states, each with its own wording (see below):
+        #  • "distant"    — a template is strongly adopted (≥0.8) AND the pre-hoc proxy
+        #                   structTM(template, unguided) is LOW (< 0.5 ≈ a different fold): the
+        #                   template was NOT already close, so high adoption is genuinely suspicious
+        #                   (the REFINED "…did not already resemble…" wording — a measured claim).
+        #  • "unmeasured" — strongly adopted but the proxy is None (US-align unavailable): we cannot
+        #                   establish the template was close, so it STILL fires (conservative; never
+        #                   suppress on a missing proxy) BUT with the GENERIC wording — it must not
+        #                   assert the "distant" condition it never measured.
+        #  • suppress     — strongly adopted but prehoc ≥ 0.5 (template already same-fold-close): the
+        #                   NATURAL-success case (convergence within a fold the unguided model already
+        #                   found), not copying → NOT flagged. (Adoption ALONE false-fired here; §9.)
+        ADOPT_HI, PREHOC_ALREADY_CLOSE = 0.8, 0.5
+        def _high(p: Dict[str, Any]) -> bool:
+            a = p.get("adoption")
+            return a is not None and a >= ADOPT_HI
+        distant = any(_high(p) and (p.get("prehoc_structTM_to_unguided") is not None
+                                    and p["prehoc_structTM_to_unguided"] < PREHOC_ALREADY_CLOSE)
+                      for p in per_template)
+        unmeasured = any(_high(p) and p.get("prehoc_structTM_to_unguided") is None
+                         for p in per_template)
+        high_adopt = distant or unmeasured
+        # "distant" takes precedence: if ANY template is measurably distant-yet-adopted, the strong
+        # measured claim is warranted even if another template's proxy was unavailable.
+        caveat_reason = "distant" if distant else ("unmeasured" if unmeasured else None)
         data = {
             "template_label":       inputs.get("template_label"),
             "n_templates":          len(inputs.get("templates") or []),
@@ -6137,6 +6161,7 @@ class ToolRouter:
             "per_template":         per_template,                 # adoption + pre-hoc proxy each
             "max_adoption":         max_adoption,
             "high_adoption_caveat": high_adopt,
+            "high_adoption_caveat_reason": caveat_reason,   # "distant" | "unmeasured" | None (wording)
             "guided_model_id":      str(guided_ref.get("model_id")),
             "unguided_model_id":    str(unguided_ref.get("model_id")),
             "n_floor_seeds":        ung.get("n_floor_seeds"),
@@ -6149,9 +6174,17 @@ class ToolRouter:
         adopt_txt = (f"fold adopted the template(s) at {max_adoption:.0%}" if max_adoption is not None
                      else "adoption n/a")
         nlab = inputs.get("template_label") or f"{len(inputs.get('templates') or [])} template(s)"
-        caveat = ("  ⚠ HIGH adoption — the fold may be FOLLOWING the template rather than "
-                  "independently converging; without an experimental structure this cannot be "
-                  "ruled out (copying vs unlocking is truth-dependent)." if high_adopt else "")
+        if caveat_reason == "distant":          # measured: template was NOT already close
+            caveat = ("  ⚠ HIGH adoption of a template the unguided fold did NOT already resemble — "
+                      "guidance may be IMPOSING the template fold rather than the construct "
+                      "independently converging; without an experimental structure this cannot be "
+                      "ruled out (copying vs unlocking is truth-dependent).")
+        elif caveat_reason == "unmeasured":     # fired conservatively; proxy unavailable — generic
+            caveat = ("  ⚠ HIGH adoption — the fold may be FOLLOWING the template rather than "
+                      "independently converging; without an experimental structure this cannot be "
+                      "ruled out (copying vs unlocking is truth-dependent).")
+        else:
+            caveat = ""
         summary = (f"Template assist ({nlab}): {plddt_txt}; {flex_txt}; {adopt_txt}. "
                    f"These are the USE-TIME-knowable effects — NOT a confirmation of correctness "
                    f"(that needs an experimental structure). Guided confidence is template-biased; "
