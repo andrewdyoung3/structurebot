@@ -1,0 +1,39 @@
+{
+  "template": "C:\\Users\\andre\\documents\\structurebot\\cache\\3H47_hexamer_clean.cif",
+  "query_len": 210,
+  "results": {
+    "unguided": null,
+    "guided": [
+      [
+        0,
+        {
+          "iptm": 0.864,
+          "mono": 0.952,
+          "ring_3H47": 0.961,
+          "ring_3P05": 0.676,
+          "n_chains": 6
+        }
+      ],
+      [
+        1,
+        {
+          "iptm": 0.859,
+          "mono": 0.961,
+          "ring_3H47": 0.965,
+          "ring_3P05": 0.689,
+          "n_chains": 6
+        }
+      ],
+      [
+        2,
+        {
+          "iptm": 0.855,
+          "mono": 0.961,
+          "ring_3H47": 0.966,
+          "ring_3P05": 0.692,
+          "n_chains": 6
+        }
+      ]
+    ]
+  }
+}
