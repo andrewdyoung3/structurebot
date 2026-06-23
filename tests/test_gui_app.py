@@ -650,7 +650,7 @@ def test_export_writes_when_named(_app, monkeypatch, tmp_path):
     import session_export, session_io
     monkeypatch.setattr(session_io, "session_paths", lambda n: {"exports": tmp_path / "exports"})
     monkeypatch.setattr(session_export, "export_session",
-                        lambda ds, d: {"any": True, "written": ["Deviation", "Solubility"],
+                        lambda ds, d, ppr=None: {"any": True, "written": ["Deviation", "Solubility"],
                                        "skipped": ["Stability ddG"], "files": []})
     w = _fakew_session(session=_SS(), presenter=_MM(), _current_session_name="expt")
     w._on_export_results()
@@ -661,7 +661,7 @@ def test_export_nothing_to_export(_app, monkeypatch, tmp_path):
     import session_export, session_io
     monkeypatch.setattr(session_io, "session_paths", lambda n: {"exports": tmp_path})
     monkeypatch.setattr(session_export, "export_session",
-                        lambda ds, d: {"any": False, "written": [], "skipped": [], "files": []})
+                        lambda ds, d, ppr=None: {"any": False, "written": [], "skipped": [], "files": []})
     w = _fakew_session(session=_SS(), presenter=_MM(), _current_session_name="expt")
     w._on_export_results()
     w.presenter.dim.assert_called_once()

@@ -67,30 +67,64 @@ v2.results.solubility = {"variant": 1.1, "wt": 1.0, "delta": 0.1}
 # V3 — nothing
 cd.add_variant("V3")
 
+# an MPNN-imported variant via the REAL import path (provenance carries mpnn_run/design_k/fasta_path)
+from variant_model import import_mpnn_designs
+mpnn_seq = SEQ[:1] + "M" + SEQ[2:]                            # one substitution at resnum 2
+mpnn_result = {"chain": "A", "fasta_path": "/tmp/run.fa",
+               "sequences": [{"sequence": SEQ, "score": -0.5, "recovery": 1.0},
+                             {"sequence": mpnn_seq, "score": -1.23, "recovery": 0.91}]}
+_tmp = iter(range(1000))
+for mv in import_mpnn_designs(cd, mpnn_result, run_id=0, next_id_fn=lambda: f"M{next(_tmp)}"):
+    cd.variants.append(mv)
+mpnn_vid = cd.variants[-1].id                                 # the design_k=1 import (mpnn_seq)
+
 # ── persist + a named session folder ──
 config.SESSION_DIR = Path(tempfile.mkdtemp(prefix="verify_export_sessions_"))
 session = SessionState()
 session.add_design_session(design.model_id, design.to_dict())
+session.add_proteinmpnn_result(design.model_id, mpnn_result)
 session_io.save_named_session(None, session, "mix")          # creates mix/ + folds/ + exports/
 
-# ── EXPORT ──
+# ── EXPORT (with proteinmpnn_results so MPNN rows can carry the design score) ──
 exports = session_io.session_paths("mix")["exports"]
-rep = session_export.export_session(session.design_sessions, exports)
+rep = session_export.export_session(session.design_sessions, exports, session.proteinmpnn_results)
 check("export wrote something (any)", rep["any"])
 check("results.xlsx written", (exports / "results.xlsx").is_file())
 import openpyxl
 wb = openpyxl.load_workbook(str(exports / "results.xlsx"))
-check("workbook has Summary + all populated result sheets",
-      wb.sheetnames == ["Summary", "Fold pLDDT", "Deviation", "Stability ddG", "Solubility",
-                        "Template assist", "Template assist dflex", "Structural align"])
+check("workbook has Summary + design-content + all populated result sheets",
+      wb.sheetnames == ["Summary", "Sequences", "Substitutions", "Fold pLDDT", "Deviation",
+                        "Stability ddG", "Solubility", "Template assist", "Template assist dflex",
+                        "Structural align"])
 import csv as _csv
 def read_csv(name):
     with open(exports / "csv" / f"{name}.csv", newline="", encoding="utf-8") as fh:
         return list(_csv.reader(fh))
-# sheet headers == csv headers (column parity)
-parity = all([c.value for c in wb[session_export._TITLE[k]][1]] == read_csv(k)[0]
-             for k in session_export._COLUMNS)
+slug = session_export._SLUG
+# sheet headers == csv headers (column parity) for every EMITTED sheet
+title_key = {t: k for k, t, _s in session_export._TYPES}
+parity = all([c.value for c in wb[t][1]] == read_csv(slug[title_key[t]])[0] for t in wb.sheetnames)
 check("workbook sheet columns == CSV columns for every type", parity)
+
+# ── phase 1.5: sequences + substitutions + FASTA, MPNN score joined, hand-made blank ──
+seqrows = read_csv("sequences"); qh = seqrows[0]
+Q = {r[qh.index("row")]: dict(zip(qh, r)) for r in seqrows[1:]}
+check("Sequences sheet has T + variants with sequences", "T" in Q and "V1" in Q and mpnn_vid in Q)
+check("MPNN variant sequence row carries the joined design score+recovery",
+      Q[mpnn_vid]["source"] == "proteinmpnn" and Q[mpnn_vid]["mpnn_score"] == "-1.23"
+      and Q[mpnn_vid]["mpnn_recovery"] == "0.91")
+check("hand-made variant has blank MPNN score", Q["V1"]["mpnn_score"] == "")
+subrows = read_csv("substitutions"); xh = subrows[0]
+mpnn_subs = [r for r in subrows[1:] if r[xh.index("variant")] == mpnn_vid]
+v1_subs = [r for r in subrows[1:] if r[xh.index("variant")] == "V1"]
+check("MPNN substitution row carries source=proteinmpnn + score",
+      bool(mpnn_subs) and mpnn_subs[0][xh.index("source")] == "proteinmpnn"
+      and mpnn_subs[0][xh.index("score")] == "-1.23")
+check("hand-made substitution row has source=manual + blank score",
+      bool(v1_subs) and v1_subs[0][xh.index("source")] == "manual" and v1_subs[0][xh.index("score")] == "")
+fasta = (exports / "sequences.fasta").read_text()
+check("sequences.fasta written with T + MPNN-score header",
+      f">{design.model_id}_A_T source=template" in fasta and "mpnn_score=-1.23" in fasta and SEQ in fasta)
 
 # partial-data Summary: blanks, never 0
 srows = read_csv("summary"); shdr = srows[0]
@@ -106,6 +140,17 @@ check("construct adoption + tm_align present on rows", S["T"]["adoption"] == "0.
 drows = read_csv("deviation"); dhdr = drows[0]
 check("deviation CSV has dRMSD + dRMSD_floor + lDDT + lDDT_floor columns",
       all(c in dhdr for c in ("dRMSD", "dRMSD_floor", "lDDT", "lDDT_floor")) and len(drows) == 11)
+
+# ── phase 2: relevance-gated profile figures (plots for profiles, none for scalars) ──
+figdir = exports / "figures"
+figs = {p.name for p in figdir.glob("*.png")} if figdir.exists() else set()
+check("pLDDT profile plot generated", any(n.startswith("plddt_") for n in figs))
+check("deviation profile plot generated (dRMSD + lDDT)", any(n.startswith("deviation_") for n in figs))
+check("template-assist Δflex profile plot generated", any(n.startswith("dflex_") for n in figs))
+check("NO figure for scalar types (solubility/structural-align/stability)",
+      not any(n.startswith(("solubility", "structural", "stability")) for n in figs))
+check("figures are real PNGs (not empty placeholders)",
+      all((figdir / n).stat().st_size > 1000 for n in figs) and bool(figs))
 
 # ── SAVE AS → self-contained fork ──
 fa = session_io.save_as_session(None, session, "mix_fork", src_name="mix")

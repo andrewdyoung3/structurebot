@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Canonical result types → (sheet title, csv slug). Order = sheet order in the workbook.
 _TYPES: List[Tuple[str, str, str]] = [
     ("summary",               "Summary",               "summary"),
+    ("sequences",             "Sequences",             "sequences"),
+    ("substitutions",         "Substitutions",         "substitutions"),
     ("fold_plddt",            "Fold pLDDT",             "fold_plddt"),
     ("deviation",             "Deviation",              "deviation"),
     ("stability_ddg",         "Stability ddG",          "stability_ddg"),
@@ -38,12 +40,18 @@ _TYPES: List[Tuple[str, str, str]] = [
 ]
 _TITLE = {k: t for k, t, _s in _TYPES}
 _SLUG = {k: s for k, _t, s in _TYPES}
-# the result types that count as "real data" (Summary is a derived roll-up, never counts)
-_RESULT_KEYS = [k for k, _t, _s in _TYPES if k != "summary"]
+# the data types that count as "exportable content" (Summary is a derived roll-up, never counts);
+# sequences/substitutions are DESIGN content (phase 1.5) — a bare construct with no results still
+# exports its sequence, so they count toward "is there anything to export".
+_DATA_KEYS = [k for k, _t, _s in _TYPES if k != "summary"]
 
 _COLUMNS: Dict[str, List[str]] = {
     "summary": ["model", "design_chain", "row", "n_mutations", "mean_plddt", "sum_ddg",
                 "solubility_delta", "max_dRMSD", "adoption", "tm_align"],
+    "sequences": ["model", "design_chain", "row", "source", "length", "sequence",
+                  "mpnn_score", "mpnn_recovery"],
+    "substitutions": ["model", "design_chain", "variant", "kind", "resnum", "from_aa", "to_aa",
+                      "residues", "source", "score", "recovery", "recommendation"],
     "fold_plddt": ["model", "design_chain", "row", "engine", "target", "resnum", "plddt"],
     "deviation": ["model", "design_chain", "variant", "chain", "resnum",
                   "dRMSD", "dRMSD_floor", "lDDT", "lDDT_floor"],
@@ -81,6 +89,32 @@ def _split_dev_key(k: Any) -> Tuple[Optional[str], Any]:
     return None, s
 
 
+def _seq_from_cells(cells) -> str:
+    """The ungapped sequence from a cells list ([{col,resnum,aa}], aa None = gap)."""
+    return "".join(c.get("aa") for c in (cells or []) if c.get("aa"))
+
+
+def _mpnn_score(prov: Dict[str, Any], model: str, var_seq: str,
+                ppr: Optional[Dict[str, Any]]) -> Tuple[Any, Any]:
+    """(score, recovery) for an MPNN-imported variant — joined from `proteinmpnn_results[model]
+    ["data"]["sequences"][design_k]` (the design model_id IS the design_sessions key; design_k is
+    the enumerate index `import_mpnn_designs` recorded) and VERIFIED by SEQUENCE match, so an
+    overwritten/later run (only the latest is stored per model) never attaches a WRONG score —
+    it blanks instead. (None, None) when no proteinmpnn_results given / no clean match."""
+    if not ppr:
+        return None, None
+    dk = prov.get("design_k")
+    if not isinstance(dk, int) or dk < 0:
+        return None, None
+    seqs = ((ppr.get(model) or {}).get("data") or {}).get("sequences") or []
+    if dk >= len(seqs):
+        return None, None
+    s = seqs[dk] or {}
+    if s.get("sequence") and var_seq and s["sequence"] != var_seq:
+        return None, None                              # stored result is a different run → blank
+    return s.get("score"), s.get("recovery")
+
+
 def _plddt_rows(model: str, chain: str, row_label: str, fold: Dict[str, Any]) -> List[Dict[str, Any]]:
     plddt = (fold or {}).get("plddt") or {}
     if not plddt:
@@ -92,10 +126,13 @@ def _plddt_rows(model: str, chain: str, row_label: str, fold: Dict[str, Any]) ->
             for rn, val in _sorted_resnum_items(plddt)]
 
 
-def build_tables(design_sessions: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+def build_tables(design_sessions: Dict[str, Any],
+                 proteinmpnn_results: Optional[Dict[str, Any]] = None) -> Dict[str, List[Dict[str, Any]]]:
     """ONE pass over the design tree → {type_key: [row-dict, …]}. Only the rows; columns come
     from `_COLUMNS`. Reshapes existing data only (no recompute). The Summary roll-up joins
-    per-variant across result types, leaving a BLANK (None) cell where a result is absent."""
+    per-variant across result types, leaving a BLANK (None) cell where a result is absent.
+    *proteinmpnn_results* (optional) lets MPNN substitution/sequence rows carry the design's
+    score + recovery (verified by sequence match; see `_mpnn_score`)."""
     rows: Dict[str, List[Dict[str, Any]]] = {k: [] for k, _t, _s in _TYPES}
 
     for model, ds in (design_sessions or {}).items():
@@ -106,6 +143,13 @@ def build_tables(design_sessions: Dict[str, Any]) -> Dict[str, List[Dict[str, An
             gf = cd.get("guided_fold") or {}
             ta = cd.get("template_assist") or {}
             sa = cd.get("structural_align") or {}
+
+            # ── design CONTENT: the template (T) sequence (phase 1.5) ──
+            tseq = _seq_from_cells(cd.get("template_cells"))
+            if tseq:
+                rows["sequences"].append({"model": model, "design_chain": chain, "row": "T",
+                                          "source": "template", "length": len(tseq), "sequence": tseq,
+                                          "mpnn_score": None, "mpnn_recovery": None})
 
             # ── construct-level (per ChainDesign) ──
             rows["fold_plddt"] += _plddt_rows(model, chain, "T", tf)
@@ -145,6 +189,38 @@ def build_tables(design_sessions: Dict[str, Any]) -> Dict[str, List[Dict[str, An
             # ── per-variant ──
             for v in cd.get("variants") or []:
                 vid = v.get("id")
+                vsource = v.get("source")
+                prov = v.get("provenance") or {}
+
+                # ── design CONTENT (phase 1.5): variant sequence + per-change substitution rows ──
+                vseq = _seq_from_cells(v.get("cells"))
+                mscore, mrec = (_mpnn_score(prov, model, vseq, proteinmpnn_results)
+                                if vsource == "proteinmpnn" else (None, None))
+                if vseq:
+                    rows["sequences"].append({"model": model, "design_chain": chain, "row": vid,
+                                              "source": vsource, "length": len(vseq), "sequence": vseq,
+                                              "mpnn_score": mscore, "mpnn_recovery": mrec})
+                accepted = {a.get("resnum"): a for a in (prov.get("accepted") or [])}
+                for m in v.get("mutations") or []:
+                    rn = m.get("resnum")
+                    if vsource == "proteinmpnn":
+                        score, rec, recd = mscore, mrec, None
+                    else:                                  # accepted-suggestion subs carry a per-resnum score
+                        acc = accepted.get(rn) or {}
+                        score, rec, recd = acc.get("combined_score"), None, acc.get("recommendation")
+                    rows["substitutions"].append({
+                        "model": model, "design_chain": chain, "variant": vid, "kind": "substitution",
+                        "resnum": rn, "from_aa": m.get("from_aa"), "to_aa": m.get("to_aa"),
+                        "residues": None, "source": m.get("source"), "score": score,
+                        "recovery": rec, "recommendation": recd})
+                for e in v.get("indels") or []:
+                    rows["substitutions"].append({
+                        "model": model, "design_chain": chain, "variant": vid,
+                        "kind": e.get("kind"), "resnum": e.get("resnum"), "from_aa": e.get("from_aa"),
+                        "to_aa": None, "residues": e.get("residues"), "source": vsource,
+                        "score": mscore if vsource == "proteinmpnn" else None,
+                        "recovery": mrec if vsource == "proteinmpnn" else None, "recommendation": None})
+
                 res = v.get("results") or {}
                 vfold = res.get("fold") or {}
                 stab = res.get("stability") or {}
@@ -203,19 +279,20 @@ def build_tables(design_sessions: Dict[str, Any]) -> Dict[str, List[Dict[str, An
     return rows
 
 
-def export_session(design_sessions: Dict[str, Any], exports_dir) -> Dict[str, Any]:
-    """Write `results.xlsx` (one sheet per non-empty result type) + `csv/{type}.csv` into
-    *exports_dir*. FAIL-LOUD: a result type with no rows is SKIPPED (no empty file); if NO result
-    type has data, nothing is written (`any=False`). Returns {any, written, skipped, files}."""
+def export_session(design_sessions: Dict[str, Any], exports_dir,
+                   proteinmpnn_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Write `results.xlsx` (one sheet per non-empty type) + `csv/{type}.csv` (+ `sequences.fasta`)
+    into *exports_dir*. FAIL-LOUD: a type with no rows is SKIPPED (no empty file); if NOTHING has
+    data (no design content nor results), nothing is written (`any=False`). Returns
+    {any, written, skipped, files}."""
     exports_dir = Path(exports_dir)
-    tables = build_tables(design_sessions)
-    present = [k for k in _RESULT_KEYS if tables.get(k)]            # result types WITH data
-    skipped = [_TITLE[k] for k in _RESULT_KEYS if not tables.get(k)]
+    tables = build_tables(design_sessions, proteinmpnn_results)
+    present = [k for k in _DATA_KEYS if tables.get(k)]             # data types (incl. sequences) WITH rows
+    skipped = [_TITLE[k] for k in _DATA_KEYS if not tables.get(k)]
     if not present:
-        return {"any": False, "written": [], "skipped": [_TITLE[k] for k in _RESULT_KEYS],
-                "files": []}
+        return {"any": False, "written": [], "skipped": [_TITLE[k] for k in _DATA_KEYS], "files": []}
 
-    emit = ["summary"] + present                                   # Summary only when there IS data
+    emit = [k for k, _t, _s in _TYPES if tables.get(k)]            # canonical order; Summary iff it has rows
     exports_dir.mkdir(parents=True, exist_ok=True)
     files: List[str] = []
 
@@ -253,4 +330,26 @@ def export_session(design_sessions: Dict[str, Any], exports_dir) -> Dict[str, An
                 w.writerow([r.get(c) for c in cols])
         files.append(str(p))
 
-    return {"any": True, "written": [_TITLE[k] for k in emit], "skipped": skipped, "files": files}
+    # ── sequences.fasta (the natural interchange) — T + every variant ──
+    if tables.get("sequences"):
+        fasta = exports_dir / "sequences.fasta"
+        with open(fasta, "w", encoding="utf-8") as fh:
+            for r in tables["sequences"]:
+                hdr = f">{r['model']}_{r['design_chain']}_{r['row']} source={r.get('source')}"
+                if r.get("mpnn_score") is not None:
+                    hdr += f" mpnn_score={r['mpnn_score']} recovery={r.get('mpnn_recovery')}"
+                fh.write(hdr + "\n" + (r.get("sequence") or "") + "\n")
+        files.append(str(fasta))
+
+    # ── phase 2: relevance-gated PROFILE figures (a bonus layer — a plotting failure never breaks
+    # the data export that already succeeded). Only per-residue profile types render a plot. ──
+    figures = {"written": [], "skipped": [], "error": None}
+    try:
+        import session_figures
+        figures = session_figures.render_profile_figures(tables, exports_dir / "figures")
+        files.extend(str(exports_dir / "figures" / n) for n in figures["written"])
+    except Exception as exc:
+        figures["error"] = f"{type(exc).__name__}: {exc}"
+
+    return {"any": True, "written": [_TITLE[k] for k in emit], "skipped": skipped,
+            "files": files, "figures": figures}
