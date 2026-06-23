@@ -2202,3 +2202,20 @@ def test_blocks_content_sized_no_internal_scrollbar(_app):
     # coupling preserved across wrapping: a column in the LAST block maps to members
     specs = p.select_specs_for_column(tab.design, 65)     # block 3 (cols 60-69) → resnum 66
     assert specs == [("1", "A", [66])]
+
+
+def test_variant_default_cell_has_explicit_contrast_bg(_app):
+    """Default view (no colour mode): a non-edited VARIANT cell paints an EXPLICIT medium-light
+    grey (high contrast vs the black glyph), not a cleared brush that inherited the dark base."""
+    from variant_workbench import _VARIANT_BG, _EDIT_BG, _GLYPH_DARK
+    p, _ = _panel([_chainseq("1", "A", "MKVLAT")])
+    p.load_model("1")
+    p._add_variant()
+    tab = p._cur_tab()
+    vid = tab.design.variants[0].id
+    # non-edited variant cell → explicit medium-light grey (was the dark-on-dark clear brush)
+    assert tab.color_hex_at(vid, 0) == _VARIANT_BG.name()
+    assert _VARIANT_BG.lightness() > 180          # genuinely light/medium, not dark
+    # an EDIT still stands out distinctly (unchanged)
+    tab.design.edit_variant(vid, 1, "W"); tab.rebuild(); tab = p._cur_tab()
+    assert tab.color_hex_at(vid, 1) == _EDIT_BG.name()
