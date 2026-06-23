@@ -336,6 +336,14 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.cancel_action.setEnabled(False)
         self.statusBar().showMessage("Ready")
 
+        # Session menu — named save / load / clear (workbench sessions). Shares session_io with
+        # the CLI (one path); load = REPLACE the current session (multi-design open is deferred).
+        sm = self.menuBar().addMenu("&Session")
+        sm.addAction("Save…", self._on_save_session)
+        sm.addAction("Load…", self._on_load_session)
+        sm.addSeparator()
+        sm.addAction("Clear / New", self._on_clear_session)
+
     def _connect(self) -> None:
         self._sig.append_html.connect(self._on_append)
         self._sig.set_busy.connect(self._on_busy)
@@ -730,22 +738,96 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.input.setEnabled(True)
         self.input.setFocus()
         self.statusBar().showMessage("Ready")
-        # Re-display any restored workbench designs now that we're on the UI thread. show_model →
-        # workbench.load_model rehydrates the persisted variants/results (the models are still
-        # open in the surviving ChimeraX). No-op when nothing was restored.
+        # Re-display any restored workbench designs now that we're on the UI thread.
+        self._redisplay_designs(getattr(self, "_restore_mids", []) or [])
+        self._restore_mids = []
+
+    def _redisplay_designs(self, mids) -> None:
+        """Re-display restored workbench designs (the SINGLE re-display contract, shared by the
+        startup restore and a named Load). For each design id: a DE-NOVO construct rehydrates
+        directly (synthetic id not in ChimeraX; its fold model is live in the reopened scene); a
+        crystal-seeded design re-shows its model. Must run on the UI thread. Per-design error-first
+        so one mis-pointing design can't abort the rest. Relies on the model ids being the SAVED
+        ones — true for both the app-restart restore (ChimeraX persists) and a named Load (opening
+        scene.cxs restores models at their saved ids)."""
         designs = getattr(self.session, "design_sessions", {}) or {}
-        for mid in getattr(self, "_restore_mids", []) or []:
+        for mid in mids:
             try:
                 dd = designs.get(mid) or {}
                 if dd.get("source") == "sequence":
-                    # DE-NOVO construct: no crystal to re-open — rehydrate directly (the
-                    # synthetic id isn't in ChimeraX; the fold survives the app restart).
                     self.workbench.rehydrate_denovo(dd)
                 else:
                     self.show_model(mid)
             except Exception as exc:
                 self.presenter.warn(f"Restore display #{mid} failed: {exc}")
-        self._restore_mids = []
+
+    def _reset_view_for_session(self) -> None:
+        """Clear the chain-grid tabs + the workbench panel before displaying a different session
+        (load = REPLACE). Does NOT close ChimeraX models — a named Load reopens scene.cxs (which
+        replaces the scene itself); Clear leaves the user's models untouched (parity with the CLI)."""
+        self.tabs.clear()
+        self._grids.clear()
+        try:
+            self.workbench.reset()
+        except Exception:
+            pass
+
+    # ── Session menu: named save / load / clear (shares session_io with the CLI) ──────
+    def _on_save_session(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save session", "Session name:")
+        if not ok or not (name or "").strip():
+            return
+        import session_io
+        info = session_io.save_named_session(self.bridge, self.session, name)
+        if not info["cxs_ok"]:
+            self.presenter.warn(f"Scene not saved ({info['cxs_error']}); state was still written.")
+        if info["json_error"]:
+            self.presenter.error(f"Save failed: {info['json_error']}")
+        else:
+            self.presenter.success(f"✓ Saved session '{info['name']}' → {info['dir']}")
+
+    def _on_load_session(self) -> None:
+        import session_io
+        names = session_io.list_saved_sessions()
+        if not names:
+            self.presenter.dim("No saved sessions yet (Session ▸ Save… first).")
+            return
+        name, ok = QtWidgets.QInputDialog.getItem(
+            self, "Load session", "Session (replaces the current one):", names, 0, False)
+        if not ok or not name:
+            return
+        self.statusBar().showMessage(f"Loading session '{name}'…")
+        info = session_io.load_named_session(self.bridge, name)
+        if info["error"]:                                  # FAIL-LOUD — never swap to a fresh state
+            self.presenter.error(f"Load failed: {info['error']}")
+            self.statusBar().showMessage("Ready")
+            return
+        if info["cxs_error"]:
+            self.presenter.warn(f"Scene: {info['cxs_error']}")
+        # Replace the session + re-point everything that holds a session reference.
+        self.session = info["state"]
+        self.router = ToolRouter(self.bridge, self.session)
+        self.workbench.attach_session(self.session)
+        self._reset_view_for_session()
+        self._redisplay_designs(list((getattr(self.session, "design_sessions", {}) or {}).keys()))
+        self.presenter.success(f"✓ Loaded session '{info['name']}'")
+        self.statusBar().showMessage("Ready")
+
+    def _on_clear_session(self) -> None:
+        if QtWidgets.QMessageBox.question(
+                self, "Clear session",
+                "Start a fresh session? Workbench designs + analysis are cleared. "
+                "Loaded ChimeraX models are left open.") != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self.session = SessionState()
+        self.router = ToolRouter(self.bridge, self.session)
+        self.workbench.attach_session(self.session)
+        self._reset_view_for_session()
+        try:
+            Path("session.json").unlink()
+        except OSError:
+            pass
+        self.presenter.dim("Session cleared — fresh start. Loaded ChimeraX models are untouched.")
 
     def _run_preflight(self) -> None:
         """Worker-thread preflight: bring up ChimeraX + Ollama, render the ✓ checklist to

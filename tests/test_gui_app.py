@@ -444,3 +444,79 @@ def test_intent_classifier_uses_config_base_url(_app, monkeypatch):
     fn = intent_registry.make_llm_classify_fn(backend_name="ollama")
     fn("do something", ["view.cartoon_only"])
     assert cap.get("url", "").startswith("http://sentinel:9999"), cap
+
+
+# ── Session menu: named save / load / clear (wiring over session_io) ───────────────
+from unittest.mock import MagicMock as _MM  # noqa: E402
+from session_state import SessionState as _SS  # noqa: E402
+
+
+def _fakew(**attrs):
+    """Bind the session-menu methods to a non-QWidget stand-in (avoids the full QMainWindow)."""
+    obj = types.SimpleNamespace(**attrs)
+    for name in ("_on_load_session", "_on_clear_session", "_on_save_session",
+                 "_redisplay_designs", "_reset_view_for_session", "show_model"):
+        setattr(obj, name, types.MethodType(getattr(W, name), obj))
+    return obj
+
+
+def test_load_session_failloud_does_not_swap(_app, monkeypatch):
+    import session_io
+    orig = _SS()
+    monkeypatch.setattr(session_io, "list_saved_sessions", lambda: ["bad"])
+    monkeypatch.setattr(session_io, "load_named_session",
+                        lambda b, n: {"name": "bad", "state": None, "error": "corrupt JSON",
+                                      "cxs_ok": False, "cxs_error": None})
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *a, **k: ("bad", True))
+    w = _fakew(bridge=_MM(), session=orig, router=_MM(), workbench=_MM(), presenter=_MM(),
+               tabs=QtWidgets.QTabWidget(), _grids={}, statusBar=lambda: _MM())
+    w._on_load_session()
+    assert w.session is orig                       # FAIL-LOUD: never swapped to a fresh/loaded state
+    w.presenter.error.assert_called_once()
+    w.workbench.attach_session.assert_not_called()
+
+
+def test_load_session_replaces_and_redisplays_denovo(_app, monkeypatch):
+    import session_io
+    new = _SS()
+    new.add_design_session("denovo-1", {"model_id": "denovo-1", "source": "sequence",
+                                        "chains": {}, "next_id": 1})
+    monkeypatch.setattr(session_io, "list_saved_sessions", lambda: ["expt"])
+    monkeypatch.setattr(session_io, "load_named_session",
+                        lambda b, n: {"name": "expt", "state": new, "error": None,
+                                      "cxs_ok": True, "cxs_error": None})
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *a, **k: ("expt", True))
+    monkeypatch.setattr(gui_app, "ToolRouter", lambda *a, **k: _MM())
+    wb = _MM()
+    w = _fakew(bridge=_MM(), session=_SS(), router=_MM(), workbench=wb, presenter=_MM(),
+               tabs=QtWidgets.QTabWidget(), _grids={}, statusBar=lambda: _MM())
+    w._on_load_session()
+    assert w.session is new                         # REPLACE
+    wb.attach_session.assert_called_with(new)
+    wb.rehydrate_denovo.assert_called_once()        # de-novo design re-displayed via the contract
+
+
+def test_clear_session_resets_state_and_view(_app, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question",
+                        lambda *a, **k: QtWidgets.QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(gui_app, "ToolRouter", lambda *a, **k: _MM())
+    orig = _SS(); wb = _MM()
+    w = _fakew(bridge=_MM(), session=orig, router=_MM(), workbench=wb, presenter=_MM(),
+               tabs=QtWidgets.QTabWidget(), _grids={"x": 1})
+    w._on_clear_session()
+    assert w.session is not orig and isinstance(w.session, _SS)   # fresh state
+    wb.attach_session.assert_called_once()
+    wb.reset.assert_called_once()
+    assert w._grids == {}                            # view reset
+
+
+def test_save_session_reports_success(_app, monkeypatch):
+    import session_io
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **k: ("my-expt", True))
+    monkeypatch.setattr(session_io, "save_named_session",
+                        lambda b, s, n: {"name": "my-expt", "dir": "/x/my-expt",
+                                         "cxs_ok": True, "cxs_error": None, "json_error": None})
+    w = _fakew(bridge=_MM(), session=_SS(), presenter=_MM())
+    w._on_save_session()
+    w.presenter.success.assert_called_once()

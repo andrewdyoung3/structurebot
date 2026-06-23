@@ -764,41 +764,32 @@ class StructureBot:
             console.print("[ok]✓[/ok] Conversation context cleared.")
 
     def _cmd_save_session(self, name: str) -> None:
-        name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
-        cxs_path  = config.SESSION_DIR / f"{name}.cxs"
-        json_path = config.SESSION_DIR / f"{name}.json"
-
-        # Save ChimeraX session
-        cx_fwd = cxs_path.as_posix()
-        result = self.bridge.run_command(f'save "{cx_fwd}"')
-        if result.get("error"):
-            console.print(f"[err]ChimeraX save failed: {escape(result['error'][:80])}[/err]")
+        # Delegate to the shared session_io core (one path for CLI + GUI).
+        import session_io
+        info = session_io.save_named_session(self.bridge, self.session, name)
+        if info["cxs_ok"]:
+            console.print(f"[ok]✓[/ok] ChimeraX session → {info['cxs_path']}")
         else:
-            console.print(f"[ok]✓[/ok] ChimeraX session → {cxs_path}")
-
-        # Save Python session state
-        self.session.save(str(json_path))
-        console.print(f"[ok]✓[/ok] Session state   → {json_path}")
+            console.print(f"[err]ChimeraX save failed: {escape(str(info['cxs_error'])[:80])}[/err]")
+        if info["json_error"]:
+            console.print(f"[err]State save failed: {escape(str(info['json_error'])[:80])}[/err]")
+        else:
+            console.print(f"[ok]✓[/ok] Session state   → {info['json_path']}")
 
     def _cmd_load_session(self, name: str) -> None:
-        name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
-        cxs_path  = config.SESSION_DIR / f"{name}.cxs"
-        json_path = config.SESSION_DIR / f"{name}.json"
-
-        if not cxs_path.is_file():
-            console.print(f"[err]Session not found: {cxs_path}[/err]")
+        # Delegate to the shared session_io core. Fail-loud: never swap to a fresh state.
+        import session_io
+        info = session_io.load_named_session(self.bridge, name)
+        if info["error"]:
+            console.print(f"[err]{escape(str(info['error'])[:120])}[/err]")
             return
-
-        cx_fwd = cxs_path.as_posix()
-        result = self.bridge.run_command(f'open "{cx_fwd}"')
-        if result.get("error"):
-            console.print(f"[err]ChimeraX open failed: {escape(result['error'][:80])}[/err]")
-        else:
-            console.print(f"[ok]✓[/ok] Loaded ChimeraX session from {cxs_path}")
-
-        if json_path.is_file():
-            self.session = SessionState.load(str(json_path))
-            console.print(f"[ok]✓[/ok] Restored session state from {json_path}")
+        if info["cxs_ok"]:
+            console.print(f"[ok]✓[/ok] Loaded ChimeraX session from {info['cxs_path']}")
+        elif info["cxs_error"]:
+            console.print(f"[warn]{escape(str(info['cxs_error'])[:80])}[/warn]")
+        self.session = info["state"]
+        self.router  = ToolRouter(self.bridge, self.session)
+        console.print(f"[ok]✓[/ok] Restored session state from {info['json_path']}")
 
     def _cmd_jobs(self) -> None:
         """Show all Robetta / PyRosetta jobs tracked in this session."""

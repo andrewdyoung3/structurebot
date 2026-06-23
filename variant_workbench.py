@@ -837,6 +837,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         edits never persist into the restored file."""
         self._session = session
 
+    def reset(self) -> None:
+        """Clear the panel to the no-design state — used on session Clear and before displaying a
+        DIFFERENT session (load = replace). Does NOT persist (the caller already swapped the
+        SessionState); a subsequent rehydrate/load_model repopulates it."""
+        self._design = None
+        self._edit_target = None
+        self._scan_cols.clear()
+        self._update_scan_label()
+        self._render()
+        self._status.setText("No structure loaded.")
+
     def rehydrate_denovo(self, design_dict: Dict[str, Any]) -> None:
         """DE-NOVO restore (no crystal): rehydrate the construct DIRECTLY from persisted data —
         NOT via controller.load_model (the synthetic id isn't in ChimeraX, and the crystal

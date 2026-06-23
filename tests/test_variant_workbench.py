@@ -2170,3 +2170,14 @@ class TestTemplateGuided:
         cd = self._fold_unguided_monomer(p)
         cd.structural_align = {"reference": "1UBQ", "shared_fold": False}
         assert p._suggested_template_ref(cd) == ""
+
+
+def test_reset_clears_design_and_tabs(_app):
+    """panel.reset() returns the panel to the no-design state (used on session Clear / before
+    loading a different session). Does not require a session swap to take effect."""
+    p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "WYF")])
+    p.load_model("1")
+    assert p._tabs.count() == 2 and p._design is not None
+    p.reset()
+    assert p._design is None
+    assert p._tabs.count() == 0
