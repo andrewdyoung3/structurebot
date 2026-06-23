@@ -234,6 +234,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                 self._put(block, len(labels) - 1, lc, cons_pct[gcol], gcol, None, None, faint=True)
             block.resizeColumnsToContents()
             block.resizeRowsToContents()
+            self._size_block_to_content(block)         # full-height, no per-block scrollbar (unified scroll)
             block.cellClicked.connect(self._on_cell)
             block.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             block.customContextMenuRequested.connect(
@@ -252,6 +253,26 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         self.setWidget(inner)
         self._mark_active_header()
         self.set_color_mode(self._mode)            # re-apply the active mode after a rebuild
+
+    @staticmethod
+    def _size_block_to_content(block: QtWidgets.QTableWidget) -> None:
+        """Make a block show ALL its rows with NO internal scrollbar, so the OUTER QScrollArea is
+        the SINGLE scroller (the unified block-scroll: T + variants + consensus/conservation scroll
+        together). Fixed to content height + width; with fixed-count blocks the outer area provides
+        ONE horizontal scrollbar if a block is wider than the window. Cause-targeting: the cause of
+        the old per-block scrollbars was each QTableWidget self-capping its height — this removes it
+        without touching any cell data / coupling (everything stays keyed on item data roles)."""
+        block.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        block.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        block.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
+        fr = 2 * block.frameWidth()
+        # horizontalHeader is hidden → no column-header height term; the vertical (row-label)
+        # header sits to the LEFT, so it adds to width, not height.
+        h = sum(block.rowHeight(r) for r in range(block.rowCount())) + fr
+        w = (sum(block.columnWidth(c) for c in range(block.columnCount()))
+             + block.verticalHeader().width() + fr)
+        block.setFixedHeight(h)
+        block.setFixedWidth(w)
 
     def _variant_label(self, vid: str) -> str:
         """Variant row header: the id plus its inline result badge (S4a), if any."""
