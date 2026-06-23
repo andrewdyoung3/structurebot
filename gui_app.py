@@ -221,6 +221,63 @@ class _PreflightWorker(QtCore.QRunnable):
         self.signals.done.emit()
 
 
+class _ReconnectSignals(QtCore.QObject):
+    done = QtCore.Signal(dict)
+
+
+class _ReconnectWorker(QtCore.QRunnable):
+    """Runs the ChimeraX relaunch + structure re-open off the UI thread (ensure_visible_gui can
+    take 20-40 s to start ChimeraX). Mutates nothing — the UI thread applies the remap + redraw."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.win = window
+        self.signals = _ReconnectSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            payload = self.win._do_reconnect()
+        except Exception as exc:                       # error-first: never crash the pool
+            self.win.presenter.error(f"Reconnect error: {type(exc).__name__}: {exc}")
+            payload = {"remap": {}, "reopened": [], "errors": [str(exc)], "outcome": "error"}
+        self.signals.done.emit(payload)
+
+
+def remap_session_model_ids(session, old_to_new: dict) -> None:
+    """Rewrite ChimeraX model ids across a SessionState after structures were re-opened with FRESH
+    ids (a closed+relaunched ChimeraX reassigns ids). Renames `structures` keys, crystal-seeded
+    `design_sessions` keys, and the model-id refs INSIDE every design (`rep_model`, `members`,
+    `template_fold`/`guided_fold.model_id`, `wt_refs[*].model_id`, `model_id`). De-novo design keys
+    (synthetic `denovo-…`) are NOT ChimeraX ids and are left as-is — only their internal fold-model
+    refs are remapped. Pure dict surgery on the persisted blobs (testable, no ChimeraX)."""
+    m = {str(o): str(n) for o, n in (old_to_new or {}).items() if str(o) != str(n)}
+    if not m:
+        return
+    structs = getattr(session, "structures", None) or {}
+    for old, new in m.items():
+        if old in structs:
+            structs[new] = structs.pop(old)
+    ds = getattr(session, "design_sessions", None) or {}
+    for key in list(ds.keys()):
+        dd = ds[key] or {}
+        for cd in (dd.get("chains") or {}).values():
+            if str(cd.get("rep_model")) in m:
+                cd["rep_model"] = m[str(cd["rep_model"])]
+            cd["members"] = [[m.get(str(mm), mm), ch] for mm, ch in (cd.get("members") or [])]
+            for slot in ("template_fold", "guided_fold"):
+                blk = cd.get(slot)
+                if isinstance(blk, dict) and str(blk.get("model_id")) in m:
+                    blk["model_id"] = m[str(blk["model_id"])]
+            for ref in (cd.get("wt_refs") or {}).values():
+                if isinstance(ref, dict) and str(ref.get("model_id")) in m:
+                    ref["model_id"] = m[str(ref["model_id"])]
+        if str(dd.get("model_id")) in m:
+            dd["model_id"] = m[str(dd["model_id"])]
+        if key in m:                                   # crystal-seeded design key == its model id
+            ds[m[key]] = ds.pop(key)
+
+
 class _HistoryLineEdit(QtWidgets.QLineEdit):
     """Command input with ↑/↓ history recall (the console affordance a user relies on)."""
 
@@ -334,6 +391,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         tb = self.addToolBar("main")
         self.cancel_action = tb.addAction("Cancel", self._on_cancel)
         self.cancel_action.setEnabled(False)
+        # Re-open / refresh the ChimeraX view: relaunch a visible ChimeraX if it was closed and
+        # re-open the session's structures so the sequence grids + workbench re-link to live 3D.
+        self.reconnect_action = tb.addAction("Reconnect ChimeraX", self._on_reconnect_clicked)
+        self.reconnect_action.setToolTip(
+            "Re-open the ChimeraX window (if closed) and re-open this session's structures so the "
+            "sequence view + Variant Workbench are linked to 3D again.")
         self.statusBar().showMessage("Ready")
 
         # Session menu — named save / load / clear (workbench sessions). Shares session_io with
@@ -833,6 +896,104 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         except OSError:
             pass
         self.presenter.dim("Session cleared — fresh start. Loaded ChimeraX models are untouched.")
+
+    # ── Reconnect / refresh the ChimeraX view (relaunch + re-open + re-link) ──────────
+    def _on_reconnect_clicked(self) -> None:
+        if not self.session.structures:
+            self.presenter.dim("Nothing to re-open — no structures in this session yet.")
+            return
+        self.reconnect_action.setEnabled(False)
+        self.statusBar().showMessage("Reconnecting ChimeraX…")
+        self.presenter.info("Reconnecting ChimeraX (relaunching if closed; re-opening structures)…")
+        w = _ReconnectWorker(self)
+        w.signals.done.connect(self._on_reconnect_done)
+        self._pool.start(w)
+
+    def _do_reconnect(self) -> dict:
+        """OFF-THREAD: ensure a VISIBLE ChimeraX is up (relaunch if it was closed), then re-open
+        every session structure that is missing from the (possibly fresh) ChimeraX, capturing each
+        one's NEW model id. Returns {remap old->new, reopened, errors, outcome}; no session mutation
+        here (the UI thread applies it). A structure already present is mapped to itself."""
+        outcome = self.bridge.ensure_visible_gui(timeout=60)
+
+        def cur_ids():
+            res = self.bridge.run_command("info models")
+            val = (res.get("value") or "") if isinstance(res, dict) else ""
+            return set(re.findall(r"#(\d+)", val))
+
+        remap, reopened, errors = {}, [], []
+        open_now = cur_ids()
+        for old_id, info in list(self.session.structures.items()):
+            name = str(info.get("name", "?"))
+            if old_id in open_now:
+                remap[old_id] = old_id                 # ChimeraX wasn't fully closed — reuse as-is
+                continue
+            target = info.get("path") or name
+            if not (re.match(r"^[A-Za-z0-9]{4}$", name.strip()) or info.get("path")):
+                errors.append(f"#{old_id} {name}: nothing to re-open from")
+                continue
+            before = cur_ids()
+            res = self.bridge.run_command(f"open {target}")
+            if isinstance(res, dict) and res.get("error"):
+                errors.append(f"{name}: {str(res['error'])[:60]}")
+                continue
+            after = cur_ids()
+            new = sorted(after - before, key=int)
+            if not new:
+                errors.append(f"{name}: opened but no new model id detected")
+                continue
+            remap[old_id] = new[-1]
+            reopened.append((name, old_id, new[-1]))
+            open_now = after
+        return {"remap": remap, "reopened": reopened, "errors": errors, "outcome": outcome}
+
+    def _denovo_fold_ids(self) -> set:
+        """Model ids that are de-novo FOLD models (referenced by a `source=='sequence'` design) —
+        these are re-displayed via `rehydrate_denovo`, NOT as plain structures."""
+        ids: set = set()
+        for dd in (getattr(self.session, "design_sessions", {}) or {}).values():
+            if (dd or {}).get("source") != "sequence":
+                continue
+            for cd in (dd.get("chains") or {}).values():
+                for slot in ("template_fold", "guided_fold"):
+                    mid = (cd.get(slot) or {}).get("model_id")
+                    if mid:
+                        ids.add(str(mid))
+                for mm, _ch in (cd.get("members") or []):
+                    ids.add(str(mm))
+        return ids
+
+    @QtCore.Slot(dict)
+    def _on_reconnect_done(self, payload: dict) -> None:
+        self.reconnect_action.setEnabled(True)
+        changed = {o: n for o, n in (payload.get("remap") or {}).items() if str(o) != str(n)}
+        if changed:
+            remap_session_model_ids(self.session, changed)   # old ids → fresh reopened ids
+            self.workbench.attach_session(self.session)
+        # Rebuild the view: re-link workbench designs (de-novo rehydrate / crystal show_model) +
+        # any plain loaded structures that aren't a de-novo fold model.
+        self._reset_view_for_session()
+        design_keys = set(getattr(self.session, "design_sessions", {}) or {})
+        self._redisplay_designs(list(design_keys))
+        fold_ids = self._denovo_fold_ids()
+        for mid in list(self.session.structures.keys()):
+            if mid in design_keys or mid in fold_ids:
+                continue
+            try:
+                self.show_model(mid)
+            except Exception as exc:
+                self.presenter.warn(f"re-show #{mid} failed: {exc}")
+        try:
+            self.bridge._maybe_apply_lean_layout()
+        except Exception:
+            pass
+        if payload.get("errors"):
+            self.presenter.warn("Reconnect issues: " + "; ".join(payload["errors"][:4]))
+        n = len(payload.get("reopened") or [])
+        self.presenter.success(
+            f"✓ ChimeraX reconnected — re-opened {n} structure(s); sequence + workbench re-linked."
+            if n else "✓ ChimeraX reconnected — view re-linked.")
+        self.statusBar().showMessage("Ready")
 
     def _run_preflight(self) -> None:
         """Worker-thread preflight: bring up ChimeraX + Ollama, render the ✓ checklist to
