@@ -762,10 +762,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 self.presenter.warn(f"Restore display #{mid} failed: {exc}")
 
     def _reset_view_for_session(self) -> None:
-        """Clear the chain-grid tabs + the workbench panel before displaying a different session
-        (load = REPLACE). Does NOT close ChimeraX models — a named Load reopens scene.cxs (which
-        replaces the scene itself); Clear leaves the user's models untouched (parity with the CLI)."""
-        self.tabs.clear()
+        """Reset the view before displaying a different session (load = REPLACE) / on Clear.
+        Removes the CHAIN-GRID tabs but KEEPS the Variant Workbench tab (it is a tab inside
+        `self.tabs`, so a blanket `clear()` would destroy the panel + its toolbar — leaving no way
+        to start a new session). The workbench is cleared to its no-design state via `reset()`.
+        Does NOT close ChimeraX models — a named Load reopens scene.cxs (replacing the scene
+        itself); Clear leaves the user's models untouched (parity with the CLI)."""
+        for i in range(self.tabs.count() - 1, -1, -1):
+            if self.tabs.widget(i) is not self.workbench:    # keep the workbench tab + its toolbar
+                self.tabs.removeTab(i)
         self._grids.clear()
         try:
             self.workbench.reset()
