@@ -72,6 +72,10 @@ _GLYPH_DARK = QtGui.QColor("#1a1a1a")       # default readable glyph on light/de
 # a dark widget palette — de-emphasised vs the active row, yet legible.
 _DIM_BG = QtGui.QColor("#eceef2")
 _DIM_FG = QtGui.QColor("#3c4250")
+# Default (no colour-mode) VARIANT sequence cell: an EXPLICIT medium-light grey so the black
+# glyph is high-contrast, instead of a cleared brush that inherited the dark widget base
+# (the old black-on-dark-grey). Distinct from the T tint (#eef4ff) + the edit highlight (#ffd27f).
+_VARIANT_BG = QtGui.QColor("#d3d7dd")
 
 
 def _contrast_fg(qcolor: QtGui.QColor) -> QtGui.QColor:
@@ -353,7 +357,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             return QtGui.QBrush(_T_BG)
         if edited:
             return QtGui.QBrush(_EDIT_BG)
-        return QtGui.QBrush()                                    # clear
+        return QtGui.QBrush(_VARIANT_BG)         # EXPLICIT medium-light grey (was clear → dark-on-dark)
 
     # ── color mode: repaint sequence rows (T + variants) by each cell's aa ──────────
     def set_color_mode(self, mode) -> None:
