@@ -520,3 +520,21 @@ def test_save_session_reports_success(_app, monkeypatch):
     w = _fakew(bridge=_MM(), session=_SS(), presenter=_MM())
     w._on_save_session()
     w.presenter.success.assert_called_once()
+
+
+def test_reset_view_keeps_workbench_tab(_app):
+    """REGRESSION: the Variant Workbench is a tab INSIDE self.tabs; _reset_view_for_session must
+    drop the chain-grid tabs but KEEP the workbench tab (a blanket clear() destroyed the panel +
+    its toolbar, leaving no way to start a new session after Clear/Load)."""
+    tabs = QtWidgets.QTabWidget()
+    wb = QtWidgets.QWidget()
+    reset_calls = {"n": 0}
+    wb.reset = lambda: reset_calls.__setitem__("n", reset_calls["n"] + 1)
+    tabs.addTab(wb, "Variant Workbench")
+    grid = QtWidgets.QWidget()
+    tabs.addTab(grid, "#1/A")
+    w = _fakew(tabs=tabs, workbench=wb, _grids={("1", "A"): grid})
+    w._reset_view_for_session()
+    widgets = [tabs.widget(i) for i in range(tabs.count())]
+    assert wb in widgets and grid not in widgets   # workbench (toolbar) kept; grid dropped
+    assert w._grids == {} and reset_calls["n"] == 1
