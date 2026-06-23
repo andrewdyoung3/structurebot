@@ -921,17 +921,19 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             val = (res.get("value") or "") if isinstance(res, dict) else ""
             return set(re.findall(r"#(\d+)", val))
 
-        remap, reopened, errors = {}, [], []
+        remap, reopened, errors, fallbacks = {}, [], [], []
         open_now = cur_ids()
         for old_id, info in list(self.session.structures.items()):
             name = str(info.get("name", "?"))
             if old_id in open_now:
                 remap[old_id] = old_id                 # ChimeraX wasn't fully closed — reuse as-is
                 continue
-            target = info.get("path") or name
-            if not (re.match(r"^[A-Za-z0-9]{4}$", name.strip()) or info.get("path")):
-                errors.append(f"#{old_id} {name}: nothing to re-open from")
+            target = self._resolve_reopen_target(info)
+            if not target:
+                errors.append(f"#{old_id} {name}: no source to re-open from "
+                              "(temp fold gone, no saved-session copy, no PDB id)")
                 continue
+            used_fallback = bool(info.get("path")) and target != info.get("path")
             before = cur_ids()
             res = self.bridge.run_command(f"open {target}")
             if isinstance(res, dict) and res.get("error"):
@@ -944,8 +946,29 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 continue
             remap[old_id] = new[-1]
             reopened.append((name, old_id, new[-1]))
+            if used_fallback:
+                fallbacks.append(name)
             open_now = after
-        return {"remap": remap, "reopened": reopened, "errors": errors, "outcome": outcome}
+        return {"remap": remap, "reopened": reopened, "errors": errors,
+                "fallbacks": fallbacks, "outcome": outcome}
+
+    def _resolve_reopen_target(self, info: dict):
+        """Best on-disk/id source to re-open a structure from, in order: its own `path` if the file
+        still exists; else a DURABLE copy in a named session's `folds/` matched by basename (the
+        FALLBACK for a de-novo fold whose volatile temp CIF was cleaned); else the 4-char PDB id
+        (ChimeraX fetches it); else None (un-reopenable)."""
+        path = info.get("path")
+        if path and Path(path).is_file():
+            return path
+        if path:
+            import session_io
+            dur = session_io.find_fold_copy(Path(path).name)
+            if dur:
+                return dur
+        name = str(info.get("name", "")).strip()
+        if re.match(r"^[A-Za-z0-9]{4}$", name):
+            return name
+        return None
 
     def _denovo_fold_ids(self) -> set:
         """Model ids that are de-novo FOLD models (referenced by a `source=='sequence'` design) —
@@ -990,8 +1013,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if payload.get("errors"):
             self.presenter.warn("Reconnect issues: " + "; ".join(payload["errors"][:4]))
         n = len(payload.get("reopened") or [])
+        nfb = len(payload.get("fallbacks") or [])
+        fb = f" ({nfb} from a saved session's folds/)" if nfb else ""
         self.presenter.success(
-            f"✓ ChimeraX reconnected — re-opened {n} structure(s); sequence + workbench re-linked."
+            f"✓ ChimeraX reconnected — re-opened {n} structure(s){fb}; sequence + workbench re-linked."
             if n else "✓ ChimeraX reconnected — view re-linked.")
         self.statusBar().showMessage("Ready")
 
