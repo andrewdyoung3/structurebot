@@ -621,3 +621,71 @@ def test_resolve_reopen_target_prefers_path_then_folds_then_pdbid(_app, monkeypa
     # 4) nothing re-openable -> None
     monkeypatch.setattr(session_io, "find_fold_copy", lambda b: None)
     assert w._resolve_reopen_target({"path": str(tmp_path / "gone.cif"), "name": "denovo-x"}) is None
+
+
+# ── Session ▸ Export results… + Save As… ──────────────────────────────────────────
+def _fakew_session(**attrs):
+    obj = types.SimpleNamespace(**attrs)
+    for name in ("_on_export_results", "_on_save_as_session", "_on_save_session"):
+        setattr(obj, name, types.MethodType(getattr(W, name), obj))
+    return obj
+
+
+def test_export_requires_named_save_first(_app, monkeypatch):
+    import session_export
+    called = {"export": 0}
+    monkeypatch.setattr(session_export, "export_session",
+                        lambda ds, d: called.__setitem__("export", called["export"] + 1) or
+                        {"any": True, "written": ["Solubility"], "skipped": [], "files": []})
+    # user declines the "save first" prompt → no export
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question",
+                        lambda *a, **k: QtWidgets.QMessageBox.StandardButton.No)
+    w = _fakew_session(session=_SS(), presenter=_MM(), _current_session_name=None)
+    w._on_export_results()
+    assert called["export"] == 0
+    w.presenter.success.assert_not_called()
+
+
+def test_export_writes_when_named(_app, monkeypatch, tmp_path):
+    import session_export, session_io
+    monkeypatch.setattr(session_io, "session_paths", lambda n: {"exports": tmp_path / "exports"})
+    monkeypatch.setattr(session_export, "export_session",
+                        lambda ds, d: {"any": True, "written": ["Deviation", "Solubility"],
+                                       "skipped": ["Stability ddG"], "files": []})
+    w = _fakew_session(session=_SS(), presenter=_MM(), _current_session_name="expt")
+    w._on_export_results()
+    w.presenter.success.assert_called_once()
+
+
+def test_export_nothing_to_export(_app, monkeypatch, tmp_path):
+    import session_export, session_io
+    monkeypatch.setattr(session_io, "session_paths", lambda n: {"exports": tmp_path})
+    monkeypatch.setattr(session_export, "export_session",
+                        lambda ds, d: {"any": False, "written": [], "skipped": [], "files": []})
+    w = _fakew_session(session=_SS(), presenter=_MM(), _current_session_name="expt")
+    w._on_export_results()
+    w.presenter.dim.assert_called_once()
+    w.presenter.success.assert_not_called()
+
+
+def test_save_as_switches_current_and_reports(_app, monkeypatch):
+    import session_io
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **k: ("fork", True))
+    monkeypatch.setattr(session_io, "save_as_session",
+                        lambda b, s, n, src_name=None: {"error": None, "name": "fork",
+                                                        "dir": "/x/fork", "copied_from": "/x/orig"})
+    w = _fakew_session(bridge=_MM(), session=_SS(), presenter=_MM(), _current_session_name="orig")
+    w._on_save_as_session()
+    assert w._current_session_name == "fork"           # live session SWITCHED to the fork
+    w.presenter.success.assert_called_once()
+
+
+def test_save_as_error_keeps_current(_app, monkeypatch):
+    import session_io
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **k: ("dup", True))
+    monkeypatch.setattr(session_io, "save_as_session",
+                        lambda b, s, n, src_name=None: {"error": "already exists", "name": "dup"})
+    w = _fakew_session(bridge=_MM(), session=_SS(), presenter=_MM(), _current_session_name="orig")
+    w._on_save_as_session()
+    assert w._current_session_name == "orig"           # unchanged on error
+    w.presenter.error.assert_called_once()

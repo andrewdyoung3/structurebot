@@ -162,3 +162,52 @@ def test_find_fold_copy_by_basename_and_suffix(session_dir):
     assert got2 and Path(got2).name == "boltz_pred_def__1.cif"
     # absent → None
     assert session_io.find_fold_copy("nope.cif") is None
+
+
+def _session_with_fold(tmp_path):
+    cif = tmp_path / "boltz_pred_q.cif"; cif.write_text("data_x\n")
+    s = SessionState()
+    s.add_design_session("denovo-1", {"model_id": "denovo-1", "source": "sequence",
+        "chains": {"c": {"group_key": "g", "rep_model": "denovo-1", "rep_chain": "A",
+                         "members": [["denovo-1", "A"]], "template_cells": [], "variants": [],
+                         "template_fold": {"cif_path": str(cif)}}}})
+    return s, cif
+
+
+def test_save_as_forks_self_contained(session_dir, tmp_path):
+    s, cif = _session_with_fold(tmp_path)
+    session_io.save_named_session(_FakeBridge(), s, "orig")
+    (session_dir / "orig" / "exports").mkdir(exist_ok=True)
+    (session_dir / "orig" / "exports" / "results.xlsx").write_text("xlsx")  # a prior export
+
+    info = session_io.save_as_session(_FakeBridge(), s, "fork", src_name="orig")
+    assert info["error"] is None
+    fork = session_dir / "fork"
+    # inherited durable artifacts travel
+    assert (fork / "exports" / "results.xlsx").is_file()
+    assert list((fork / "folds").glob("*.cif"))                       # fold copy present
+    # the fork's session.json fold path points INTO the fork (self-contained), not orig/ or temp
+    forked = SessionState.load(str(fork / "session.json"))
+    p = forked.get_design_session("denovo-1")["chains"]["c"]["template_fold"]["cif_path"]
+    assert Path(p).parent == (fork / "folds") and Path(p).is_file()
+    # original is untouched; live session unmutated
+    assert (session_dir / "orig" / "session.json").is_file()
+    assert s.get_design_session("denovo-1")["chains"]["c"]["template_fold"]["cif_path"] == str(cif)
+
+
+def test_save_as_fork_survives_temp_fold_deletion(session_dir, tmp_path):
+    s, cif = _session_with_fold(tmp_path)
+    session_io.save_named_session(_FakeBridge(), s, "orig")
+    cif.unlink()                                                      # the volatile temp fold is GONE
+    info = session_io.save_as_session(_FakeBridge(), s, "fork2", src_name="orig")
+    assert info["error"] is None
+    forked = SessionState.load(str(session_dir / "fork2" / "session.json"))
+    p = forked.get_design_session("denovo-1")["chains"]["c"]["template_fold"]["cif_path"]
+    assert Path(p).parent == (session_dir / "fork2" / "folds") and Path(p).is_file()  # from inherited copy
+
+
+def test_save_as_refuses_existing_name(session_dir, tmp_path):
+    s, _ = _session_with_fold(tmp_path)
+    session_io.save_named_session(_FakeBridge(), s, "taken")
+    info = session_io.save_as_session(_FakeBridge(), s, "taken", src_name=None)
+    assert info["error"] and "already exists" in info["error"]
