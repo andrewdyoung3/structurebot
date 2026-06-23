@@ -323,6 +323,7 @@ def test_opened_mid_focus_uses_ground_truth(_app):
     w = types.SimpleNamespace(_opened_mids=["3"], _pending_focus=["1"])
     w._finish_request = lambda: None
     w.show_model = lambda mid: shown.append(mid)
+    w._isolate_foreign_models = lambda: None      # opened a model → isolate fires (stubbed here)
     W._on_request_done(w)
     assert shown == ["3"]                                     # real id wins over next_model_id guess
 
@@ -689,3 +690,49 @@ def test_save_as_error_keeps_current(_app, monkeypatch):
     w._on_save_as_session()
     assert w._current_session_name == "orig"           # unchanged on error
     w.presenter.error.assert_called_once()
+
+
+# ── multi-window isolation: hide another window's models in a shared ChimeraX ──────
+class _IsoBridge:
+    def __init__(self, visible):
+        self._visible = visible
+        self.commands = []
+    def visible_model_ids(self):
+        return list(self._visible)
+    def run_command(self, cmd, timeout=None):
+        self.commands.append(cmd)
+        return {"value": "", "error": None}
+
+
+def _iso_win(**attrs):
+    obj = types.SimpleNamespace(**attrs)
+    obj._isolate_foreign_models = types.MethodType(W._isolate_foreign_models, obj)
+    return obj
+
+
+def test_isolate_hides_foreign_models_still_visible(_app):
+    br = _IsoBridge(visible=["1", "2"])                 # #1 = another window's model, #2 = mine
+    w = _iso_win(bridge=br, _foreign_mids={"1"})
+    w._isolate_foreign_models()
+    assert br.commands == ["hide #1 models"]            # the foreign model is hidden, mine untouched
+
+
+def test_isolate_noop_when_foreign_already_hidden(_app):
+    br = _IsoBridge(visible=["2", "3"])                 # the foreign #1 is no longer visible
+    w = _iso_win(bridge=br, _foreign_mids={"1"})
+    w._isolate_foreign_models()
+    assert br.commands == []
+
+
+def test_isolate_noop_with_no_foreign_baseline(_app):
+    br = _IsoBridge(visible=["1", "2"])
+    w = _iso_win(bridge=br, _foreign_mids=set())        # fresh ChimeraX at startup → nothing foreign
+    w._isolate_foreign_models()
+    assert br.commands == []
+
+
+def test_isolate_hides_multiple_foreign_sorted(_app):
+    br = _IsoBridge(visible=["1", "2", "10"])
+    w = _iso_win(bridge=br, _foreign_mids={"10", "1"})  # mine = #2
+    w._isolate_foreign_models()
+    assert br.commands == ["hide #1,10 models"]         # numeric sort, not lexical
