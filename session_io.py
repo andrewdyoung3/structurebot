@@ -165,6 +165,94 @@ def save_named_session(bridge, session: SessionState, name: str) -> Dict[str, An
     return info
 
 
+def _relocate_folds_merge(design_sessions: Dict[str, Any], folds_dir: Path) -> Dict[str, Any]:
+    """Like `_relocate_folds` but MERGES into an existing *folds_dir* (never wipes it — used by
+    Save As, where the fork has already inherited durable copies from the source folder). For each
+    fold path: copy the live file in + rewrite if it still exists; else if a copy of that basename
+    is ALREADY in folds_dir (inherited), rewrite to it; else leave the path (best-effort)."""
+    out = copy.deepcopy(design_sessions or {})
+    mapping: Dict[str, str] = {}
+
+    def relocate(holder: Any, key: str) -> None:
+        if not isinstance(holder, dict):
+            return
+        src = holder.get(key)
+        if not isinstance(src, str) or not src:
+            return
+        if src in mapping:
+            holder[key] = mapping[src]
+            return
+        dst = folds_dir / Path(src).name               # fold basenames are unique (boltz_pred_<rand>)
+        if dst.is_file():                              # inherited copy (copytree) — prefer it, no dup
+            mapping[src] = str(dst)
+            holder[key] = str(dst)
+            return
+        p = Path(src)
+        if p.is_file():                                # else copy the live file into the fork
+            try:
+                shutil.copyfile(p, dst)
+            except OSError:
+                return
+            mapping[src] = str(dst)
+            holder[key] = str(dst)
+
+    for ds in out.values():
+        for cd in (ds.get("chains") or {}).values():
+            for slot in _FOLD_SLOTS:
+                for k in _FOLD_KEYS:
+                    relocate(cd.get(slot), k)
+            for ref in (cd.get("wt_refs") or {}).values():
+                relocate(ref, "path")
+    return out
+
+
+def save_as_session(bridge, session: SessionState, new_name: str,
+                    src_name: Optional[str] = None) -> Dict[str, Any]:
+    """FORK the current session into a NEW self-contained folder `SESSION_DIR/{new_name}/`:
+    inherit the source session's durable on-disk artifacts (scene.cxs, folds/, exports/) by
+    copying its folder, then re-serialize the CURRENT in-memory state over the fork's session.json
+    (with fold paths rewritten INTO the fork's folds/ — so the fork never references the source) and
+    re-capture the live scene.cxs. The live session is never mutated. Returns
+    {name, dir, error, copied_from, cxs_ok, cxs_error}. Never raises. Errors if the dest exists."""
+    paths = session_paths(new_name)
+    info: Dict[str, Any] = {"name": sanitize_session_name(new_name), "dir": paths["dir"],
+                            "error": None, "copied_from": None, "cxs_ok": False, "cxs_error": None}
+    if paths["dir"].exists():
+        info["error"] = f"a session named '{sanitize_session_name(new_name)}' already exists"
+        return info
+    try:
+        src_dir = session_dir(src_name) if src_name else None
+        if src_dir and src_dir.is_dir():
+            shutil.copytree(src_dir, paths["dir"])     # inherit folds/ + exports/ + scene.cxs
+            info["copied_from"] = str(src_dir)
+        else:
+            paths["dir"].mkdir(parents=True, exist_ok=True)
+        paths["folds"].mkdir(parents=True, exist_ok=True)
+        paths["exports"].mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        info["error"] = f"could not create fork folder: {type(exc).__name__}: {exc}"
+        return info
+    # fresh scene.cxs from the live bridge (current 3D), else keep the inherited one
+    if bridge is not None:
+        try:
+            res = bridge.run_command(f'save "{paths["cxs"].as_posix()}"')
+            info["cxs_error"] = res.get("error")
+            info["cxs_ok"] = not res.get("error")
+        except Exception as exc:
+            info["cxs_error"] = f"{type(exc).__name__}: {exc}"
+    # re-serialize live state over the fork's session.json, MERGING new folds into the inherited set
+    try:
+        original = session.design_sessions
+        session.design_sessions = _relocate_folds_merge(original, paths["folds"])
+        try:
+            session.save(str(paths["json"]))
+        finally:
+            session.design_sessions = original
+    except Exception as exc:
+        info["error"] = f"state write failed: {type(exc).__name__}: {exc}"
+    return info
+
+
 def load_named_session(bridge, name: str) -> Dict[str, Any]:
     """Load a named session. Validates session.json FIRST (fail-loud) and only then reopens
     scene.cxs. Returns {name, dir, cxs_path, json_path, state, error, cxs_ok, cxs_error}:

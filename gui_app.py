@@ -340,6 +340,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._opened_mids: List[str] = []     # REAL opened ids from the bridge — focus TRUTH
         self._services: List[ManagedService] = []   # things WE started → teardown on close
         self._started_chimerax = False
+        self._current_session_name = None       # the named session the live state belongs to (Save/Load/Save As)
 
         # Ground-truth tab focus: the bridge hands us the REAL opened model id.
         self.bridge.on_structure_opened = self._note_opened
@@ -403,7 +404,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # the CLI (one path); load = REPLACE the current session (multi-design open is deferred).
         sm = self.menuBar().addMenu("&Session")
         sm.addAction("Save…", self._on_save_session)
+        sm.addAction("Save As…", self._on_save_as_session)
         sm.addAction("Load…", self._on_load_session)
+        sm.addSeparator()
+        sm.addAction("Export results…", self._on_export_results)
         sm.addSeparator()
         sm.addAction("Clear / New", self._on_clear_session)
 
@@ -852,6 +856,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if info["json_error"]:
             self.presenter.error(f"Save failed: {info['json_error']}")
         else:
+            self._current_session_name = info["name"]
             self.presenter.success(f"✓ Saved session '{info['name']}' → {info['dir']}")
 
     def _on_load_session(self) -> None:
@@ -878,6 +883,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.workbench.attach_session(self.session)
         self._reset_view_for_session()
         self._redisplay_designs(list((getattr(self.session, "design_sessions", {}) or {}).keys()))
+        self._current_session_name = info["name"]
         self.presenter.success(f"✓ Loaded session '{info['name']}'")
         self.statusBar().showMessage("Ready")
 
@@ -891,11 +897,56 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.router = ToolRouter(self.bridge, self.session)
         self.workbench.attach_session(self.session)
         self._reset_view_for_session()
+        self._current_session_name = None
         try:
             Path("session.json").unlink()
         except OSError:
             pass
         self.presenter.dim("Session cleared — fresh start. Loaded ChimeraX models are untouched.")
+
+    def _on_save_as_session(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save As", "New session name:")
+        if not ok or not (name or "").strip():
+            return
+        import session_io
+        info = session_io.save_as_session(self.bridge, self.session, name,
+                                          src_name=self._current_session_name)
+        if info["error"]:
+            self.presenter.error(f"Save As failed: {info['error']}")
+            return
+        # Switch the live session to the fork — subsequent Save/Export land in it; the original is
+        # frozen as a snapshot.
+        self._current_session_name = info["name"]
+        frm = f" (forked from '{Path(info['copied_from']).name}')" if info.get("copied_from") else ""
+        self.presenter.success(f"✓ Saved As '{info['name']}'{frm} → {info['dir']}; now editing the fork.")
+
+    def _on_export_results(self) -> None:
+        """Export the session's results into {name}/exports/ (results.xlsx + csv/). Requires a named
+        session — if unnamed, prompt to Save first (reuse the Save dialog). Fail-loud: skip result
+        types with no data; nothing-has-data → no files written."""
+        import session_io
+        import session_export
+        if not self._current_session_name:
+            if QtWidgets.QMessageBox.question(
+                    self, "Save first",
+                    "Exports live inside a named session's folder. Save this session first?"
+                    ) != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            self._on_save_session()                    # prompts for a name + sets _current_session_name
+            if not self._current_session_name:         # user cancelled the save
+                return
+        exports_dir = session_io.session_paths(self._current_session_name)["exports"]
+        rep = session_export.export_session(getattr(self.session, "design_sessions", {}) or {},
+                                            exports_dir)
+        if not rep["any"]:
+            self.presenter.dim("Nothing to export yet — no fold / deviation / stability / "
+                               "solubility / template-assist / alignment results in this session.")
+            return
+        msg = f"✓ Exported {len(rep['written'])} result type(s) → {exports_dir} "
+        msg += f"(results.xlsx + csv/). Written: {', '.join(rep['written'])}."
+        if rep["skipped"]:
+            msg += f"  Skipped (no data): {', '.join(rep['skipped'])}."
+        self.presenter.success(msg)
 
     # ── Reconnect / refresh the ChimeraX view (relaunch + re-open + re-link) ──────────
     def _on_reconnect_clicked(self) -> None:
