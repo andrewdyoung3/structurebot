@@ -341,6 +341,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._services: List[ManagedService] = []   # things WE started → teardown on close
         self._started_chimerax = False
         self._current_session_name = None       # the named session the live state belongs to (Save/Load/Save As)
+        # Models ALREADY open when this window connected — i.e. opened by ANOTHER StructureBot
+        # window sharing this ChimeraX (REST :60001). Hidden when this window opens its own model
+        # so the current working model isn't overlaid by a different window's structure.
+        self._foreign_mids: set = set()
 
         # Ground-truth tab focus: the bridge hands us the REAL opened model id.
         self.bridge.on_structure_opened = self._note_opened
@@ -626,16 +630,36 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None
+        opened = bool(self._opened_mids)
         self._finish_request()
+        if opened:                              # a fold opened a model → isolate from other windows
+            self._isolate_foreign_models()
 
     @QtCore.Slot()
     def _on_request_done(self) -> None:
         # Ground truth first: the REAL opened ids the bridge captured; the next_model_id()
         # guesses are only the fallback when the bridge saw no open result.
+        opened = bool(self._opened_mids)
         focus = list(self._opened_mids) if self._opened_mids else list(self._pending_focus)
         self._finish_request()
         for mid in focus:                       # after an open, focus the new model's tab
             self.show_model(mid)
+        if opened:                              # claimed a working model → hide other windows' models
+            self._isolate_foreign_models()
+
+    def _isolate_foreign_models(self) -> None:
+        """In a SHARED ChimeraX, HIDE (not close) any still-visible model that was already open
+        when this window connected — i.e. opened by another StructureBot window — so the current
+        working model isn't overlaid. Best-effort; never touches this window's own models (they
+        have ids that weren't in the startup baseline)."""
+        if not getattr(self, "_foreign_mids", None):
+            return
+        try:
+            still = self._foreign_mids & set(self.bridge.visible_model_ids())
+            if still:
+                self.bridge.run_command("hide #" + ",".join(sorted(still, key=int)) + " models")
+        except Exception:
+            pass
 
     def _note_opened(self, model_id) -> None:
         """Bridge post-open hook (worker thread): record the REAL opened model id."""
@@ -1122,6 +1146,14 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             p.success(f"✓ Ping OK ({ping['latency_ms']} ms) — {ver}")
         else:
             p.warn(f"⚠ Ping failed: {ping['result'].get('error')}")
+        # Baseline of models ALREADY open in this (possibly shared) ChimeraX — i.e. opened by
+        # ANOTHER StructureBot window. They are hidden once THIS window opens its own model, so
+        # the current working model isn't overlaid (models created later by this window — opens,
+        # folds, assemblies — get ids NOT in this set, so they're never hidden).
+        try:
+            self._foreign_mids = set(self.bridge.visible_model_ids())
+        except Exception:
+            self._foreign_mids = set()
         # Structure-only window: hide Log/Models/CLI/Toolbar NOW (at startup), not just
         # on first open — so the clean structure view is up before any model loads.
         # Once-per-session guarded; the first-open call remains a no-op fallback.
