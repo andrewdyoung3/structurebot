@@ -2181,3 +2181,24 @@ def test_reset_clears_design_and_tabs(_app):
     p.reset()
     assert p._design is None
     assert p._tabs.count() == 0
+
+
+def test_blocks_content_sized_no_internal_scrollbar(_app):
+    """Unified block-scroll: each wrapped block shows ALL its rows with NO internal scrollbar
+    (the outer QScrollArea is the single scroller), and the column→residue coupling survives
+    across wrapping (a column in a LATER block still maps to its members)."""
+    from variant_workbench import _COLS
+    seq = "ACDEFGHIKLMNPQRSTVWY" * 3 + "ACDEFGHIKL"      # 70 residues → 3 blocks (30,30,10)
+    p, _ = _panel([_chainseq("1", "A", seq)])
+    p.load_model("1")
+    p._add_variant()                                      # stack a variant (taller blocks)
+    tab = p._cur_tab()
+    assert len(tab._blocks) == 3                          # wrapped at _COLS=30
+    assert isinstance(tab, QtWidgets.QScrollArea) and tab.widgetResizable()  # the one outer scroller
+    for b in tab._blocks:
+        assert b.verticalScrollBarPolicy() == QtCore.Qt.ScrollBarAlwaysOff   # no per-block scrollbar
+        assert b.minimumHeight() == b.maximumHeight()     # fixed to content
+        assert b.height() >= sum(b.rowHeight(r) for r in range(b.rowCount()))  # every row visible
+    # coupling preserved across wrapping: a column in the LAST block maps to members
+    specs = p.select_specs_for_column(tab.design, 65)     # block 3 (cols 60-69) → resnum 66
+    assert specs == [("1", "A", [66])]
