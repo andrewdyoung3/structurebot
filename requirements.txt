@@ -24,10 +24,12 @@ PySide6==6.11.1
 # freesasa   — SASA for glycan/solvent accessibility (falls back to Bio.PDB
 #              ShrakeRupley if absent, but it is a first-class path)
 # openpyxl   — stability/ddG .xlsx export
+# matplotlib — session-export profile figures (Agg/headless); numpy>=1.25 already satisfied (no bump)
 numpy==2.4.6
 biopython==1.87
 freesasa==2.2.1
 openpyxl==3.1.5
+matplotlib==3.11.0
 
 # ── Test/dev tooling ───────────────────────────────────────────────────────────
 # Running the suite (pytest) is NOT a runtime dependency — it lives in:

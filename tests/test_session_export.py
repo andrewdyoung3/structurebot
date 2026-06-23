@@ -65,16 +65,16 @@ def test_export_writes_workbook_and_csvs_with_matching_columns(tmp_path):
 
     import openpyxl
     wb = openpyxl.load_workbook(str(xlsx))
-    # every populated result type present as a sheet (+ Summary); none empty
-    expected = ["Summary", "Fold pLDDT", "Deviation", "Stability ddG", "Solubility",
-                "Template assist", "Template assist dflex", "Structural align"]
+    # Substitutions appears (variants have mutations); Sequences does NOT (this fixture has no cells)
+    expected = ["Summary", "Substitutions", "Fold pLDDT", "Deviation", "Stability ddG",
+                "Solubility", "Template assist", "Template assist dflex", "Structural align"]
     assert wb.sheetnames == expected
-    # workbook sheet headers == CSV headers == _COLUMNS for each type
-    for key, cols in _COLUMNS.items():
-        ws = wb[_TITLE[key]]
-        assert [c.value for c in ws[1]] == cols
-        csv_rows = _read_csv(tmp_path / "csv" / f"{key}.csv")
-        assert csv_rows[0] == cols                      # same columns in the CSV
+    # for every EMITTED sheet: workbook header == CSV header == _COLUMNS[key]
+    title_to_key = {t: k for k, t, _s in session_export._TYPES}
+    for title in wb.sheetnames:
+        key = title_to_key[title]
+        assert [c.value for c in wb[title][1]] == _COLUMNS[key]
+        assert _read_csv(tmp_path / "csv" / f"{session_export._SLUG[key]}.csv")[0] == _COLUMNS[key]
 
 
 def test_summary_partial_data_blank_never_zero(tmp_path):
@@ -136,3 +136,83 @@ def test_build_tables_no_recompute_is_pure():
     snap = copy.deepcopy(ds)
     build_tables(ds)
     assert ds == snap                                    # input not mutated
+
+
+def _design_with_sequences():
+    """Template ACDE; V1 hand-made C2W; V2 MPNN C2Y (joinable score); V3 MPNN whose stored
+    sequence MISMATCHES (a later run overwrote) → score must blank, never wrong."""
+    tcells = [{"col": i, "resnum": i + 1, "aa": a} for i, a in enumerate("ACDE")]
+    def vc(seq): return [{"col": i, "resnum": i + 1, "aa": a} for i, a in enumerate(seq)]
+    ds = {"denovo-1": {"model_id": "denovo-1", "source": "sequence", "chains": {"c": {
+        "rep_chain": "A", "template_cells": tcells, "variants": [
+            {"id": "V1", "source": "manual", "provenance": {}, "cells": vc("AWDE"),
+             "mutations": [{"resnum": 2, "from_aa": "C", "to_aa": "W", "source": "manual"}],
+             "indels": [], "results": {}},
+            {"id": "V2", "source": "proteinmpnn",
+             "provenance": {"mpnn_run": 0, "design_k": 1, "fasta_path": "/x.fa"}, "cells": vc("AYDE"),
+             "mutations": [{"resnum": 2, "from_aa": "C", "to_aa": "Y", "source": "proteinmpnn"}],
+             "indels": [], "results": {}},
+            {"id": "V3", "source": "proteinmpnn",
+             "provenance": {"mpnn_run": 0, "design_k": 0, "fasta_path": "/x.fa"}, "cells": vc("AHDE"),
+             "mutations": [{"resnum": 2, "from_aa": "C", "to_aa": "H", "source": "proteinmpnn"}],
+             "indels": [], "results": {}},
+        ]}}}}
+    # stored result: design_k 1 == AYDE (matches V2); design_k 0 == AZDE (does NOT match V3's AHDE)
+    ppr = {"denovo-1": {"data": {"fasta_path": "/x.fa", "sequences": [
+        {"sequence": "AZDE", "score": -1.0, "recovery": 0.80},
+        {"sequence": "AYDE", "score": -1.23, "recovery": 0.91}]}}}
+    return ds, ppr
+
+
+def test_sequences_and_substitutions_with_mpnn_join(tmp_path):
+    ds, ppr = _design_with_sequences()
+    rep = export_session(ds, tmp_path, ppr)
+    assert rep["any"] is True
+
+    seq = _read_csv(tmp_path / "csv" / "sequences.csv"); sh = seq[0]
+    S = {r[sh.index("row")]: dict(zip(sh, r)) for r in seq[1:]}
+    assert S["T"]["sequence"] == "ACDE" and S["T"]["source"] == "template"
+    assert S["V2"]["source"] == "proteinmpnn" and S["V2"]["mpnn_score"] == "-1.23" \
+        and S["V2"]["mpnn_recovery"] == "0.91"
+    assert S["V1"]["mpnn_score"] == ""                 # hand-made → blank
+    assert S["V3"]["mpnn_score"] == ""                 # MPNN but stored seq mismatched → BLANK (not wrong)
+
+    sub = _read_csv(tmp_path / "csv" / "substitutions.csv"); bh = sub[0]
+    B = {r[bh.index("variant")]: dict(zip(bh, r)) for r in sub[1:]}
+    assert B["V1"]["kind"] == "substitution" and B["V1"]["from_aa"] == "C" and B["V1"]["to_aa"] == "W"
+    assert B["V1"]["source"] == "manual" and B["V1"]["score"] == ""        # hand-made → blank score
+    assert B["V2"]["source"] == "proteinmpnn" and B["V2"]["score"] == "-1.23" and B["V2"]["recovery"] == "0.91"
+
+    # FASTA travels, with the MPNN score in the header
+    fasta = (tmp_path / "sequences.fasta").read_text()
+    assert ">denovo-1_A_T source=template" in fasta and "ACDE" in fasta
+    assert ">denovo-1_A_V2 source=proteinmpnn mpnn_score=-1.23" in fasta
+
+
+def test_indels_appear_in_substitutions(tmp_path):
+    ds = {"m": {"source": "sequence", "chains": {"c": {"rep_chain": "A",
+        "template_cells": [{"col": i, "resnum": i + 1, "aa": a} for i, a in enumerate("ACDE")],
+        "variants": [{"id": "V1", "source": "manual", "provenance": {},
+                      "cells": [{"col": 0, "resnum": 1, "aa": "A"}, {"col": 1, "resnum": None, "aa": None}],
+                      "mutations": [],
+                      "indels": [{"kind": "deletion", "col": 1, "resnum": 2, "from_aa": "C"},
+                                 {"kind": "insertion", "col": 4, "resnum": 4, "residues": "GG"}],
+                      "results": {}}]}}}}
+    export_session(ds, tmp_path)
+    rows = _read_csv(tmp_path / "csv" / "substitutions.csv"); h = rows[0]
+    kinds = {r[h.index("kind")] for r in rows[1:]}
+    assert kinds == {"deletion", "insertion"}
+    ins = [r for r in rows[1:] if r[h.index("kind")] == "insertion"][0]
+    assert ins[h.index("residues")] == "GG"
+
+
+def test_bare_construct_exports_its_sequence(tmp_path):
+    # a de-novo construct with a sequence but NO results / variants → still exportable (design content)
+    ds = {"denovo-1": {"source": "sequence", "chains": {"c": {"rep_chain": "A",
+        "template_cells": [{"col": i, "resnum": i + 1, "aa": a} for i, a in enumerate("ACDEFG")],
+        "variants": []}}}}
+    rep = export_session(ds, tmp_path)
+    assert rep["any"] is True and "Sequences" in rep["written"]
+    assert (tmp_path / "sequences.fasta").is_file()
+    import openpyxl
+    assert openpyxl.load_workbook(str(tmp_path / "results.xlsx")).sheetnames == ["Sequences"]

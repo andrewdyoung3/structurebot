@@ -937,13 +937,16 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 return
         exports_dir = session_io.session_paths(self._current_session_name)["exports"]
         rep = session_export.export_session(getattr(self.session, "design_sessions", {}) or {},
-                                            exports_dir)
+                                            exports_dir,
+                                            getattr(self.session, "proteinmpnn_results", {}) or {})
         if not rep["any"]:
             self.presenter.dim("Nothing to export yet — no fold / deviation / stability / "
                                "solubility / template-assist / alignment results in this session.")
             return
-        msg = f"✓ Exported {len(rep['written'])} result type(s) → {exports_dir} "
-        msg += f"(results.xlsx + csv/). Written: {', '.join(rep['written'])}."
+        nfig = len((rep.get("figures") or {}).get("written") or [])
+        msg = f"✓ Exported {len(rep['written'])} table(s) → {exports_dir} "
+        msg += f"(results.xlsx + csv/{' + sequences.fasta' if 'Sequences' in rep['written'] else ''}"
+        msg += f"{f' + {nfig} figure(s)' if nfig else ''}). Written: {', '.join(rep['written'])}."
         if rep["skipped"]:
             msg += f"  Skipped (no data): {', '.join(rep['skipped'])}."
         self.presenter.success(msg)
