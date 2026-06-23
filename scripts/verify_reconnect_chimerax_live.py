@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception: pass
 
+import config
 from chimerax_bridge import ChimeraXBridge
 from session_state import SessionState
 from seq_editor.controller import SequenceEditorController
@@ -52,7 +53,8 @@ check("after 'close': ChimeraX is empty (relaunch premise)", ids() == set())
 # 3) Build a minimal window stand-in + run the real reconnect logic (stub the GUI relaunch only).
 win = types.SimpleNamespace(bridge=bridge, session=session)
 bridge.ensure_visible_gui = lambda timeout=60: "connected"     # the GUI-relaunch step (existing path)
-win._do_reconnect = types.MethodType(gui_app.StructureBotWindow._do_reconnect, win)
+for _m in ("_do_reconnect", "_resolve_reopen_target"):
+    setattr(win, _m, types.MethodType(getattr(gui_app.StructureBotWindow, _m), win))
 payload = win._do_reconnect()
 print(f"[reconnect] remap={payload['remap']} reopened={payload['reopened']} errors={payload['errors']}")
 new_id = payload["remap"].get(mid)
@@ -71,6 +73,33 @@ ctrl = SequenceEditorController(run, lambda **k: {})
 run("select clear")
 ctrl.select_residues_multi([(new_id, "A", [10])])
 check("column-select on the re-linked design selects atoms in the reopened model", sel_count() > 0)
+
+# ── 6) FALLBACK: a de-novo fold whose volatile temp CIF is GONE re-opens from a saved folds/ copy ──
+import tempfile, session_io
+config.SESSION_DIR = Path(tempfile.mkdtemp(prefix="verify_rc_sessions_"))
+run("close session")
+b = ids(); run("open 1ubq"); fmid = (sorted(ids() - b, key=int) or ["1"])[-1]
+tmp_cif = os.path.join(tempfile.gettempdir(), "boltz_pred_rcverify.cif")
+run(f'save "{Path(tmp_cif).as_posix()}" #{fmid}')              # the volatile temp fold CIF
+fs = SessionState()
+fs.add_structure(fmid, "denovo_fold", path=tmp_cif)            # a fold structure (path, not a PDB id)
+fs.add_design_session("denovo-rc", {"model_id": "denovo-rc", "source": "sequence",
+    "chains": {"c": {"group_key": "g", "rep_model": fmid, "rep_chain": "A",
+                     "members": [[fmid, "A"]], "template_cells": [], "variants": [],
+                     "template_fold": {"model_id": fmid, "cif_path": tmp_cif}}}})
+session_io.save_named_session(None, fs, "rc_expt")            # copies template_fold.cif into folds/
+os.unlink(tmp_cif)                                             # the temp original is now GONE
+run("close session")                                          # relaunch premise (empty ChimeraX)
+
+winf = types.SimpleNamespace(bridge=bridge, session=fs)
+winf._resolve_reopen_target = types.MethodType(gui_app.StructureBotWindow._resolve_reopen_target, winf)
+winf._do_reconnect = types.MethodType(gui_app.StructureBotWindow._do_reconnect, winf)
+pf = winf._do_reconnect()
+check("fold re-opened from the saved-session folds/ copy (temp original gone)",
+      bool(pf["reopened"]) and "denovo_fold" in (pf.get("fallbacks") or []))
+new_fmid = pf["remap"].get(fmid)
+run("select clear"); ctrl.select_residues_multi([(new_fmid, "A", [10])])
+check("column-select hits the fold re-opened from the durable copy", sel_count() > 0)
 
 print(f"\n══ RESULT: {len(PASS)} passed, {len(FAIL)} failed ══")
 if FAIL: print("FAILED:", FAIL); sys.exit(1)

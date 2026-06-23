@@ -602,3 +602,22 @@ def test_reconnect_done_applies_remap_and_relinks(_app, monkeypatch):
     assert "4" in s.design_sessions                              # crystal design re-keyed
     assert shown == ["4"]                                        # re-shown at the NEW id
     w.presenter.success.assert_called_once()
+
+
+def test_resolve_reopen_target_prefers_path_then_folds_then_pdbid(_app, monkeypatch, tmp_path):
+    import session_io
+    w = _fakew(session=_SS())
+    w._resolve_reopen_target = types.MethodType(W._resolve_reopen_target, w)
+    # 1) existing path wins
+    real = tmp_path / "live.cif"; real.write_text("x")
+    assert w._resolve_reopen_target({"path": str(real), "name": "x"}) == str(real)
+    # 2) path gone -> durable folds/ copy (the FALLBACK)
+    monkeypatch.setattr(session_io, "find_fold_copy",
+                        lambda b: "/sessions/expt/folds/boltz_pred_z.cif" if b == "boltz_pred_z.cif" else None)
+    got = w._resolve_reopen_target({"path": str(tmp_path / "boltz_pred_z.cif"), "name": "denovo"})
+    assert got == "/sessions/expt/folds/boltz_pred_z.cif"
+    # 3) no path, 4-char name -> PDB id fetch
+    assert w._resolve_reopen_target({"name": "2hhb"}) == "2hhb"
+    # 4) nothing re-openable -> None
+    monkeypatch.setattr(session_io, "find_fold_copy", lambda b: None)
+    assert w._resolve_reopen_target({"path": str(tmp_path / "gone.cif"), "name": "denovo-x"}) is None

@@ -147,3 +147,18 @@ def test_load_state_only_when_no_cxs(session_dir):
     info = session_io.load_named_session(_FakeBridge(), "stateonly")
     assert info["state"] is not None and info["error"] is None
     assert not info["cxs_ok"] and "no scene.cxs" in info["cxs_error"]
+
+
+def test_find_fold_copy_by_basename_and_suffix(session_dir):
+    (session_dir / "expt" / "folds").mkdir(parents=True)
+    (session_dir / "expt" / "folds" / "boltz_pred_abc.cif").write_text("x")
+    (session_dir / "other" / "folds").mkdir(parents=True)
+    (session_dir / "other" / "folds" / "boltz_pred_def__1.cif").write_text("y")
+    # exact basename match (across sessions)
+    got = session_io.find_fold_copy("boltz_pred_abc.cif")
+    assert got and Path(got).name == "boltz_pred_abc.cif" and Path(got).parent.parent.name == "expt"
+    # collision-suffixed variant matched by stem
+    got2 = session_io.find_fold_copy("boltz_pred_def.cif")
+    assert got2 and Path(got2).name == "boltz_pred_def__1.cif"
+    # absent → None
+    assert session_io.find_fold_copy("nope.cif") is None

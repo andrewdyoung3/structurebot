@@ -24,7 +24,7 @@ import copy
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import config
 from session_state import SessionState
@@ -101,6 +101,31 @@ def _relocate_folds(design_sessions: Dict[str, Any], folds_dir: Path) -> Dict[st
             for ref in (cd.get("wt_refs") or {}).values():
                 relocate(ref, "path")
     return out
+
+
+def find_fold_copy(basename: str) -> Optional[str]:
+    """Search every named session's `folds/` for a DURABLE copy of *basename* — the fallback used
+    when a fold's volatile temp CIF was cleaned (Boltz writes to the system temp dir). Tries the
+    exact basename first, then the collision-suffixed `{stem}__N{ext}` variants `save` may have
+    written. Fold basenames are effectively unique (`boltz_pred_<random>.cif`), so a basename match
+    is reliable. Returns the durable path or None."""
+    name = Path(basename).name
+    if not name:
+        return None
+    stem, suffix = Path(name).stem, Path(name).suffix
+    try:
+        fold_dirs = [d / "folds" for d in config.SESSION_DIR.iterdir() if (d / "folds").is_dir()]
+    except OSError:
+        return None
+    for folds in fold_dirs:                            # exact basename wins
+        cand = folds / name
+        if cand.is_file():
+            return str(cand)
+    for folds in fold_dirs:                            # then a collision-suffixed copy
+        for cand in sorted(folds.glob(f"{stem}__*{suffix}")):
+            if cand.is_file():
+                return str(cand)
+    return None
 
 
 def save_named_session(bridge, session: SessionState, name: str) -> Dict[str, Any]:
