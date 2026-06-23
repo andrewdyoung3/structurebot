@@ -538,3 +538,67 @@ def test_reset_view_keeps_workbench_tab(_app):
     widgets = [tabs.widget(i) for i in range(tabs.count())]
     assert wb in widgets and grid not in widgets   # workbench (toolbar) kept; grid dropped
     assert w._grids == {} and reset_calls["n"] == 1
+
+
+# ── Reconnect ChimeraX: model-id remap + reopen/relink flow ───────────────────────
+def test_remap_session_model_ids_crystal_and_denovo(_app):
+    """remap rewrites structures keys, crystal design keys, AND internal fold refs of a de-novo
+    design (whose synthetic key is untouched but its members/template_fold ids move)."""
+    from gui_app import remap_session_model_ids
+    s = _SS()
+    s.structures = {"1": {"name": "2hhb"}, "3": {"name": "ubq"}}
+    s.add_design_session("1", {"model_id": "1", "source": "structure",
+                               "chains": {"k": {"rep_model": "1", "members": [["1", "A"]],
+                                                "template_fold": {}, "guided_fold": {}}}})
+    s.add_design_session("denovo-x", {"model_id": "denovo-x", "source": "sequence",
+        "chains": {"c": {"rep_model": "3", "members": [["3", "A"], ["3", "B"]],
+                         "template_fold": {"model_id": "3"}, "guided_fold": {"model_id": "3"},
+                         "wt_refs": {"boltz:assembly": {"model_id": "3"}}}}})
+    remap_session_model_ids(s, {"1": "5", "3": "7"})
+    assert set(s.structures) == {"5", "7"}                       # structures rekeyed
+    assert "5" in s.design_sessions and "1" not in s.design_sessions  # crystal key moved
+    assert s.design_sessions["5"]["chains"]["k"]["members"] == [["5", "A"]]
+    dn = s.design_sessions["denovo-x"]["chains"]["c"]             # de-novo key UNCHANGED
+    assert dn["rep_model"] == "7" and dn["members"] == [["7", "A"], ["7", "B"]]
+    assert dn["template_fold"]["model_id"] == "7" and dn["guided_fold"]["model_id"] == "7"
+    assert dn["wt_refs"]["boltz:assembly"]["model_id"] == "7"
+
+
+def test_remap_noop_when_ids_unchanged(_app):
+    from gui_app import remap_session_model_ids
+    s = _SS(); s.structures = {"1": {"name": "x"}}
+    remap_session_model_ids(s, {"1": "1"})                        # self-map → no change
+    assert set(s.structures) == {"1"}
+
+
+def test_reconnect_clicked_noop_without_structures(_app):
+    w = _fakew(session=_SS(), presenter=_MM(),
+               reconnect_action=_MM(), statusBar=lambda: _MM(), _pool=_MM())
+    # bind the reconnect handler too
+    w._on_reconnect_clicked = types.MethodType(W._on_reconnect_clicked, w)
+    w._on_reconnect_clicked()
+    w.presenter.dim.assert_called_once()                         # "nothing to re-open"
+    w._pool.start.assert_not_called()
+
+
+def test_reconnect_done_applies_remap_and_relinks(_app, monkeypatch):
+    from session_state import SessionState
+    s = SessionState()
+    s.structures = {"1": {"name": "2hhb"}}
+    s.add_design_session("1", {"model_id": "1", "source": "structure",
+                               "chains": {"k": {"rep_model": "1", "members": [["1", "A"]]}}})
+    shown = []
+    w = _fakew(session=s, workbench=_MM(), presenter=_MM(), reconnect_action=_MM(),
+               statusBar=lambda: _MM(), tabs=QtWidgets.QTabWidget(), _grids={})
+    for name in ("_do_reconnect", "_on_reconnect_done", "_denovo_fold_ids",
+                 "_redisplay_designs", "_reset_view_for_session"):
+        setattr(w, name, types.MethodType(getattr(W, name), w))
+    w.show_model = lambda mid: shown.append(mid)
+    monkeypatch.setattr(gui_app, "ToolRouter", lambda *a, **k: _MM())
+    w.bridge = _MM(); w.bridge._maybe_apply_lean_layout = lambda: None
+    w._on_reconnect_done({"remap": {"1": "4"}, "reopened": [("2hhb", "1", "4")],
+                          "errors": [], "outcome": "started"})
+    assert set(s.structures) == {"4"}                            # remapped
+    assert "4" in s.design_sessions                              # crystal design re-keyed
+    assert shown == ["4"]                                        # re-shown at the NEW id
+    w.presenter.success.assert_called_once()
