@@ -819,28 +819,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                            "US-align TM/RMSD + superposition-free per-residue "
                                            "deviation. The asymmetry is stated in the readout.")
         self._compare_folds_btn.triggered.connect(self._on_compare_folds_clicked)
-        # DISULFIDE SUITE — three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
-        #   A Discover — multi-seed bonding FREQUENCY (the model's empirical pairing prior, measured)
-        #   B Geometry — measured Cα/Cβ/SG/χSS vs canonical windows for THIS fold (cheap, no fold)
-        #   C Fold with declared bond — introduce Cys (via substitution) + fold WITH the bond (biases)
-        self._ss_menu = self._construct_fold_menu.addMenu("Disulfides")
-        self._ss_discover_btn = self._ss_menu.addAction("Discover (multi-seed frequency)…")
-        self._ss_discover_btn.setToolTip("Fold the construct UNCONSTRAINED across N seeds and report "
-                                         "how often each Cys pair sits in bonding geometry — the "
-                                         "model's empirical pairing prior, MEASURED with N. Folds N "
-                                         "seeds (compute).")
-        self._ss_discover_btn.triggered.connect(self._on_disulfide_discover)
-        self._ss_geometry_btn = self._ss_menu.addAction("Geometry readout (this fold)…")
-        self._ss_geometry_btn.setToolTip("Measure Cα–Cα / Cβ–Cβ / SG–SG / χSS vs canonical windows "
-                                         "for the cysteine pairs in the CURRENT fold. Cheap — reads "
-                                         "coordinates, does NOT fold. Needs an unguided construct fold.")
-        self._ss_geometry_btn.triggered.connect(self._on_disulfide_geometry)
-        self._ss_constrain_btn = self._ss_menu.addAction("Fold with declared bond (introduce Cys)…")
-        self._ss_constrain_btn.setToolTip("Declare a disulfide between two positions: introduce Cys "
-                                          "there (via the substitution path) and fold WITH the bond "
-                                          "constraint. The constraint BIASES toward the bond; it does "
-                                          "NOT enforce geometry — the result is measured, never assumed.")
-        self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
         self._fold_vis_btn = fold_menu.addAction("Hide folds")
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
@@ -887,6 +865,43 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._fold_menu_btn.setMenu(fold_menu)
         bar.addWidget(self._fold_menu_btn)
         bar.addSpacing(12)
+
+        # Disulfides ▾ — TOP-LEVEL (sibling of Fold ▾, not buried) so the cysteine/disulfide suite
+        # is discoverable. Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
+        #   A Discover — multi-seed bonding FREQUENCY (the model's empirical pairing prior, measured)
+        #   B Geometry — measured Cα/Cβ/SG/χSS vs canonical windows for THIS fold (cheap, no fold)
+        #   C Fold with declared bond — introduce Cys (via substitution) + fold WITH the bond (biases)
+        # Each action is ENABLED by its real precondition (greyed = visibly unavailable, not a silent
+        # no-op): Discover needs a de-novo construct; Geometry + Fold-with-bond need it FOLDED. The
+        # enabled state is SYNCED on tab-change / render / fold (`_sync_disulfide_menu_enabled`).
+        self._ss_menu_btn = QtWidgets.QToolButton()
+        self._ss_menu_btn.setText("Disulfides")
+        self._ss_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._ss_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        ss_menu = QtWidgets.QMenu(self._ss_menu_btn)
+        ss_menu.setToolTipsVisible(True)
+        self._ss_discover_btn = ss_menu.addAction("Discover (multi-seed frequency)…")
+        self._ss_discover_btn.setToolTip("Fold the construct UNCONSTRAINED across N seeds and report "
+                                         "how often each Cys pair sits in bonding geometry — the "
+                                         "model's empirical pairing prior, MEASURED with N. Folds N "
+                                         "seeds (compute). Needs a de-novo construct (Add sequence).")
+        self._ss_discover_btn.triggered.connect(self._on_disulfide_discover)
+        self._ss_geometry_btn = ss_menu.addAction("Geometry readout (this fold)…")
+        self._ss_geometry_btn.setToolTip("Measure Cα–Cα / Cβ–Cβ / SG–SG / χSS vs canonical windows "
+                                         "for the cysteine pairs in the CURRENT fold. Cheap — reads "
+                                         "coordinates, does NOT fold. Needs a folded construct.")
+        self._ss_geometry_btn.triggered.connect(self._on_disulfide_geometry)
+        self._ss_constrain_btn = ss_menu.addAction("Fold with declared bond (introduce Cys)…")
+        self._ss_constrain_btn.setToolTip("Declare a disulfide between two positions: introduce Cys "
+                                          "there (via the substitution path) and fold WITH the bond "
+                                          "constraint. The constraint BIASES toward the bond; it does "
+                                          "NOT enforce geometry — the result is measured, never assumed. "
+                                          "Needs a folded construct.")
+        self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
+        self._ss_menu_btn.setMenu(ss_menu)
+        bar.addWidget(self._ss_menu_btn)
+        bar.addSpacing(12)
+        self._sync_disulfide_menu_enabled()           # initial precondition state (greyed until ready)
 
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
         # WT reference fold (same engine+target). Establishes the WT reference + noise floor
@@ -1019,6 +1034,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
         self._sync_align_ref_toggle()         # reflect the (rehydrated) active cd's reference state
+        self._sync_disulfide_menu_enabled()   # grey/enable the Disulfides actions by precondition
         self._status.setText(
             f"Workbench: {len(self._design.chains)} unique chain(s). Click a column to "
             f"select in 3D (all copies); add/edit variants; pick a color mode.")
@@ -1820,6 +1836,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         cur = (tab.design if tab is not None else next(iter(self._design.chains.values()), None))
         mp = (cur.template_fold.get("mean_plddt") if cur is not None else None)
         mp_txt = f", chain pLDDT {mp:.1f}" if isinstance(mp, (int, float)) else ""
+        self._sync_disulfide_menu_enabled()   # the construct is now folded → enable Geometry/Fold-with-bond
         self._status.setText(
             f"Construct folded ({data.get('engine')}, {len(sent_ids)}-chain): model "
             f"#{fold_mid}{mp_txt}, pLDDT-coloured. Selection + colour now act on the fold; "
@@ -1892,13 +1909,31 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.launchRequested.emit(spec)
 
     # ── Disulfide-suite handlers ─────────────────────────────────────────────────────
+    def _sync_disulfide_menu_enabled(self) -> None:
+        """Enable each Disulfides action by its REAL precondition so an unavailable action is
+        VISIBLY GREYED (far clearer than a silent no-op): Discover needs a de-novo construct;
+        Geometry + Fold-with-bond need the construct FOLDED. Synced on tab-change / render / fold."""
+        if getattr(self, "_ss_discover_btn", None) is None:
+            return
+        denovo = self._design is not None and self._design.source == "sequence"
+        self._ss_discover_btn.setEnabled(denovo)               # folds fresh → needs only a construct
+        if not denovo:                                         # (also the pre-`_tabs` __init__ call)
+            self._ss_geometry_btn.setEnabled(False)
+            self._ss_constrain_btn.setEnabled(False)
+            return
+        cd = self._cur_tab().design if self._cur_tab() else None
+        tf = (cd.template_fold if cd else None) or {}
+        folded = bool(tf.get("cif_path") or tf.get("model_id"))
+        self._ss_geometry_btn.setEnabled(folded)               # reads the existing fold's CIF
+        self._ss_constrain_btn.setEnabled(folded)              # folds a variant against the T-fold
+
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
             self._status.setText("Disulfides are for de-novo constructs — Add sequence first.")
             return
         spec = self.disulfide_discovery_launch_spec()
-        if spec is None:
-            self._status.setText("Discovery needs a folded construct — Fold construct first.")
+        if spec is None:                                       # only None when not a de-novo construct
+            self._status.setText("Disulfide discovery needs a de-novo construct — Add sequence first.")
             return
         self._status.setText("Folding N unconstrained seeds for disulfide discovery (compute)…")
         self.launchRequested.emit(spec)
@@ -2175,6 +2210,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._scan_cols.clear()                # cols index this tab's template; reset
         self._update_scan_label()
         self._sync_align_ref_toggle()          # reflect THIS cd's aligned-reference state
+        self._sync_disulfide_menu_enabled()    # grey/enable the Disulfides actions by precondition
         self._apply_color_to(tab)
         self._push_3d_color(tab)
 

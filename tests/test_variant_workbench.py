@@ -2396,3 +2396,56 @@ class TestDisulfideSuite:
         self._construct(p)
         assert p.build_disulfide_introduce_spec(5, 5) is None         # same column
         assert p.build_disulfide_introduce_spec(2, 999) is None       # out of range
+
+    # ── GUI-SURFACE guard: the Disulfides menu actually RENDERS at top level, the actions are
+    #    wired (trigger reaches the handler), and enabled-state tracks the precondition. This is
+    #    the test the no-ChimeraX v1 verify lacked — it closes the discoverability blind spot.
+    def test_disulfide_menu_is_top_level_with_three_actions(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        assert p._ss_menu_btn.text() == "Disulfides"             # a TOP-LEVEL toolbar button…
+        acts = p._ss_menu_btn.menu().actions()
+        assert {p._ss_discover_btn, p._ss_geometry_btn, p._ss_constrain_btn} <= set(acts)
+        # NOT buried under the construct-fold submenu anymore
+        assert p._ss_discover_btn not in p._construct_fold_menu.actions()
+
+    def test_disulfide_actions_enabled_state_tracks_precondition(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        # no design → ALL greyed (a visibly-unavailable action, not a silent no-op)
+        assert not p._ss_discover_btn.isEnabled()
+        assert not p._ss_geometry_btn.isEnabled() and not p._ss_constrain_btn.isEnabled()
+        # de-novo construct (not yet folded) → Discover enabled, Geometry/Fold-with-bond still greyed
+        p._add_sequence_construct("binder", "MKVLWAACGTDE")
+        assert p._ss_discover_btn.isEnabled()
+        assert not p._ss_geometry_btn.isEnabled() and not p._ss_constrain_btn.isEnabled()
+        # folded → all three enabled
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "model_id": "7", "cif_path": "/tmp/x.cif"}
+        p._sync_disulfide_menu_enabled()
+        assert p._ss_geometry_btn.isEnabled() and p._ss_constrain_btn.isEnabled()
+
+    def test_disulfide_actions_trigger_reaches_handlers(self, _app, monkeypatch):
+        # drive the actual user gesture (QAction.trigger() == a menu click) and assert the
+        # connected handler ran end-to-end — a DROPPED signal connection can't pass this.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)                                   # de-novo + folded (cif_path/model_id)
+        p._sync_disulfide_menu_enabled()
+        emitted = []
+        p.launchRequested.connect(lambda spec: emitted.append(spec))
+        p._ss_discover_btn.trigger()                             # == click "Discover"
+        assert emitted and emitted[-1]["tool"] == "disulfide_discovery"
+        p._ss_geometry_btn.trigger()                            # == click "Geometry readout"
+        assert emitted[-1]["tool"] == "disulfide_geometry"
+        # Fold-with-bond prompts for the pair → mock the dialog, then the trigger must emit a fold
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("2 9", True)))
+        p._ss_constrain_btn.trigger()                           # == click "Fold with declared bond"
+        assert emitted[-1]["tool"] == "boltz"
+        assert emitted[-1]["tool_inputs"]["disulfide_bonds"] == [(2, 9)]
+
+    def test_disabled_action_trigger_is_a_noop(self, _app):
+        # a greyed action does nothing on trigger() (Qt suppresses the signal) — no spurious launch
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        emitted = []
+        p.launchRequested.connect(lambda spec: emitted.append(spec))
+        p._ss_geometry_btn.trigger()                            # greyed (no construct) → no-op
+        assert emitted == []
