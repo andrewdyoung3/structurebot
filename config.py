@@ -456,8 +456,17 @@ BOLTZ_SEED: int = int(os.environ.get("BOLTZ_SEED", "0"))
 BOLTZ_RECYCLING_STEPS: int = int(os.environ.get("BOLTZ_RECYCLING_STEPS", "3"))
 BOLTZ_SAMPLING_STEPS: int = int(os.environ.get("BOLTZ_SAMPLING_STEPS", "200"))
 BOLTZ_DIFFUSION_SAMPLES: int = int(os.environ.get("BOLTZ_DIFFUSION_SAMPLES", "1"))
-# Wall-clock budget for one Boltz fold (GPU; a small dimer is ~1 min, larger complexes more).
+# Wall-clock budget for one Boltz fold. A flat default badly under-budgets large complexes:
+# Boltz's N×N pair representation makes runtime ~QUADRATIC in total residues (a small dimer
+# ~1 min; a ~1260-res hexamer on the Blackwell --no_kernels path ~4.3 h — which blew the old
+# flat 1800s). So unless BOLTZ_TIMEOUT is set EXPLICITLY (operator override — wins), the budget
+# is SIZE-SCALED per fold: clamp(ceil(SCALE·total_res²), FLOOR, CAP). SCALE=0.012 puts a
+# 1260-res fold at ~19000s (≈ the proven-good 18000s eval budget) and a small monomer at FLOOR.
 BOLTZ_TIMEOUT: int = int(os.environ.get("BOLTZ_TIMEOUT", "1800"))
+BOLTZ_TIMEOUT_EXPLICIT: bool = "BOLTZ_TIMEOUT" in os.environ   # explicit env override beats scaling
+BOLTZ_TIMEOUT_SCALE: float = float(os.environ.get("BOLTZ_TIMEOUT_SCALE", "0.012"))
+BOLTZ_TIMEOUT_FLOOR: int = int(os.environ.get("BOLTZ_TIMEOUT_FLOOR", "1800"))
+BOLTZ_TIMEOUT_CAP:   int = int(os.environ.get("BOLTZ_TIMEOUT_CAP", "21600"))
 # S4c noise floor: total seeds (1 reference + N-1) folded to MEASURE the cross-seed WT
 # variance for a STOCHASTIC engine (Boltz). N=4 balances a usable per-residue stdev/range
 # against compute (paid once per design+combo, cached). Deterministic engines (ESMFold)

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import shlex
@@ -67,6 +68,11 @@ class BoltzBridge:
         self._sampling = int(getattr(_cfg, "BOLTZ_SAMPLING_STEPS", 200))
         self._samples = int(getattr(_cfg, "BOLTZ_DIFFUSION_SAMPLES", 1))
         self._timeout = int(getattr(_cfg, "BOLTZ_TIMEOUT", 1800))
+        # Size-scaling knobs (see _resolve_timeout). An explicit BOLTZ_TIMEOUT env wins over scaling.
+        self._timeout_explicit = bool(getattr(_cfg, "BOLTZ_TIMEOUT_EXPLICIT", False))
+        self._timeout_scale    = float(getattr(_cfg, "BOLTZ_TIMEOUT_SCALE", 0.012))
+        self._timeout_floor    = int(getattr(_cfg, "BOLTZ_TIMEOUT_FLOOR", 1800))
+        self._timeout_cap      = int(getattr(_cfg, "BOLTZ_TIMEOUT_CAP", 21600))
         from wsl_bridge import WSLBridge
         self._wsl = WSLBridge(distribution=self._distro)
 
@@ -104,6 +110,7 @@ class BoltzBridge:
         allow_remote: bool = False,
         label:        str = "boltz",
         templates:    Optional[List[Dict[str, Any]]] = None,
+        timeout:      Optional[int] = None,
     ) -> Dict[str, Any]:
         """Fold *chains* (one `protein` block each, MSA-free) with Boltz via WSL. Returns the
         result contract (success/cif_path/mean_plddt/iptm/chains_ptm/plddt/source/seed/error).
@@ -147,9 +154,10 @@ class BoltzBridge:
         except _RemoteBreach as exc:
             return self._err(label, f"LOCAL-ONLY breach refused: {exc}")
 
-        r = wsl.run_command(cmd, timeout=self._timeout)
+        budget = self._resolve_timeout(chains, timeout)
+        r = wsl.run_command(cmd, timeout=budget)
         if not r.get("ok"):
-            return self._err(label, f"Boltz run failed: {r.get('error') or (r.get('stderr','') or '')[-200:]}")
+            return self._err(label, self._run_failure_message(r, chains, budget))
 
         parsed = self._parse_outputs(out_dir, chains)
         if not parsed.get("success"):
@@ -180,6 +188,49 @@ class BoltzBridge:
             val = d.split(":", 1)[1].strip()
             if val != "empty":
                 raise _RemoteBreach(f"YAML msa is '{val}', not 'empty' (would hit the remote server)")
+
+    # ── Wall-clock budget (size-scaled) ─────────────────────────────────────────
+    def _resolve_timeout(self, chains: List[Dict[str, str]], timeout: Optional[int]) -> int:
+        """Per-fold wall-clock budget. Precedence: an explicit caller *timeout* wins; else an
+        explicit BOLTZ_TIMEOUT env override wins; else SIZE-SCALE by total residues. Boltz's
+        runtime is ~quadratic in total length (the N×N pair representation), so the budget is
+        ``clamp(ceil(SCALE·total_res²), FLOOR, CAP)`` — a small monomer lands on the FLOOR, a
+        ~1100-res dimer at ~4 h, a ~1260-res hexamer near the CAP — so a large GUI fold no
+        longer silently dies at the old flat 1800s nor needs a manual env bump each time."""
+        if timeout is not None:
+            return int(timeout)
+        if self._timeout_explicit:
+            return self._timeout
+        total = sum(len(c.get("sequence", "") or "") for c in chains)
+        scaled = math.ceil(self._timeout_scale * total * total)
+        return max(self._timeout_floor, min(scaled, self._timeout_cap))
+
+    def _run_failure_message(
+        self, r: Dict[str, Any], chains: List[Dict[str, str]], budget: int
+    ) -> str:
+        """Turn a failed Boltz run into an INFORMATIVE message — cause + size + next step, never a
+        bare wall. Distinguishes a genuine TIMEOUT (ran long) from a real Boltz ERROR: a crash
+        must NOT be mislabelled as a timeout — surface its swallowed per-input traceback instead
+        (the HIV-work lesson). For a timeout, says whether the fold hit the size-scaled budget or
+        the hard cap, reports the residue count, and points at the BOLTZ_TIMEOUT override / size."""
+        timed_out = "timed out" in str(r.get("error", "")).lower()
+        if not timed_out:
+            # A real failure (non-zero exit / crash), not a wall — surface the ACTUAL cause.
+            swallowed = self._extract_boltz_error(r.get("stdout", ""), r.get("stderr", ""))
+            base = r.get("error") or (r.get("stderr", "") or "")[-200:] or "unknown error"
+            return f"Boltz run failed: {swallowed or base}"
+        total = sum(len(c.get("sequence", "") or "") for c in chains)
+        if self._timeout_explicit:               # operator-set budget — own wording, no scaling claim
+            return (f"Boltz fold timed out after {budget}s "
+                    f"(BOLTZ_TIMEOUT override; {total} residues). "
+                    f"Increase BOLTZ_TIMEOUT, or reduce size.")
+        raw_scaled = math.ceil(self._timeout_scale * total * total)
+        if raw_scaled >= self._timeout_cap:      # the scaled estimate blew past the hard cap
+            hrs = self._timeout_cap / 3600.0
+            return (f"Boltz fold exceeded the {hrs:g}h cap ({total} residues); "
+                    f"raise BOLTZ_TIMEOUT to override, or reduce size.")
+        return (f"Boltz fold timed out after {budget}s — the size-scaled budget for "
+                f"{total} residues. Raise BOLTZ_TIMEOUT to override, or reduce size.")
 
     # ── YAML + output parsing ───────────────────────────────────────────────────
     def _translate_template_paths(
