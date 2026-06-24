@@ -31,3 +31,6 @@ ThermoMPNN_repo/
 
 # RaSP (cloned for probe; not committed — weights bundled in-repo)
 RaSP_repo/
+
+# one-off Boltz diagnostic (kept on disk, not tracked)
+scripts/diag_pcna_homotrimer_fold.py
