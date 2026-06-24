@@ -23,6 +23,11 @@ Result schema (``predict`` return value)
       "success":        bool,
       "error":          None | str,
       "oom_risk":       bool,            # blocked pre-launch OR runtime CUDA OOM
+      "remote_consent_required": bool,   # True when refused for lack of allow_remote (no call made)
+      "engine":         "colabfold",     # engine-agnostic fold provenance
+      "remote_msa":     True,            # PROVENANCE: this fold LEFT local-only (remote MSA server)
+      "pdb_path":       "<windows path>",# engine-agnostic alias of ranked_pdb (fold_summary contract)
+      "n_chains":       int,             # colon-joined chain count (homo copies OR hetero len)
       "ranked_pdb":     "<windows path>" | "",
       "mean_plddt":     float,           # 0-100
       "plddt":          {1: 87.3, ...},  # per-residue, 1-based
@@ -146,45 +151,85 @@ class ColabFoldBridge:
 
     def predict(
         self,
-        sequence:    str,
+        sequence:    Optional[str] = None,
         copies:      int = 1,
         template:    Optional[str] = None,
         num_models:  Optional[int] = None,
         num_recycle: Optional[int] = None,
         quick:       bool = False,
         label:       str = "colabfold",
+        chains:      Optional[List[Dict[str, str]]] = None,
+        allow_remote: bool = False,
     ) -> Dict[str, Any]:
         """
         Fold *sequence* (optionally as a homo-oligomer of *copies* chains).
 
         Parameters
         ----------
-        sequence    : single-chain amino-acid sequence (one-letter).
+        sequence    : single-chain amino-acid sequence (one-letter). Used for the
+                      monomer / homo-oligomer path; ignored when *chains* is given.
         copies      : 1 = monomer; >1 = colon-joined homo-oligomer (multimer model).
+        chains      : HETERO multi-chain path — [{"id","sequence"}, …]; the DISTINCT
+                      sequences are colon-joined (AF-Multimer heteromer) and *copies*
+                      is forced to 1. The Workbench emits exactly this shape
+                      (construct_fold_launch_spec) so a hetero construct folds unchanged.
         template    : optional PDB id or local .pdb path → custom-template mode.
                       De novo (no template) when None.
         num_models  : AF2 models to run (default config.COLABFOLD_NUM_MODELS).
         num_recycle : recycles per model (default config.COLABFOLD_NUM_RECYCLE).
         quick       : if True, force num_models=1, num_recycle=1 (plumbing preset).
+        allow_remote: REQUIRED True to actually fold — ColabFold's MSA is remote, so
+                      this is the fail-closed consent flag (set only after the user
+                      consents to leaving LOCAL-ONLY). False → no network call, returns
+                      a remote_consent_required error.
         """
         import time as _time
 
-        # ── Validate sequence ────────────────────────────────────────────────────
-        if not sequence or not sequence.strip():
-            return self._error("empty sequence")
-        seq = "".join(sequence.split()).upper()
-        bad = sorted(set(seq) - _VALID_AA)
-        if bad:
+        # ── FAIL-CLOSED REMOTE-MSA CONSENT GUARD (load-bearing) ──────────────────
+        # ColabFold's ONLY mode is the remote MSA server — the §0 LOCAL-ONLY breach
+        # surface (unlike Boltz/ESMFold it has no local fold). Refuse HERE, with NO
+        # network/WSL work, unless the caller passes an EXPLICIT allow_remote that is
+        # set ONLY after surfaced user consent (Workbench dialog / NL banner). This is
+        # the single chokepoint both entry points funnel through, so the invariant
+        # "crossing LOCAL-ONLY is always conscious" holds by construction.
+        if not allow_remote:
             return self._error(
-                f"sequence contains non-standard residue(s): {', '.join(bad)}. "
-                "Use the 20 standard one-letter amino-acid codes."
+                "ColabFold needs explicit consent to leave LOCAL-ONLY: it sends the "
+                "sequence to the remote MSA server. No network call was made.",
+                remote_consent_required=True,
             )
 
-        try:
-            copies = int(copies)
-        except (TypeError, ValueError):
-            copies = 1
-        copies = max(1, copies)
+        # ── Resolve the fold input: hetero `chains` list OR homo `sequence`+copies ──
+        if chains:
+            chain_seqs, cerr = self._clean_chain_seqs(chains)
+            if cerr:
+                return self._error(cerr)
+            copies         = 1                       # explicit chains override the homo multiplier
+            seq_line       = ":".join(chain_seqs)    # distinct seqs colon-joined = AF-Multimer heteromer
+            n_chains       = len(chain_seqs)
+            length         = len(chain_seqs[0])      # nominal single-chain length (reporting only)
+            total_residues = sum(len(s) for s in chain_seqs)
+            cache_seq      = seq_line
+        else:
+            if not sequence or not sequence.strip():
+                return self._error("empty sequence")
+            seq = "".join(sequence.split()).upper()
+            bad = sorted(set(seq) - _VALID_AA)
+            if bad:
+                return self._error(
+                    f"sequence contains non-standard residue(s): {', '.join(bad)}. "
+                    "Use the 20 standard one-letter amino-acid codes."
+                )
+            try:
+                copies = int(copies)
+            except (TypeError, ValueError):
+                copies = 1
+            copies         = max(1, copies)
+            seq_line       = ":".join([seq] * copies)   # colon-join → homo-multimer when copies>1
+            n_chains       = copies
+            length         = len(seq)
+            total_residues = length * copies
+            cache_seq      = seq
 
         if quick:
             num_models, num_recycle = 1, 1
@@ -193,9 +238,7 @@ class ColabFoldBridge:
         n_models  = max(1, min(5, n_models))
         n_recycle = max(1, n_recycle)
 
-        length         = len(seq)
-        total_residues = length * copies
-        eta_s          = self.estimate_runtime_s(total_residues, n_models, n_recycle)
+        eta_s = self.estimate_runtime_s(total_residues, n_models, n_recycle)
 
         # ── Total-residue guard (pre-launch OOM protection) ───────────────────────
         budget = int(getattr(_cfg, "COLABFOLD_MAX_TOTAL_RESIDUES", 1500))
@@ -215,7 +258,7 @@ class ColabFoldBridge:
             )
 
         # ── Cache lookup ───────────────────────────────────────────────────────────
-        cache_key = self._cache_key(seq, copies, template, n_models, n_recycle)
+        cache_key = self._cache_key(cache_seq, copies, template, n_models, n_recycle)
         cache_dir = Path(_cfg.COLABFOLD_CACHE_DIR) / f"colabfold_{cache_key}"
         cached = self._load_cache(cache_dir)
         if cached is not None:
@@ -245,7 +288,7 @@ class ColabFoldBridge:
                 return self._error(f"template error: {terr}")
 
         # ── Build worker + run ───────────────────────────────────────────────────────
-        seq_line = ":".join([seq] * copies)   # colon-join → multimer when copies>1
+        # (seq_line / total_residues / length already resolved above for both paths)
         wsl_out  = f"/tmp/colabfold_{cache_key}"
         wsl_fasta = f"{wsl_out}/in.fasta"
         wsl_result = f"/tmp/colabfold_{cache_key}_result.json"
@@ -345,6 +388,7 @@ class ColabFoldBridge:
             "error":          None,
             "oom_risk":       False,
             "ranked_pdb":     ranked_pdb,
+            "pdb_path":       ranked_pdb,             # engine-agnostic alias (fold_summary contract)
             "mean_plddt":     mean_plddt,
             "plddt":          plddt,
             "pae":            data.get("pae"),
@@ -352,6 +396,7 @@ class ColabFoldBridge:
             "iptm":           data.get("iptm"),
             "length":         length,
             "copies":         copies,
+            "n_chains":       n_chains,
             "total_residues": total_residues,
             "num_models":     n_models,
             "num_recycle":    n_recycle,
@@ -360,6 +405,8 @@ class ColabFoldBridge:
             "eta_s":          eta_s,
             "elapsed_s":      elapsed_s,
             "gpu_used":       data.get("gpu_used"),   # True/False/None (CPU-fallback flag)
+            "engine":         "colabfold",            # engine-agnostic fold provenance
+            "remote_msa":     True,                   # PROVENANCE: this fold LEFT local-only
             "source":         "colabfold_wsl2",
         }
         self._save_cache(cache_dir, result)
@@ -595,16 +642,37 @@ except Exception as exc:
     # ── Error helper ──────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _clean_chain_seqs(chains: List[Dict[str, str]]) -> Tuple[List[str], Optional[str]]:
+        """Validate + normalize a hetero `chains` list → ([cleaned upper sequences], None) or
+        ([], error). One-letter standard AA only (the colon-join is built from this)."""
+        out: List[str] = []
+        for c in chains or []:
+            s = "".join(str((c or {}).get("sequence", "")).split()).upper()
+            if not s:
+                return [], f"chain '{(c or {}).get('id', '?')}' has an empty sequence"
+            bad = sorted(set(s) - _VALID_AA)
+            if bad:
+                return [], (f"chain '{(c or {}).get('id', '?')}' has non-standard residue(s): "
+                            f"{', '.join(bad)}. Use the 20 standard one-letter codes.")
+            out.append(s)
+        if not out:
+            return [], "empty chains list"
+        return out, None
+
+    @staticmethod
     def _error(
         message:  str,
         oom_risk: bool = False,
         extra:    Optional[Dict[str, Any]] = None,
+        remote_consent_required: bool = False,
     ) -> Dict[str, Any]:
         base = {
             "success":        False,
             "error":          message,
             "oom_risk":       oom_risk,
+            "remote_consent_required": remote_consent_required,
             "ranked_pdb":     "",
+            "pdb_path":       "",
             "mean_plddt":     0.0,
             "plddt":          {},
             "pae":            None,
@@ -612,6 +680,7 @@ except Exception as exc:
             "iptm":           None,
             "length":         0,
             "copies":         1,
+            "n_chains":       0,
             "total_residues": 0,
             "num_models":     0,
             "num_recycle":    0,
@@ -619,6 +688,8 @@ except Exception as exc:
             "cached":         False,
             "eta_s":          0.0,
             "elapsed_s":      0.0,
+            "engine":         "colabfold",
+            "remote_msa":     True,
             "source":         "error",
         }
         if extra:

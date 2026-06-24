@@ -567,7 +567,7 @@ def _router_with_mpnn(colabfold):
     r.session.structures = {"1": {"name": "1il8", "path": "x.pdb"}}
     r.session.add_proteinmpnn_result("1", _MPNN)
     r._fetch_sequence = lambda *a, **k: _WT                # WT chain fallback
-    r._build_colabfold_viz = lambda *a, **k: ([], [])     # type: ignore
+    r._build_colabfold_viz = lambda *a, **k: ([], [], None)   # 3-tuple (cmds, exps, new_id)
     r._open_pngs = lambda *a, **k: None                    # type: ignore
     return r
 
@@ -581,14 +581,16 @@ def test_mpnn_top_sequence_is_best_score_from_session():
 def test_colabfold_auto_pulls_mpnn_top_design():
     cf = _CapturingColabFold()
     r = _router_with_mpnn(cf)
-    r._run_colabfold({"model_id": "1"}, user_input="fold the top design with colabfold")
+    r._run_colabfold({"model_id": "1", "allow_remote": True},
+                     user_input="fold the top design with colabfold")
     assert cf.sequences == ["CDEFGHIK"], cf.sequences        # the MPNN top design, not the WT chain
 
 
 def test_colabfold_does_not_auto_pull_for_a_plain_chain_fold():
     cf = _CapturingColabFold()
     r = _router_with_mpnn(cf)
-    r._run_colabfold({"model_id": "1", "chain": "A"}, user_input="fold chain A with colabfold")
+    r._run_colabfold({"model_id": "1", "chain": "A", "allow_remote": True},
+                     user_input="fold chain A with colabfold")
     assert cf.sequences == [_WT], cf.sequences               # WT chain — NOT the design
 
 
@@ -611,9 +613,10 @@ def test_auto_pull_reads_cache_fasta_when_no_session(tmp_path, monkeypatch):
     r = _router(_FakeRosetta(), chimerax=_FakeChimerax(), colabfold=cf)
     r.session.structures = {"1": {"name": "1il8", "path": "x.pdb"}}   # NO add_proteinmpnn_result
     r._fetch_sequence = lambda *a, **k: _WT
-    r._build_colabfold_viz = lambda *a, **k: ([], [])
+    r._build_colabfold_viz = lambda *a, **k: ([], [], None)   # 3-tuple (cmds, exps, new_id)
     r._open_pngs = lambda *a, **k: None
-    r._run_colabfold({"model_id": "1"}, user_input="fold the redesign with colabfold")
+    r._run_colabfold({"model_id": "1", "allow_remote": True},
+                     user_input="fold the redesign with colabfold")
     assert cf.sequences == ["CDEFGHIK"], cf.sequences        # top design read from the cache FASTA
 
 
