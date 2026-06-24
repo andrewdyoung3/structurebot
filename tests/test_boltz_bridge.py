@@ -89,7 +89,7 @@ class TestLocalOnlyGuardFailClosed:
         b = _bridge()
         # force a breach: YAML build emits a non-empty msa
         monkeypatch.setattr(b, "_build_yaml",
-                            lambda chains, templates=None:
+                            lambda chains, templates=None, constraints=None:
                             "version: 1\nsequences:\n  - protein:\n      msa: remote\n")
         res = b.predict([{"id": "A", "sequence": "MK"}])
         assert res["success"] is False
@@ -147,6 +147,22 @@ class TestYaml:
         y = BoltzBridge._build_yaml([{"id": "A", "sequence": "MK"}])
         assert "templates:" not in y                 # plain de-novo fold unchanged
 
+    def test_disulfide_bond_constraints_block(self):
+        # Mode C: a declared SG–SG bond → a top-level `constraints: - bond:` block, DECLARATIVE
+        # (no path, no msa, no remote) so the fail-closed LOCAL-ONLY guard is unaffected.
+        y = BoltzBridge._build_yaml(
+            [{"id": "A", "sequence": "MKVC"}], None,
+            [{"atom1": ["A", 2, "SG"], "atom2": ["A", 4, "SG"]}])
+        assert "constraints:" in y
+        assert "- bond:" in y
+        assert "atom1: [A, 2, SG]" in y and "atom2: [A, 4, SG]" in y
+        assert y.count("msa: empty") == 1            # still MSA-free
+        BoltzBridge._assert_local_only("boltz predict x.yaml --seed 0", y, False)  # no breach
+
+    def test_no_constraints_block_when_absent(self):
+        y = BoltzBridge._build_yaml([{"id": "A", "sequence": "MK"}])
+        assert "constraints:" not in y               # plain fold unchanged
+
 
 # ── TEMPLATE-GUIDED YAML injection ────────────────────────────────────────────────────
 
@@ -190,7 +206,7 @@ class TestTemplateYaml:
         b = _bridge()
         b._wsl.translate_path = lambda p: "/wsl" + str(p).replace("\\", "/")
         captured = {}
-        def fake_build(chains, templates=None):
+        def fake_build(chains, templates=None, constraints=None):
             captured["templates"] = templates
             return "version: 1\nsequences:\n  - protein:\n      msa: empty\n"
         monkeypatch.setattr(b, "_build_yaml", fake_build)

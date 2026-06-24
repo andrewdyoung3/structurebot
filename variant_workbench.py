@@ -819,6 +819,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                            "US-align TM/RMSD + superposition-free per-residue "
                                            "deviation. The asymmetry is stated in the readout.")
         self._compare_folds_btn.triggered.connect(self._on_compare_folds_clicked)
+        # DISULFIDE SUITE — three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
+        #   A Discover — multi-seed bonding FREQUENCY (the model's empirical pairing prior, measured)
+        #   B Geometry — measured Cα/Cβ/SG/χSS vs canonical windows for THIS fold (cheap, no fold)
+        #   C Fold with declared bond — introduce Cys (via substitution) + fold WITH the bond (biases)
+        self._ss_menu = self._construct_fold_menu.addMenu("Disulfides")
+        self._ss_discover_btn = self._ss_menu.addAction("Discover (multi-seed frequency)…")
+        self._ss_discover_btn.setToolTip("Fold the construct UNCONSTRAINED across N seeds and report "
+                                         "how often each Cys pair sits in bonding geometry — the "
+                                         "model's empirical pairing prior, MEASURED with N. Folds N "
+                                         "seeds (compute).")
+        self._ss_discover_btn.triggered.connect(self._on_disulfide_discover)
+        self._ss_geometry_btn = self._ss_menu.addAction("Geometry readout (this fold)…")
+        self._ss_geometry_btn.setToolTip("Measure Cα–Cα / Cβ–Cβ / SG–SG / χSS vs canonical windows "
+                                         "for the cysteine pairs in the CURRENT fold. Cheap — reads "
+                                         "coordinates, does NOT fold. Needs an unguided construct fold.")
+        self._ss_geometry_btn.triggered.connect(self._on_disulfide_geometry)
+        self._ss_constrain_btn = self._ss_menu.addAction("Fold with declared bond (introduce Cys)…")
+        self._ss_constrain_btn.setToolTip("Declare a disulfide between two positions: introduce Cys "
+                                          "there (via the substitution path) and fold WITH the bond "
+                                          "constraint. The constraint BIASES toward the bond; it does "
+                                          "NOT enforce geometry — the result is measured, never assumed.")
+        self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
         self._fold_vis_btn = fold_menu.addAction("Hide folds")
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
@@ -1869,6 +1891,54 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status.setText(f"Comparing {a_lbl} vs {b_lbl} (US-align + per-residue)…")
         self.launchRequested.emit(spec)
 
+    # ── Disulfide-suite handlers ─────────────────────────────────────────────────────
+    def _on_disulfide_discover(self) -> None:
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Disulfides are for de-novo constructs — Add sequence first.")
+            return
+        spec = self.disulfide_discovery_launch_spec()
+        if spec is None:
+            self._status.setText("Discovery needs a folded construct — Fold construct first.")
+            return
+        self._status.setText("Folding N unconstrained seeds for disulfide discovery (compute)…")
+        self.launchRequested.emit(spec)
+
+    def _on_disulfide_geometry(self) -> None:
+        spec = self.disulfide_geometry_launch_spec()
+        if spec is None:
+            self._status.setText("Geometry readout needs an unguided construct fold on disk "
+                                 "(Fold construct first).")
+            return
+        self.launchRequested.emit(spec)
+
+    def _on_disulfide_constrain(self) -> None:
+        if self._design is None or self._design.source != "sequence":
+            self._status.setText("Declared disulfide bonds are for de-novo constructs.")
+            return
+        cd = self._cur_tab().design if self._cur_tab() else None
+        if cd is None or not (cd.template_fold or {}).get("model_id"):
+            self._status.setText("Fold the construct first (the bond folds a variant against the T-fold).")
+            return
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Fold with declared disulfide bond",
+            "Two residue numbers to bond (introduces Cys there), e.g. '12 45':")
+        if not ok or not (text or "").strip():
+            return
+        toks = [t for t in re.split(r"[,\s]+", text.strip()) if t]
+        if len(toks) != 2 or not all(t.lstrip("-").isdigit() for t in toks):
+            self._status.setText("Enter exactly two residue numbers (e.g. 12 45).")
+            return
+        ra, rb = int(toks[0]), int(toks[1])
+        spec = self.build_disulfide_introduce_spec(ra, rb, engine="boltz")
+        if spec is None:
+            self._status.setText(f"Could not declare a bond at {ra}/{rb} — check both are valid, "
+                                 f"distinct residue positions in the construct.")
+            return
+        self._persist()
+        self._status.setText(f"Introduced Cys at {ra} and {rb}; folding WITH the declared bond "
+                             f"(biases toward it, geometry measured on the result)…")
+        self.launchRequested.emit(spec)
+
     def apply_align_folds_result(self, spec: dict, result: dict) -> None:
         """Surface the comparative-fold readout (US-align TM/RMSD + per-residue agreement) — the
         honest 'local single-sequence Boltz vs MSA-informed ColabFold' framing is in the summary."""
@@ -2869,6 +2939,106 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "_variant_id": v.id,
         }
 
+    # ── Disulfide suite (Modes A discovery / B geometry-readout / C declared-constraint) ──────
+    def disulfide_discovery_launch_spec(self, n_copies: int = 1) -> Optional[dict]:
+        """MODE A spec — fold the construct UNCONSTRAINED across N seeds → per-cys-pair bonding
+        FREQUENCY. Reuses `construct_fold_launch_spec` for the construct's chains/sequence (same
+        seq source as the fold), then routes to the `disulfide_discovery` tool. De-novo only."""
+        base = self.construct_fold_launch_spec("boltz", n_copies)
+        if base is None:
+            return None
+        bti = base["tool_inputs"]
+        ti: Dict[str, object] = {"model_id": bti.get("model_id")}
+        if bti.get("chains"):
+            ti["chains"] = bti["chains"]
+        else:
+            ti["sequence"] = bti.get("sequence")
+            ti["chain"] = base.get("_denovo_fold_chains", ["A"])[0] if base.get("_denovo_fold_chains") else "A"
+        return {
+            "tool": "disulfide_discovery", "tool_inputs": ti,
+            "user_input": "[Workbench] disulfide discovery — multi-seed bonding frequency (unconstrained)",
+            "confidence": "low", "refresh": "disulfide_discovery",
+        }
+
+    def disulfide_geometry_launch_spec(self) -> Optional[dict]:
+        """MODE B spec — read the construct's EXISTING fold (`cd.template_fold` CIF) and report the
+        MEASURED cysteine-pair geometry. CHEAP (reads coordinates; NEVER folds). None until folded."""
+        cd = self._cur_tab().design if self._cur_tab() else None
+        tf = (cd.template_fold if cd else None) or {}
+        cif = tf.get("cif_path")
+        if not cif:
+            return None
+        return {
+            "tool": "disulfide_geometry", "tool_inputs": {"cif_path": cif},
+            "user_input": "[Workbench] disulfide geometry readout (measured, this fold)",
+            "confidence": "high", "refresh": "disulfide_geometry",      # cheap + deterministic → no gate
+        }
+
+    @staticmethod
+    def _col_for_resnum(cd, resnum: int) -> Optional[int]:
+        for i, c in enumerate(cd.template_cells):
+            if (not c.is_gap) and c.resnum == int(resnum):
+                return i
+        return None
+
+    def build_disulfide_introduce_spec(self, resnum_a: int, resnum_b: int,
+                                       engine: str = "boltz") -> Optional[dict]:
+        """MODE C (introduce) — declare a disulfide between two positions that are NOT yet cysteine:
+        GENUINELY COMPOSE with the substitution subsystem (`add_variant` + `edit_variant(col,"C")`,
+        the existing path — not a parallel cysteine-introduction), then fold THAT variant WITH the
+        declared `bond` constraint. The author-resnum→1-based chain-index conversion (the real
+        correctness hinge) runs through the tested `disulfide_geometry.resnum_to_chain_index` over
+        the variant's ungapped resnums. Returns the constrained fold spec (refresh='fold'), or None."""
+        import disulfide_geometry as _dg
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        if cd is None or self._design is None or self._design.source != "sequence":
+            return None
+        col_a, col_b = self._col_for_resnum(cd, resnum_a), self._col_for_resnum(cd, resnum_b)
+        if col_a is None or col_b is None or col_a == col_b:
+            return None
+        # COMPOSE with substitution: make a variant carrying Cys at BOTH positions (the real path).
+        vid = f"SS_{resnum_a}_{resnum_b}"
+        if cd.get_variant(vid) is None:
+            cd.add_variant(vid, source="manual")
+        cd.edit_variant(vid, col_a, "C", source="disulfide_introduce")
+        cd.edit_variant(vid, col_b, "C", source="disulfide_introduce")
+        tab.set_active_row(vid)
+        spec = self.fold_launch_spec(engine)            # folds THIS (now-Cys) variant
+        if spec is None:
+            return None
+        v = cd.get_variant(vid)
+        ordered = [c.resnum for c in v.cells if (not c.is_gap) and c.resnum is not None]
+        ia = _dg.resnum_to_chain_index(ordered, resnum_a)
+        ib = _dg.resnum_to_chain_index(ordered, resnum_b)
+        if ia is None or ib is None:
+            return None
+        chain_id = cd.rep_chain
+        spec["tool_inputs"]["disulfide_constraints"] = [_dg.bond_constraint(chain_id, ia, ib)]
+        spec["tool_inputs"]["disulfide_bonds"] = [(int(resnum_a), int(resnum_b))]
+        spec["user_input"] = (f"[Workbench] fold {vid} with a DECLARED Cys{resnum_a}–Cys{resnum_b} "
+                              f"bond (biases toward it; does NOT enforce geometry) — {engine}, LOCAL-ONLY")
+        spec["_variant_id"] = vid
+        return spec
+
+    def apply_disulfide_discovery_result(self, spec: dict, result: dict) -> None:
+        """MODE A readout — the model's EMPIRICAL pairing prior, measured with N (never asserted)."""
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "disulfide_discovery":
+                self._status.setText(step.get("summary") if step.get("success")
+                                     else f"Disulfide discovery failed: {step.get('error')}")
+                return
+        self._status.setText("Disulfide discovery produced no result.")
+
+    def apply_disulfide_geometry_result(self, spec: dict, result: dict) -> None:
+        """MODE B readout — measured geometry of THIS fold (factual, not a bond declaration)."""
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "disulfide_geometry":
+                self._status.setText(step.get("summary") if step.get("success")
+                                     else f"Disulfide geometry failed: {step.get('error')}")
+                return
+        self._status.setText("Disulfide geometry produced no result.")
+
     def _on_fold_clicked(self) -> None:
         tab = self._cur_tab()
         v = self._active_variant(tab)
@@ -3459,6 +3629,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 parts.append(f"ipTM {fold['iptm']:.2f}")
             if fold.get("remote_msa"):              # PROVENANCE: this fold LEFT local-only (ColabFold)
                 parts.append("⚠ remote-MSA")
+            if fold.get("constrained"):             # PROVENANCE: biased by a declared disulfide bond
+                nb = len(fold.get("disulfide_bonds") or [])
+                parts.append(f"SS-bond×{nb}" if nb else "SS-bond")
         return " · ".join(parts)
 
     def _find_variant(self, variant_id: str):

@@ -775,6 +775,13 @@ def fold_summary(step_data: Dict[str, Any],
     # crossed the LOCAL-ONLY boundary. Absent/False for the local engines (Boltz/ESMFold).
     if d.get("remote_msa"):
         out["remote_msa"] = True
+    # DECLARED-DISULFIDE PROVENANCE — ADDITIVE: a Mode-C fold BIASED by a declared bond carries the
+    # bond pair(s) + the `constrained` flag, so a saved/exported session never blurs which folds
+    # were constraint-biased vs unconstrained. Absent for a plain fold.
+    if d.get("constrained"):
+        out["constrained"] = True
+        if d.get("disulfide_bonds"):
+            out["disulfide_bonds"] = d["disulfide_bonds"]
     if d.get("seed") is not None:
         out["seed"] = d["seed"]                            # seed-pinned provenance (reproducibility)
     # Predicted-structure file path — ADDITIVE: lets a reused fold (e.g. a de-novo construct's

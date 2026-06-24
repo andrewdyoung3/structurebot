@@ -52,7 +52,8 @@ _COLUMNS: Dict[str, List[str]] = {
                   "mpnn_score", "mpnn_recovery"],
     "substitutions": ["model", "design_chain", "variant", "kind", "resnum", "from_aa", "to_aa",
                       "residues", "source", "score", "recovery", "recommendation"],
-    "fold_plddt": ["model", "design_chain", "row", "engine", "target", "remote_msa", "resnum", "plddt"],
+    "fold_plddt": ["model", "design_chain", "row", "engine", "target", "remote_msa",
+                   "constrained", "disulfide_bonds", "resnum", "plddt"],
     "deviation": ["model", "design_chain", "variant", "chain", "resnum",
                   "dRMSD", "dRMSD_floor", "lDDT", "lDDT_floor"],
     "stability_ddg": ["model", "design_chain", "variant", "resnum", "from_aa", "to_aa",
@@ -120,11 +121,14 @@ def _plddt_rows(model: str, chain: str, row_label: str, fold: Dict[str, Any]) ->
     if not plddt:
         return []
     eng, tgt = fold.get("engine"), fold.get("target")
-    # remote_msa provenance travels into the export so a saved/exported session records which
-    # folds LEFT local-only (ColabFold) vs the local engines — never silently blurred.
+    # remote_msa + disulfide-constraint provenance travel into the export so a saved/exported
+    # session records which folds LEFT local-only (ColabFold) and which were BIASED by a declared
+    # disulfide bond — never silently blurred (same pattern as remote_msa/templated).
     remote = bool(fold.get("remote_msa"))
+    constrained = bool(fold.get("constrained"))
+    ss = ";".join(f"{a}-{b}" for a, b in (fold.get("disulfide_bonds") or [])) or None
     return [{"model": model, "design_chain": chain, "row": row_label, "engine": eng,
-             "target": tgt, "remote_msa": remote,
+             "target": tgt, "remote_msa": remote, "constrained": constrained, "disulfide_bonds": ss,
              "resnum": _as_int(rn) if _as_int(rn) is not None else rn,
              "plddt": val}
             for rn, val in _sorted_resnum_items(plddt)]

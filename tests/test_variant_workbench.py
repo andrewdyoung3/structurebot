@@ -2334,3 +2334,65 @@ class TestColabFoldComparative:
         assert {d["model_id"] for d in descs} == {"1", "2"}       # crystal excluded
         cf = next(d for d in descs if d["model_id"] == "2")
         assert cf["remote_msa"] is True and "remote MSA" in cf["label"]
+
+
+# ── Fold-based disulfide suite (Modes A discovery / B geometry / C introduce-constrain) ──
+class TestDisulfideSuite:
+    def _construct(self, p, seq="MKVLWAACGTDE", start=1):
+        p._add_sequence_construct("binder", seq)
+        cd = next(iter(p._design.chains.values()))
+        if start != 1:                                   # force a NON-1-start author numbering
+            for i, c in enumerate(cd.template_cells):
+                c.resnum = start + i
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        return cd
+
+    def test_discovery_spec_routes_to_discovery_tool(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._construct(p)
+        spec = p.disulfide_discovery_launch_spec()
+        assert spec["tool"] == "disulfide_discovery" and spec["refresh"] == "disulfide_discovery"
+        assert spec["tool_inputs"].get("sequence") == "MKVLWAACGTDE"
+
+    def test_geometry_spec_reads_the_construct_fold_cif(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._construct(p)
+        spec = p.disulfide_geometry_launch_spec()
+        assert spec["tool"] == "disulfide_geometry"
+        assert spec["tool_inputs"]["cif_path"] == "/tmp/binder.cif"
+
+    def test_geometry_spec_none_until_folded(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("b", "MKVCAAC")        # not folded → no cif_path
+        assert p.disulfide_geometry_launch_spec() is None
+
+    def test_introduce_composes_with_substitution_path(self, _app):
+        # declaring a bond on NON-cysteine positions must REUSE add_variant + edit_variant("C")
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        spec = p.build_disulfide_introduce_spec(2, 9)
+        assert spec is not None and spec["_variant_id"] == "SS_2_9"
+        v = cd.get_variant("SS_2_9")
+        assert v is not None and v.sequence[1] == "C" and v.sequence[8] == "C"  # real substitution
+        assert spec["tool_inputs"]["disulfide_bonds"] == [(2, 9)]
+        assert spec["tool_inputs"]["disulfide_constraints"] == [
+            {"atom1": ["A", 2, "SG"], "atom2": ["A", 9, "SG"]}]
+        assert "biases toward it" in spec["user_input"]   # honesty wording (not "enforce")
+
+    def test_introduce_mapping_is_correct_on_non_one_start_construct(self, _app):
+        # the load-bearing correctness hinge: author resnums starting at 10 → 1-based INDEX ≠ resnum
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p, start=10)                # author resnums 10..21
+        spec = p.build_disulfide_introduce_spec(12, 19)  # author 12,19 → index 3,10
+        assert spec["tool_inputs"]["disulfide_constraints"] == [
+            {"atom1": ["A", 3, "SG"], "atom2": ["A", 10, "SG"]}]
+        assert spec["tool_inputs"]["disulfide_bonds"] == [(12, 19)]   # provenance keeps author resnums
+        v = cd.get_variant("SS_12_19")
+        assert v.sequence[2] == "C" and v.sequence[9] == "C"          # Cys at the right positions
+
+    def test_introduce_rejects_same_or_invalid_position(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._construct(p)
+        assert p.build_disulfide_introduce_spec(5, 5) is None         # same column
+        assert p.build_disulfide_introduce_spec(2, 999) is None       # out of range

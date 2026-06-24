@@ -101,6 +101,7 @@ _GPU_BRIDGE_TOOLS = frozenset({
     "proteinmpnn", "mpnn_esmfold", "rfdiffusion", "colabfold",
     "validate_design", "esmfold", "esm", "boltz",
     "variant_deviation",   # S4c: may fold the WT reference set (engine-driven) when absent
+    "disulfide_discovery", # Mode A: folds N unconstrained seeds (Mode B geometry-readout is cheap)
 })
 
 # ColabFold remote-MSA consent — the SINGLE boundary-crossing message both entry points
@@ -2113,6 +2114,10 @@ class ToolRouter:
                 return self._run_assembly_analyser(inputs)
             if tool == "disulfide":
                 return self._run_disulfide(inputs)
+            if tool == "disulfide_discovery":
+                return self._run_disulfide_discovery(inputs)
+            if tool == "disulfide_geometry":
+                return self._run_disulfide_geometry(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3007,9 +3012,16 @@ class ToolRouter:
         templates, terr = self._resolve_boltz_templates(inputs.get("templates"))
         if terr:
             return ToolStepResult(tool="boltz", success=False, error=terr)
+        # DECLARED DISULFIDE BOND (Mode C, optional): `disulfide_constraints` is the emit-ready
+        # Boltz `bond` list (the CALLER already mapped author-resnum→1-based chain index via
+        # disulfide_geometry — the tested conversion); `disulfide_bonds` is the author-resnum pairs
+        # kept for provenance + the readout. A constraint BIASES toward the bond, it does NOT enforce
+        # geometry — the geometry is MEASURED on the result, never assumed (honesty layer).
+        constraints  = inputs.get("disulfide_constraints")
+        declared_ss  = inputs.get("disulfide_bonds")          # [(resnum_a, resnum_b), …] author resnums
         t0  = _time.perf_counter()
         res = bridge.predict(chains, seed=inputs.get("seed"), allow_remote=not local_only,
-                             templates=templates)
+                             templates=templates, constraints=constraints)
         elapsed_ms = (_time.perf_counter() - t0) * 1000
         if not res.get("success"):
             return ToolStepResult(
@@ -3075,17 +3087,142 @@ class ToolRouter:
                 "source":             res.get("source"),
                 "seed":               res.get("seed"),
                 "cif_path":           cif_path,
+                "disulfide_bonds":    declared_ss,    # PROVENANCE: the declared bond(s) (author resnums)
+                "constrained":        bool(constraints),  # this fold was BIASED by a declared bond
                 "commands":           cmds,         # executed live (transparency)
             },
             viz_commands=[],          # already executed live against the REAL id
             viz_explanations=[],
-            summary=(f"Boltz-2 ({shape}{', template-guided' if templated else ''}, local): "
+            summary=(f"Boltz-2 ({shape}{', template-guided' if templated else ''}"
+                     f"{', SS-constrained' if constraints else ''}, local): "
                      f"model #{new_id} — mean pLDDT {mean_plddt:.1f} ({conf})"
                      + (f", ipTM {iptm:.3f}" if isinstance(iptm, (int, float)) else "")
                      + (f", adopted template at {adoption:.0%}" if adoption is not None else "")
                      + f", seed={res.get('seed')}."),
             elapsed_ms=elapsed_ms,
         )
+
+    # ── Disulfide suite — Mode A discovery (multi-seed frequency) + Mode B geometry readout ──
+    def _fold_n_seeds(self, chains: List[Dict[str, str]], n: int, *,
+                      templates: Optional[List[Dict[str, Any]]] = None,
+                      constraints: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+        """Fold *chains* across N seeds — the SHARED multi-seed primitive (the SAME seed convention
+        as the deviation floor: `BOLTZ_SEED` base + a contiguous range), so there is ONE seeding
+        scheme, not a forked second path. Returns the cif paths of the folds that SUCCEEDED.
+        Mode A calls this UNCONSTRAINED (`constraints=None` — the discovery question is what the
+        model thinks UNPROMPTED). Cheap callers (Mode B) must NEVER reach here."""
+        import config as _cfg
+        base = int(getattr(_cfg, "BOLTZ_SEED", 0))
+        bridge = self._get_boltz_bridge()
+        paths: List[str] = []
+        for s in range(base, base + max(1, int(n))):
+            r = bridge.predict(chains, seed=s, allow_remote=False,
+                               templates=templates, constraints=constraints)
+            if r.get("success") and r.get("cif_path"):
+                paths.append(r["cif_path"])
+        return paths
+
+    def _resolve_disulfide_chains(self, inputs: Dict[str, Any]):
+        chains = inputs.get("chains")
+        if not chains:
+            seq = inputs.get("sequence")
+            if not seq:
+                return None
+            chains = [{"id": inputs.get("chain", "A"), "sequence": seq}]
+        return chains
+
+    def _run_disulfide_discovery(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """MODE A — DISCOVERY (observe, frequency-based). Fold the construct UNCONSTRAINED across N
+        seeds and report, per cysteine pair, HOW OFTEN it sits in disulfide-bonding geometry. This
+        frequency IS the model's learned pairing prior expressed EMPIRICALLY (measured, not asserted
+        — always reported with N). Distinct from Mode C (which IMPOSES a bond): A observes what the
+        model thinks unprompted. Reuses `_fold_n_seeds` (the shared seed machinery) + the shared
+        geometry core (`pair_geometry.bonding_compatible` = SG–SG within the bonding window)."""
+        import config as _cfg, itertools, time as _time
+        from disulfide_geometry import parse_cys_atoms, pair_geometry
+        chains = self._resolve_disulfide_chains(inputs)
+        if not chains:
+            return ToolStepResult(tool="disulfide_discovery", success=False,
+                                  error="Disulfide discovery needs the construct's chains/sequence.")
+        n = int(inputs.get("n_seeds") or getattr(_cfg, "DEVIATION_FLOOR_N", 4))
+        t0 = _time.perf_counter()
+        paths = self._fold_n_seeds(chains, n)             # UNCONSTRAINED — the discovery invariant
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+        if not paths:
+            return ToolStepResult(tool="disulfide_discovery", success=False,
+                                  error="No unconstrained folds succeeded — cannot tally pairing frequency.")
+        n_done = len(paths)
+        tally: Dict[tuple, Dict[str, Any]] = {}
+        for p in paths:
+            cys = parse_cys_atoms(p)
+            for ch, residues in cys.items():
+                for ra, rb in itertools.combinations(sorted(residues), 2):
+                    pg = pair_geometry(residues[ra], residues[rb])
+                    t = tally.setdefault((ch, ra, rb), {"compat": 0, "sg": []})
+                    if pg["bonding_compatible"]:
+                        t["compat"] += 1
+                    if pg["sg_sg"] is not None:
+                        t["sg"].append(pg["sg_sg"])
+        pairs = []
+        for (ch, ra, rb), t in tally.items():
+            sgs = sorted(t["sg"])
+            pairs.append({
+                "chain": ch, "resnum_a": ra, "resnum_b": rb,
+                "n_compatible": t["compat"], "n_folds": n_done,
+                "frequency": round(t["compat"] / n_done, 3),
+                "median_sg_sg": (round(sgs[len(sgs) // 2], 3) if sgs else None),
+            })
+        pairs.sort(key=lambda d: (-d["frequency"], -d["n_compatible"]))
+        top = pairs[0] if pairs else None
+        if top is None:
+            summary = (f"Disulfide discovery: no cysteine pairs in the construct "
+                       f"(across {n_done} unconstrained folds).")
+        else:
+            head = "; ".join(
+                f"Cys{d['resnum_a']}–Cys{d['resnum_b']}: bonding-compatible in "
+                f"{d['n_compatible']}/{d['n_folds']} folds" for d in pairs[:3])
+            summary = (f"Disulfide discovery ({n_done} unconstrained folds — the model's empirical "
+                       f"pairing prior, measured): {head}.")
+        return ToolStepResult(
+            tool="disulfide_discovery", success=True,
+            data={"pairs": pairs, "n_folds": n_done, "mode": "discovery"},
+            summary=summary, elapsed_ms=elapsed_ms)
+
+    def _run_disulfide_geometry(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """MODE B — GEOMETRY READOUT (observe, any pair). Report the MEASURED geometry (Cα–Cα,
+        Cβ–Cβ, SG–SG, χSS vs canonical windows) for cysteine pairs in ONE existing fold — a
+        FACTUAL measurement of the produced structure, NOT a declaration that a bond exists. CHEAP:
+        it READS coordinates from a fold already on disk; it NEVER folds (must not trigger Mode A's
+        multi-seed run). Reads `cif_path` (an existing fold); optional `pairs` = [(ra,rb)] else
+        every cysteine pair."""
+        import itertools
+        import os as _os
+        from disulfide_geometry import parse_cys_atoms, pair_geometry
+        cif = inputs.get("cif_path")
+        if not cif or not _os.path.isfile(cif):
+            return ToolStepResult(tool="disulfide_geometry", success=False,
+                                  error="Geometry readout needs an existing fold CIF on disk.")
+        cys = parse_cys_atoms(cif)
+        want = inputs.get("pairs")
+        out = []
+        for ch, residues in cys.items():
+            combos = (want if want else list(itertools.combinations(sorted(residues), 2)))
+            for ra, rb in combos:
+                if ra in residues and rb in residues:
+                    out.append({"chain": ch, "resnum_a": ra, "resnum_b": rb,
+                                **pair_geometry(residues[ra], residues[rb])})
+        out.sort(key=lambda d: (d["sg_sg"] if d["sg_sg"] is not None else 1e9))
+        if not out:
+            summary = "Disulfide geometry: no cysteine pairs to measure in this fold."
+        else:
+            b = out[0]
+            chi = f"{b['chi_ss']:.0f}°" if b["chi_ss"] is not None else "n/a"
+            verdict = ("disulfide-compatible geometry" if b["bonding_compatible"]
+                       else "geometrically incompatible")
+            summary = (f"Disulfide geometry (measured, this fold): Cys{b['resnum_a']}–Cys{b['resnum_b']} "
+                       f"— {verdict} (Cα–Cα {b['ca_ca']} Å, SG–SG {b['sg_sg']} Å, χSS {chi}).")
+        return ToolStepResult(tool="disulfide_geometry", success=True,
+                              data={"pairs": out, "mode": "geometry"}, summary=summary)
 
     def _resolve_boltz_templates(
         self, templates: Optional[List[Dict[str, Any]]]
