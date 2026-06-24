@@ -272,6 +272,14 @@ def remap_session_model_ids(session, old_to_new: dict) -> None:
             for ref in (cd.get("wt_refs") or {}).values():
                 if isinstance(ref, dict) and str(ref.get("model_id")) in m:
                     ref["model_id"] = m[str(ref["model_id"])]
+            # Alignment overlay: the US-align REFERENCE (and the in-place-transformed query fold)
+            # ids must follow a reconnect too, or the alignment-visibility toggle would target a
+            # stale id after a closed+relaunched ChimeraX reassigns ids.
+            sa = cd.get("structural_align")
+            if isinstance(sa, dict):
+                for fld in ("reference_model_id", "query_model_id"):
+                    if str(sa.get(fld)) in m:
+                        sa[fld] = m[str(sa[fld])]
         if str(dd.get("model_id")) in m:
             dd["model_id"] = m[str(dd["model_id"])]
         if key in m:                                   # crystal-seeded design key == its model id

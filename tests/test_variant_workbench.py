@@ -1917,6 +1917,74 @@ class TestStructuralAlign:
         assert cd.structural_align["shared_fold"] is False
         assert "not structurally similar" in p._status.text().lower()
 
+    # ── alignment-overlay visibility (US-align reference under the single-source authority) ──
+    def _align_with_reference(self, p, ref_id="9"):
+        cd = self._fold_monomer_construct(p)
+        spec = {"_align_ukey": p._cur_cd_ukey()}
+        p.apply_structural_align_result(spec, {"tool_step_results": [{"tool": "structural_align",
+            "data": {"ref_label": "1MBN", "tm_ref": 0.771, "tm_query": 0.721, "rmsd": 2.46,
+                     "n_aligned": 136, "matrix": [0] * 12, "shared_fold": True,
+                     "reference_model_id": ref_id}}]})
+        return cd
+
+    def test_reference_under_visibility_authority_shown_by_default(self, _app):
+        p, _ = self._denovo_panel()
+        self._align_with_reference(p, ref_id="9")
+        tab = p._cur_tab()
+        # a fresh align REPLACES the slot (no `hidden`) → the reference is shown
+        assert "show #9 models" in p.fold_visibility_commands(tab)
+
+    def test_global_hide_alignment_references(self, _app):
+        p, _ = self._denovo_panel()
+        self._align_with_reference(p, ref_id="9")
+        tab = p._cur_tab()
+        p._align_ref_vis_btn.setChecked(True)            # global "Hide alignment references"
+        cmds = p.fold_visibility_commands(tab)
+        assert "hide #9 models" in cmds and "show #9 models" not in cmds
+
+    def test_per_cd_aligned_reference_toggle_persists_and_hides(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._align_with_reference(p, ref_id="9")
+        tab = p._cur_tab()
+        p._show_align_ref_cb.setChecked(False)           # per-cd OFF → persist + hide
+        assert cd.structural_align["hidden"] is True
+        assert "hide #9 models" in p.fold_visibility_commands(tab)
+        p._show_align_ref_cb.setChecked(True)            # back ON → shown
+        assert cd.structural_align["hidden"] is False
+        assert "show #9 models" in p.fold_visibility_commands(tab)
+
+    def test_fold_and_reference_toggles_independent_composable(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._align_with_reference(p, ref_id="9")
+        cd.guided_fold = {"model_id": "8"}               # a fold model in the same scene
+        tab = p._cur_tab()
+        # Hide folds → fold hidden, reference STILL shown (independent)
+        p._fold_vis_btn.setChecked(True)
+        cmds = p.fold_visibility_commands(tab)
+        assert "hide #8 models" in cmds and "show #9 models" in cmds
+        # reverse: Hide alignment references → reference hidden, fold shown
+        p._fold_vis_btn.setChecked(False)
+        p._align_ref_vis_btn.setChecked(True)
+        cmds = p.fold_visibility_commands(tab)
+        assert "show #8 models" in cmds and "hide #9 models" in cmds
+
+    def test_hidden_reference_not_reshown_by_color_push(self, _app):
+        # the color-only invariant EXTENDED to alignment refs: a color push must NOT re-show a
+        # toggle-hidden reference (the load-bearing correctness point).
+        p, _ = self._denovo_panel()
+        self._align_with_reference(p, ref_id="9")
+        tab = p._cur_tab()
+        p._show_align_ref_cb.setChecked(False)           # hide the reference
+        combined = p.fold_visibility_commands(tab) + p.color_commands_for(tab)
+        assert "hide #9 models" in combined
+        assert "show #9 models" not in combined          # never re-shown by colour
+
+    def test_per_cd_toggle_disabled_when_no_reference(self, _app):
+        p, _ = self._denovo_panel()
+        self._fold_monomer_construct(p)                  # folded, but NOT aligned → no reference
+        p._sync_align_ref_toggle()
+        assert p._show_align_ref_cb.isEnabled() is False
+
 
 class TestTemplateGuided:
     """Template-guided fold (first build) — panel side. The guided-fold spec populates a

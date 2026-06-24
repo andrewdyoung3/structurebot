@@ -189,6 +189,42 @@ def test_align_folds_compares_two_folds_with_framing(tmp_path, monkeypatch):
     assert "USalign" in w.run_command.call_args[0][0]
 
 
+def test_pdb_id_reference_registered_in_session(tmp_path, monkeypatch):
+    # The just-opened PDB-id reference is tracked in session.structures (aligned_reference
+    # metadata, name=PDB id) → under the visibility authority + reopen-by-id on reconnect.
+    r = _router()
+    qf = tmp_path / "fold.cif"; qf.write_text("x")
+    rf = tmp_path / "1mbn.pdb"; rf.write_text("y")
+    w = _fake_wsl()
+    w.run_command.return_value = {"ok": True, "stdout": USALIGN_OUT, "stderr": "", "error": None}
+    monkeypatch.setattr(wsl_bridge, "WSLBridge", lambda **k: w)
+    r._download_pdb_by_id = MagicMock(return_value=str(rf))
+    r.bridge.run_command.return_value = {"value": "Opened model #12"}
+    r._parse_model_spec = MagicMock(return_value="#12")
+    out = r._run_structural_align({
+        "query_path": str(qf), "query_model_id": "7",
+        "reference_pdb_id": "1MBN", "ref_label": "1MBN"})
+    assert out.success
+    r.session.add_structure.assert_called_once()
+    args, kwargs = r.session.add_structure.call_args
+    assert args[0] == "12"                                  # the opened reference's id
+    assert kwargs["metadata"]["aligned_reference"] is True
+    assert kwargs["metadata"]["ref_pdb_id"] == "1MBN"
+
+
+def test_loaded_model_reference_not_reregistered(tmp_path, monkeypatch):
+    # A loaded-model reference is ALREADY its own session structure → no double-registration.
+    r = _router()
+    qf = tmp_path / "f.cif"; qf.write_text("x"); rf = tmp_path / "r.pdb"; rf.write_text("y")
+    w = _fake_wsl()
+    w.run_command.return_value = {"ok": True, "stdout": USALIGN_OUT, "stderr": "", "error": None}
+    monkeypatch.setattr(wsl_bridge, "WSLBridge", lambda **k: w)
+    r.bridge.run_command.return_value = {"value": ""}
+    r._run_structural_align({"query_path": str(qf), "query_model_id": "7",
+                             "reference_path": str(rf), "reference_model_id": "5", "ref_label": "#5"})
+    r.session.add_structure.assert_not_called()             # #5 was already open/registered
+
+
 def test_align_folds_needs_both_files_on_disk(tmp_path):
     r = _router()
     fa = tmp_path / "a.cif"; fa.write_text("x")

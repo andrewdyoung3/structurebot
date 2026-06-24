@@ -6127,6 +6127,19 @@ class ToolRouter:
                 ro = self.bridge.run_command(f'open "{Path(ref_path).as_posix()}"')
                 spec = self._parse_model_spec(ro, None)
                 ref_model_id = spec.lstrip("#") if spec else None
+                if ref_model_id:
+                    # TRACK the just-opened reference in session.structures so it is (a) under the
+                    # workbench's alignment-visibility authority (toggleable like a fold) and (b)
+                    # reconnect-aware: name = the 4-char PDB id → `_resolve_reopen_target` re-fetches
+                    # it by id on reload. (The loaded-model reference is ALREADY its own session
+                    # structure and re-opens from that entry — no separate tracking needed.)
+                    try:
+                        self.session.add_structure(
+                            ref_model_id, (ref_id or ref_label),
+                            path=ref_path,
+                            metadata={"aligned_reference": True, "ref_pdb_id": (ref_id or None)})
+                    except Exception:
+                        pass
             vm = self._view_matrix_command(query_model_id, parsed["matrix"])
             self.bridge.run_command(vm); overlay_cmds.append(vm)
             if ref_model_id:                           # neutral grey ref under the pLDDT fold
