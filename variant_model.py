@@ -770,6 +770,11 @@ def fold_summary(step_data: Dict[str, Any],
         out["iptm"] = float(d["iptm"])
     if d.get("chains_ptm") is not None:
         out["chains_ptm"] = d["chains_ptm"]                # per-chain pTM, {chain_idx: ptm}
+    # REMOTE-MSA PROVENANCE — ADDITIVE: True only for a ColabFold fold (which LEFT local-only).
+    # Threads to the panel badge + export rows so a saved session never blurs which folds
+    # crossed the LOCAL-ONLY boundary. Absent/False for the local engines (Boltz/ESMFold).
+    if d.get("remote_msa"):
+        out["remote_msa"] = True
     if d.get("seed") is not None:
         out["seed"] = d["seed"]                            # seed-pinned provenance (reproducibility)
     # Predicted-structure file path — ADDITIVE: lets a reused fold (e.g. a de-novo construct's

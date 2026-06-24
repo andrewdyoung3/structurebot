@@ -2219,3 +2219,50 @@ def test_variant_default_cell_has_explicit_contrast_bg(_app):
     # an EDIT still stands out distinctly (unchanged)
     tab.design.edit_variant(vid, 1, "W"); tab.rebuild(); tab = p._cur_tab()
     assert tab.color_hex_at(vid, 1) == _EDIT_BG.name()
+
+
+# ── ColabFold comparative-fold: provenance badge + Compare-folds wiring ───────────
+class TestColabFoldComparative:
+    """Remote-MSA provenance reaches the badge, and the Compare-folds spec builder +
+    predicted-model gatherer (all pure / logic-level; no GPU, no remote)."""
+
+    def _v_with_fold(self, fold):
+        import types
+        return types.SimpleNamespace(
+            results=types.SimpleNamespace(fold=fold, stability=None, solubility=None))
+
+    def test_badge_shows_remote_msa_marker(self):
+        v = self._v_with_fold({"mean_plddt": 88.0, "remote_msa": True})
+        badge = VariantWorkbenchPanel._badge_for(v)
+        assert "remote-MSA" in badge and "pLDDT 88" in badge
+
+    def test_badge_local_fold_has_no_remote_marker(self):
+        v = self._v_with_fold({"mean_plddt": 90.0, "iptm": 0.95})   # Boltz, local
+        badge = VariantWorkbenchPanel._badge_for(v)
+        assert "remote-MSA" not in badge and "ipTM 0.95" in badge
+
+    def test_build_align_folds_spec_pairs_two_folds(self):
+        spec = VariantWorkbenchPanel.build_align_folds_spec(
+            {"label": "#1 boltz", "path": "a.cif", "model_id": "1", "engine": "boltz", "remote_msa": False},
+            {"label": "#2 colabfold", "path": "b.pdb", "model_id": "2", "engine": "colabfold", "remote_msa": True})
+        assert spec["tool"] == "align_folds" and spec["refresh"] == "align_folds"
+        ti = spec["tool_inputs"]
+        assert ti["fold_a"]["engine"] == "boltz" and ti["fold_b"]["remote_msa"] is True
+
+    def test_build_align_folds_spec_none_without_both_paths(self):
+        assert VariantWorkbenchPanel.build_align_folds_spec(
+            {"path": "a.cif"}, {"model_id": "2"}) is None     # fold_b has no on-disk path
+
+    def test_predicted_fold_descriptors_gathers_remote_and_local(self):
+        import types
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
+        p._session = types.SimpleNamespace(structures={
+            "1": {"path": "boltz.cif", "metadata": {"predicted": True, "engine": "boltz"}},
+            "2": {"path": "cf.pdb", "metadata": {"predicted": True, "engine": "colabfold",
+                                                 "remote_msa": True}},
+            "3": {"path": "crystal.cif", "metadata": {}},          # NOT predicted → excluded
+        })
+        descs = p._predicted_fold_descriptors()
+        assert {d["model_id"] for d in descs} == {"1", "2"}       # crystal excluded
+        cf = next(d for d in descs if d["model_id"] == "2")
+        assert cf["remote_msa"] is True and "remote MSA" in cf["label"]

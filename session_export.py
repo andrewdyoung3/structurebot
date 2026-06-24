@@ -52,7 +52,7 @@ _COLUMNS: Dict[str, List[str]] = {
                   "mpnn_score", "mpnn_recovery"],
     "substitutions": ["model", "design_chain", "variant", "kind", "resnum", "from_aa", "to_aa",
                       "residues", "source", "score", "recovery", "recommendation"],
-    "fold_plddt": ["model", "design_chain", "row", "engine", "target", "resnum", "plddt"],
+    "fold_plddt": ["model", "design_chain", "row", "engine", "target", "remote_msa", "resnum", "plddt"],
     "deviation": ["model", "design_chain", "variant", "chain", "resnum",
                   "dRMSD", "dRMSD_floor", "lDDT", "lDDT_floor"],
     "stability_ddg": ["model", "design_chain", "variant", "resnum", "from_aa", "to_aa",
@@ -120,8 +120,12 @@ def _plddt_rows(model: str, chain: str, row_label: str, fold: Dict[str, Any]) ->
     if not plddt:
         return []
     eng, tgt = fold.get("engine"), fold.get("target")
+    # remote_msa provenance travels into the export so a saved/exported session records which
+    # folds LEFT local-only (ColabFold) vs the local engines — never silently blurred.
+    remote = bool(fold.get("remote_msa"))
     return [{"model": model, "design_chain": chain, "row": row_label, "engine": eng,
-             "target": tgt, "resnum": _as_int(rn) if _as_int(rn) is not None else rn,
+             "target": tgt, "remote_msa": remote,
+             "resnum": _as_int(rn) if _as_int(rn) is not None else rn,
              "plddt": val}
             for rn, val in _sorted_resnum_items(plddt)]
 

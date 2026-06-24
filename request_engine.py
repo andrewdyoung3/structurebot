@@ -24,7 +24,7 @@ import re
 from typing import List, Optional, Tuple
 
 from translator import RefusalError, probe_chimerax_verbs
-from tool_router import ToolRouter
+from tool_router import ToolRouter, _COLABFOLD_REMOTE_CONSENT_MSG
 
 
 class RequestEngine:
@@ -295,6 +295,12 @@ class RequestEngine:
             if not commands:
                 return
 
+        # 7b. ColabFold REMOTE-MSA consent — the §0 LOCAL-ONLY boundary. BOTH front-end
+        #     paths reach this shared spine, so crossing local-only is ALWAYS a conscious,
+        #     surfaced choice (never silent). Declined → abort before any network call.
+        if not self._grant_remote_consent(result, presenter):
+            return
+
         presenter.blank()
 
         # Initialize execution state (used after try/except block)
@@ -477,6 +483,28 @@ class RequestEngine:
             on_result(result)
 
     # ── panel tool-launch entry (build a result dict, enter the shared spine) ─────
+    @staticmethod
+    def _grant_remote_consent(result: dict, presenter) -> bool:
+        """Surfaced consent for the ColabFold remote-MSA boundary (leaving LOCAL-ONLY).
+
+        No-op (returns True) unless a colabfold run is planned WITHOUT a prior `allow_remote`.
+        Then it surfaces the exact boundary wording and requires an EXPLICIT yes: on consent it
+        sets `allow_remote=True` in the colabfold inputs (so the router/bridge — both fail-closed
+        on that flag — proceed) and returns True; on decline it returns False so the caller aborts
+        before any network call. The SINGLE chokepoint both front-end paths funnel through, so
+        crossing local-only is always conscious — there is no silent remote fold."""
+        if "colabfold" not in (result.get("tools_needed") or []):
+            return True
+        cf = (result.get("tool_inputs") or {}).get("colabfold")
+        if not isinstance(cf, dict) or cf.get("allow_remote"):
+            return True                          # already consented (or nothing to gate)
+        presenter.warn(_COLABFOLD_REMOTE_CONSENT_MSG)
+        if not presenter.ask_yes_no(_COLABFOLD_REMOTE_CONSENT_MSG + "\n\nContinue?", default="n"):
+            presenter.dim("ColabFold remote fold declined — staying LOCAL-ONLY.")
+            return False
+        cf["allow_remote"] = True                # consent granted → unlock the network call
+        return True
+
     def handle_tool_request(
         self,
         tool:        str,

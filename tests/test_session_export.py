@@ -108,6 +108,26 @@ def test_deviation_keeps_both_metrics_and_floors(tmp_path):
     assert d["2"]["lDDT"] == "0.7" and d["2"]["lDDT_floor"] == "0.9"
 
 
+def test_remote_msa_provenance_reaches_fold_plddt_export(tmp_path):
+    # A ColabFold (remote-MSA) construct fold → the export's fold_plddt rows MUST carry the
+    # remote_msa tag (the column reaches the table, not just the badge), so a saved/exported
+    # session never blurs which folds left LOCAL-ONLY. Local engines tag False.
+    ds = {"dn-1": {"model_id": "dn-1", "source": "sequence", "chains": {"c1": {
+        "rep_chain": "A", "members": [["2", "A"]],
+        "template_fold": {"engine": "colabfold", "target": "monomer", "mean_plddt": 88.0,
+                          "remote_msa": True, "plddt": {1: 88.0, 2: 90.0}},
+        "variants": []}}}}
+    assert "remote_msa" in _COLUMNS["fold_plddt"]
+    tables = build_tables(ds)
+    fp = tables["fold_plddt"]
+    assert fp and all(row["remote_msa"] is True for row in fp)     # remote fold tagged in every row
+    # a LOCAL Boltz fold tags remote_msa False (never blank/missing)
+    ds["dn-1"]["chains"]["c1"]["template_fold"] = {
+        "engine": "boltz", "target": "monomer", "mean_plddt": 90.0, "plddt": {1: 90.0}}
+    fp2 = build_tables(ds)["fold_plddt"]
+    assert fp2 and all(row["remote_msa"] is False for row in fp2)
+
+
 def test_failloud_skips_empty_types(tmp_path):
     # a session with ONLY solubility data → deviation/stability/fold/assist/align all skipped
     ds = {"m": {"source": "sequence", "chains": {"c": {"rep_chain": "A", "variants": [

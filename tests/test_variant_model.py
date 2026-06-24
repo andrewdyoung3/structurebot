@@ -112,6 +112,18 @@ class TestFoldSummary:
         out = fold_summary({"engine": "esmfold", "new_model_id": "2", "mean_plddt": 80.0,
                             "plddt": {1: 80.0}}, author_resnums=[1])
         assert "iptm" not in out and "chains_ptm" not in out and "seed" not in out
+
+    def test_remote_msa_provenance_threaded_for_colabfold(self):
+        # ColabFold emits remote_msa=True → threaded ADDITIVELY (provenance: this fold left local-only)
+        out = fold_summary({"engine": "colabfold", "new_model_id": "5", "mean_plddt": 88.0,
+                            "plddt": {1: 88.0}, "remote_msa": True}, author_resnums=[1])
+        assert out["remote_msa"] is True and out["engine"] == "colabfold"
+
+    def test_remote_msa_absent_for_local_engines(self):
+        # Boltz/ESMFold (no remote_msa) → key absent (byte-identical to pre-ColabFold)
+        out = fold_summary({"engine": "boltz", "new_model_id": "3", "mean_plddt": 90.0,
+                            "plddt": {1: 90.0}}, author_resnums=[1])
+        assert "remote_msa" not in out
 from color_modes import ddg_color
 from seq_editor.controller import ResidueCell, ChainSeq
 

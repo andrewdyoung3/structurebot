@@ -56,7 +56,8 @@ _RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα 
 _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
 _LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
 _DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
-_FOLD_ENGINES = ("esmfold", "boltz")        # S4b engine picker order (Boltz lands its own stage)
+_FOLD_ENGINES = ("esmfold", "boltz", "colabfold")   # engines whose step data the fold seam consumes
+_LOCAL_FOLD_ENGINES = ("esmfold", "boltz")  # LOCAL-ONLY engines; colabfold leaves the boundary (remote MSA)
 _GUIDED_TEMPLATE_THRESHOLD_A = 10.0         # default Boltz template force-threshold (Å) for hard steering
 _RESNUM_ROLE = QtCore.Qt.UserRole           # cell → template column index
 _ROW_ROLE = QtCore.Qt.UserRole + 1          # cell → row id ("T"/"V1"/… / _SUGGEST_ROW / None)
@@ -733,8 +734,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._construct_fold_menu = fold_menu.addMenu("Fold construct (de novo)")
         self._construct_fold_acts = []
         _NMER = [(1, "monomer"), (2, "dimer"), (3, "trimer"), (4, "tetramer")]
-        for _eng in ("esmfold", "boltz"):
-            _sub = self._construct_fold_menu.addMenu(_eng)
+        for _eng in ("esmfold", "boltz", "colabfold"):
+            # ColabFold is the one REMOTE engine — labelled + tool-tipped so the boundary is
+            # visible AT selection (the spine's consent gate then surfaces it again before any call).
+            _menu_label = ("colabfold (remote MSA — leaves local-only)"
+                           if _eng == "colabfold" else _eng)
+            _sub = self._construct_fold_menu.addMenu(_menu_label)
+            if _eng == "colabfold":
+                _sub.setToolTip("ColabFold (AF2) — uses the REMOTE MSA server, so this LEAVES "
+                                "LOCAL-ONLY. A comparative accuracy reference vs the local Boltz "
+                                "fold: local single-sequence Boltz vs MSA-informed ColabFold "
+                                "(largely measures the MSA's value, not a fair model-vs-model test).")
             for _n, _lbl in _NMER:
                 _a = _sub.addAction(f"{_lbl} (N={_n})")
                 if _eng == "esmfold" and _n > 1:
@@ -748,12 +758,29 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # unguided T-fold). Monomer first; the per-template list is multimer-ready. Reuses the
         # Align dialog's PDB-id / loaded-model picker; pre-fills a shared-fold align reference.
         self._guided_fold_btn = self._construct_fold_menu.addMenu("guided by template (Boltz)")
+        self._guided_fold_btn.setToolTip("Boltz template-guided: per-chain MULTI-template "
+                                         "soft-consensus (force/threshold) — LOCAL-ONLY.")
         self._guided_fold_acts = []
         for _n, _lbl in _NMER:
             _g = self._guided_fold_btn.addAction(f"{_lbl} (N={_n})")
             _g.triggered.connect(
                 lambda _checked=False, k=_n: self._on_construct_fold_guided("boltz", k))
             self._guided_fold_acts.append(_g)
+        # ColabFold template-guided — COARSER: a SINGLE custom PDB template (not Boltz's per-chain
+        # multi-template scheme) AND remote-MSA. Both differences are surfaced in the menu label +
+        # tooltip so "ColabFold template-guided" can't be mistaken for Boltz family behaviour.
+        self._guided_fold_cf_btn = self._construct_fold_menu.addMenu(
+            "guided by template (ColabFold — 1 template, remote MSA)")
+        self._guided_fold_cf_btn.setToolTip("ColabFold template-guided: a SINGLE custom PDB "
+                                            "template (coarser than Boltz's per-chain multi-template "
+                                            "force/threshold) AND uses the REMOTE MSA server "
+                                            "(leaves LOCAL-ONLY). Extra templates are ignored.")
+        self._guided_fold_cf_acts = []
+        for _n, _lbl in _NMER:
+            _gc = self._guided_fold_cf_btn.addAction(f"{_lbl} (N={_n})")
+            _gc.triggered.connect(
+                lambda _checked=False, k=_n: self._on_construct_fold_guided("colabfold", k))
+            self._guided_fold_cf_acts.append(_gc)
         # STAGE 2 — AUTO template discovery: foldseek the construct's UNGUIDED MONOMER fold against
         # the LOCAL PDB DB → ranked structural neighbours → the SAME picker as manual selection →
         # guided re-fold. Closes the orphan case (a designed sequence with no known family to type
@@ -783,6 +810,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                              "template (US-align, sequence-independent) — TM>0.5 "
                                              "means the fold adopted the template.")
         self._validate_guided_btn.triggered.connect(self._on_validate_guided_clicked)
+        # COMPARE two folds (any engines) — the comparative-fold readout: US-align TM/RMSD +
+        # per-residue agreement between e.g. the LOCAL Boltz fold and the REMOTE-MSA ColabFold fold.
+        self._compare_folds_btn = self._construct_fold_menu.addAction(
+            "Compare two folds (US-align + per-residue)…")
+        self._compare_folds_btn.setToolTip("Structurally compare two open predicted models (any "
+                                           "engines) — e.g. local Boltz vs MSA-informed ColabFold. "
+                                           "US-align TM/RMSD + superposition-free per-residue "
+                                           "deviation. The asymmetry is stated in the readout.")
+        self._compare_folds_btn.triggered.connect(self._on_compare_folds_clicked)
         self._fold_vis_btn = fold_menu.addAction("Hide folds")
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
@@ -1033,13 +1069,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             blocks[ukey] = block
             fold_chains.extend({"id": ch, "sequence": seq} for ch in block)
         n_total = len(fold_chains)
-        if n_total > 1 and engine != "boltz":
-            return None                                    # ESMFold can't fold an assembly
+        if n_total > 1 and engine not in ("boltz", "colabfold"):
+            return None                                    # ESMFold can't fold an assembly (Boltz/ColabFold can)
         ti: Dict[str, object] = {
             "model_id":    self._design.model_id,          # synthetic (stable persistence key)
             "engine":      engine,
             "open_model":  True,
-            "local_only":  True,
+            # ColabFold leaves LOCAL-ONLY (remote MSA) — flag it so the spine's consent gate
+            # fires; the local engines stay local_only. allow_remote is NOT set here (the gate
+            # sets it only after the user consents → no silent network call).
+            "local_only":  engine in _LOCAL_FOLD_ENGINES,
             "no_reference": True,                          # EXPLICIT skip-matchmaker (no crystal)
         }
         if n_total > 1:
@@ -1118,14 +1157,35 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not refs:
             return None
         spec = self.construct_fold_launch_spec(engine, n_copies)
-        if spec is None or engine != "boltz":
-            return None                                    # template-guided is Boltz-only
+        if spec is None or engine not in ("boltz", "colabfold"):
+            return None                                    # template-guided is Boltz / ColabFold only
+        ti = spec["tool_inputs"]
+        labels = [r.get("label") or r.get("pdb_id") or "template" for r in refs]
+
+        if engine == "colabfold":
+            # ColabFold custom-template mode takes a SINGLE PDB template (--custom-template-path)
+            # — COARSER than Boltz's per-chain multi-template force/threshold scheme. If the user
+            # picked several, only the FIRST is used; surface that so "ColabFold template-guided"
+            # is never silently mistaken for Boltz's family / multi-template behaviour.
+            first = refs[0]
+            ti["template"] = first.get("path") or first.get("pdb_id")
+            dropped = (f" (+{len(refs) - 1} more IGNORED — ColabFold uses ONE template)"
+                       if len(refs) > 1 else "")
+            spec["user_input"] = (f"[Workbench] fold construct guided by {labels[0]}{dropped} — "
+                                  f"ColabFold, REMOTE MSA (leaves LOCAL-ONLY), single custom template")
+            spec["refresh"] = "construct_fold_guided"
+            spec["_guided_template"] = {
+                "label": labels[0], "labels": labels[:1], "n_templates": 1,
+                "force": False, "threshold": None, "coarse_single_template": True,
+                "pdb_id": first.get("pdb_id"), "path": first.get("path"),
+            }
+            return spec
+
+        # Boltz: the full per-template list (force/threshold, multi-template soft-consensus).
         entries = [e for e in (self._build_template_entry(r, spec) for r in refs) if e]
         if not entries:
             return None
-        ti = spec["tool_inputs"]
         ti["templates"] = entries
-        labels = [r.get("label") or r.get("pdb_id") or "template" for r in refs]
         n = len(entries)
         any_hard = any(e.get("force") for e in entries)
         label = labels[0] if n == 1 else f"{n} templates ({', '.join(labels)})"
@@ -1224,7 +1284,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         fam = f"{len(refs)} templates (soft-consensus)" if len(refs) > 1 else \
               f"{refs[0]['label']} ({'hard' if hard else 'soft'})"
-        self._status.setText(f"Folding the construct guided by {fam} via Boltz (LOCAL-ONLY)…")
+        _where = ("ColabFold (REMOTE MSA — leaves local-only; single template)"
+                  if engine == "colabfold" else "Boltz (LOCAL-ONLY)")
+        self._status.setText(f"Folding the construct guided by {fam} via {_where}…")
         self.launchRequested.emit(spec)
 
     # ── STAGE 2: foldseek auto template discovery → the same picker → guided re-fold ──
@@ -1722,6 +1784,84 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"Construct folded ({data.get('engine')}, {len(sent_ids)}-chain): model "
             f"#{fold_mid}{mp_txt}, pLDDT-coloured. Selection + colour now act on the fold; "
             f"no matchmaker (de novo, no reference).")
+
+    # ── Compare two folds (US-align + per-residue) — comparative-fold readout ─────────
+    def _predicted_fold_descriptors(self) -> List[Dict[str, Any]]:
+        """Open PREDICTED models as align-folds descriptors {label, engine, model_id, path,
+        remote_msa}, newest first — gathered from the live session's structures (the bridges
+        register each fold with predicted/engine/remote_msa metadata + its on-disk path)."""
+        sess = getattr(self, "_session", None)
+        structs = getattr(sess, "structures", {}) if sess is not None else {}
+        out: List[Dict[str, Any]] = []
+        for mid, info in (structs or {}).items():
+            meta = (info or {}).get("metadata") or {}
+            if not meta.get("predicted") or not (info or {}).get("path"):
+                continue
+            eng = meta.get("engine") or "fold"
+            out.append({
+                "model_id":   str(mid),
+                "engine":     eng,
+                "remote_msa": bool(meta.get("remote_msa")),
+                "path":       info.get("path"),
+                "label":      f"#{mid} {eng}" + (" (remote MSA)" if meta.get("remote_msa") else ""),
+            })
+        out.sort(key=lambda d: int(d["model_id"]) if d["model_id"].isdigit() else 0, reverse=True)
+        return out
+
+    @staticmethod
+    def build_align_folds_spec(fold_a: Dict[str, Any], fold_b: Dict[str, Any],
+                               multichain: bool = False, chain: str = "A") -> Optional[dict]:
+        """Pure: align_folds launch spec from two fold descriptors (each {label,engine,model_id,
+        path,remote_msa}). None unless BOTH carry an on-disk path (US-align reads files)."""
+        if not (fold_a.get("path") and fold_b.get("path")):
+            return None
+        return {
+            "tool": "align_folds",
+            "tool_inputs": {"fold_a": fold_a, "fold_b": fold_b,
+                            "multichain": multichain, "chain": chain},
+            "user_input": (f"[Workbench] compare folds {fold_a.get('label')} vs "
+                           f"{fold_b.get('label')} — US-align + per-residue deviation"),
+            "confidence": "high",
+            "refresh": "align_folds",
+        }
+
+    def _on_compare_folds_clicked(self) -> None:
+        """Pick two open predicted models → compare via US-align + per-residue deviation."""
+        cands = self._predicted_fold_descriptors()
+        if len(cands) < 2:
+            self._status.setText("Compare folds needs TWO open predicted models — fold the "
+                                 "construct with two engines (e.g. Boltz, then ColabFold) first.")
+            return
+        labels = [c["label"] for c in cands]
+        a_lbl, ok = QtWidgets.QInputDialog.getItem(
+            self, "Compare folds — first model", "Fold A:", labels, 0, False)
+        if not ok:
+            return
+        rest = [l for l in labels if l != a_lbl] or labels
+        b_lbl, ok = QtWidgets.QInputDialog.getItem(
+            self, "Compare folds — second model", "Fold B:", rest, 0, False)
+        if not ok:
+            return
+        fold_a = next(c for c in cands if c["label"] == a_lbl)
+        fold_b = next(c for c in cands if c["label"] == b_lbl)
+        spec = self.build_align_folds_spec(fold_a, fold_b)
+        if spec is None:
+            self._status.setText("Could not build the compare request (a fold file is missing).")
+            return
+        self._status.setText(f"Comparing {a_lbl} vs {b_lbl} (US-align + per-residue)…")
+        self.launchRequested.emit(spec)
+
+    def apply_align_folds_result(self, spec: dict, result: dict) -> None:
+        """Surface the comparative-fold readout (US-align TM/RMSD + per-residue agreement) — the
+        honest 'local single-sequence Boltz vs MSA-informed ColabFold' framing is in the summary."""
+        for step in (result or {}).get("tool_step_results", []) or []:
+            if step.get("tool") == "align_folds":
+                if step.get("success"):
+                    self._status.setText(step.get("summary") or "Folds compared.")
+                else:
+                    self._status.setText(f"Compare folds failed: {step.get('error')}")
+                return
+        self._status.setText("Compare folds produced no result.")
 
     @staticmethod
     def _chains_ptm_by_id(chains_ptm, observed) -> Dict[str, Any]:
@@ -3240,6 +3380,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 parts.append(f"pLDDT {fold['mean_plddt']:.0f}")
             if fold.get("iptm") is not None:        # multimer interface confidence (Boltz)
                 parts.append(f"ipTM {fold['iptm']:.2f}")
+            if fold.get("remote_msa"):              # PROVENANCE: this fold LEFT local-only (ColabFold)
+                parts.append("⚠ remote-MSA")
         return " · ".join(parts)
 
     def _find_variant(self, variant_id: str):

@@ -152,3 +152,58 @@ def test_run_usalign_failure_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(wsl_bridge, "WSLBridge", lambda **k: w)
     out = r._run_structural_align({"query_path": str(qf), "reference_path": str(rf)})
     assert not out.success and "US-align failed" in out.error
+
+
+# ── D. _run_align_folds — compare two existing folds (US-align + per-residue), reuse only ──
+def _ca_line(coords):
+    # minimal {resnum: (x,y,z)} map for the per-residue deviation reuse
+    return {i + 1: xyz for i, xyz in enumerate(coords)}
+
+
+def test_align_folds_compares_two_folds_with_framing(tmp_path, monkeypatch):
+    """Two existing fold files (local Boltz vs remote ColabFold) → US-align TM/RMSD + per-residue
+    deviation, with the asymmetry stated up front. REUSE ONLY (no new alignment code)."""
+    r = _router()
+    fa = tmp_path / "boltz.cif"; fa.write_text("x")
+    fb = tmp_path / "colabfold.pdb"; fb.write_text("y")
+    w = _fake_wsl()
+    w.run_command.return_value = {"ok": True, "stdout": USALIGN_OUT, "stderr": "", "error": None}
+    monkeypatch.setattr(wsl_bridge, "WSLBridge", lambda **k: w)
+    # both models "open" → identical Cα so the per-residue agreement path runs
+    ca = _ca_line([(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)])
+    r._read_fold_ca = MagicMock(return_value=ca)
+    out = r._run_align_folds({
+        "fold_a": {"label": "#1 boltz", "engine": "boltz", "model_id": "1",
+                   "path": str(fa), "remote_msa": False},
+        "fold_b": {"label": "#2 colabfold", "engine": "colabfold", "model_id": "2",
+                   "path": str(fb), "remote_msa": True},
+    })
+    assert out.success
+    d = out.data
+    assert d["tm"] == 0.7711 and d["rmsd"] == 2.46 and d["n_aligned"] == 136
+    assert d["mean_ddm_A"] == 0.0 and d["mean_lddt"] == 1.0 and d["n_common"] == 4  # identical Cα
+    # asymmetry stated: local single-sequence vs MSA-informed (NOT a fair model-vs-model test)
+    assert "local single-sequence" in d["framing"] and "MSA-informed" in d["framing"]
+    assert "not a fair model-vs-model test" in d["framing"].lower()
+    assert "boltz" in out.summary.lower() and "colabfold" in out.summary.lower()
+    assert "USalign" in w.run_command.call_args[0][0]
+
+
+def test_align_folds_needs_both_files_on_disk(tmp_path):
+    r = _router()
+    fa = tmp_path / "a.cif"; fa.write_text("x")
+    out = r._run_align_folds({"fold_a": {"path": str(fa)},
+                              "fold_b": {"path": "/nope/b.pdb"}})
+    assert not out.success and "on disk" in out.error.lower()
+
+
+def test_align_folds_skips_per_residue_when_no_open_model(tmp_path, monkeypatch):
+    r = _router()
+    fa = tmp_path / "a.cif"; fa.write_text("x"); fb = tmp_path / "b.pdb"; fb.write_text("y")
+    w = _fake_wsl()
+    w.run_command.return_value = {"ok": True, "stdout": USALIGN_OUT, "stderr": "", "error": None}
+    monkeypatch.setattr(wsl_bridge, "WSLBridge", lambda **k: w)
+    out = r._run_align_folds({"fold_a": {"label": "A", "path": str(fa)},   # no model_id → no Cα
+                              "fold_b": {"label": "B", "path": str(fb)}})
+    assert out.success and out.data["mean_ddm_A"] is None       # TM/RMSD still captured
+    assert out.data["tm"] == 0.7711

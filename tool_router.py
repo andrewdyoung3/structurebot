@@ -103,6 +103,16 @@ _GPU_BRIDGE_TOOLS = frozenset({
     "variant_deviation",   # S4c: may fold the WT reference set (engine-driven) when absent
 })
 
+# ColabFold remote-MSA consent — the SINGLE boundary-crossing message both entry points
+# (Workbench engine-picker dialog AND the NL colabfold/alphafold intent) surface BEFORE any
+# network call. ColabFold is the one fold engine that leaves LOCAL-ONLY (its MSA is remote),
+# so crossing that boundary is always a conscious, surfaced choice (default-off, never silent).
+_COLABFOLD_REMOTE_CONSENT_MSG = (
+    "Fold with ColabFold — uses the remote MSA server (leaves LOCAL-ONLY). "
+    "Comparative reference vs the local Boltz fold; the sequence is sent to the "
+    "ColabFold MSA server."
+)
+
 # Representation classifier — created once so _claude_capped latch persists across calls
 _repr_classify_fn = None
 
@@ -1753,7 +1763,11 @@ class ToolRouter:
             copies  = inp.get("copies", 1)
             shape   = "monomer" if copies <= 1 else f"{copies}-copy homo-oligomer"
             tmpl    = " (templated)" if inp.get("template") else ""
-            return f"ColabFold AF2 structure prediction — {shape}{tmpl} (remote MSA)"
+            return (f"ColabFold AF2 structure prediction — {shape}{tmpl} "
+                    f"(REMOTE MSA — LEAVES LOCAL-ONLY, sequence sent to the ColabFold MSA server)")
+        if tool == "align_folds":
+            return ("Compare two folds — US-align TM/RMSD + per-residue deviation "
+                    "(e.g. local Boltz vs MSA-informed ColabFold; the asymmetry is stated)")
         if tool == "validate_design":
             return ("Validate design — ColabFold confidence + matchmaker RMSD + "
                     "Rosetta folding-energy sanity (evidence-rich report)")
@@ -2079,6 +2093,8 @@ class ToolRouter:
                 return self._run_variant_deviation(inputs)
             if tool == "structural_align":
                 return self._run_structural_align(inputs)
+            if tool == "align_folds":
+                return self._run_align_folds(inputs)
             if tool == "template_assist":
                 return self._run_template_assist(inputs)
             if tool == "representation":
@@ -4426,35 +4442,52 @@ class ToolRouter:
         """
         import time as _time
 
-        user_input = user_input or inputs.get("_user_input", "")
-        model_id   = inputs.get("model_id") or self._first_model_id()
-        copies     = int(inputs.get("copies", 1) or 1)
-        template   = inputs.get("template")
-        quick      = bool(inputs.get("quick", False))
+        user_input   = user_input or inputs.get("_user_input", "")
+        model_id     = inputs.get("model_id") or self._first_model_id()
+        copies       = int(inputs.get("copies", 1) or 1)
+        template     = inputs.get("template")
+        quick        = bool(inputs.get("quick", False))
+        allow_remote = bool(inputs.get("allow_remote"))
+        chains       = inputs.get("chains")           # hetero Workbench construct: [{id,sequence}, …]
 
-        # ── Resolve sequence ──────────────────────────────────────────────────────
+        # ── REMOTE-MSA CONSENT GATE (load-bearing) — BOTH entry points funnel here ──
+        # No network call without surfaced consent. The Workbench engine-picker dialog and
+        # the NL colabfold/alphafold banner each set allow_remote=True ONLY AFTER the user
+        # accepts leaving LOCAL-ONLY; until then we return the consent prompt and NEVER touch
+        # the bridge (which is itself fail-closed on the same flag — defense in depth).
+        if not allow_remote:
+            return ToolStepResult(
+                tool="colabfold", success=False,
+                error=_COLABFOLD_REMOTE_CONSENT_MSG,
+                data={"remote_consent_required": True,
+                      "consent_message":  _COLABFOLD_REMOTE_CONSENT_MSG,
+                      "colabfold_inputs": dict(inputs)},   # re-dispatch payload once accepted
+            )
+
+        # ── Resolve sequence (homo/monomer path; skipped when `chains` is given) ────
         # Priority: explicit/pasted sequence → MPNN top design (auto-pull, when the
         # request refers to "the redesign"/"the top design"; RETRIEVED, never re-runs
         # MPNN) → the loaded structure's chain.
         sequence = inputs.get("sequence")
         mpnn_src = None
-        if not sequence and self._refers_to_mpnn_design(user_input):
-            sequence, mpnn_src = self._mpnn_top_sequence(model_id)
-        if not sequence:
-            sequence = self._fetch_sequence(model_id, inputs.get("chain"))
-        if not sequence:
-            return ToolStepResult(
-                tool="colabfold", success=False,
-                error=(
-                    "ColabFold needs an amino-acid sequence. Provide one explicitly "
-                    "(e.g. 'fold MKT... as a dimer with colabfold'), redesign a chain "
-                    "with ProteinMPNN first then 'fold the top design', or load a "
-                    "structure so its chain sequence can be used."
-                ),
-            )
-        if mpnn_src:
-            print(f"  ColabFold: folding the top ProteinMPNN design ({mpnn_src}, no re-run).",
-                  flush=True)
+        if not chains:
+            if not sequence and self._refers_to_mpnn_design(user_input):
+                sequence, mpnn_src = self._mpnn_top_sequence(model_id)
+            if not sequence:
+                sequence = self._fetch_sequence(model_id, inputs.get("chain"))
+            if not sequence:
+                return ToolStepResult(
+                    tool="colabfold", success=False,
+                    error=(
+                        "ColabFold needs an amino-acid sequence. Provide one explicitly "
+                        "(e.g. 'fold MKT... as a dimer with colabfold'), redesign a chain "
+                        "with ProteinMPNN first then 'fold the top design', or load a "
+                        "structure so its chain sequence can be used."
+                    ),
+                )
+            if mpnn_src:
+                print(f"  ColabFold: folding the top ProteinMPNN design ({mpnn_src}, no re-run).",
+                      flush=True)
 
         # ── Resolve optional template (PDB id → local file) ────────────────────────
         template_path: Optional[str] = None
@@ -4478,9 +4511,9 @@ class ToolRouter:
         # quick=True overrides both to 1/1 there.
         t0 = _time.perf_counter()
         result = bridge.predict(
-            sequence=sequence, copies=copies, template=template_path,
+            sequence=sequence, copies=copies, chains=chains, template=template_path,
             num_models=None, num_recycle=None, quick=quick,
-            label=f"model{model_id}",
+            label=f"model{model_id}", allow_remote=True,   # consent already established above
         )
         elapsed_ms = (_time.perf_counter() - t0) * 1000
 
@@ -4506,16 +4539,33 @@ class ToolRouter:
         self._open_pngs(result.get("png_paths", {}))
 
         # ── Build ChimeraX viz (open ranked PDB → pLDDT palette → seq → matchmaker) ─
-        viz_cmds, viz_exps = self._build_colabfold_viz(result, inputs, model_id)
+        viz_cmds, viz_exps, new_id = self._build_colabfold_viz(result, inputs, model_id)
+
+        # ── Make the result a fold_summary-shaped step datum (engine-agnostic seam) ──
+        # So the Workbench construct-fold path (`apply_construct_fold_result`/`apply_fold_result`)
+        # consumes ColabFold exactly like Boltz/ESMFold — carrying the `remote_msa` provenance
+        # all the way to the panel badge + export rows. `new_model_id` is the LIVE opened id.
+        n_chains = int(result.get("n_chains", result.get("copies", 1)) or 1)
+        ref_id   = None if inputs.get("no_reference") else inputs.get("compare_to")
+        result["new_model_id"]       = new_id
+        result["target"]             = "monomer" if n_chains <= 1 else "assembly"
+        result["reference_model_id"] = str(ref_id) if ref_id is not None else None
+        try:
+            self.session.add_structure(
+                new_id, f"colabfold_pred_{model_id}", path=result.get("ranked_pdb"),
+                metadata={"predicted": True, "engine": "colabfold", "remote_msa": True})
+        except Exception:
+            pass
 
         mean_plddt = result["mean_plddt"]
         conf = "very high" if mean_plddt > 90 else "high" if mean_plddt > 70 else \
                "low" if mean_plddt > 50 else "very low"
         ptm = result.get("ptm")
         iptm = result.get("iptm")
-        _shape = "monomer" if result["copies"] <= 1 else f"{result['copies']}-mer"
+        _shape = "monomer" if n_chains <= 1 else f"{n_chains}-mer"
         summary = (
-            f"ColabFold ({_shape}): mean pLDDT {mean_plddt:.1f} ({conf} confidence)"
+            f"ColabFold ({_shape}, REMOTE MSA — left local-only): "
+            f"mean pLDDT {mean_plddt:.1f} ({conf} confidence)"
             + (f", pTM {ptm:.2f}" if isinstance(ptm, (int, float)) else "")
             + (f", ipTM {iptm:.2f}" if isinstance(iptm, (int, float)) else "")
             + (" [cached]" if result.get("cached") else "")
@@ -4542,13 +4592,14 @@ class ToolRouter:
         Viewer, and — when a compare_to structure resolves — superpose with
         matchmaker. The new model id is taken from session.next_model_id(), which
         is exactly what main.py assigns to the open command it later state-tracks.
-        """
+        Returns (cmds, exps, new_id) — new_id threads into the result so the Workbench
+        fold seam re-points to the LIVE opened model (engine-agnostic, like Boltz)."""
         ranked = result.get("ranked_pdb", "")
         if not ranked:
-            return [], []
+            return [], [], None
         pdb_posix = Path(ranked).as_posix()
-        cmds, exps, _new_id = self._fold_viz_commands(pdb_posix, inputs)
-        return cmds, exps
+        cmds, exps, new_id = self._fold_viz_commands(pdb_posix, inputs)
+        return cmds, exps, new_id
 
     def _fold_viz_commands(
         self,
@@ -5938,6 +5989,90 @@ class ToolRouter:
         nums = ",".join(f"{float(v):.10g}" for v in matrix12)
         mid = str(model_id).lstrip("#")
         return f"view matrix models #{mid},{nums}"
+
+    def _run_align_folds(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """Compare TWO existing folds of the same construct (ANY engines) — the comparative-fold
+        readout. REUSE ONLY, no new alignment code: US-align (LOCAL-ONLY WSL binary) for the
+        whole-structure TM/RMSD, and the superposition-free per-residue deviation machinery
+        (`_per_residue_ddm`/`_per_residue_lddt` over the open models' Cα) for agreement.
+
+        Framed HONESTLY: the headline case is the LOCAL single-sequence Boltz fold vs the
+        MSA-informed ColabFold fold — NOT a fair model-vs-model test (one has an MSA, one does
+        not), so it largely measures the MSA's value as an accuracy yardstick for the local fold.
+        The asymmetry is stated up front in the summary; provenance (which fold was remote) is
+        carried through so the readout never implies same-footing."""
+        import os as _os
+        import shlex as _shlex
+        import config as _cfg
+        a = inputs.get("fold_a") or {}
+        b = inputs.get("fold_b") or {}
+        path_a, path_b = a.get("path"), b.get("path")
+        if not path_a or not _os.path.isfile(path_a) or not path_b or not _os.path.isfile(path_b):
+            return ToolStepResult(tool="align_folds", success=False,
+                                  error="Align folds needs BOTH fold files on disk (fold each first).")
+        label_a = a.get("label") or a.get("engine") or "fold A"
+        label_b = b.get("label") or b.get("engine") or "fold B"
+        # ── US-align A vs B (LOCAL-ONLY WSL binary; reads CIF/PDB directly) ────────
+        from wsl_bridge import WSLBridge
+        wsl = WSLBridge(distribution=getattr(_cfg, "USALIGN_WSL_DISTRO", "Ubuntu-24.04"))
+        if not wsl.is_available():
+            return ToolStepResult(tool="align_folds", success=False,
+                                  error="WSL2 unavailable — US-align runs in WSL.")
+        qa = wsl.translate_path(_os.path.abspath(path_a))
+        rb = wsl.translate_path(_os.path.abspath(path_b))
+        exe = getattr(_cfg, "USALIGN_EXE", "/home/andre/USalign/USalign")
+        cmd = f"{_shlex.quote(exe)} {_shlex.quote(qa)} {_shlex.quote(rb)} -outfmt 2 -m -"
+        res = wsl.run_command(cmd, timeout=getattr(_cfg, "USALIGN_TIMEOUT", 120))
+        if not res.get("ok"):
+            return ToolStepResult(tool="align_folds", success=False,
+                                  error=f"US-align failed: {res.get('error') or res.get('stderr','')[:200]}")
+        parsed = self._parse_usalign_output(res.get("stdout", ""))
+        if not parsed:
+            return ToolStepResult(tool="align_folds", success=False,
+                                  error="Could not parse US-align output (no scores).")
+        # ── Per-residue agreement over the OPEN models' Cα (superposition-free) ────
+        multichain = bool(inputs.get("multichain"))
+        chain      = inputs.get("chain", "A")
+        mean_ddm = mean_lddt = None
+        n_common = 0
+        ca_a = self._read_fold_ca(a.get("model_id"), multichain, chain) if a.get("model_id") else {}
+        ca_b = self._read_fold_ca(b.get("model_id"), multichain, chain) if b.get("model_id") else {}
+        common = sorted(set(ca_a) & set(ca_b))
+        n_common = len(common)
+        if n_common >= 3:
+            ddm  = self._per_residue_ddm(ca_a, ca_b, common)
+            lddt = self._per_residue_lddt(ca_a, ca_b, common)
+            mean_ddm  = round(sum(ddm.values()) / len(ddm), 3) if ddm else None
+            mean_lddt = round(sum(lddt.values()) / len(lddt), 4) if lddt else None
+        remote_a, remote_b = bool(a.get("remote_msa")), bool(b.get("remote_msa"))
+        # Asymmetry framing: name the local-single-seq vs MSA-informed pairing when present.
+        if remote_a ^ remote_b:
+            local_lbl  = label_b if remote_a else label_a
+            remote_lbl = label_a if remote_a else label_b
+            framing = (f"local single-sequence {local_lbl} vs MSA-informed {remote_lbl} — "
+                       f"NOT a fair model-vs-model test (one has an MSA, one does not); this "
+                       f"largely measures the MSA's value as an accuracy yardstick for the local fold")
+        else:
+            framing = (f"{label_a} vs {label_b} — both same-provenance "
+                       f"({'remote MSA' if remote_a else 'local single-sequence'})")
+        data = {
+            "fold_a": {k: a.get(k) for k in ("label", "engine", "model_id", "remote_msa")},
+            "fold_b": {k: b.get(k) for k in ("label", "engine", "model_id", "remote_msa")},
+            "tm": round(parsed.get("tm2", 0.0), 4), "tm_a": round(parsed.get("tm1", 0.0), 4),
+            "rmsd": round(parsed.get("rmsd", 0.0), 3), "n_aligned": parsed.get("lali"),
+            "mean_ddm_A": mean_ddm, "mean_lddt": mean_lddt, "n_common": n_common,
+            "framing": framing,
+        }
+        agree = ("HIGH" if data["tm"] >= 0.8 else "moderate" if data["tm"] >= 0.5 else "LOW")
+        summary = (
+            f"Align folds — {framing}.\n"
+            f"  {label_a} ↔ {label_b}: TM {data['tm']:.3f} ({agree} structural agreement), "
+            f"RMSD {data['rmsd']:.2f} Å over {data['n_aligned']} residues"
+            + (f"; mean per-residue dRMSD {mean_ddm:.2f} Å, Cα-lDDT {mean_lddt:.3f} "
+               f"(over {n_common} common Cα)" if mean_ddm is not None else
+               " (per-residue agreement skipped — a model was not open for Cα).")
+        )
+        return ToolStepResult(tool="align_folds", success=True, data=data, summary=summary)
 
     def _run_structural_align(self, inputs: Dict[str, Any]) -> "ToolStepResult":
         """Sequence-INDEPENDENT structural alignment of a de-novo construct's FOLD onto a chosen

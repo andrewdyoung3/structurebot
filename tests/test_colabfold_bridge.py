@@ -158,7 +158,7 @@ def test_worker_omits_jax_cache_when_empty():
 def test_predict_passes_jax_cache_from_config(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload())
-    bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
     assert _cfg.COLABFOLD_JAX_COMPILE_CACHE_DIR in bridge._wsl.scripts[0]
 
 
@@ -169,7 +169,7 @@ def test_predict_passes_jax_cache_from_config(cache_tmp):
 def test_oligomer_colon_join_in_worker(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload())
-    bridge.predict("ACDEFGHIKL", copies=3, quick=True)
+    bridge.predict("ACDEFGHIKL", copies=3, quick=True, allow_remote=True)
     # The FASTA line embedded in the worker must be the colon-joined homo-trimer.
     assert any("ACDEFGHIKL:ACDEFGHIKL:ACDEFGHIKL" in s for s in bridge._wsl.scripts)
 
@@ -177,7 +177,7 @@ def test_oligomer_colon_join_in_worker(cache_tmp):
 def test_monomer_has_no_colon(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload())
-    bridge.predict("ACDEFGHIKL", copies=1, quick=True)
+    bridge.predict("ACDEFGHIKL", copies=1, quick=True, allow_remote=True)
     script = bridge._wsl.scripts[0]
     # Find the embedded seq_line literal; it must not contain a chain separator.
     assert "ACDEFGHIKL" in script
@@ -193,7 +193,7 @@ def test_residue_guard_blocks_over_budget(monkeypatch):
     bridge = ColabFoldBridge()
     fake = _FakeWSL(_ok_payload())
     bridge._wsl = fake
-    res = bridge.predict("A" * 60, copies=2)   # 120 > 100
+    res = bridge.predict("A" * 60, copies=2, allow_remote=True)   # 120 > 100
     assert res["success"] is False
     assert res["oom_risk"] is True
     assert "budget" in res["error"].lower()
@@ -205,19 +205,19 @@ def test_oligomer_guard_counts_copies(monkeypatch):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload())
     # 500 aa x 4 copies = 2000 > 1500
-    res = bridge.predict("A" * 500, copies=4)
+    res = bridge.predict("A" * 500, copies=4, allow_remote=True)
     assert res["success"] is False and res["oom_risk"] is True
     assert "2000" in res["error"]
 
 
 def test_invalid_residue_rejected():
-    res = ColabFoldBridge().predict("ACDEXZ123")
+    res = ColabFoldBridge().predict("ACDEXZ123", allow_remote=True)
     assert res["success"] is False
     assert "non-standard" in res["error"].lower()
 
 
 def test_empty_sequence_rejected():
-    res = ColabFoldBridge().predict("   ")
+    res = ColabFoldBridge().predict("   ", allow_remote=True)
     assert res["success"] is False
 
 
@@ -228,7 +228,7 @@ def test_empty_sequence_rejected():
 def test_result_parsing_success(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload())
-    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", copies=2, quick=True)
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", copies=2, quick=True, allow_remote=True)
     assert res["success"] is True
     assert res["ptm"] == 0.44
     assert res["iptm"] == 0.61
@@ -248,7 +248,7 @@ def test_runtime_oom_surfaced(cache_tmp):
         _ok_payload(), run_ok=False,
         stdout="2026 RESOURCE_EXHAUSTED: Out of memory while allocating",
     )
-    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
     assert res["success"] is False
     assert res["oom_risk"] is True
 
@@ -256,7 +256,7 @@ def test_runtime_oom_surfaced(cache_tmp):
 def test_worker_error_payload_surfaced(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL({"success": False, "error": "no rank_001 outputs", "oom": False})
-    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
     assert res["success"] is False
     assert "no rank_001" in res["error"]
 
@@ -334,7 +334,7 @@ def test_bridge_propagates_full_worker_error_not_300_clip(cache_tmp):
     bridge._wsl = _FakeWSL({"success": False, "error": big_error, "oom": False,
                             "returncode": 1, "stdout_tail": _REAL_TRACEBACK_STDOUT,
                             "stderr_tail": _BENIGN_STDERR})
-    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
     assert res["success"] is False
     assert "THE REAL CAUSE" in res["error"]            # real cause propagated
     assert len(res["error"]) > 300                     # not the old 300-char clip
@@ -351,12 +351,12 @@ def test_cache_hit_returns_without_folding(cache_tmp):
     bridge._wsl = fake
     seq = "ACDEFGHIKLMNPQRSTVWY"
 
-    first = bridge.predict(seq, copies=1, quick=True)
+    first = bridge.predict(seq, copies=1, quick=True, allow_remote=True)
     assert first["success"] and first["cached"] is False
     assert fake.run_called == 1
 
     # Second identical call → cache hit, no second worker launch.
-    second = bridge.predict(seq, copies=1, quick=True)
+    second = bridge.predict(seq, copies=1, quick=True, allow_remote=True)
     assert second["success"] and second["cached"] is True
     assert second["source"] == "cache"
     assert fake.run_called == 1                       # unchanged
@@ -472,7 +472,7 @@ def test_open_and_viz_reads_real_id_not_guess():
 def test_viz_commands_basic():
     r = ToolRouter(bridge=None, session=SessionState())
     result = {"ranked_pdb": "C:/cache/colabfold_x/ranked.pdb", "copies": 1}
-    cmds, exps = r._build_colabfold_viz(result, {"chain": "A"}, model_id="1")
+    cmds, exps, _new_id = r._build_colabfold_viz(result, {"chain": "A"}, model_id="1")
     joined = "\n".join(cmds)
     assert any(c.startswith("open ") for c in cmds)
     assert "color byattribute bfactor" in joined and "palette alphafold" in joined
@@ -486,13 +486,13 @@ def test_viz_commands_basic():
 def test_viz_matchmaker_when_compare_to():
     r = ToolRouter(bridge=None, session=SessionState())
     result = {"ranked_pdb": "C:/cache/colabfold_x/ranked.pdb", "copies": 1}
-    cmds, _ = r._build_colabfold_viz(result, {"compare_to": "#1/A"}, model_id="2")
+    cmds, _, _new_id = r._build_colabfold_viz(result, {"compare_to": "#1/A"}, model_id="2")
     assert any(c.startswith("matchmaker ") and "#1/A" in c for c in cmds)
 
 
 def test_viz_empty_when_no_pdb():
     r = ToolRouter(bridge=None, session=SessionState())
-    cmds, exps = r._build_colabfold_viz({"ranked_pdb": ""}, {}, model_id="1")
+    cmds, exps, _new_id = r._build_colabfold_viz({"ranked_pdb": ""}, {}, model_id="1")
     assert cmds == [] and exps == []
 
 
@@ -523,7 +523,7 @@ def test_open_emits_no_sequence_viewer(monkeypatch):
 def test_predict_errors_when_env_unavailable(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload(), available=False)
-    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
     assert res["success"] is False
     assert "wsl2" in res["error"].lower()
 
@@ -531,12 +531,145 @@ def test_predict_errors_when_env_unavailable(cache_tmp):
 def test_predict_errors_when_colabfold_missing(cache_tmp):
     bridge = ColabFoldBridge()
     bridge._wsl = _FakeWSL(_ok_payload(), cf=False)
-    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
     assert res["success"] is False
     assert "colabfold env" in res["error"].lower()
 
 
 # ── Optional live fold (opt-in; never runs in CI) ───────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Remote-MSA CONSENT GATE (load-bearing) + hetero multimer + provenance
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_bridge_fail_closed_without_consent_makes_NO_network_call(cache_tmp):
+    """The load-bearing invariant: predict() WITHOUT allow_remote must NOT touch the WSL
+    worker (no network call) and must flag the consent requirement."""
+    bridge = ColabFoldBridge()
+    fake = _FakeWSL(_ok_payload())
+    bridge._wsl = fake
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True)        # no allow_remote
+    assert res["success"] is False
+    assert res["remote_consent_required"] is True
+    assert fake.run_called == 0                                     # NEVER launched the worker
+    assert "leave LOCAL-ONLY" in res["error"] or "consent" in res["error"].lower()
+
+
+def test_bridge_hetero_chains_colon_join_and_residue_count(cache_tmp):
+    """A hetero `chains` list folds via a colon-join of the DISTINCT sequences (AF-Multimer
+    heteromer) with the correct total-residue count."""
+    bridge = ColabFoldBridge()
+    fake = _FakeWSL(_ok_payload())
+    bridge._wsl = fake
+    res = bridge.predict(chains=[{"id": "A", "sequence": "ACDEF"},
+                                 {"id": "B", "sequence": "GHIKLMN"}],
+                         quick=True, allow_remote=True)
+    assert res["success"] is True
+    assert res["total_residues"] == 12 and res["n_chains"] == 2     # 5 + 7, two distinct chains
+    # the worker FASTA line is the two DISTINCT sequences colon-joined (heteromer), not a copy
+    script = fake.scripts[-1]
+    assert "ACDEF:GHIKLMN" in script
+    assert res["remote_msa"] is True and res["engine"] == "colabfold"
+
+
+def test_bridge_homo_copies_still_colon_joins_one_sequence(cache_tmp):
+    bridge = ColabFoldBridge()
+    fake = _FakeWSL(_ok_payload())
+    bridge._wsl = fake
+    bridge.predict("ACDEF", copies=3, quick=True, allow_remote=True)
+    assert "ACDEF:ACDEF:ACDEF" in fake.scripts[-1]                  # homo path unchanged
+
+
+def test_bridge_hetero_rejects_bad_residue(cache_tmp):
+    bridge = ColabFoldBridge()
+    bridge._wsl = _FakeWSL(_ok_payload())
+    res = bridge.predict(chains=[{"id": "A", "sequence": "ACDEZ"}],
+                         quick=True, allow_remote=True)
+    assert res["success"] is False and "non-standard" in res["error"]
+
+
+def test_bridge_result_carries_remote_provenance(cache_tmp):
+    bridge = ColabFoldBridge()
+    bridge._wsl = _FakeWSL(_ok_payload())
+    res = bridge.predict("ACDEFGHIKLMNPQRSTVWY", quick=True, allow_remote=True)
+    assert res["remote_msa"] is True
+    assert res["engine"] == "colabfold"
+    assert res["source"] == "colabfold_wsl2"
+    assert res["pdb_path"] == res["ranked_pdb"]                     # engine-agnostic alias
+
+
+def test_router_run_colabfold_gate_blocks_bridge_without_consent():
+    """Router-level chokepoint: _run_colabfold WITHOUT allow_remote must NOT call the bridge
+    (no network) and must surface the consent prompt — covering BOTH the NL and Workbench
+    paths, which both funnel through here."""
+    from unittest.mock import MagicMock
+    r = ToolRouter(bridge=MagicMock(), session=SessionState())
+    fake_bridge = MagicMock()
+    r._get_colabfold_bridge = lambda: fake_bridge
+    res = r._run_colabfold({"sequence": "ACDEFGHIKL"})             # no allow_remote
+    assert res.success is False
+    assert res.data.get("remote_consent_required") is True
+    fake_bridge.predict.assert_not_called()                        # the network was never reached
+
+
+def test_router_run_colabfold_passes_consent_and_chains_through():
+    from unittest.mock import MagicMock
+    r = ToolRouter(bridge=MagicMock(), session=SessionState())
+    fake_bridge = MagicMock()
+    fake_bridge.predict.return_value = {"success": False, "error": "stop"}  # stop after the call
+    r._get_colabfold_bridge = lambda: fake_bridge
+    chains = [{"id": "A", "sequence": "ACDEF"}, {"id": "B", "sequence": "GHIKL"}]
+    r._run_colabfold({"chains": chains, "allow_remote": True})
+    _, kwargs = fake_bridge.predict.call_args
+    assert kwargs["allow_remote"] is True and kwargs["chains"] == chains
+
+
+class _ConsentPresenter:
+    """Mock presenter capturing the surfaced consent (warn/dim) + answering the yes/no."""
+    def __init__(self, say_yes):
+        self.say_yes = say_yes
+        self.warned = []
+        self.dimmed = []
+    def warn(self, m): self.warned.append(m)
+    def dim(self, m): self.dimmed.append(m)
+    def ask_yes_no(self, q, default="y"): return self.say_yes
+
+
+def test_engine_consent_gate_declined_aborts_without_setting_flag():
+    from request_engine import RequestEngine
+    res = {"tools_needed": ["colabfold"],
+           "tool_inputs": {"colabfold": {"sequence": "ACDEF"}}}
+    p = _ConsentPresenter(say_yes=False)
+    ok = RequestEngine._grant_remote_consent(res, p)
+    assert ok is False                                              # caller aborts → no execution
+    assert "allow_remote" not in res["tool_inputs"]["colabfold"]    # flag NOT set
+    assert p.warned and "remote MSA" in p.warned[0]                 # boundary surfaced
+
+
+def test_engine_consent_gate_accepted_sets_allow_remote():
+    from request_engine import RequestEngine
+    res = {"tools_needed": ["colabfold"],
+           "tool_inputs": {"colabfold": {"sequence": "ACDEF"}}}
+    ok = RequestEngine._grant_remote_consent(res, _ConsentPresenter(say_yes=True))
+    assert ok is True
+    assert res["tool_inputs"]["colabfold"]["allow_remote"] is True  # consent → flag set
+
+
+def test_engine_consent_gate_noop_for_non_colabfold():
+    from request_engine import RequestEngine
+    # a boltz plan must not trip the gate (no dialog, proceeds)
+    assert RequestEngine._grant_remote_consent(
+        {"tools_needed": ["boltz"], "tool_inputs": {}}, _ConsentPresenter(say_yes=False)) is True
+
+
+def test_engine_consent_gate_noop_when_already_consented():
+    from request_engine import RequestEngine
+    res = {"tools_needed": ["colabfold"],
+           "tool_inputs": {"colabfold": {"sequence": "ACDEF", "allow_remote": True}}}
+    p = _ConsentPresenter(say_yes=False)
+    assert RequestEngine._grant_remote_consent(res, p) is True      # already consented → no re-prompt
+    assert not p.warned
+
 
 _RUN_LIVE = os.environ.get("STRUCTUREBOT_RUN_LIVE_COLABFOLD") == "1"
 
@@ -551,7 +684,7 @@ def test_live_tiny_monomer_fold():
     if not bridge.is_available():
         pytest.skip("ColabFold env / WSL2 not available")
     seq = "MLSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF"   # villin HP36
-    res = bridge.predict(seq, copies=1, quick=True)
+    res = bridge.predict(seq, copies=1, quick=True, allow_remote=True)
     assert res["success"], res.get("error")
     assert res["mean_plddt"] > 0
     assert Path(res["ranked_pdb"]).is_file()
