@@ -823,6 +823,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._fold_vis_btn.setToolTip("Show/hide ALL predicted fold models in 3D.")
         self._fold_vis_btn.setCheckable(True)
         self._fold_vis_btn.toggled.connect(self._on_fold_visibility_toggled)
+        # GLOBAL alignment-reference visibility — the exact parallel to "Hide folds", under the SAME
+        # single-source authority (fold_visibility_commands). Force-hides EVERY US-align reference
+        # (the PDBs the construct fold was overlaid onto), so they don't accumulate stuck-visible.
+        self._align_ref_vis_btn = fold_menu.addAction("Hide alignment references")
+        self._align_ref_vis_btn.setToolTip("Show/hide ALL US-align reference structures (the PDBs "
+                                           "you aligned the construct's fold onto).")
+        self._align_ref_vis_btn.setCheckable(True)
+        self._align_ref_vis_btn.toggled.connect(self._on_align_ref_visibility_toggled)
         # Escape hatch: lay the variant folds + the WT reference out SIDE-BY-SIDE (not
         # overlaid) in the one 3D scene via ChimeraX `tile`. Targets the specific fold models
         # (not bare `tile`, which would drag in any hidden models). Shared camera; the models
@@ -845,6 +853,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._show_ref_cb.setChecked(True)
         self._show_ref_cb.setToolTip("Show the WT template (reference) structure in the overlay.")
         self._show_ref_cb.toggled.connect(self._on_overlay_toggle)
+        # PER-CD alignment reference toggle (mirrors Template/Variant-fold): show/hide the ACTIVE
+        # construct's US-align reference. State persists on cd.structural_align["hidden"] (so each
+        # cd's reference is independently remembered); effective visibility = global AND per.
+        self._show_align_ref_cb = fold_menu.addAction("Aligned reference")
+        self._show_align_ref_cb.setCheckable(True)
+        self._show_align_ref_cb.setChecked(True)
+        self._show_align_ref_cb.setToolTip("Show the ACTIVE construct's US-align reference (the PDB "
+                                           "its fold was aligned onto) in the overlay.")
+        self._show_align_ref_cb.toggled.connect(self._on_align_ref_overlay_toggle)
         self._fold_menu_btn.setMenu(fold_menu)
         bar.addWidget(self._fold_menu_btn)
         bar.addSpacing(12)
@@ -979,6 +996,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.rowMenuRequested.connect(lambda rid, gp, t=tab: self._on_row_menu(t, rid, gp))
             copies = "+".join(c for _m, c in cd.members)
             self._tabs.addTab(tab, f"{cd.rep_chain}  ({copies}, {len(cd.template_cells)} aa)")
+        self._sync_align_ref_toggle()         # reflect the (rehydrated) active cd's reference state
         self._status.setText(
             f"Workbench: {len(self._design.chains)} unique chain(s). Click a column to "
             f"select in 3D (all copies); add/edit variants; pick a color mode.")
@@ -2086,6 +2104,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._edit_target = None
         self._scan_cols.clear()                # cols index this tab's template; reset
         self._update_scan_label()
+        self._sync_align_ref_toggle()          # reflect THIS cd's aligned-reference state
         self._apply_color_to(tab)
         self._push_3d_color(tab)
 
@@ -3229,7 +3248,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             cd = tab.design if tab else None
         if cd is None:
             return
-        cd.structural_align = data
+        cd.structural_align = data            # fresh align REPLACES the slot → reference shown (no `hidden`)
+        self._sync_align_ref_toggle()         # reflect the fresh reference in the per-cd toggle
         validating = bool((spec or {}).get("_validate_guided"))
         if validating:
             # Mirror the adoption TM into the assist slot so the assist readout can cite it.
@@ -3312,6 +3332,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                             for cd in self._design.chains.values()
                             if (cd.guided_fold or {}).get("model_id")}):
             cmds.append(f"hide #{gmid} models" if hide_all else f"show #{gmid} models")
+        # ALIGNMENT REFERENCES (US-align "Align to PDB"): the chosen PDB the construct's fold was
+        # overlaid onto, opened into the scene. Brought under THIS single authority so a color/
+        # overlay push can't re-show a toggle-hidden reference (the color-only invariant extended
+        # to the alignment case). Effective visibility = (global "Hide alignment references" OFF)
+        # AND (this cd's per-reference toggle ON, persisted as `structural_align["hidden"]`).
+        cmds += self._align_ref_visibility_commands()
         models = self._fold_models(self._design)
         if not models:
             return cmds
@@ -3332,6 +3358,57 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         tab = self._cur_tab()
         if tab is not None:
             self._push_3d_color(tab)
+
+    def _align_ref_visibility_commands(self) -> List[str]:
+        """show/hide for each cd's US-align reference under the SAME authority as folds. Pure →
+        single source for the push, live-verify, and tests. Effective visibility per reference =
+        (global "Hide alignment references" OFF) AND (this cd's persisted toggle ON). De-novo only
+        (a crystal design has no construct alignment reference)."""
+        if self._design is None:
+            return []
+        global_hide = self._align_ref_vis_btn.isChecked()
+        cmds: List[str] = []
+        for cd in self._design.chains.values():
+            sa = cd.structural_align or {}
+            ref = sa.get("reference_model_id")
+            if not ref:
+                continue
+            show = (not global_hide) and (not sa.get("hidden"))
+            cmds.append(f"show #{ref} models" if show else f"hide #{ref} models")
+        return cmds
+
+    def _on_align_ref_visibility_toggled(self, checked: bool) -> None:
+        """GLOBAL 'Hide alignment references' toggled → re-push (force-hides ALL refs when checked)."""
+        self._align_ref_vis_btn.setText("Show alignment references" if checked
+                                        else "Hide alignment references")
+        tab = self._cur_tab()
+        if tab is not None:
+            self._push_3d_color(tab)
+
+    def _on_align_ref_overlay_toggle(self, checked: bool = False) -> None:
+        """PER-CD 'Aligned reference' toggled → persist the ACTIVE cd's hidden flag, re-push."""
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        if cd is not None and cd.structural_align:
+            cd.structural_align["hidden"] = (not checked)
+            self._persist()
+            self._push_3d_color(tab)
+
+    def _sync_align_ref_toggle(self) -> None:
+        """Reflect the ACTIVE cd's persisted aligned-reference state in the per-cd toggle, and
+        enable it ONLY when the active cd actually has an alignment reference. Signals blocked so
+        syncing the checkmark never re-triggers a push."""
+        cb = getattr(self, "_show_align_ref_cb", None)
+        if cb is None:
+            return
+        tab = self._cur_tab()
+        cd = tab.design if tab else None
+        sa = (cd.structural_align if cd else None) or {}
+        has_ref = bool(sa.get("reference_model_id"))
+        cb.blockSignals(True)
+        cb.setEnabled(has_ref)
+        cb.setChecked(has_ref and not sa.get("hidden"))
+        cb.blockSignals(False)
 
     def tile_commands(self) -> List[str]:
         """The commands to lay the WT reference + every variant fold out SIDE-BY-SIDE:

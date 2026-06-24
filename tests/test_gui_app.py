@@ -572,6 +572,21 @@ def test_remap_noop_when_ids_unchanged(_app):
     assert set(s.structures) == {"1"}
 
 
+def test_remap_rewrites_structural_align_reference(_app):
+    """A reconnect (fresh ids) must move the alignment reference/query ids too, or the
+    alignment-visibility toggle would target a stale id."""
+    from gui_app import remap_session_model_ids
+    s = _SS()
+    s.structures = {"9": {"name": "1mbn", "metadata": {"aligned_reference": True}}}
+    s.add_design_session("denovo-y", {"model_id": "denovo-y", "source": "sequence",
+        "chains": {"c": {"rep_model": "7", "members": [["7", "A"]], "template_fold": {"model_id": "7"},
+                         "structural_align": {"reference_model_id": "9", "query_model_id": "7"}}}})
+    remap_session_model_ids(s, {"9": "11", "7": "8"})
+    sa = s.design_sessions["denovo-y"]["chains"]["c"]["structural_align"]
+    assert sa["reference_model_id"] == "11" and sa["query_model_id"] == "8"
+    assert set(s.structures) == {"11"}                            # the reference structure rekeyed
+
+
 def test_reconnect_clicked_noop_without_structures(_app):
     w = _fakew(session=_SS(), presenter=_MM(),
                reconnect_action=_MM(), statusBar=lambda: _MM(), _pool=_MM())
