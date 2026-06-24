@@ -326,6 +326,107 @@ class TestPredictFlow:
         assert "--use_msa_server" not in ran_cmd and "--seed 7" in ran_cmd
 
 
+# ── Size-scaled wall-clock budget (_resolve_timeout) ─────────────────────────────────
+
+class TestSizeScaledTimeout:
+    def _b(self):
+        # default knobs (scale 0.012, floor 1800, cap 21600, no explicit env override)
+        b = _bridge()
+        b._timeout_explicit = False
+        b._timeout_scale = 0.012
+        b._timeout_floor = 1800
+        b._timeout_cap = 21600
+        b._timeout = 1800
+        return b
+
+    def test_small_fold_lands_on_floor(self):
+        b = self._b()
+        # 100 res → 0.012·100² = 120s, below the 1800 floor → floored
+        assert b._resolve_timeout([{"id": "A", "sequence": "M" * 100}], None) == 1800
+
+    def test_large_dimer_scales_quadratically(self):
+        b = self._b()
+        # 550+550 = 1100 res → ceil(0.012·1100²) = 14521s (≈4 h), well above the old flat 1800
+        budget = b._resolve_timeout(
+            [{"id": "A", "sequence": "M" * 550}, {"id": "B", "sequence": "M" * 550}], None)
+        assert budget == 14521
+
+    def test_huge_fold_clamped_to_cap(self):
+        b = self._b()
+        # 2000 res → 0.012·2000² = 48000s, clamped to the 21600 cap
+        assert b._resolve_timeout([{"id": "A", "sequence": "M" * 2000}], None) == 21600
+
+    def test_explicit_caller_timeout_wins(self):
+        b = self._b()
+        assert b._resolve_timeout([{"id": "A", "sequence": "M" * 1100}], 999) == 999
+
+    def test_explicit_env_override_beats_scaling(self):
+        b = self._b()
+        b._timeout_explicit = True          # operator set BOLTZ_TIMEOUT — authoritative
+        b._timeout = 7200
+        assert b._resolve_timeout([{"id": "A", "sequence": "M" * 1100}], None) == 7200
+
+    def test_predict_passes_scaled_budget_to_run_command(self, monkeypatch):
+        # the budget computed from sequence length is what actually reaches wsl.run_command.
+        b = self._b()
+        b._wsl.run_command = MagicMock(return_value={"ok": False, "error": "stop"})
+        monkeypatch.setattr(b, "_parse_outputs",
+                            lambda out_dir, chains: {"success": False, "error": "x"})
+        b.predict([{"id": "A", "sequence": "M" * 550}, {"id": "B", "sequence": "M" * 550}])
+        assert b._wsl.run_command.call_args.kwargs["timeout"] == 14521
+
+
+# ── Informative timeout / failure messages (cause + size + next step) ────────────────
+
+class TestInformativeFailureMessage:
+    def _b(self):
+        b = _bridge()
+        b._timeout_explicit = False
+        b._timeout_scale = 0.012
+        b._timeout_floor = 1800
+        b._timeout_cap = 21600
+        b._timeout = 1800
+        return b
+
+    @staticmethod
+    def _timeout_result(secs):
+        # the shape WSLBridge.run_command returns on subprocess.TimeoutExpired
+        return {"ok": False, "returncode": -1, "stdout": "", "stderr": "",
+                "error": f"WSL2 command timed out after {secs}s: boltz predict ..."}
+
+    def test_cap_timeout_message_names_cap_size_and_override(self):
+        b = self._b()
+        b._wsl.run_command = MagicMock(return_value=self._timeout_result(21600))
+        # 2000 res → scaled 48000s ≥ 21600 cap
+        res = b.predict([{"id": "A", "sequence": "M" * 2000}])
+        assert res["success"] is False
+        err = res["error"]
+        assert "6h cap" in err and "2000 residues" in err and "BOLTZ_TIMEOUT" in err
+
+    def test_subcap_timeout_message_reports_computed_value_and_size(self):
+        b = self._b()
+        b._wsl.run_command = MagicMock(return_value=self._timeout_result(14521))
+        # 550+550 = 1100 res → computed budget 14521s (below the cap)
+        res = b.predict([{"id": "A", "sequence": "M" * 550}, {"id": "B", "sequence": "M" * 550}])
+        assert res["success"] is False
+        err = res["error"]
+        assert "timed out after 14521s" in err and "1100 residues" in err and "BOLTZ_TIMEOUT" in err
+
+    def test_real_error_is_not_mislabelled_as_timeout(self):
+        # Boltz crashed (non-zero exit, a swallowed ValueError) — NOT a wall. The message must
+        # surface the real cause and must NOT call it a timeout.
+        b = self._b()
+        b._wsl.run_command = MagicMock(return_value={
+            "ok": False, "returncode": 1, "stdout": "",
+            "stderr": "ValueError: Template chain A is not one of the protein chains!\n",
+            "error": "Command exited 1: ValueError: Template chain A is not one of the protein chains!"})
+        res = b.predict([{"id": "A", "sequence": "M" * 1100}])
+        assert res["success"] is False
+        err = res["error"]
+        assert "failed" in err.lower() and "Template chain A" in err
+        assert "timed out" not in err.lower() and "cap" not in err.lower()
+
+
 def test_boltz_available_swallows_errors(monkeypatch):
     import boltz_bridge
     monkeypatch.setattr(boltz_bridge.BoltzBridge, "is_available",
