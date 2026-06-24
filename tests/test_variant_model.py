@@ -124,6 +124,18 @@ class TestFoldSummary:
         out = fold_summary({"engine": "boltz", "new_model_id": "3", "mean_plddt": 90.0,
                             "plddt": {1: 90.0}}, author_resnums=[1])
         assert "remote_msa" not in out
+
+    def test_disulfide_constraint_provenance_threaded(self):
+        # a Mode-C constrained fold carries the declared bond(s) + the `constrained` flag
+        out = fold_summary({"engine": "boltz", "new_model_id": "8", "mean_plddt": 86.0,
+                            "plddt": {1: 86.0}, "constrained": True,
+                            "disulfide_bonds": [(12, 45)]}, author_resnums=[1])
+        assert out["constrained"] is True and out["disulfide_bonds"] == [(12, 45)]
+
+    def test_disulfide_provenance_absent_for_plain_fold(self):
+        out = fold_summary({"engine": "boltz", "new_model_id": "3", "mean_plddt": 90.0,
+                            "plddt": {1: 90.0}}, author_resnums=[1])
+        assert "constrained" not in out and "disulfide_bonds" not in out
 from color_modes import ddg_color
 from seq_editor.controller import ResidueCell, ChainSeq
 

@@ -212,61 +212,11 @@ def extract_sequence(
 
 # ── Geometry calculations ─────────────────────────────────────────────────────
 
-def calc_distance(
-    p1: Tuple[float, float, float],
-    p2: Tuple[float, float, float],
-) -> float:
-    """Euclidean distance between two 3D points."""
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
-
-
-def calc_dihedral(
-    a1: Tuple[float, float, float],
-    b1: Tuple[float, float, float],
-    b2: Tuple[float, float, float],
-    a2: Tuple[float, float, float],
-) -> float:
-    """
-    Dihedral angle a1-b1-b2-a2 in degrees, range [-180, 180].
-
-    Uses the atan2 formula:
-        v1 = b1 - a1,  v2 = b2 - b1,  v3 = a2 - b2
-        n1 = v1 x v2,  n2 = v2 x v3
-        angle = atan2( (v2/|v2| x n1) . n2,  n1 . n2 )
-
-    Returns 0.0 for degenerate geometries where any three atoms
-    are collinear (cross-product is near-zero).  Callers that need to
-    distinguish a genuine 0 degree dihedral from a degenerate case
-    should check whether the residue has a real CB atom beforehand.
-    """
-    def _sub(u, v):
-        return (u[0]-v[0], u[1]-v[1], u[2]-v[2])
-    def _dot(u, v):
-        return u[0]*v[0] + u[1]*v[1] + u[2]*v[2]
-    def _cross(u, v):
-        return (u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0])
-
-    v1 = _sub(b1, a1)   # CA1 → CB1
-    v2 = _sub(b2, b1)   # CB1 → CB2
-    v3 = _sub(a2, b2)   # CB2 → CA2
-
-    n1 = _cross(v1, v2)
-    n2 = _cross(v2, v3)
-
-    if _dot(n1, n1) < 1e-10 or _dot(n2, n2) < 1e-10:
-        return 0.0      # degenerate: atoms are collinear
-
-    v2_mag = math.sqrt(_dot(v2, v2))
-    if v2_mag < 1e-10:
-        return 0.0
-
-    inv_v2 = 1.0 / v2_mag
-    v2_hat = (v2[0]*inv_v2, v2[1]*inv_v2, v2[2]*inv_v2)
-    m1 = _cross(v2_hat, n1)     # (v2/|v2|) x n1
-
-    x = _dot(n1, n2)
-    y = _dot(m1, n2)
-    return math.degrees(math.atan2(y, x))
+# calc_distance / calc_dihedral are the SHARED geometry primitives — they now live in
+# `disulfide_geometry` (the single source both this interchain tool and the fold-based modes
+# call) and are re-exported here so existing callers/tests (`from disulfide_bridge import
+# calc_distance, calc_dihedral`) keep working unchanged.
+from disulfide_geometry import calc_distance, calc_dihedral  # noqa: E402,F401
 
 
 def geometry_score(

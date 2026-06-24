@@ -128,6 +128,27 @@ def test_remote_msa_provenance_reaches_fold_plddt_export(tmp_path):
     assert fp2 and all(row["remote_msa"] is False for row in fp2)
 
 
+def test_disulfide_constraint_provenance_reaches_fold_plddt_export(tmp_path):
+    # A Mode-C constrained fold → the export's fold_plddt rows carry constrained + the bond pairs
+    # (provenance reaches the export TABLE, not just the badge), so a saved/exported session
+    # records which folds were disulfide-bias-constrained. A plain fold tags constrained False.
+    ds = {"dn-1": {"model_id": "dn-1", "source": "sequence", "chains": {"c1": {
+        "rep_chain": "A", "members": [["2", "A"]],
+        "template_fold": {"engine": "boltz", "target": "monomer", "mean_plddt": 86.0,
+                          "constrained": True, "disulfide_bonds": [(12, 45)],
+                          "plddt": {1: 86.0, 2: 88.0}},
+        "variants": []}}}}
+    assert "constrained" in _COLUMNS["fold_plddt"] and "disulfide_bonds" in _COLUMNS["fold_plddt"]
+    fp = build_tables(ds)["fold_plddt"]
+    assert fp and all(row["constrained"] is True for row in fp)
+    assert all(row["disulfide_bonds"] == "12-45" for row in fp)
+    # plain fold → constrained False, disulfide_bonds None
+    ds["dn-1"]["chains"]["c1"]["template_fold"] = {
+        "engine": "boltz", "target": "monomer", "mean_plddt": 90.0, "plddt": {1: 90.0}}
+    fp2 = build_tables(ds)["fold_plddt"]
+    assert fp2 and all(row["constrained"] is False and row["disulfide_bonds"] is None for row in fp2)
+
+
 def test_failloud_skips_empty_types(tmp_path):
     # a session with ONLY solubility data → deviation/stability/fold/assist/align all skipped
     ds = {"m": {"source": "sequence", "chains": {"c": {"rep_chain": "A", "variants": [

@@ -110,6 +110,7 @@ class BoltzBridge:
         allow_remote: bool = False,
         label:        str = "boltz",
         templates:    Optional[List[Dict[str, Any]]] = None,
+        constraints:  Optional[List[Dict[str, Any]]] = None,
         timeout:      Optional[int] = None,
     ) -> Dict[str, Any]:
         """Fold *chains* (one `protein` block each, MSA-free) with Boltz via WSL. Returns the
@@ -131,7 +132,7 @@ class BoltzBridge:
         # Translate each template's on-disk structure path into WSL before it enters the YAML
         # (Boltz reads the cif/pdb from inside WSL, like the YAML/out paths below).
         tmpl_yaml = self._translate_template_paths(templates) if templates else None
-        yaml_text = self._build_yaml(chains, tmpl_yaml)
+        yaml_text = self._build_yaml(chains, tmpl_yaml, constraints)
         # Workspace on the WINDOWS side so outputs are readable back without a copy roundtrip.
         work = tempfile.mkdtemp(prefix="boltz_")
         yaml_path = os.path.join(work, "boltz_in.yaml")
@@ -250,8 +251,9 @@ class BoltzBridge:
 
     @staticmethod
     def _build_yaml(
-        chains:    List[Dict[str, str]],
-        templates: Optional[List[Dict[str, Any]]] = None,
+        chains:      List[Dict[str, str]],
+        templates:   Optional[List[Dict[str, Any]]] = None,
+        constraints: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Boltz input YAML. Chains fold MSA-free (`msa: empty`). When *templates* is given,
         a top-level `templates:` block is appended — one entry per dict, emitting only the
@@ -288,6 +290,20 @@ class BoltzBridge:
                     lines.append("    force: true")
                     if t.get("threshold") is not None:
                         lines.append(f"    threshold: {t['threshold']}")
+        if constraints:
+            # DECLARED BOND constraints (Mode C — a disulfide between two residues' SG atoms).
+            # Boltz `bond` schema: per-entry `atom1`/`atom2` = [CHAIN_ID, 1-based RES_IDX, ATOM].
+            # A constraint is DECLARATIVE — it adds NO path, NO `msa:` line and NO remote flag, so
+            # the fail-closed LOCAL-ONLY guard is unaffected (chains still declare `msa: empty`).
+            # `atom1`/`atom2` align with `bond` UNDER the item (6 spaces, like protein's children).
+            lines.append("constraints:")
+            for c in constraints:
+                a1, a2 = c.get("atom1"), c.get("atom2")
+                if not (a1 and a2):
+                    continue                        # skip a malformed entry (missing atom spec)
+                lines.append("  - bond:")
+                lines.append(f"      atom1: {_yaml_id(a1)}")
+                lines.append(f"      atom2: {_yaml_id(a2)}")
         return "\n".join(lines) + "\n"
 
     def _parse_outputs(self, out_dir: str, chains: List[Dict[str, str]]) -> Dict[str, Any]:
