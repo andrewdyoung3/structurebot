@@ -2118,6 +2118,8 @@ class ToolRouter:
                 return self._run_disulfide_discovery(inputs)
             if tool == "disulfide_geometry":
                 return self._run_disulfide_geometry(inputs)
+            if tool == "disulfide_scan":
+                return self._run_disulfide_scan(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3223,6 +3225,48 @@ class ToolRouter:
                        f"— {verdict} (Cα–Cα {b['ca_ca']} Å, SG–SG {b['sg_sg']} Å, χSS {chi}).")
         return ToolStepResult(tool="disulfide_geometry", success=True,
                               data={"pairs": out, "mode": "geometry"}, summary=summary)
+
+    # The load-bearing caveat for the engineering scan — rides with every Mode-D readout (the
+    # heatmap is the most over-read-prone surface; the caveat must never separate from it).
+    _DISULFIDE_SCAN_CAVEAT = (
+        "Geometrically viable disulfide-engineering sites in THIS predicted fold — a starting "
+        "point. Does NOT imply the X→C mutations are tolerated, that the protein still folds, or "
+        "that the bond will form. Validate by introducing the Cys pair and re-folding."
+    )
+
+    def _run_disulfide_scan(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """MODE D — ENGINEERING SCAN (find NOVEL installable sites). An all-pairs, residue-AGNOSTIC
+        BACKBONE scan of ONE existing fold: where COULD a disulfide be installed if both residues
+        were mutated to Cys (Cα–Cα + Cβ–Cβ + Cα-Cβ-Cβ-Cα orientation, soft-graded; NO χSS — no Sγ
+        pre-mutation). CHEAP — reads coordinates, NEVER folds; a cheap Cα prefilter keeps the O(N²)
+        scan fast on assemblies (output-lossless). Distinct from A/B (existing cysteines). Returns a
+        ranked candidate list (source of truth) + a per-residue best-partner map (the heatmap index)
+        + the load-bearing geometric-only CAVEAT. Reads `cif_path`."""
+        import os as _os
+        from disulfide_geometry import parse_backbone_atoms, scan_engineerable_sites
+        cif = inputs.get("cif_path")
+        if not cif or not _os.path.isfile(cif):
+            return ToolStepResult(tool="disulfide_scan", success=False,
+                                  error="Engineering scan needs an existing fold CIF on disk.")
+        atoms = parse_backbone_atoms(cif)
+        ranked, best = scan_engineerable_sites(atoms)
+        # best_partner keyed by (chain, resnum); flatten to {chain: {resnum: score}} for the heatmap.
+        best_by_chain: Dict[str, Dict[int, float]] = {}
+        for (ch, rn), sc in best.items():
+            best_by_chain.setdefault(ch, {})[rn] = round(sc, 4)
+        if not ranked:
+            summary = ("Engineering scan: no geometrically viable disulfide-engineering sites in "
+                       "this fold. " + self._DISULFIDE_SCAN_CAVEAT)
+        else:
+            head = "; ".join(f"{d['resnum_a']}–{d['resnum_b']} (score {d['score']:.2f})"
+                             for d in ranked[:3])
+            summary = (f"Engineering scan — {len(ranked)} candidate site(s); top: {head}. "
+                       + self._DISULFIDE_SCAN_CAVEAT)
+        return ToolStepResult(
+            tool="disulfide_scan", success=True,
+            data={"pairs": ranked, "best_partner": best_by_chain, "mode": "engineering_scan",
+                  "caveat": self._DISULFIDE_SCAN_CAVEAT},
+            summary=summary)
 
     def _resolve_boltz_templates(
         self, templates: Optional[List[Dict[str, Any]]]

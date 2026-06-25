@@ -128,6 +128,10 @@ class ChainDesign:
     # guided_mean_plddt, unguided_mean_plddt, d_plddt, d_flex:{resno->Å}, n_stabilized, tm_adopt,
     # force, threshold, ...}. Distinct from a fold — this is the comparison.
     template_assist: Dict[str, Any] = field(default_factory=dict)
+    # Mode D engineering scan: NOVEL installable disulfide sites found by the backbone scan of the
+    # construct's fold. Shape: {pairs:[ranked candidate dicts], best_partner:{chain:{resnum:score}},
+    # caveat}. The ranked list is the source of truth; best_partner feeds the heatmap colour mode.
+    disulfide_scan: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -363,6 +367,7 @@ class DesignSession:
                 wt_refs        = dict(cd.get("wt_refs") or {}),
                 template_fold  = dict(cd.get("template_fold") or {}),
                 structural_align = dict(cd.get("structural_align") or {}),
+                disulfide_scan   = dict(cd.get("disulfide_scan") or {}),
                 guided_fold    = dict(cd.get("guided_fold") or {}),
                 template_assist = dict(cd.get("template_assist") or {}),
             )

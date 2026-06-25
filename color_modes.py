@@ -165,6 +165,26 @@ def deviation_color(deviation: Optional[float],
     return _DEV_BANDS[-1][1]
 
 
+# ── disulfide-ENGINEERABILITY heatmap (Mode D; per-residue best-partner score in [0,1]) ──────
+# A residue's colour = its BEST available partner's engineerability score. The heatmap is a
+# NAVIGATIONAL INDEX (a glowing residue points you to the ranked pair-list, which is the data) —
+# it does NOT promise the mutation is tolerated or the bond will form (caveat rides on the mode).
+_SS_SCAN_MIN = 0.05                 # below this = not engineerable → neutral (no colour)
+_SS_PALE = (0xe8, 0xe2, 0xc0)       # faint gold (a just-viable site)
+_SS_GOLD = (0xf2, 0xa6, 0x1c)       # saturated gold (a best-fit site glows strongest)
+
+
+def disulfide_compat_color(score: Optional[float]) -> Optional[str]:
+    """Per-residue disulfide-engineerability (best-partner score 0–1) → pale→gold hex. None when
+    *score* is None or below the surfacing threshold (not engineerable → no colour, never painted
+    as a result). Best-fit sites saturate the gold."""
+    if score is None or score < _SS_SCAN_MIN:
+        return None
+    t = min(1.0, (score - _SS_SCAN_MIN) / (1.0 - _SS_SCAN_MIN))
+    rgb = tuple(_SS_PALE[i] + t * (_SS_GOLD[i] - _SS_PALE[i]) for i in range(3))
+    return _hex(rgb)
+
+
 # Cα-lDDT disruption ramp — by lDDT VALUE (1 = locally conserved … 0 = fully changed), so the
 # scale is INVERTED vs deviation: LOWER lDDT = MORE disrupted = warmer. Floor-gated like the
 # deviation ramp (lDDT ≥ floor → neutral: changed no more than the WT does across seeds).

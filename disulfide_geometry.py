@@ -82,11 +82,13 @@ def _in_window(val: Optional[float], lo: float, hi: float) -> Optional[bool]:
 
 # ── mmCIF cysteine-atom parser (the `_atom_site` loop; SG/CB/CA per CYS) ───────────────────
 
-def parse_cys_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
-    """Parse CYS SG/CB/CA coordinates from a fold's mmCIF, in ONE pass over the `_atom_site`
-    loop (the repo's parsing convention — robust column lookup from the loop header; mmCIF
-    column order is not fixed). Returns ``{auth_asym_id: {auth_seq_id: {"CA":xyz,"CB":xyz,
-    "SG":xyz}}}`` for CYS residues only. A residue missing an atom simply lacks that key."""
+def _parse_atom_site(cif_path: str, want_atoms, comp_id=None) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
+    """ONE-pass `_atom_site` loop parse (the repo's mmCIF convention — robust column lookup from the
+    loop header; column order is not fixed). Returns ``{auth_asym_id: {auth_seq_id: {atom: xyz}}}``
+    for the atoms in *want_atoms*, restricted to residues of *comp_id* (None = ALL residue types).
+    A residue missing an atom simply lacks that key. Shared by `parse_cys_atoms` (CYS, SG/CB/CA)
+    and `parse_backbone_atoms` (all residues, CA/CB)."""
+    want = set(want_atoms)
     cols: List[str] = []
     in_loop = False
     out: Dict[str, Dict[int, Dict[str, Vec3]]] = {}
@@ -103,10 +105,10 @@ def parse_cys_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
                     if len(parts) < len(cols):
                         continue
                     col = {c.split(".")[1]: parts[i] for i, c in enumerate(cols)}
-                    if (col.get("label_comp_id") or "").upper() != "CYS":
+                    if comp_id is not None and (col.get("label_comp_id") or "").upper() != comp_id:
                         continue
                     atom = col.get("label_atom_id")
-                    if atom not in ("CA", "CB", "SG"):
+                    if atom not in want:
                         continue
                     ch = col.get("auth_asym_id") or col.get("label_asym_id")
                     rid = col.get("auth_seq_id") or col.get("label_seq_id")
@@ -125,6 +127,19 @@ def parse_cys_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
     except OSError:
         return {}
     return out
+
+
+def parse_cys_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
+    """CYS SG/CB/CA coordinates from a fold's mmCIF → ``{chain: {resnum: {"CA","CB","SG"}}}`` for
+    CYS residues only (Modes A/B — existing cysteines)."""
+    return _parse_atom_site(cif_path, ("CA", "CB", "SG"), comp_id="CYS")
+
+
+def parse_backbone_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
+    """CA/CB of ALL residues from a fold's mmCIF → ``{chain: {resnum: {"CA","CB"}}}`` (Mode D —
+    the residue-agnostic backbone scan). Glycine has no CB; its entry holds CA only (the scan
+    falls back to CA as a pseudo-Cβ, standard disulfide-engineering practice)."""
+    return _parse_atom_site(cif_path, ("CA", "CB"), comp_id=None)
 
 
 # ── pair geometry + window membership (the shared measurement Modes A/B/C report) ─────────
@@ -177,3 +192,97 @@ def pair_geometry(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3]) -> Dict[str, o
         "bonding_compatible": bool(w["sg_sg"]),                    # SG–SG in the bonding window
         "all_windows": bool(measured) and all(measured),          # every measured axis in window
     }
+
+
+# ── Mode D: backbone disulfide-ENGINEERING scan (find NOVEL installable sites) ──────────────
+# Residue-agnostic backbone geometry — NO χSS (no Sγ exists pre-mutation). Soft-graded windows,
+# never hard cutoffs (a SUGGESTION surface, not a filter). The combine is a PRODUCT of the three
+# axes, so the Cα–Cα distance dominates: a far-apart pair scores ~0 (physically — too far = no
+# disulfide regardless of orientation). That same property makes the Cα PREFILTER lossless.
+CA_CA_SCORE_IDEAL, CA_CA_SCORE_SIGMA = 5.5, 1.0     # Cα–Cα soft window (Å)
+CB_CB_SCORE_SIGMA = 0.6                              # Cβ–Cβ soft window σ (centre = CB_CB_IDEAL 3.8)
+ORIENT_IDEAL_D, ORIENT_CUTOFF_D = 90.0, 135.0       # |Cα-Cβ-Cβ-Cα| dihedral: ±90° ideal
+CA_CA_PREFILTER_GATE = 9.0     # Cα–Cα beyond this → ca-score < 0.0022 → sub-threshold; skip scoring
+SCAN_MIN_SEQ_SEP = 2           # exclude sequence-adjacent residues (cannot form a disulfide)
+SCAN_MIN_SCORE = 0.05          # pairs below this aren't engineerable-enough to surface (gate is
+                               # conservative vs THIS default, so the prefilter is output-lossless)
+
+
+def _gauss_score(x: float, mu: float, sigma: float) -> float:
+    return math.exp(-((x - mu) ** 2) / (2.0 * sigma * sigma))
+
+
+def _orient_score(dihedral_deg: Optional[float]) -> float:
+    """Soft raised-cosine on |dev from ±90°|: 1.0 at ±90°, 0.5 at 0/180°, 0 beyond the cutoff.
+    None (a Gly pseudo-Cβ → orientation undefined) → 0.5 neutral. Soft, never a hard cutoff
+    except the far-deviation floor."""
+    if dihedral_deg is None:
+        return 0.5
+    dev = min(abs(dihedral_deg - ORIENT_IDEAL_D), abs(dihedral_deg + ORIENT_IDEAL_D))
+    if dev >= ORIENT_CUTOFF_D:
+        return 0.0
+    return (1.0 + math.cos(dev * math.pi / 180.0)) / 2.0
+
+
+def backbone_pair_score(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3]) -> Optional[Dict[str, object]]:
+    """Soft-graded engineerability of INSTALLING a disulfide between two residues (residue-agnostic;
+    CA + CB, Gly → CA as a pseudo-Cβ). NO χSS. Returns the measured backbone geometry (Cα–Cα,
+    Cβ–Cβ, Cα-Cβ-Cβ-Cα orientation) + per-axis soft scores + a combined ``score`` in [0,1] (the
+    PRODUCT — graded, Cα-distance-dominant; near-misses score lower but are NEVER hard-eliminated).
+    None if either residue lacks a Cα. PURE."""
+    ca1, ca2 = res_a.get("CA"), res_b.get("CA")
+    if not (ca1 and ca2):
+        return None
+    cb1 = res_a.get("CB") or ca1                     # Gly: CA stands in as the pseudo-Cβ
+    cb2 = res_b.get("CB") or ca2
+    has_cb = bool(res_a.get("CB") and res_b.get("CB"))
+    ca = calc_distance(ca1, ca2)
+    cb = calc_distance(cb1, cb2)
+    dih = calc_dihedral(ca1, cb1, cb2, ca2) if has_cb else None
+    ca_sc, cb_sc = _gauss_score(ca, CA_CA_SCORE_IDEAL, CA_CA_SCORE_SIGMA), _gauss_score(cb, CB_CB_IDEAL, CB_CB_SCORE_SIGMA)
+    or_sc = _orient_score(dih)
+    return {
+        "ca_ca": round(ca, 3), "cb_cb": round(cb, 3),
+        "orientation": (None if dih is None else round(dih, 1)),
+        "ca_score": round(ca_sc, 4), "cb_score": round(cb_sc, 4), "orient_score": round(or_sc, 4),
+        "score": round(ca_sc * cb_sc * or_sc, 4),
+    }
+
+
+def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], *,
+                            min_seq_sep: int = SCAN_MIN_SEQ_SEP,
+                            ca_gate: Optional[float] = CA_CA_PREFILTER_GATE,
+                            min_score: float = SCAN_MIN_SCORE):
+    """INTRACHAIN all-pairs backbone scan for NOVEL installable disulfide sites. Per chain, every
+    residue pair separated by ≥ *min_seq_sep* in sequence is scored by `backbone_pair_score`; a
+    cheap conservative Cα–Cα PREFILTER (*ca_gate*) skips pairs too far to clear *min_score* BEFORE
+    the dihedral compute — SPEED only, the OUTPUT is identical to a full scan (gated-out pairs are
+    sub-threshold). Returns ``(ranked_pairs, best_partner)``: ranked_pairs sorted by score desc;
+    best_partner ``{(chain, resnum): best score}`` for the heatmap (a residue's colour = its best
+    available partner's score). Pass ``ca_gate=None`` for an un-prefiltered full scan."""
+    ranked: List[Dict[str, object]] = []
+    best: Dict[tuple, float] = {}
+    for ch, residues in (atoms_by_chain or {}).items():
+        rns = sorted(residues)
+        for ia in range(len(rns)):
+            ra = rns[ia]
+            ca_a = residues[ra].get("CA")
+            if not ca_a:
+                continue
+            for ib in range(ia + 1, len(rns)):
+                rb = rns[ib]
+                if abs(rb - ra) < min_seq_sep:
+                    continue
+                ca_b = residues[rb].get("CA")
+                if not ca_b:
+                    continue
+                if ca_gate is not None and calc_distance(ca_a, ca_b) > ca_gate:
+                    continue                          # PREFILTER — too far; skip the full score
+                pg = backbone_pair_score(residues[ra], residues[rb])
+                if pg is None or pg["score"] < min_score:
+                    continue
+                ranked.append({"chain": ch, "resnum_a": ra, "resnum_b": rb, **pg})
+                best[(ch, ra)] = max(best.get((ch, ra), 0.0), float(pg["score"]))
+                best[(ch, rb)] = max(best.get((ch, rb), 0.0), float(pg["score"]))
+    ranked.sort(key=lambda d: -d["score"])
+    return ranked, best
