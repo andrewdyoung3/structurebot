@@ -37,6 +37,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from color_modes import (all_modes, combined_disruption_color, ddg_color,
                          disulfide_compat_color, get_mode, plddt_color)
+from disulfide_geometry import pair_chains, pair_label
 from seq_library import (build_numbering_header_content,
                          build_numbering_header_with_insertions)
 from variant_model import (AlignedCell, ChainDesign, DesignSession,
@@ -704,14 +705,15 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
 
     @staticmethod
     def _pair_detail(key: str, p: dict) -> str:
+        lbl = pair_label(p, cys=True)
         if key == "D":
             ornt = p.get("orientation")
-            return (f"Cys{p['resnum_a']}–Cys{p['resnum_b']} — score {p.get('score', 0):.2f} "
+            return (f"{lbl} — score {p.get('score', 0):.2f} "
                     f"(MEASURED, this fold): Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
                     f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}. Geometric "
                     f"compatibility only — installing needs introducing the Cys pair + re-folding "
                     f"(Declare below).")
-        return f"Cys{p['resnum_a']}–Cys{p['resnum_b']} highlighted in 3D."
+        return f"{lbl} highlighted in 3D."
 
     # ── populate (each consumer calls its own) ──────────────────────────────────────
     def _fill_table(self, key: str, cd, pairs: List[dict], rowvals) -> None:
@@ -733,13 +735,13 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
 
     def populate_assess(self, cd, pairs: List[dict]) -> None:
         self._fill_table("A", cd, pairs, lambda p: [
-            f"{p['resnum_a']}–{p['resnum_b']}", f"{p.get('n_compatible', 0)}/{p.get('n_folds', 0)}",
+            pair_label(p), f"{p.get('n_compatible', 0)}/{p.get('n_folds', 0)}",
             str(p.get("n_folds", "")), str(p.get("median_sg_sg", "") if p.get("median_sg_sg") is not None else "—")])
 
     def populate_geometry(self, cd, pairs: List[dict]) -> None:
         def _row(p):
             chi = p.get("chi_ss")
-            return [f"{p['resnum_a']}–{p['resnum_b']}", str(p.get("sg_sg", "—")),
+            return [pair_label(p), str(p.get("sg_sg", "—")),
                     str(p.get("cb_cb", "—")), str(p.get("ca_ca", "—")),
                     ("—" if chi is None else f"{chi:.0f}"),
                     "yes" if p.get("bonding_compatible") else "no"]
@@ -753,7 +755,7 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                                   or "Geometric compatibility only — a starting point, not a recommendation."))
             sec["caveat"].setVisible(bool(pairs))
         self._fill_table("D", cd, pairs, lambda p: [
-            f"{p['resnum_a']}–{p['resnum_b']}", f"{p.get('score', 0):.2f}",
+            pair_label(p), f"{p.get('score', 0):.2f}",
             f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
             ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}")])
 
@@ -3404,10 +3406,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         mid = (cd.template_fold or {}).get("model_id")
         if not mid or not pair:
             return []
-        ch = pair.get("chain") or cd.rep_chain
+        # chain PER MEMBER (pair_chains tolerates the legacy single-`chain` shape); fall back to the
+        # rep chain when absent. SAME-chain collapses to the original combined spec (output identical);
+        # CROSS-chain (step 4) unions the two members' specs.
+        ca, cb = pair_chains(pair)
+        ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
         ra, rb = pair.get("resnum_a"), pair.get("resnum_b")
-        both = f"#{mid}/{ch}:{ra},{rb}"
-        a, b = f"#{mid}/{ch}:{ra}", f"#{mid}/{ch}:{rb}"
+        a, b = f"#{mid}/{ca}:{ra}", f"#{mid}/{cb}:{rb}"
+        both = f"#{mid}/{ca}:{ra},{rb}" if ca == cb else f"{a} {b}"
         return [
             "~display",                                        # clear any prior highlight first
             f"show {both} atoms",

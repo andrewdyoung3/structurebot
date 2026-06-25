@@ -3181,7 +3181,7 @@ class ToolRouter:
         for (ch, ra, rb), t in tally.items():
             sgs = sorted(t["sg"])
             pairs.append({
-                "chain": ch, "resnum_a": ra, "resnum_b": rb,
+                "chain_a": ch, "resnum_a": ra, "chain_b": ch, "resnum_b": rb,  # intrachain: both = ch
                 "n_compatible": t["compat"], "n_folds": n_done,
                 "frequency": round(t["compat"] / n_done, 3),
                 "median_sg_sg": (round(sgs[len(sgs) // 2], 3) if sgs else None),
@@ -3223,7 +3223,7 @@ class ToolRouter:
             combos = (want if want else list(itertools.combinations(sorted(residues), 2)))
             for ra, rb in combos:
                 if ra in residues and rb in residues:
-                    out.append({"chain": ch, "resnum_a": ra, "resnum_b": rb,
+                    out.append({"chain_a": ch, "resnum_a": ra, "chain_b": ch, "resnum_b": rb,  # intrachain
                                 **pair_geometry(residues[ra], residues[rb])})
         out.sort(key=lambda d: (d["sg_sg"] if d["sg_sg"] is not None else 1e9))
         if not out:

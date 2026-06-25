@@ -130,7 +130,10 @@ class ChainDesign:
     template_assist: Dict[str, Any] = field(default_factory=dict)
     # Mode D engineering scan: NOVEL installable disulfide sites found by the backbone scan of the
     # construct's fold. Shape: {pairs:[ranked candidate dicts], best_partner:{chain:{resnum:score}},
-    # caveat}. The ranked list is the source of truth; best_partner feeds the heatmap colour mode.
+    # caveat}. Each pair carries chain_a/resnum_a + chain_b/resnum_b (intra-chain → chain_a ==
+    # chain_b; a LEGACY saved scan may carry only `chain`, rehydrated as same-chain via
+    # disulfide_geometry.pair_chains). The ranked list is the source of truth; best_partner feeds
+    # the heatmap colour mode.
     disulfide_scan: Dict[str, Any] = field(default_factory=dict)
 
     @property
