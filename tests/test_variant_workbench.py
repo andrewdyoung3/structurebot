@@ -2878,3 +2878,124 @@ class TestCrossChainModeC:
         joined = " ".join(pushed)
         assert "#7/A:3" in joined and "#7/B:7" in joined          # both members ACROSS chains
         assert "distance #7/A:3@CB #7/B:7@CB" in joined           # the cross-chain Cβ–Cβ span
+
+
+class TestDisulfideLoadedPdbSource:
+    """B (geometry) / D (scan) / interface on a LOADED crystal/model — the structure-source
+    abstraction (`_active_structure`), the reported symptom: these were greyed on a loaded PDB.
+    A (discovery) + C (declare) stay DE-NOVO-only (they fold a sequence)."""
+
+    def _session(self):
+        from session_state import SessionState
+        return SessionState()
+
+    @staticmethod
+    def _install_save(c):
+        """ChimeraX `save … models #mid` side-effect → write a stub file at the saved path (the
+        coordinate parse itself is the router tool's job, tested there). Increments the content each
+        call so a test can prove a RE-save (no stale cache)."""
+        state = {"n": 0}
+        def _run(cmd):
+            m = re.search(r'save "([^"]+)"', cmd or "")
+            if m:
+                state["n"] += 1
+                Path(m.group(1)).write_text(f"data_ss_v{state['n']}\n")
+        c._run.side_effect = _run
+        return state
+
+    def _loaded(self, chainseqs, mid="2", saveable=True):
+        p, c = _panel(chainseqs, session=self._session())
+        if saveable:
+            self._install_save(c)
+        else:
+            c._run.side_effect = lambda cmd: None          # save yields NO file (closed/unsaveable)
+        p.load_model(mid)
+        assert p._design.source == "structure"             # a LOADED crystal/model, not de-novo
+        return p, c
+
+    # ── gate matrix: de-novo-unfolded / de-novo-folded / loaded-monomer / loaded-multimer ──────
+    def test_gate_loaded_monomer_enables_B_D_not_A_C_interface(self, _app):
+        p, _ = self._loaded([_chainseq("2", "A", "MKVCAACGTDE")])
+        assert p._ss_geometry_btn.isEnabled() and p._ss_scan_btn.isEnabled()   # B + D on a loaded PDB
+        assert not p._ss_discover_btn.isEnabled()          # A folds a sequence → de-novo only
+        assert not p._ss_constrain_btn.isEnabled()         # C folds a variant → de-novo only
+        assert not p._ss_interface_btn.isEnabled()         # monomer → no interface
+
+    def test_gate_loaded_multimer_enables_interface(self, _app):
+        p, _ = self._loaded([_chainseq("2", "A", "MKVCAAC"), _chainseq("2", "B", "WYFGTDE")])
+        assert p._tabs.count() == 2                         # hetero → two chains
+        assert p._ss_geometry_btn.isEnabled() and p._ss_scan_btn.isEnabled()
+        assert p._ss_interface_btn.isEnabled()             # ≥2 chains → interface enabled
+        assert not (p._ss_discover_btn.isEnabled() or p._ss_constrain_btn.isEnabled())
+
+    def test_gate_denovo_unfolded_only_A(self, _app):
+        p, _ = _panel([], session=self._session())
+        p._add_sequence_construct("binder", "MKVCAACGTDE")  # de-novo, NOT folded
+        assert p._ss_discover_btn.isEnabled()               # A: needs only a construct
+        assert not (p._ss_geometry_btn.isEnabled() or p._ss_scan_btn.isEnabled()
+                    or p._ss_constrain_btn.isEnabled() or p._ss_interface_btn.isEnabled())
+
+    def test_gate_denovo_folded_enables_A_B_D_C(self, _app):
+        p, _ = _panel([], session=self._session())
+        p._add_sequence_construct("binder", "MKVCAACGTDE")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "model_id": "7", "cif_path": "/tmp/x.cif"}
+        p._sync_disulfide_menu_enabled()
+        assert (p._ss_discover_btn.isEnabled() and p._ss_geometry_btn.isEnabled()
+                and p._ss_scan_btn.isEnabled() and p._ss_constrain_btn.isEnabled())
+
+    # ── spec builders source the LOADED model's fresh CIF ──────────────────────────────────────
+    def test_loaded_geometry_spec_sources_saved_cif(self, _app):
+        p, _ = self._loaded([_chainseq("2", "A", "MKVCAACGTDE")])
+        spec = p.disulfide_geometry_launch_spec()
+        assert spec is not None and spec["tool"] == "disulfide_geometry"
+        cif = spec["tool_inputs"]["cif_path"]
+        assert cif.endswith("ss_struct_2.cif") and Path(cif).is_file()   # fresh save off the live model
+
+    def test_loaded_scan_and_interface_specs_source_saved_cif(self, _app):
+        p, _ = self._loaded([_chainseq("2", "A", "MKVCAAC"), _chainseq("2", "B", "WYFGTDE")])
+        sc = p.disulfide_scan_launch_spec()
+        iface = p.disulfide_interface_scan_launch_spec()
+        assert sc["tool"] == "disulfide_scan" and Path(sc["tool_inputs"]["cif_path"]).is_file()
+        assert iface["tool"] == "disulfide_interface_scan" and Path(iface["tool_inputs"]["cif_path"]).is_file()
+
+    def test_loaded_interface_spec_none_on_monomer(self, _app):
+        p, _ = self._loaded([_chainseq("2", "A", "MKVCAACGTDE")])
+        assert p.disulfide_interface_scan_launch_spec() is None          # single chain → no interface
+
+    # ── fresh-save: the cache can NEVER serve stale coordinates against a changed model ─────────
+    def test_loaded_resaves_each_call_never_stale(self, _app):
+        p, c = self._loaded([_chainseq("2", "A", "MKVCAACGTDE")])
+        s1 = p._active_structure(); v1 = Path(s1["cif_path"]).read_text()
+        s2 = p._active_structure(); v2 = Path(s2["cif_path"]).read_text()
+        assert s1["cif_path"] == s2["cif_path"]            # same temp path…
+        assert v1 != v2                                    # …RE-WRITTEN each call (current state, not a cache)
+        assert c._run.side_effect is not None              # the save actually ran (not served from a stale path)
+
+    # ── fail-closed: an unsaveable / closed loaded model → None, no silent no-op scan ──────────
+    def test_loaded_unsaveable_fails_closed(self, _app):
+        p, _ = self._loaded([_chainseq("3", "A", "MKVCAACGTDE")], mid="3", saveable=False)
+        assert p._active_structure() is None                            # fail-CLOSED (no file produced)
+        assert p.disulfide_geometry_launch_spec() is None
+        assert p.disulfide_scan_launch_spec() is None
+
+    def test_loaded_unsaveable_click_launches_nothing(self, _app):
+        p, _ = self._loaded([_chainseq("3", "A", "MKVCAACGTDE")], mid="3", saveable=False)
+        emitted = []
+        p.launchRequested.connect(lambda s: emitted.append(s))
+        p._ss_scan_btn.trigger()                            # the action is enabled, but the click…
+        assert not emitted                                  # …is NOT a silent no-op scan — nothing launched
+        assert "open" in p._status.text().lower() or "structure" in p._status.text().lower()
+
+    # ── highlight targets the LIVE loaded model id, not the temp save ─────────────────────────
+    def test_highlight_pair_specs_use_live_loaded_id(self, _app):
+        p, _ = self._loaded([_chainseq("2", "A", "MKVCAACGTDE")])
+        cd = next(iter(p._design.chains.values()))
+        assert not (cd.template_fold or {}).get("model_id")             # a loaded model has no fold
+        mid, a, b, both = p._disulfide_pair_specs(cd, {"chain_a": "A", "resnum_a": 3,
+                                                       "chain_b": "A", "resnum_b": 7})
+        assert mid == "2"                                  # the LIVE rendered id (rep_model), what the user sees
+        assert "#2/A:3" in a and "ss_struct" not in (a + b + both)      # not the temp copy
+        cmds = " ".join(p._disulfide_scan_highlight_commands(cd, {"chain_a": "A", "resnum_a": 3,
+                                                                  "chain_b": "A", "resnum_b": 7}))
+        assert "#2/A:3,7" in cmds and "distance #2/A:3@CB #2/A:7@CB" in cmds

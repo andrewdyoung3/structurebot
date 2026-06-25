@@ -1281,6 +1281,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     # ── toolbar actions ────────────────────────────────────────────────────────────
     def _cur_tab(self) -> Optional[_ChainDesignTab]:
+        if getattr(self, "_tabs", None) is None:     # pre-`_tabs` __init__ calls (e.g. the gate sync)
+            return None
         w = self._tabs.currentWidget()
         return w if isinstance(w, _ChainDesignTab) else None
 
@@ -2149,31 +2151,97 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.launchRequested.emit(spec)
 
     # ── Disulfide-suite handlers ─────────────────────────────────────────────────────
+    # ── structure-source abstraction (§9 universal-disulfide convergence, input side) ──────────
+    # B (geometry) / D (scan) / interface READ coordinates — they don't care whether the structure
+    # is a DE-NOVO construct's fold OR a LOADED crystal/model. One helper yields the active design's
+    # {cif_path, model_id} from EITHER source so the cheap read-modes work on a loaded PDB, not just
+    # a de-novo fold (the reported symptom: these were greyed on a loaded PDB). The DEEP cross-chain
+    # ESM+ΔΔG engineering tool (`disulfide_bridge`) stays the parallel escalation path, not merged.
+
+    def _has_structure(self) -> bool:
+        """True if the ACTIVE design has a structure to read disulfide geometry from — EITHER a
+        de-novo construct that's been FOLDED (`cd.template_fold`) OR a LOADED crystal/model (source
+        'structure', a live ChimeraX model id). The CHEAP gate predicate — no ChimeraX I/O (the
+        actual save + fail-closed happens at action time in `_active_structure`)."""
+        if self._design is None:
+            return False
+        cd = self._cur_tab().design if self._cur_tab() else None
+        if cd is None:
+            return False
+        tf = cd.template_fold or {}
+        if tf.get("cif_path") or tf.get("model_id"):
+            return True                                        # de-novo folded (a fold on disk/in 3D)
+        return self._design.source == "structure" and bool(cd.rep_model)   # loaded crystal/model
+
+    def _active_structure(self) -> Optional[Dict[str, Any]]:
+        """The active design's structure as ``{cif_path, model_id}`` from EITHER source, or None when
+        there is no readable structure (fail-CLOSED — a closed/unsaveable loaded model returns None so
+        the caller greys/no-ops instead of scanning absent or STALE coordinates).
+
+        de-novo → the FOLD on `cd.template_fold` (its cif_path + the fold model id), unchanged.
+        loaded  → the live ChimeraX model SAVED FRESH to a temp mmCIF on EVERY call (never cached on
+                  the design). Re-saving here — rather than reading a stored path — is the staleness
+                  guard: an edit / replace-at-same-id / close-reopen is always captured because the
+                  file is re-written from the model's CURRENT state at read time. `model_id` is the
+                  LIVE rendered id (what the user sees), NOT the temp copy — so 3D highlight lands on
+                  the structure on screen."""
+        cd = self._cur_tab().design if self._cur_tab() else None
+        if cd is None or self._design is None:
+            return None
+        tf = cd.template_fold or {}
+        if tf.get("cif_path") or tf.get("model_id"):
+            cif = tf.get("cif_path")
+            return {"cif_path": cif, "model_id": tf.get("model_id")} if cif else None
+        if self._design.source != "structure":
+            return None
+        mid = cd.rep_model or self._design.model_id
+        cif = self._save_loaded_model_cif(mid)
+        return {"cif_path": cif, "model_id": str(mid)} if cif else None
+
+    def _save_loaded_model_cif(self, mid) -> Optional[str]:
+        """Save a LIVE ChimeraX model to a FRESH temp mmCIF for coordinate reading; None if the save
+        fails or yields no file (model closed / not open → fail-CLOSED). ALWAYS deletes any prior file
+        at the path and re-saves, so the file can NEVER serve a stale model's coordinates. mmCIF (not
+        PDB) — the disulfide parser reads the `_atom_site` loop."""
+        mid = str(mid).lstrip("#").strip()
+        tmp = os.path.join(tempfile.gettempdir(), f"ss_struct_{mid.replace('.', '_')}.cif")
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)                                 # never serve a prior save's coordinates
+        except OSError:
+            pass
+        try:
+            self._c._run(f'save "{Path(tmp).as_posix()}" models #{mid}')
+        except Exception as exc:
+            self._status.setText(f"Could not read model #{mid} for disulfide analysis: {exc}")
+            return None
+        if not os.path.isfile(tmp):
+            self._status.setText(f"Model #{mid} produced no structure file — is it still open?")
+            return None
+        return tmp
+
     def _sync_disulfide_menu_enabled(self) -> None:
-        """Enable each Disulfides action by its REAL precondition so an unavailable action is
-        VISIBLY GREYED (far clearer than a silent no-op): Assess-existing needs a de-novo construct;
-        Measure-geometry / Find-sites / Declare-bonds need it FOLDED. Synced on tab-change/render/fold."""
+        """Enable each Disulfides action by its REAL precondition so an unavailable action is VISIBLY
+        GREYED (far clearer than a silent no-op). Assess-existing (A) + Declare-bonds (C) fold a
+        SEQUENCE → DE-NOVO constructs only (C also needs the construct folded). Measure-geometry (B) +
+        Find-sites (D) + Interface READ a structure → enabled on EITHER a folded de-novo construct OR a
+        LOADED crystal/model (the structure-source abstraction); interface additionally needs ≥2 chains.
+        Synced on tab-change / render / fold / load."""
         if getattr(self, "_ss_discover_btn", None) is None:
             return
         denovo = self._design is not None and self._design.source == "sequence"
-        self._ss_discover_btn.setEnabled(denovo)               # folds fresh → needs only a construct
-        if not denovo:                                         # (also the pre-`_tabs` __init__ call)
-            self._ss_geometry_btn.setEnabled(False)
-            self._ss_scan_btn.setEnabled(False)
-            if getattr(self, "_ss_interface_btn", None) is not None:
-                self._ss_interface_btn.setEnabled(False)
-            self._ss_constrain_btn.setEnabled(False)
-            return
         cd = self._cur_tab().design if self._cur_tab() else None
-        tf = (cd.template_fold if cd else None) or {}
-        folded = bool(tf.get("cif_path") or tf.get("model_id"))
-        self._ss_geometry_btn.setEnabled(folded)               # reads the existing fold's CIF
-        self._ss_scan_btn.setEnabled(folded)                   # reads the fold's backbone (no fold)
-        self._ss_constrain_btn.setEnabled(folded)              # folds a variant against the T-fold
-        # Interface scan needs a folded MULTIMER (≥2 fold chains) — an inter-chain bond is meaningless
-        # on a monomer; greyed (not a silent no-op) when the construct is a single chain.
-        n_chains = sum(len(c.members) for c in self._design.chains.values())
-        self._ss_interface_btn.setEnabled(folded and n_chains >= 2)
+        denovo_folded = bool(denovo and cd and (cd.template_fold or {}).get("model_id"))
+        self._ss_discover_btn.setEnabled(denovo)               # A: folds N seeds → needs a construct
+        self._ss_constrain_btn.setEnabled(denovo_folded)       # C: folds a variant against the T-fold
+        has_struct = self._has_structure()                     # de-novo folded OR loaded crystal/model
+        self._ss_geometry_btn.setEnabled(has_struct)           # B: reads the existing structure coords
+        self._ss_scan_btn.setEnabled(has_struct)               # D: reads the backbone (no fold)
+        # Interface scan needs ≥2 chains (an inter-chain bond is meaningless on a monomer) — greyed
+        # (not a silent no-op) on a single-chain structure, de-novo OR loaded alike.
+        if getattr(self, "_ss_interface_btn", None) is not None:
+            n_chains = sum(len(c.members) for c in self._design.chains.values()) if self._design else 0
+            self._ss_interface_btn.setEnabled(has_struct and n_chains >= 2)
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -2191,16 +2259,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     def _on_disulfide_geometry(self) -> None:
         spec = self.disulfide_geometry_launch_spec()
         if spec is None:
-            self._status.setText("Measure pair geometry needs a folded construct on disk "
-                                 "(Fold construct first).")
+            self._status.setText("Measure pair geometry needs a readable structure — fold the "
+                                 "construct, or check the loaded model is still open.")
             return
         self.launchRequested.emit(spec)
 
     def _on_disulfide_scan(self) -> None:
         spec = self.disulfide_scan_launch_spec()
         if spec is None:
-            self._status.setText("Find engineerable sites needs a folded construct on disk "
-                                 "(Fold construct first).")
+            self._status.setText("Find engineerable sites needs a readable structure — fold the "
+                                 "construct, or check the loaded model is still open.")
             return
         self._status.setText("Scanning the backbone for engineerable disulfide sites "
                              "(geometric compatibility only — a starting point)…")
@@ -2209,8 +2277,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     def _on_disulfide_interface_scan(self) -> None:
         spec = self.disulfide_interface_scan_launch_spec()
         if spec is None:
-            self._status.setText("Find interface sites needs a folded MULTIMER on disk (fold the "
-                                 "construct as an assembly first).")
+            self._status.setText("Find interface sites needs a readable MULTIMER (≥2 chains) — fold "
+                                 "the construct as an assembly, or load a multi-chain structure.")
             return
         self._status.setText("Scanning the chain–chain interface for inter-subunit disulfide sites "
                              "(geometric compatibility only — a starting point)…")
@@ -3316,48 +3384,45 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         }
 
     def disulfide_geometry_launch_spec(self) -> Optional[dict]:
-        """MODE B spec — read the construct's EXISTING fold (`cd.template_fold` CIF) and report the
-        MEASURED cysteine-pair geometry. CHEAP (reads coordinates; NEVER folds). None until folded."""
-        cd = self._cur_tab().design if self._cur_tab() else None
-        tf = (cd.template_fold if cd else None) or {}
-        cif = tf.get("cif_path")
-        if not cif:
+        """MODE B spec — read the active design's EXISTING structure (the de-novo construct's fold OR
+        a LOADED crystal/model, via `_active_structure`) and report the MEASURED cysteine-pair
+        geometry. CHEAP (reads coordinates; NEVER folds). None until there is a structure to read."""
+        src = self._active_structure()
+        if src is None:
             return None
         return {
-            "tool": "disulfide_geometry", "tool_inputs": {"cif_path": cif},
-            "user_input": "[Workbench] disulfide geometry readout (measured, this fold)",
+            "tool": "disulfide_geometry", "tool_inputs": {"cif_path": src["cif_path"]},
+            "user_input": "[Workbench] disulfide geometry readout (measured, this structure)",
             "confidence": "high", "refresh": "disulfide_geometry",      # cheap + deterministic → no gate
         }
 
     def disulfide_scan_launch_spec(self) -> Optional[dict]:
-        """MODE D spec — backbone scan of the construct's EXISTING fold for NOVEL engineerable
-        disulfide sites. CHEAP (reads coordinates; NEVER folds). None until folded."""
-        cd = self._cur_tab().design if self._cur_tab() else None
-        tf = (cd.template_fold if cd else None) or {}
-        cif = tf.get("cif_path")
-        if not cif:
+        """MODE D spec — backbone scan of the active design's EXISTING structure (de-novo fold OR a
+        LOADED crystal/model, via `_active_structure`) for NOVEL engineerable disulfide sites. CHEAP
+        (reads coordinates; NEVER folds). None until there is a structure to read."""
+        src = self._active_structure()
+        if src is None:
             return None
         return {
-            "tool": "disulfide_scan", "tool_inputs": {"cif_path": cif},
-            "user_input": "[Workbench] find engineerable disulfide sites (backbone scan, this fold)",
+            "tool": "disulfide_scan", "tool_inputs": {"cif_path": src["cif_path"]},
+            "user_input": "[Workbench] find engineerable disulfide sites (backbone scan, this structure)",
             "confidence": "high", "refresh": "disulfide_scan",          # cheap + deterministic → no gate
             "_align_ukey": self._cur_cd_ukey(),
         }
 
     def disulfide_interface_scan_launch_spec(self) -> Optional[dict]:
-        """INTERFACE-SCAN spec — cross-chain backbone scan of the construct's EXISTING fold for NOVEL
-        inter-subunit disulfide sites. CHEAP (reads coordinates; NEVER folds). None until the
-        construct is folded as a MULTIMER (≥2 fold chains — an inter-chain bond needs ≥2 chains)."""
-        cd = self._cur_tab().design if self._cur_tab() else None
-        tf = (cd.template_fold if cd else None) or {}
-        cif = tf.get("cif_path")
-        if not cif or self._design is None:
+        """INTERFACE-SCAN spec — cross-chain backbone scan of the active design's EXISTING structure
+        (de-novo fold OR a LOADED crystal/model, via `_active_structure`) for NOVEL inter-subunit
+        disulfide sites. CHEAP (reads coordinates; NEVER folds). None unless the structure has a
+        MULTIMER (≥2 chains — an inter-chain bond needs ≥2 chains)."""
+        src = self._active_structure()
+        if src is None or self._design is None:
             return None
         if sum(len(c.members) for c in self._design.chains.values()) < 2:
             return None                                                 # monomer → no interface
         return {
-            "tool": "disulfide_interface_scan", "tool_inputs": {"cif_path": cif},
-            "user_input": "[Workbench] find interface disulfide sites (inter-chain scan, this fold)",
+            "tool": "disulfide_interface_scan", "tool_inputs": {"cif_path": src["cif_path"]},
+            "user_input": "[Workbench] find interface disulfide sites (inter-chain scan, this structure)",
             "confidence": "high", "refresh": "disulfide_interface_scan",   # cheap + deterministic → no gate
             "_align_ukey": self._cur_cd_ukey(),
         }
@@ -3629,10 +3694,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     @staticmethod
     def _disulfide_pair_specs(cd, pair: dict):
-        """(mid, a, b, both) ChimeraX specs for a pair on the construct's fold. Chain PER MEMBER
-        (`pair_chains` tolerates the legacy single-`chain` shape); rep chain when absent. SAME-chain
-        collapses to one combined spec, CROSS-chain unions the two members. (None,…) if not folded."""
-        mid = (cd.template_fold or {}).get("model_id")
+        """(mid, a, b, both) ChimeraX specs for a pair on the design's structure. The model id is the
+        de-novo construct's FOLD model (`cd.template_fold.model_id`) OR — for a LOADED crystal/model —
+        the LIVE rendered id `cd.rep_model` (so a pair-click highlights the structure ON SCREEN, not
+        the temp save). Chain PER MEMBER (`pair_chains` tolerates the legacy single-`chain` shape);
+        rep chain when absent. SAME-chain collapses to one combined spec, CROSS-chain unions the two
+        members. (None,…) if there is no REAL structure id — an UNFOLDED de-novo construct's
+        `rep_model` is the synthetic ``denovo-…`` id (nothing in ChimeraX), so it is NOT a highlight
+        target; only a fold model id or a loaded model's live id is."""
+        mid = (cd.template_fold or {}).get("model_id") or cd.rep_model
+        if mid and str(mid).startswith("denovo-"):         # synthetic de-novo id → nothing rendered yet
+            mid = None
         if not mid or not pair:
             return None, None, None, None
         ca, cb = pair_chains(pair)
