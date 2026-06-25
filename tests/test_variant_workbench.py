@@ -2524,13 +2524,17 @@ class TestDisulfideSuite:
         return cd
 
     def test_scan_highlight_commands_for_a_pair(self, _app):
+        # GLOW recipe: bright opaque spheres on the pair + transparency-the-rest + a halo + distance
         p, _ = _panel([], session=__import__("session_state").SessionState())
         cd = self._scanned(p)
         cmds = p._disulfide_scan_highlight_commands(cd, cd.disulfide_scan["pairs"][0])
         joined = " ".join(cmds)
-        assert "#7/A:5,9 atoms" in joined and "@CB sphere" in joined   # both members, Cβ spheres
-        assert "color #7/A:5,9 gold" in joined and "select #7/A:5,9" in joined
-        assert "distance #7/A:5@CB #7/A:9@CB" in joined                # the Cβ–Cβ measured span
+        assert "show #7/A:5,9 atoms" in joined and "style #7/A:5,9 sphere" in joined  # the lit element
+        assert "color #7/A:5,9 gold target a" in joined                # atoms only (cartoon keeps colour)
+        assert "transparency #7 70 target c" in joined                 # GHOST the rest → spotlight
+        assert "transparency #7/A:5,9 0 target c" in joined            # keep the glowed cartoon opaque
+        assert "graphics selection color gold" in joined and "graphics selection width 5" in joined  # halo
+        assert "select #7/A:5,9" in joined and "distance #7/A:5@CB #7/A:9@CB" in joined
 
     def test_scan_highlight_empty_without_fold(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
@@ -2545,7 +2549,8 @@ class TestDisulfideSuite:
         cd = self._construct(p)
         pair = {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9, "score": 0.91}
         joined = " ".join(p._disulfide_scan_highlight_commands(cd, pair))
-        assert "#7/A:5,9 atoms" in joined and "color #7/A:5,9 gold" in joined
+        assert "show #7/A:5,9 atoms" in joined and "color #7/A:5,9 gold target a" in joined
+        assert "transparency #7 70 target c" in joined
         assert "distance #7/A:5@CB #7/A:9@CB" in joined
 
     def test_scan_highlight_cross_chain_unions_members(self, _app):
@@ -2559,6 +2564,35 @@ class TestDisulfideSuite:
         assert "#7/A:5" in joined and "#7/B:9" in joined         # each member on its OWN chain
         assert "#7/A:5,9" not in joined                          # NOT the same-chain combined spec
         assert "distance #7/A:5@CB #7/B:9@CB" in joined          # cross-chain Cβ–Cβ span
+
+    def test_glow_restores_prior_before_applying_next(self, _app):
+        # NON-DESTRUCTIVE: glow pair A, then pair B → B's push RESTORES A (un-ghost + hide A's atoms)
+        # BEFORE applying B's glow, so glows/transparency never STACK.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)                                  # model #7
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        pairA = {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9}
+        pairB = {"chain_a": "A", "resnum_a": 3, "chain_b": "A", "resnum_b": 7}
+        p._highlight_disulfide_pair(cd, pairA)
+        assert p._glow_state == {"mid": "7", "both": "#7/A:5,9"}   # A's glow recorded
+        pushed.clear()
+        p._highlight_disulfide_pair(cd, pairB)
+        ri = pushed.index("transparency #7 0 target c")           # un-ghost (restore A) …
+        assert "hide #7/A:5,9 atoms" in pushed                    # … A's residues back to cartoon
+        bi = pushed.index("show #7/A:3,7 atoms")                  # … THEN B is glowed
+        assert ri < bi                                            # restore BEFORE apply (no stacking)
+        assert p._glow_state == {"mid": "7", "both": "#7/A:3,7"}  # now B is the active glow
+
+    def test_glow_no_state_without_fold(self, _app):
+        # an unfolded construct → no glow emitted, no lingering state to restore
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("b", "MKVCAAC")
+        cd = next(iter(p._design.chains.values()))
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._highlight_disulfide_pair(cd, {"resnum_a": 1, "resnum_b": 4})
+        assert pushed == [] and p._glow_state is None
 
     # ── the PERSISTENT Disulfides tab (whole-suite home; replaces the vanishing dialog) ─────
     def test_disulfides_tab_exists_as_a_widget(self, _app):
@@ -2604,17 +2638,18 @@ class TestDisulfideSuite:
         assert p.disulfides_tab._sec["D"]["table"].rowCount() == 2
 
     def test_tab_row_click_highlights_the_right_pair_on_the_current_construct(self, _app):
-        # trigger-reaches-handler-with-correct-TARGET: a row-click on the tab produces the highlight
-        # for THAT pair on THIS construct's model, through the existing _run_commands_bg seam.
+        # trigger-reaches-handler-with-correct-TARGET: a row-click GLOWS THAT pair on THIS model, and
+        # RESTORES the prior glow first (populate preselected 5–9) — non-destructive, not stacking.
         p, _ = _panel([], session=__import__("session_state").SessionState())
         cd = self._scanned(p)                                          # model #7, pairs 5–9 and 3–7
         pushed = []
         p._run_commands_bg = lambda cmds: pushed.extend(cmds)
-        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)         # preselect row 0 → glow 5–9
         pushed.clear()
         p.disulfides_tab._sec["D"]["table"].cellClicked.emit(1, 0)    # click the 2nd pair (3–7)
-        assert any("#7/A:3,7 atoms" in c for c in pushed)             # right pair, right model
-        assert not any("#7/A:5,9" in c for c in pushed)               # NOT the other pair
+        assert any("show #7/A:3,7 atoms" in c for c in pushed)        # GLOW the clicked pair (3–7)
+        assert any("hide #7/A:5,9 atoms" in c for c in pushed)        # un-glow the PRIOR pair (5–9)
+        assert not any("show #7/A:5,9" in c for c in pushed)          # 5–9 is restored, NOT re-glowed
 
     def test_tab_declare_button_feeds_mode_c(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
