@@ -156,11 +156,15 @@ def resnum_to_chain_index(ordered_resnums: List[int], resnum: int) -> Optional[i
         return None
 
 
-def bond_constraint(chain_id: str, idx_a: int, idx_b: int, atom: str = "SG") -> Dict[str, object]:
+def bond_constraint(chain_a: str, idx_a: int, chain_b: str, idx_b: int,
+                    atom: str = "SG") -> Dict[str, object]:
     """A Boltz `bond` constraint entry between two residues' *atom* (default SG): the
-    ``{atom1:[chain,idx,atom], atom2:[chain,idx,atom]}`` shape `_build_yaml` emits. Indices are
-    1-based chain indices (see `resnum_to_chain_index`)."""
-    return {"atom1": [chain_id, int(idx_a), atom], "atom2": [chain_id, int(idx_b), atom]}
+    ``{atom1:[chain,idx,atom], atom2:[chain,idx,atom]}`` shape `_build_yaml` emits. A chain PER
+    ATOM (``chain_a``/``chain_b``) so an INTER-chain bond is representable — ``atom1:[CHAIN_A, ia,
+    SG], atom2:[CHAIN_B, ib, SG]``. A same-chain bond passes the SAME chain for both and emits the
+    IDENTICAL constraint as before. Indices are 1-based chain indices (see `resnum_to_chain_index`),
+    each within ITS OWN chain. PURE."""
+    return {"atom1": [chain_a, int(idx_a), atom], "atom2": [chain_b, int(idx_b), atom]}
 
 
 # ── pair-shape helpers (the two-chain container; intra-chain = chain_a == chain_b) ─────────

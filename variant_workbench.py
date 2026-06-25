@@ -3329,7 +3329,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             ia, ib = _dg.resnum_to_chain_index(ordered, a), _dg.resnum_to_chain_index(ordered, b)
             if ia is None or ib is None:
                 return None
-            constraints.append(_dg.bond_constraint(chain_id, ia, ib))
+            # SAME-chain (intra) declare: both atoms on cd.rep_chain → identical constraint to before.
+            # Step 3 makes each member resolve against ITS OWN chain for a cross-chain bond.
+            constraints.append(_dg.bond_constraint(chain_id, ia, chain_id, ib))
         spec["tool_inputs"]["disulfide_constraints"] = constraints
         spec["tool_inputs"]["disulfide_bonds"] = list(pairs)
         _pp = ", ".join(f"Cys{a}–Cys{b}" for a, b in pairs)

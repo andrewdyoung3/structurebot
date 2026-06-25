@@ -130,8 +130,16 @@ def test_resnum_to_chain_index_with_gaps_in_numbering():
 
 
 def test_bond_constraint_shape():
-    c = g.bond_constraint("A", 3, 36)
+    # SAME-chain (both atoms chain A) must emit EXACTLY what it did before the per-atom-chain split
+    c = g.bond_constraint("A", 3, "A", 36)
     assert c == {"atom1": ["A", 3, "SG"], "atom2": ["A", 36, "SG"]}
+
+
+def test_bond_constraint_inter_chain():
+    # the step-2 capability: a chain PER ATOM → an INTER-chain bond is representable (atom1 on A,
+    # atom2 on B). Nothing wires a cross-chain pair through this yet (that's step 3).
+    c = g.bond_constraint("A", 3, "B", 36)
+    assert c == {"atom1": ["A", 3, "SG"], "atom2": ["B", 36, "SG"]}
 
 
 def test_parse_cys_atoms_only_cysteines(tmp_path):
