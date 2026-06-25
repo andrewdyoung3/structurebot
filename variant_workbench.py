@@ -3288,22 +3288,63 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 return i
         return None
 
+    def _normalize_ss_pairs(self, pairs):
+        """Mode-C pair input → ``[(chain_a, resnum_a, chain_b, resnum_b)]``. Accepts a single entry
+        or a list of: ``(a, b)`` resnum tuples (SAME-chain on the active cd) or reshaped pair dicts
+        carrying ``chain_a``/``chain_b`` (or a legacy single ``chain`` → both, via `pair_chains`).
+        None on malformed input. PURE-ish (reads the active cd's rep chain for bare tuples)."""
+        if isinstance(pairs, (tuple, dict)):
+            pairs = [pairs]
+        tab = self._cur_tab()
+        active_rep = (tab.design.rep_chain if (tab and tab.design) else None)
+        out = []
+        for p in (pairs or []):
+            if isinstance(p, dict):
+                cha, chb = pair_chains(p)
+                ra, rb = p.get("resnum_a"), p.get("resnum_b")
+            else:
+                try:
+                    ra, rb = p
+                except (TypeError, ValueError):
+                    return None
+                cha = chb = active_rep
+            if ra is None or rb is None or cha is None or chb is None:
+                return None
+            out.append((str(cha), int(ra), str(chb), int(rb)))
+        return out
+
+    def _chain_to_cd(self) -> Dict[str, "ChainDesign"]:
+        """Map each fold chain id → the ChainDesign that owns it (every cd's `members` chain).
+        Post-construct-fold a homo-oligomer's copies share ONE cd (members A,B,… on the same cd);
+        a hetero complex has one cd per distinct chain — so this resolves a declared chain to the
+        cd whose `ordered` resnum list a member must be mapped against (the cross-chain hinge)."""
+        m: Dict[str, "ChainDesign"] = {}
+        for cd in (self._design.chains.values() if self._design else []):
+            for (_mdl, ch) in cd.members:
+                m[str(ch)] = cd
+        return m
+
     def build_disulfide_introduce_spec(self, pairs, engine: str = "boltz") -> Optional[dict]:
         """MODE C (introduce) — declare ONE OR MORE disulfide bonds between positions that are NOT
         yet cysteine: GENUINELY COMPOSE with the substitution subsystem (`add_variant` +
         `edit_variant(col,"C")` at EVERY declared position — the existing path, not a parallel
         cysteine-introduction), then fold THAT variant WITH all declared `bond` constraints. Each
         author-resnum→1-based chain-index conversion (the correctness hinge) runs through the tested
-        `disulfide_geometry.resnum_to_chain_index`. *pairs* is a single `(a,b)` tuple or a list of
-        them. Returns the constrained fold spec (refresh='fold'), or None (any pair invalid)."""
+        `disulfide_geometry.resnum_to_chain_index`. *pairs* accepts `(a,b)` resnum tuples (SAME-chain
+        on the active cd) AND reshaped cross-chain pair dicts (`chain_a`/`chain_b`). Returns the
+        constrained fold spec (refresh='fold'), or None (any pair invalid)."""
         import disulfide_geometry as _dg
-        if isinstance(pairs, tuple):
-            pairs = [pairs]
-        pairs = [(int(a), int(b)) for a, b in (pairs or [])]
-        tab = self._cur_tab()
-        cd = tab.design if tab else None
-        if not pairs or cd is None or self._design is None or self._design.source != "sequence":
+        norm = self._normalize_ss_pairs(pairs)
+        if not norm or self._design is None or self._design.source != "sequence":
             return None
+        tab = self._cur_tab()
+        active_rep = (tab.design.rep_chain if (tab and tab.design) else None)
+        # CROSS-chain (or same-chain on a non-active cd) → the inter-chain path; only when EVERY pair
+        # is same-chain on the ACTIVE cd do we take the unchanged intra-chain path (byte-identical).
+        if not all(cha == chb == active_rep for (cha, _ra, chb, _rb) in norm):
+            return self._build_cross_chain_ss_spec(norm, engine, _dg)
+        cd = tab.design
+        pairs = [(ra, rb) for (_ca, ra, _cb, rb) in norm]
         # validate columns up front (all must resolve, distinct within a pair)
         cols = {}
         for a, b in pairs:
@@ -3330,7 +3371,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             if ia is None or ib is None:
                 return None
             # SAME-chain (intra) declare: both atoms on cd.rep_chain → identical constraint to before.
-            # Step 3 makes each member resolve against ITS OWN chain for a cross-chain bond.
             constraints.append(_dg.bond_constraint(chain_id, ia, chain_id, ib))
         spec["tool_inputs"]["disulfide_constraints"] = constraints
         spec["tool_inputs"]["disulfide_bonds"] = list(pairs)
@@ -3339,6 +3379,89 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                               f"(biases toward them; does NOT enforce geometry) — {engine}, LOCAL-ONLY")
         spec["_variant_id"] = vid
         return spec
+
+    def _build_cross_chain_ss_spec(self, norm, engine: str, _dg) -> Optional[dict]:
+        """MODE C, INTER-chain — declare a disulfide whose two residues live on DIFFERENT fold
+        chains (inter-subunit). The correctness gate (silent-wrong-residue, not a crash): each
+        member is resolved against ITS OWN chain's ordered list and the Cys substitution is composed
+        on BOTH owning cds, then the WHOLE assembly is folded with `atom1:[CHAIN_A,…], atom2:
+        [CHAIN_B,…]`. None on any invalid endpoint. Requires the construct already folded (the
+        deviation/compare reference) + a multi-chain (Boltz) assembly."""
+        chain_cd = self._chain_to_cd()
+        cols_by_cd: Dict[int, Tuple["ChainDesign", set]] = {}   # id(cd) -> (cd, {col})
+        endpoints = []   # (cha, cda, ra, chb, cdb, rb)
+        for (cha, ra, chb, rb) in norm:
+            cda, cdb = chain_cd.get(cha), chain_cd.get(chb)
+            if cda is None or cdb is None:
+                return None
+            cola, colb = self._col_for_resnum(cda, ra), self._col_for_resnum(cdb, rb)
+            if cola is None or colb is None:
+                return None
+            if cha == chb and cola == colb:          # a residue can't bond to itself
+                return None
+            cols_by_cd.setdefault(id(cda), (cda, set()))[1].add(cola)
+            cols_by_cd.setdefault(id(cdb), (cdb, set()))[1].add(colb)
+            endpoints.append((cha, cda, ra, chb, cdb, rb))
+        # COMPOSE on BOTH cds: one SS variant per involved cd, Cys at all its declared cols.
+        vid = "SS_" + "_".join(f"{cha}{ra}-{chb}{rb}" for (cha, ra, chb, rb) in norm)
+        for (cd, cols) in cols_by_cd.values():
+            if cd.get_variant(vid) is None:
+                cd.add_variant(vid, source="manual")
+            for col in cols:
+                cd.edit_variant(vid, col, "C", source="disulfide_introduce")
+        # primary cd: the active one if involved, else the first involved (the fold/readout anchor).
+        tab = self._cur_tab()
+        active_cd = tab.design if tab else None
+        primary = active_cd if (active_cd is not None and id(active_cd) in cols_by_cd) \
+            else next(iter(cols_by_cd.values()))[0]
+        ptab = self._focus_tab_for_design(primary)
+        if ptab is not None:
+            ptab.set_active_row(vid)
+        tf = primary.template_fold or {}
+        if not tf.get("model_id"):
+            return None                              # construct not folded → no reference to fold against
+        eng = tf.get("engine", engine)
+        # FULL-COMPLEX composition: each involved cd contributes its SS-variant sequence (Cys
+        # introduced), every other cd its template T — across that cd's member chains (same ids/order
+        # as the construct T-fold, so it lines up 1:1 with the deviation reference).
+        chains: List[Dict[str, str]] = []
+        for c in self._design.chains.values():
+            cv = c.get_variant(vid)
+            seq = cv.sequence if cv is not None else "".join(
+                cc.aa for cc in c.template_cells if cc.aa is not None)
+            chains.extend({"id": ch, "sequence": seq} for (_m, ch) in c.members)
+        if len(chains) < 2 or eng not in ("boltz", "colabfold"):
+            return None                              # an inter-chain bond needs a multi-chain fold
+        # CONSTRAINTS: each endpoint resolved against ITS OWN cd's ordered list (the mis-map guard).
+        constraints, bonds = [], []
+        for (cha, cda, ra, chb, cdb, rb) in endpoints:
+            oa = [c.resnum for c in cda.get_variant(vid).cells if (not c.is_gap) and c.resnum is not None]
+            ob = [c.resnum for c in cdb.get_variant(vid).cells if (not c.is_gap) and c.resnum is not None]
+            ia, ib = _dg.resnum_to_chain_index(oa, ra), _dg.resnum_to_chain_index(ob, rb)
+            if ia is None or ib is None:
+                return None
+            constraints.append(_dg.bond_constraint(cha, ia, chb, ib))   # atom1:[A,ia], atom2:[B,ib]
+            bonds.append((ra, rb))
+        _pp = ", ".join(f"Cys{cha}:{ra}–Cys{chb}:{rb}" for (cha, ra, chb, rb) in norm)
+        return {
+            "tool": eng,
+            "tool_inputs": {
+                "model_id":    self._design.model_id,
+                "chain":       primary.rep_chain,
+                "engine":      eng,
+                "open_model":  True,
+                "local_only":  True,
+                "compare_to":  tf.get("model_id"),
+                "chains":      chains,
+                "disulfide_constraints": constraints,
+                "disulfide_bonds":       bonds,
+            },
+            "user_input": (f"[Workbench] fold {vid} with DECLARED inter-chain bond(s) {_pp} "
+                           f"(biases toward them; does NOT enforce geometry) — {eng}, LOCAL-ONLY"),
+            "confidence": "low",
+            "refresh": "fold",
+            "_variant_id": vid,
+        }
 
     def _scan_target_cd(self, spec: dict):
         """The construct a disulfide result belongs to: the spec's `_align_ukey` cd, else the active."""

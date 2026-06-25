@@ -2659,3 +2659,118 @@ class TestDisulfideSuite:
         assert "SS-bond" in (p._badge_for(cd.get_variant("SS_2-9")))   # provenance badge intact
         # AND the C section now records the readout
         assert "Cys2–Cys9" in p.disulfides_tab._sec["C"]["readout"].text()
+
+
+class TestCrossChainModeC:
+    """Step 3 — cross-chain Mode C (inter-subunit disulfide). The correctness gate: each member is
+    resolved against ITS OWN chain's ordered list; the Cys substitution is composed on BOTH cds;
+    the constraint emits atom1:[CHAIN_A,…], atom2:[CHAIN_B,…]. The failure mode is SILENT-WRONG-
+    RESIDUE (not a crash), so verification concentrates here."""
+
+    def _denovo_panel(self):
+        from session_state import SessionState
+        return _panel([], session=SessionState())
+
+    def _homodimer(self, p, seq="MKVLWAACTE"):
+        # ONE cd folded as a Boltz dimer → members [(7,A),(7,B)] (a homo-oligomer is ONE cd across
+        # two member chains).
+        p._add_sequence_construct("dimer", seq)
+        spec = p.construct_fold_launch_spec("boltz", 2)
+        plddt = {i: 90.0 for i in range(1, len(seq) + 1)}
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "chain_ids": ["A", "B"], "plddt_by_chain": {"A": plddt, "B": plddt},
+            "cif_path": "/tmp/dimer.cif"}}]})
+        return next(iter(p._design.chains.values()))
+
+    def _hetero(self, p, seqA, seqB, startA=1, startB=1):
+        # TWO distinct sequences → two cds; folded as a 2-chain assembly (A=cd0, B=cd1). Optional
+        # non-1 author numbering per chain to exercise per-chain index resolution.
+        p._add_sequence_construct("cplx", [(seqA, 1), (seqB, 1)])
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        pa = {i: 90.0 for i in range(1, len(seqA) + 1)}
+        pb = {i: 90.0 for i in range(1, len(seqB) + 1)}
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "chain_ids": ["A", "B"], "plddt_by_chain": {"A": pa, "B": pb},
+            "cif_path": "/tmp/cplx.cif"}}]})
+        cds = list(p._design.chains.values())
+        for (cd, start) in [(cds[0], startA), (cds[1], startB)]:
+            if start != 1:
+                for i, c in enumerate(cd.template_cells):
+                    c.resnum = start + i
+        return cds
+
+    # ── homo-dimer inter-subunit bond (the live-verify analog: one cd, two member chains) ──
+    def test_homodimer_emits_two_distinct_chains(self, _app):
+        p, _ = self._denovo_panel()
+        self._homodimer(p)                              # members A,B on ONE cd
+        spec = p.build_disulfide_introduce_spec(
+            {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 3})
+        assert spec is not None
+        cons = spec["tool_inputs"]["disulfide_constraints"]
+        # resnum 3 → index 3 (numbered 1..N); two DISTINCT chains, same residue position
+        assert cons == [{"atom1": ["A", 3, "SG"], "atom2": ["B", 3, "SG"]}]
+        # the folded assembly carries Cys on BOTH member chains (col 2 = resnum 3)
+        chains = spec["tool_inputs"]["chains"]
+        assert [c["id"] for c in chains] == ["A", "B"]
+        assert chains[0]["sequence"][2] == "C" and chains[1]["sequence"][2] == "C"
+
+    # ── shared-author-numbering: CHAIN discrimination (the realistic silent trap) ──
+    def test_shared_numbering_resolves_distinct_chains(self, _app):
+        # both chains numbered 1..N: A:5 ↔ B:5. A naive impl reusing the active cd's chain for BOTH
+        # atoms would emit [A,5],[A,5] — each atom MUST carry its own distinct chain.
+        p, _ = self._denovo_panel()
+        self._hetero(p, "ACDEFGHIKL", "MNPQRSTVWY")     # A=cd0 (1..10), B=cd1 (1..10)
+        spec = p.build_disulfide_introduce_spec(
+            {"chain_a": "A", "resnum_a": 5, "chain_b": "B", "resnum_b": 5})
+        cons = spec["tool_inputs"]["disulfide_constraints"]
+        assert cons == [{"atom1": ["A", 5, "SG"], "atom2": ["B", 5, "SG"]}]
+        assert cons[0]["atom2"][0] == "B"               # DISTINCT chain, not the active cd's A
+
+    # ── shared-author-numbering: INDEX discrimination (per-chain resolution is genuine) ──
+    def test_shared_numbering_index_resolves_against_own_chain(self, _app):
+        # the silent-wrong trap: A 1..40, B 21..60. Declare A:30 ↔ B:30. B:30 EXISTS in A's list
+        # (index 30) AND in B's own list (index 10). The correct index is 10; a mis-map against A's
+        # list gives 30 → points at the WRONG residue, the fold 'succeeds' looking wrong.
+        p, _ = self._denovo_panel()
+        self._hetero(p, "ACDEFGHIKL" * 4, "MNPQRSTVWY" * 4, startB=21)   # A=1..40, B=21..60
+        spec = p.build_disulfide_introduce_spec(
+            {"chain_a": "A", "resnum_a": 30, "chain_b": "B", "resnum_b": 30})
+        cons = spec["tool_inputs"]["disulfide_constraints"]
+        # A:30 → index 30 (A's list); B:30 → index 10 (B's OWN list), NOT 30 (the mis-map)
+        assert cons == [{"atom1": ["A", 30, "SG"], "atom2": ["B", 10, "SG"]}]
+
+    # ── two-cd composition: BOTH cds get the Cys; the fold carries it on both chains ──
+    def test_two_cd_composition_introduces_cys_on_both(self, _app):
+        p, _ = self._denovo_panel()
+        cds = self._hetero(p, "ACDEFGHIKL" * 4, "MNPQRSTVWY" * 4, startB=21)
+        spec = p.build_disulfide_introduce_spec(
+            {"chain_a": "A", "resnum_a": 30, "chain_b": "B", "resnum_b": 30})
+        vid = spec["_variant_id"]
+        vA, vB = cds[0].get_variant(vid), cds[1].get_variant(vid)
+        assert vA is not None and vB is not None        # BOTH cds carry the SS variant
+        assert vA.sequence[29] == "C"                   # A:30 → col 29 (0-based, 1..40)
+        assert vB.sequence[9] == "C"                    # B:30 → col 9 (0-based, 21..60)
+        # the folded assembly's chains carry Cys on BOTH (a constraint at B:30 is wrong if B was
+        # never actually mutated there)
+        chains = {c["id"]: c["sequence"] for c in spec["tool_inputs"]["chains"]}
+        assert chains["A"][29] == "C" and chains["B"][9] == "C"
+
+    # ── genuine per-chain resolution: a residue absent on the partner chain fails SAFE ──
+    def test_absent_on_partner_chain_returns_none(self, _app):
+        # B has no residue 99 → per-chain resolution genuinely returns None (never a silent map
+        # onto some other chain that happens to contain 99).
+        p, _ = self._denovo_panel()
+        self._hetero(p, "ACDEFGHIKL" * 4, "MNPQRSTVWY")   # A=1..40, B=1..10
+        assert p.build_disulfide_introduce_spec(
+            {"chain_a": "A", "resnum_a": 30, "chain_b": "B", "resnum_b": 99}) is None
+
+    # ── same-chain dict on the active cd still takes the UNCHANGED intra path ──
+    def test_same_chain_dict_takes_intra_path(self, _app):
+        p, _ = self._denovo_panel()
+        self._homodimer(p)                              # rep_chain A
+        spec = p.build_disulfide_introduce_spec(
+            {"chain_a": "A", "resnum_a": 3, "chain_b": "A", "resnum_b": 7})
+        cons = spec["tool_inputs"]["disulfide_constraints"]
+        assert cons == [{"atom1": ["A", 3, "SG"], "atom2": ["A", 7, "SG"]}]   # both atoms on A
