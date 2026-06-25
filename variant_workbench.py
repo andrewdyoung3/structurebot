@@ -3202,7 +3202,123 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             if tab is not None:
                 self._apply_color_to(tab)
                 self._push_3d_color(tab)
+            self._show_disulfide_scan_dialog(cd)               # the ranked list = the source of truth
         self._status.setText(step.get("summary") or "Engineering scan complete.")
+
+    @staticmethod
+    def _disulfide_scan_highlight_commands(cd, pair: dict) -> List[str]:
+        """ChimeraX commands to HIGHLIGHT a scanned pair on the construct's T-fold: both members'
+        Cβ as gold spheres + a selection + the Cβ–Cβ distance (the geometry justifying its score).
+        Pure → single source for the click action, the live-verify, and tests. [] if not folded."""
+        mid = (cd.template_fold or {}).get("model_id")
+        if not mid or not pair:
+            return []
+        ch = pair.get("chain") or cd.rep_chain
+        ra, rb = pair.get("resnum_a"), pair.get("resnum_b")
+        both = f"#{mid}/{ch}:{ra},{rb}"
+        a, b = f"#{mid}/{ch}:{ra}", f"#{mid}/{ch}:{rb}"
+        return [
+            "~display",                                        # clear any prior highlight first
+            f"show {both} atoms",
+            f"style {both}@CB sphere",
+            f"color {both} gold",
+            f"select {both}",
+            f"distance {a}@CB {b}@CB",                         # the Cβ–Cβ measured span
+        ]
+
+    def _show_disulfide_scan_dialog(self, cd) -> None:
+        """The ranked engineering-site list = the SOURCE OF TRUTH (the heatmap is just a navigational
+        index). A MODELESS table of candidate pairs (pair / score / Cα–Cα / Cβ–Cβ / orientation),
+        sorted best-first; clicking a row HIGHLIGHTS both members (Cβ spheres) in 3D + shows the
+        pair's measured geometry; 'Declare bond and fold' feeds the chosen pair into the Mode-C
+        introduce→constrain loop. The load-bearing geometric-only CAVEAT rides at the top."""
+        pairs = (cd.disulfide_scan or {}).get("pairs") or []
+        if not pairs:
+            return
+        prior = getattr(self, "_ss_scan_dialog", None)
+        if prior is not None:
+            prior.close()
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Engineerable disulfide sites (backbone scan)")
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        cav = QtWidgets.QLabel("⚠ " + ((cd.disulfide_scan or {}).get("caveat")
+                               or "Geometric compatibility only — a starting point, not a recommendation."))
+        cav.setWordWrap(True); cav.setStyleSheet("color: #b36b00;")
+        lay.addWidget(cav)
+        lay.addWidget(QtWidgets.QLabel("Ranked candidate sites (click a row to highlight both "
+                                       "residues in 3D; this list — not the heatmap — is the data):"))
+        cols = ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"]
+        tbl = QtWidgets.QTableWidget(len(pairs), len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        for i, p in enumerate(pairs):
+            ornt = p.get("orientation")
+            vals = [f"{p['resnum_a']}–{p['resnum_b']}", f"{p.get('score', 0):.2f}",
+                    f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
+                    ("—" if ornt is None else f"{ornt:.0f}")]
+            for j, v in enumerate(vals):
+                it = QtWidgets.QTableWidgetItem(v)
+                if j == 0:
+                    it.setData(QtCore.Qt.UserRole, i)          # row → pair index
+                tbl.setItem(i, j, it)
+        tbl.resizeColumnsToContents()
+        lay.addWidget(tbl)
+        geom = QtWidgets.QLabel("Select a candidate to see its measured geometry.")
+        geom.setWordWrap(True); geom.setStyleSheet("color: #444;")
+        lay.addWidget(geom)
+
+        def _row_pair(row: int) -> Optional[dict]:
+            return pairs[row] if 0 <= row < len(pairs) else None
+
+        def _on_row(row: int, _col: int = 0) -> None:
+            p = _row_pair(row)
+            if p is None:
+                return
+            self._run_commands_bg(self._disulfide_scan_highlight_commands(cd, p))
+            ornt = p.get("orientation")
+            geom.setText(
+                f"Cys{p['resnum_a']}–Cys{p['resnum_b']} — score {p.get('score', 0):.2f} "
+                f"(MEASURED, this fold): Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
+                f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}. "
+                f"Geometric compatibility only — installing it needs introducing the Cys pair + "
+                f"re-folding (Declare below).")
+        tbl.cellClicked.connect(_on_row)
+
+        bb = QtWidgets.QDialogButtonBox()
+        declare = bb.addButton("Declare bond and fold", QtWidgets.QDialogButtonBox.AcceptRole)
+        bb.addButton("Close", QtWidgets.QDialogButtonBox.RejectRole)
+
+        def _declare() -> None:
+            row = tbl.currentRow()
+            p = _row_pair(row)
+            if p is None:
+                self._status.setText("Select a candidate site first.")
+                return
+            dlg.close()
+            self._declare_disulfide_from_scan((p["resnum_a"], p["resnum_b"]))
+        declare.clicked.connect(_declare)
+        bb.rejected.connect(dlg.close)
+        lay.addWidget(bb)
+        if pairs:
+            tbl.selectRow(0); _on_row(0)                       # preselect + highlight the best site
+        self._ss_scan_dialog = dlg
+        dlg.show()
+
+    def _declare_disulfide_from_scan(self, pair) -> None:
+        """Feed a scanned pair into the Mode-C introduce→constrain loop (the engineering loop's
+        D→C step) — the SAME path the 'Declare cysteine bonds and fold' menu action uses."""
+        spec = self.build_disulfide_introduce_spec([pair], engine="boltz")
+        if spec is None:
+            self._status.setText(f"Could not declare a bond at {pair[0]}–{pair[1]} "
+                                 f"(check both are valid construct positions).")
+            return
+        self._persist()
+        self._status.setText(f"Introduced Cys for {pair[0]}–{pair[1]}; folding WITH the declared "
+                             f"bond (biases toward it, geometry measured on the result)…")
+        self.launchRequested.emit(spec)
 
     def _on_fold_clicked(self) -> None:
         tab = self._cur_tab()
