@@ -907,12 +907,24 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         to start a new session). The workbench is cleared to its no-design state via `reset()`.
         Does NOT close ChimeraX models — a named Load reopens scene.cxs (replacing the scene
         itself); Clear leaves the user's models untouched (parity with the CLI)."""
+        # KEEP the persistent suite tabs (the workbench + its toolbar AND the sibling Disulfides tab —
+        # a sibling, not the workbench, so it was being swept out with the chain grids and never
+        # re-added). Drop only the chain-grid tabs.
+        disulfides = getattr(self.workbench, "disulfides_tab", None)
         for i in range(self.tabs.count() - 1, -1, -1):
-            if self.tabs.widget(i) is not self.workbench:    # keep the workbench tab + its toolbar
+            w = self.tabs.widget(i)
+            if w is not self.workbench and w is not disulfides:
                 self.tabs.removeTab(i)
         self._grids.clear()
         try:
             self.workbench.reset()
+        except Exception:
+            pass
+        # CLEAR-on-reset: the kept Disulfides tab's content is the PRIOR session's (stale after a
+        # Load — references a construct no longer loaded). Keep the tab, empty it; new scans refill.
+        try:
+            if disulfides is not None:
+                disulfides.reset()
         except Exception:
             pass
 
