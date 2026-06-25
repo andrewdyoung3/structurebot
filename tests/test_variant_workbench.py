@@ -2510,3 +2510,74 @@ class TestDisulfideSuite:
         p._mode_combo.setCurrentIndex(idx)                      # == user picks "Disulfide sites"
         txt = p._status.text().lower()
         assert "does not imply" in txt and "starting point" in txt and "navigational index" in txt
+
+    # ── the clickable ranked-list widget (the source of truth + click-to-highlight) ────────
+    def _scanned(self, p):
+        cd = self._construct(p)
+        cd.disulfide_scan = {"pairs": [
+            {"chain": "A", "resnum_a": 5, "resnum_b": 9, "score": 0.91, "ca_ca": 5.5,
+             "cb_cb": 3.8, "orientation": 88.0},
+            {"chain": "A", "resnum_a": 3, "resnum_b": 7, "score": 0.62, "ca_ca": 6.4,
+             "cb_cb": 4.2, "orientation": None}],      # Gly-pair: orientation undefined
+            "best_partner": {"A": {5: 0.91, 9: 0.91, 3: 0.62, 7: 0.62}},
+            "caveat": "a starting point. Does NOT imply the X→C mutations are tolerated."}
+        return cd
+
+    def test_scan_highlight_commands_for_a_pair(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)
+        cmds = p._disulfide_scan_highlight_commands(cd, cd.disulfide_scan["pairs"][0])
+        joined = " ".join(cmds)
+        assert "#7/A:5,9 atoms" in joined and "@CB sphere" in joined   # both members, Cβ spheres
+        assert "color #7/A:5,9 gold" in joined and "select #7/A:5,9" in joined
+        assert "distance #7/A:5@CB #7/A:9@CB" in joined                # the Cβ–Cβ measured span
+
+    def test_scan_highlight_empty_without_fold(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("b", "MKVCAAC")
+        cd = next(iter(p._design.chains.values()))
+        assert p._disulfide_scan_highlight_commands(cd, {"resnum_a": 1, "resnum_b": 4}) == []
+
+    def test_ranked_list_dialog_builds_with_pairs_and_caveat(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)
+        p._show_disulfide_scan_dialog(cd)
+        dlg = p._ss_scan_dialog
+        tbl = dlg.findChild(QtWidgets.QTableWidget)
+        assert tbl.rowCount() == 2
+        assert tbl.item(0, 0).text() == "5–9" and tbl.item(0, 1).text() == "0.91"   # best first
+        assert tbl.item(1, 4).text() == "—"                            # Gly orientation → em-dash
+        # the load-bearing caveat is in the dialog
+        labels = [w.text().lower() for w in dlg.findChildren(QtWidgets.QLabel)]
+        assert any("does not imply" in t and "starting point" in t for t in labels)
+
+    def test_ranked_list_row_click_highlights_both_members(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._show_disulfide_scan_dialog(cd)
+        tbl = p._ss_scan_dialog.findChild(QtWidgets.QTableWidget)
+        pushed.clear()
+        tbl.cellClicked.emit(1, 0)                                     # == click row 1 (pair 3–7)
+        assert any("#7/A:3,7 atoms" in c for c in pushed)              # the 2nd pair highlighted
+
+    def test_declare_from_scan_feeds_mode_c(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)
+        emitted = []
+        p.launchRequested.connect(lambda s: emitted.append(s))
+        p._declare_disulfide_from_scan((5, 9))                         # the D→C loop from the list
+        assert emitted[-1]["tool"] == "boltz"
+        assert emitted[-1]["tool_inputs"]["disulfide_bonds"] == [(5, 9)]
+        assert cd.get_variant("SS_5-9").sequence[4] == "C"            # Cys introduced at the site
+
+    def test_scan_result_auto_opens_the_ranked_list(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        result = {"tool_step_results": [{"tool": "disulfide_scan", "success": True, "data": {
+            "pairs": [{"chain": "A", "resnum_a": 2, "resnum_b": 9, "score": 0.7,
+                       "ca_ca": 5.6, "cb_cb": 3.9, "orientation": 91.0}],
+            "best_partner": {"A": {2: 0.7, 9: 0.7}}, "caveat": "a starting point."}}]}
+        p.apply_disulfide_scan_result({"_align_ukey": p._cur_cd_ukey()}, result)
+        assert getattr(p, "_ss_scan_dialog", None) is not None and p._ss_scan_dialog.isVisible()
