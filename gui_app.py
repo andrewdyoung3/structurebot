@@ -371,6 +371,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self.workbench, "Variant Workbench")   # Stage-1 panel (first tab)
+        # PERSISTENT Disulfides results tab (whole-suite home) — a sibling top-level tab. It survives
+        # switching back to "Variant Workbench" + panel rebuilds (the old modeless dialog vanished).
+        self.tabs.addTab(self.workbench.disulfides_tab, "Disulfides")
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(

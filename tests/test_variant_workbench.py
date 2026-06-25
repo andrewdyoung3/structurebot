@@ -2538,46 +2538,102 @@ class TestDisulfideSuite:
         cd = next(iter(p._design.chains.values()))
         assert p._disulfide_scan_highlight_commands(cd, {"resnum_a": 1, "resnum_b": 4}) == []
 
-    def test_ranked_list_dialog_builds_with_pairs_and_caveat(self, _app):
+    # ── the PERSISTENT Disulfides tab (whole-suite home; replaces the vanishing dialog) ─────
+    def test_disulfides_tab_exists_as_a_widget(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
-        cd = self._scanned(p)
-        p._show_disulfide_scan_dialog(cd)
-        dlg = p._ss_scan_dialog
-        tbl = dlg.findChild(QtWidgets.QTableWidget)
-        assert tbl.rowCount() == 2
-        assert tbl.item(0, 0).text() == "5–9" and tbl.item(0, 1).text() == "0.91"   # best first
-        assert tbl.item(1, 4).text() == "—"                            # Gly orientation → em-dash
-        # the load-bearing caveat is in the dialog
-        labels = [w.text().lower() for w in dlg.findChildren(QtWidgets.QLabel)]
-        assert any("does not imply" in t and "starting point" in t for t in labels)
+        from variant_workbench import DisulfidesResultsTab
+        assert isinstance(p.disulfides_tab, DisulfidesResultsTab)
+        # all four mode sections present, each dormant (placeholder shown) before any run
+        for k in ("A", "B", "D", "C"):
+            sec = p.disulfides_tab._sec[k]
+            assert sec["placeholder"].text()                          # a "Run … to populate" placeholder
 
-    def test_ranked_list_row_click_highlights_both_members(self, _app):
-        p, _ = _panel([], session=__import__("session_state").SessionState())
-        cd = self._scanned(p)
-        pushed = []
-        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
-        p._show_disulfide_scan_dialog(cd)
-        tbl = p._ss_scan_dialog.findChild(QtWidgets.QTableWidget)
-        pushed.clear()
-        tbl.cellClicked.emit(1, 0)                                     # == click row 1 (pair 3–7)
-        assert any("#7/A:3,7 atoms" in c for c in pushed)              # the 2nd pair highlighted
-
-    def test_declare_from_scan_feeds_mode_c(self, _app):
-        p, _ = _panel([], session=__import__("session_state").SessionState())
-        cd = self._scanned(p)
-        emitted = []
-        p.launchRequested.connect(lambda s: emitted.append(s))
-        p._declare_disulfide_from_scan((5, 9))                         # the D→C loop from the list
-        assert emitted[-1]["tool"] == "boltz"
-        assert emitted[-1]["tool_inputs"]["disulfide_bonds"] == [(5, 9)]
-        assert cd.get_variant("SS_5-9").sequence[4] == "C"            # Cys introduced at the site
-
-    def test_scan_result_auto_opens_the_ranked_list(self, _app):
+    def test_scan_populates_D_section_others_stay_dormant(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
         cd = self._construct(p)
-        result = {"tool_step_results": [{"tool": "disulfide_scan", "success": True, "data": {
-            "pairs": [{"chain": "A", "resnum_a": 2, "resnum_b": 9, "score": 0.7,
-                       "ca_ca": 5.6, "cb_cb": 3.9, "orientation": 91.0}],
-            "best_partner": {"A": {2: 0.7, 9: 0.7}}, "caveat": "a starting point."}}]}
-        p.apply_disulfide_scan_result({"_align_ukey": p._cur_cd_ukey()}, result)
-        assert getattr(p, "_ss_scan_dialog", None) is not None and p._ss_scan_dialog.isVisible()
+        cd.disulfide_scan = {"pairs": [
+            {"chain": "A", "resnum_a": 5, "resnum_b": 9, "score": 0.91, "ca_ca": 5.5,
+             "cb_cb": 3.8, "orientation": 88.0}],
+            "best_partner": {"A": {5: 0.91, 9: 0.91}}, "caveat": "x"}
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        t = p.disulfides_tab
+        assert t._sec["D"]["table"].rowCount() == 1
+        assert t._sec["D"]["table"].item(0, 0).text() == "5–9"
+        assert t._sec["D"]["declare_btn"].isEnabled()
+        # A/B/C UNRUN → their tables stay empty + the placeholder is the live state (dormant,
+        # not a blank table reading as broken)
+        assert t._sec["A"]["table"].rowCount() == 0 and t._sec["B"]["table"].rowCount() == 0
+        assert t._sec["A"]["table"].isHidden()                        # no blank table shown
+        assert not t._sec["A"]["placeholder"].isHidden()             # the "Run … to populate" hint IS shown
+
+    def test_tab_persists_across_a_tab_switch_with_content_intact(self, _app):
+        # THE bug: the dialog vanished. The tab must survive switching away + back with its rows.
+        from PySide6 import QtWidgets as _W
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        # simulate the real window: the tab is one page in a QTabWidget alongside the panel
+        host = _W.QTabWidget(); host.addTab(p, "Variant Workbench"); host.addTab(p.disulfides_tab, "Disulfides")
+        host.setCurrentIndex(1); host.setCurrentIndex(0); host.setCurrentIndex(1)   # switch away + back
+        tbl = p.disulfides_tab._sec["D"]["table"]
+        assert tbl.rowCount() == 2 and tbl.item(0, 0).text() == "5–9"  # pairs STILL listed
+        # a panel rebuild (re-render of the chain grids) must NOT wipe the tab either
+        p._render()
+        assert p.disulfides_tab._sec["D"]["table"].rowCount() == 2
+
+    def test_tab_row_click_highlights_the_right_pair_on_the_current_construct(self, _app):
+        # trigger-reaches-handler-with-correct-TARGET: a row-click on the tab produces the highlight
+        # for THAT pair on THIS construct's model, through the existing _run_commands_bg seam.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)                                          # model #7, pairs 5–9 and 3–7
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        pushed.clear()
+        p.disulfides_tab._sec["D"]["table"].cellClicked.emit(1, 0)    # click the 2nd pair (3–7)
+        assert any("#7/A:3,7 atoms" in c for c in pushed)             # right pair, right model
+        assert not any("#7/A:5,9" in c for c in pushed)               # NOT the other pair
+
+    def test_tab_declare_button_feeds_mode_c(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._scanned(p)
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        emitted = []
+        p.launchRequested.connect(lambda s: emitted.append(s))
+        p.disulfides_tab._sec["D"]["table"].selectRow(0)              # the 5–9 site
+        p.disulfides_tab._sec["D"]["declare_btn"].click()
+        assert emitted[-1]["tool"] == "boltz" and emitted[-1]["tool_inputs"]["disulfide_bonds"] == [(5, 9)]
+        assert cd.get_variant("SS_5-9").sequence[4] == "C"           # Cys introduced at the site
+
+    def test_assess_and_geometry_populate_their_sections(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        spec = {"_align_ukey": p._cur_cd_ukey()}
+        p.apply_disulfide_discovery_result(spec, {"tool_step_results": [{"tool": "disulfide_discovery",
+            "success": True, "summary": "ok", "data": {"pairs": [
+                {"chain": "A", "resnum_a": 5, "resnum_b": 9, "n_compatible": 8, "n_folds": 10,
+                 "frequency": 0.8, "median_sg_sg": 2.1}], "n_folds": 10}}]})
+        p.apply_disulfide_geometry_result(spec, {"tool_step_results": [{"tool": "disulfide_geometry",
+            "success": True, "summary": "ok", "data": {"pairs": [
+                {"chain": "A", "resnum_a": 5, "resnum_b": 9, "sg_sg": 2.1, "cb_cb": 3.8, "ca_ca": 5.6,
+                 "chi_ss": -88.0, "bonding_compatible": True}]}}]})
+        t = p.disulfides_tab
+        assert t._sec["A"]["table"].rowCount() == 1 and "8/10" in t._sec["A"]["table"].item(0, 1).text()
+        assert t._sec["B"]["table"].rowCount() == 1 and t._sec["B"]["table"].item(0, 5).text() == "yes"
+
+    def test_mode_c_tab_readout_is_additive_keeps_model_badge_provenance(self, _app):
+        # routing Mode C's readout into the tab must NOT replace the model/badge/provenance surfacing
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        v = cd.add_variant("SS_2-9", source="manual")
+        result = {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "12", "target": "monomer", "mean_plddt": 88.0,
+            "plddt": {1: 88.0}, "source": "local_boltz_env", "constrained": True,
+            "disulfide_bonds": [(2, 9)]}}]}
+        p.apply_fold_result("SS_2-9", result)
+        f = cd.get_variant("SS_2-9").results.fold
+        # the existing fold provenance still lands (model + constrained + bonds) — NOT replaced
+        assert f.get("model_id") == "12" and f["constrained"] is True and f["disulfide_bonds"] == [(2, 9)]
+        assert "SS-bond" in (p._badge_for(cd.get_variant("SS_2-9")))   # provenance badge intact
+        # AND the C section now records the readout
+        assert "Cys2–Cys9" in p.disulfides_tab._sec["C"]["readout"].text()
