@@ -163,6 +163,38 @@ def bond_constraint(chain_id: str, idx_a: int, idx_b: int, atom: str = "SG") -> 
     return {"atom1": [chain_id, int(idx_a), atom], "atom2": [chain_id, int(idx_b), atom]}
 
 
+# ── pair-shape helpers (the two-chain container; intra-chain = chain_a == chain_b) ─────────
+# A suite pair carries its chain PER MEMBER (`chain_a`/`chain_b`) so the same container holds an
+# intra-chain pair (chain_a == chain_b) and — from step 4 — a cross-chain one (chain_a != chain_b),
+# one shape not a fork. These two readers are the SINGLE source the router + workbench (display,
+# highlight) + persistence rehydration go through, and they tolerate the LEGACY single-`chain`
+# shape (pre-reshape pairs + old saved Mode-D scans) so a saved session still reads.
+
+def pair_chains(pair: Dict[str, object]) -> Tuple[Optional[str], Optional[str]]:
+    """The ``(chain_a, chain_b)`` of a pair dict. Reshaped pairs carry both keys; a LEGACY pair
+    carrying only ``chain`` reads as ``chain_a == chain_b == chain`` (the back-compat hinge for
+    old saved scans). None for a key genuinely absent. PURE."""
+    ca, cb = pair.get("chain_a"), pair.get("chain_b")
+    if ca is None and cb is None:
+        ch = pair.get("chain")
+        return ch, ch
+    return ca, cb
+
+
+def pair_label(pair: Dict[str, object], *, cys: bool = False) -> str:
+    """Human pair label. SAME-chain → bare ``140-88`` (or ``Cys140-Cys88`` with *cys*) so the
+    shipped intra-chain display is visually UNCHANGED; CROSS-chain (chain_a != chain_b) →
+    ``A:140 <-> B:88`` (chain shown on BOTH members — unreadable otherwise). Reads the reshaped
+    chains via `pair_chains` (legacy single-`chain` → same-chain branch). PURE."""
+    ca, cb = pair_chains(pair)
+    ra, rb = pair.get("resnum_a"), pair.get("resnum_b")
+    pre = "Cys" if cys else ""
+    if ca is not None and cb is not None and ca != cb:
+        sep = " " if cys else ""
+        return f"{pre}{sep}{ca}:{ra} ↔ {pre}{sep}{cb}:{rb}"
+    return f"{pre}{ra}–{pre}{rb}"
+
+
 def pair_geometry(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3]) -> Dict[str, object]:
     """Measured disulfide geometry between two CYS residues (each ``{"CA","CB","SG"}``): the
     SG–SG / Cβ–Cβ / Cα–Cα distances + χSS, each with its canonical-window membership, plus a
@@ -257,7 +289,8 @@ def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]
     residue pair separated by ≥ *min_seq_sep* in sequence is scored by `backbone_pair_score`; a
     cheap conservative Cα–Cα PREFILTER (*ca_gate*) skips pairs too far to clear *min_score* BEFORE
     the dihedral compute — SPEED only, the OUTPUT is identical to a full scan (gated-out pairs are
-    sub-threshold). Returns ``(ranked_pairs, best_partner)``: ranked_pairs sorted by score desc;
+    sub-threshold). Returns ``(ranked_pairs, best_partner)``: ranked_pairs sorted by score desc,
+    each carrying ``chain_a``/``chain_b`` (equal here — intrachain) + ``resnum_a``/``resnum_b``;
     best_partner ``{(chain, resnum): best score}`` for the heatmap (a residue's colour = its best
     available partner's score). Pass ``ca_gate=None`` for an un-prefiltered full scan."""
     ranked: List[Dict[str, object]] = []
@@ -281,7 +314,10 @@ def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]
                 pg = backbone_pair_score(residues[ra], residues[rb])
                 if pg is None or pg["score"] < min_score:
                     continue
-                ranked.append({"chain": ch, "resnum_a": ra, "resnum_b": rb, **pg})
+                # INTRACHAIN: both members are on `ch`, so the two-chain pair shape collapses to
+                # chain_a == chain_b here (no cross-chain enumeration until step 4). best_partner is
+                # keyed per MEMBER by ITS OWN chain — already the cross-chain-correct form.
+                ranked.append({"chain_a": ch, "resnum_a": ra, "chain_b": ch, "resnum_b": rb, **pg})
                 best[(ch, ra)] = max(best.get((ch, ra), 0.0), float(pg["score"]))
                 best[(ch, rb)] = max(best.get((ch, rb), 0.0), float(pg["score"]))
     ranked.sort(key=lambda d: -d["score"])

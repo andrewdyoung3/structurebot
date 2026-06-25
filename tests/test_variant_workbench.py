@@ -2538,6 +2538,28 @@ class TestDisulfideSuite:
         cd = next(iter(p._design.chains.values()))
         assert p._disulfide_scan_highlight_commands(cd, {"resnum_a": 1, "resnum_b": 4}) == []
 
+    def test_scan_highlight_new_shape_same_chain_identical(self, _app):
+        # the reshape is TRANSPARENT for intra-chain: a NEW-shape same-chain pair highlights with
+        # the SAME combined spec as the legacy single-`chain` pair (no behaviour change).
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        pair = {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9, "score": 0.91}
+        joined = " ".join(p._disulfide_scan_highlight_commands(cd, pair))
+        assert "#7/A:5,9 atoms" in joined and "color #7/A:5,9 gold" in joined
+        assert "distance #7/A:5@CB #7/A:9@CB" in joined
+
+    def test_scan_highlight_cross_chain_unions_members(self, _app):
+        # the CONTAINER handles a cross-chain pair (step-4 shape): the spec unions each member's OWN
+        # chain rather than assuming one. This is a unit test of the pure command builder — the suite
+        # does NOT enumerate cross-chain pairs yet (step 1 is intra-chain only).
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        pair = {"chain_a": "A", "resnum_a": 5, "chain_b": "B", "resnum_b": 9, "score": 0.91}
+        joined = " ".join(p._disulfide_scan_highlight_commands(cd, pair))
+        assert "#7/A:5" in joined and "#7/B:9" in joined         # each member on its OWN chain
+        assert "#7/A:5,9" not in joined                          # NOT the same-chain combined spec
+        assert "distance #7/A:5@CB #7/B:9@CB" in joined          # cross-chain Cβ–Cβ span
+
     # ── the PERSISTENT Disulfides tab (whole-suite home; replaces the vanishing dialog) ─────
     def test_disulfides_tab_exists_as_a_widget(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())

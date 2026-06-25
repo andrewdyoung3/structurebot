@@ -326,6 +326,34 @@ class TestStage4cDeviation:
             "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
         assert DesignSession.from_dict(ds3.to_dict()).chains["k|1/A"].structural_align == {}
 
+    def test_disulfide_scan_roundtrip_new_shape(self):
+        # Mode D engineering scan survives persistence; reshaped pairs carry chain_a/chain_b.
+        ds = DesignSession("denovo-x", source="sequence", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        ds.chains["k|1/A"].disulfide_scan = {
+            "pairs": [{"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9, "score": 0.91}],
+            "best_partner": {"A": {5: 0.91, 9: 0.91}}, "caveat": "geometric only"}
+        sc = DesignSession.from_dict(ds.to_dict()).chains["k|1/A"].disulfide_scan
+        p = sc["pairs"][0]
+        from disulfide_geometry import pair_chains, pair_label
+        assert pair_chains(p) == ("A", "A") and pair_label(p) == "5–9"
+        assert sc["best_partner"]["A"][5] == 0.91
+
+    def test_disulfide_scan_roundtrip_legacy_single_chain(self):
+        # BACK-COMPAT (required): a session SAVED before the reshape carries pairs with only `chain`.
+        # It must rehydrate as a valid SAME-chain pair (people have saved sessions; the suite now
+        # writes the new shape, so only a load path exercises this).
+        ds = DesignSession("denovo-x", source="sequence", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        ds.chains["k|1/A"].disulfide_scan = {        # OLD shape: single `chain`, no chain_a/chain_b
+            "pairs": [{"chain": "A", "resnum_a": 5, "resnum_b": 9, "score": 0.91}],
+            "best_partner": {"A": {5: 0.91, 9: 0.91}}, "caveat": "geometric only"}
+        sc = DesignSession.from_dict(ds.to_dict()).chains["k|1/A"].disulfide_scan
+        p = sc["pairs"][0]
+        from disulfide_geometry import pair_chains, pair_label
+        assert pair_chains(p) == ("A", "A")          # legacy `chain` → same-chain pair
+        assert pair_label(p) == "5–9"                # and renders bare (display unchanged)
+
     def test_model_color_targets_predicted_model_per_chain(self):
         # red only above-floor residues; run-grouped, reset baseline per chain, #mid spec
         val = lambda ch, rn: ("#e23b3b" if rn in (5, 6) else None)

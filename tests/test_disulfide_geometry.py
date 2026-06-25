@@ -216,3 +216,62 @@ def test_scan_best_partner_map():
     # each surfaced residue's best-partner score = the max score of any pair it's in
     assert best.get(("A", 1)) is not None and best[("A", 1)] == best[("A", 5)]
     assert ("A", 9) not in best                             # far residue never gets a partner
+
+
+# ── pair-shape reshape: two-chain container, intra-chain only (no cross-chain leakage) ───
+def _scan_atoms_two_chains():
+    # chain A and chain B EACH carry an internal engineerable pair (res 1↔5). B:1 also sits within
+    # disulfide range of A:5 — a cross-chain pair that WOULD be engineerable if enumerated; the
+    # per-chain scan must NOT surface it (no cross-chain enumeration until step 4).
+    return {
+        "A": {1: {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0)},
+              5: {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)}},
+        "B": {1: {"CA": (0.5, 0.0, 0.0), "CB": (0.5, 1.5, 0.0)},   # ~5 Å from A:5 → would-be partner
+              5: {"CA": (6.0, 0.0, 0.0), "CB": (4.3, 1.5, 0.0)}},
+    }
+
+
+def test_scan_emits_chain_per_member_intrachain():
+    ranked, _ = g.scan_engineerable_sites(_scan_atoms())
+    assert ranked
+    for p in ranked:
+        assert "chain_a" in p and "chain_b" in p            # reshaped container (chain per member)
+        assert p["chain_a"] == p["chain_b"] == "A"          # intra-chain: both members on one chain
+
+
+def test_scan_no_cross_chain_leakage():
+    # container widened, BEHAVIOR unchanged: a multi-chain fold yields ONLY intra-chain pairs, even
+    # though a cross-chain pair here would be geometrically engineerable. Don't surface what Mode C
+    # / the interface mode can't yet act on.
+    ranked, best = g.scan_engineerable_sites(_scan_atoms_two_chains())
+    assert ranked
+    assert all(p["chain_a"] == p["chain_b"] for p in ranked)    # NO pair spans two chains
+    assert {p["chain_a"] for p in ranked} == {"A", "B"}         # both chains scanned (intra each)
+    assert all(isinstance(k, tuple) and k[0] in ("A", "B") for k in best)   # best keyed per member
+
+
+# ── pair-shape helpers: reshaped + legacy back-compat + display collapse ──────────────
+def test_pair_chains_reshaped():
+    assert g.pair_chains({"chain_a": "A", "chain_b": "B"}) == ("A", "B")
+    assert g.pair_chains({"chain_a": "A", "chain_b": "A"}) == ("A", "A")
+
+
+def test_pair_chains_legacy_single_chain():
+    # the back-compat hinge: an OLD saved scan carries only `chain` → reads as same-chain
+    assert g.pair_chains({"chain": "A", "resnum_a": 5, "resnum_b": 9}) == ("A", "A")
+
+
+def test_pair_label_same_chain_is_bare():
+    # SAME-chain display is visually UNCHANGED (bare resnums) — the reshape is container-only here
+    assert g.pair_label({"chain_a": "A", "chain_b": "A", "resnum_a": 5, "resnum_b": 9}) == "5–9"
+    assert g.pair_label({"chain": "A", "resnum_a": 5, "resnum_b": 9}) == "5–9"      # legacy → bare
+    assert g.pair_label({"chain_a": "A", "chain_b": "A", "resnum_a": 5, "resnum_b": 9},
+                        cys=True) == "Cys5–Cys9"
+
+
+def test_pair_label_cross_chain_shows_both_chains():
+    # CROSS-chain MUST show the chain on BOTH members (ambiguous otherwise)
+    assert g.pair_label({"chain_a": "A", "chain_b": "B", "resnum_a": 140, "resnum_b": 88}) \
+        == "A:140 ↔ B:88"
+    assert g.pair_label({"chain_a": "A", "chain_b": "B", "resnum_a": 140, "resnum_b": 88},
+                        cys=True) == "Cys A:140 ↔ Cys B:88"
