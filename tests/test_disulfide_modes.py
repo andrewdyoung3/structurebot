@@ -171,12 +171,59 @@ def test_engineering_scan_empty_when_no_viable_sites():
     assert out.success and out.data["pairs"] == [] and "starting point" in out.summary.lower()
 
 
+# ── interface scan (cross-chain analogue of Mode D — inter-subunit sites at the interface) ──
+def _interface_cif():
+    # chain A and chain B with ONE engineerable interface pair (A:5 ↔ B:5, Cα 5.5 / Cβ 3.8); the
+    # other residues are far from the OTHER chain (buried/non-interface) → must not surface.
+    return (
+        "data_model\nloop_\n"
+        "_atom_site.group_PDB\n_atom_site.label_atom_id\n_atom_site.label_comp_id\n"
+        "_atom_site.auth_asym_id\n_atom_site.auth_seq_id\n"
+        "_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n"
+        "ATOM CA VAL A 5 0.0 0.0 0.0\nATOM CB VAL A 5 0.0 1.5 0.0\n"
+        "ATOM CA LEU A 9 40.0 0.0 0.0\nATOM CB LEU A 9 40.0 1.5 0.0\n"
+        "ATOM CA VAL B 5 5.5 0.0 0.0\nATOM CB VAL B 5 3.8 1.5 0.0\n"
+        "ATOM CA LEU B 9 80.0 0.0 0.0\nATOM CB LEU B 9 80.0 1.5 0.0\n#\n"
+    )
+
+
+def test_interface_scan_finds_cross_chain_sites_and_carries_caveat():
+    r = _router()
+    r._fold_n_seeds = MagicMock()                  # the scan must NEVER fold (cheap geometry only)
+    out = r._run_disulfide_interface_scan({"cif_path": _write(_interface_cif())})
+    assert out.success and out.data["pairs"]
+    top = out.data["pairs"][0]
+    assert top["chain_a"] == "A" and top["chain_b"] == "B"      # CROSS-chain
+    assert {top["resnum_a"], top["resnum_b"]} == {5}
+    surfaced = {(p["chain_a"], p["resnum_a"]) for p in out.data["pairs"]} \
+        | {(p["chain_b"], p["resnum_b"]) for p in out.data["pairs"]}
+    assert ("A", 9) not in surfaced and ("B", 9) not in surfaced  # non-interface → interface-bounded
+    assert out.data["caveat"] and "does not imply" in out.data["caveat"].lower()
+    r._fold_n_seeds.assert_not_called()
+
+
+def test_interface_scan_needs_a_multimer():
+    # one chain → no interface; explicit error, never a silent empty
+    mono = ("data_model\nloop_\n_atom_site.group_PDB\n_atom_site.label_atom_id\n"
+            "_atom_site.label_comp_id\n_atom_site.auth_asym_id\n_atom_site.auth_seq_id\n"
+            "_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n"
+            "ATOM CA ALA A 1 0.0 0.0 0.0\nATOM CA ALA A 5 5.5 0.0 0.0\n#\n")
+    out = _router()._run_disulfide_interface_scan({"cif_path": _write(mono)})
+    assert out.success is False and "multi-chain" in out.error.lower()
+
+
+def test_interface_scan_needs_a_cif():
+    out = _router()._run_disulfide_interface_scan({"cif_path": "/nope/x.cif"})
+    assert out.success is False and "fold cif" in out.error.lower()
+
+
 # ── cosmetic: the pipeline strip shows real tool names (no "Unknown tool") ────────────
 def test_step_description_real_names_for_disulfide_tools():
     r = _router()
     for tool, key in [("disulfide_discovery", "discovery"),
                       ("disulfide_geometry", "geometry"),
-                      ("disulfide_scan", "engineering scan")]:
+                      ("disulfide_scan", "engineering scan"),
+                      ("disulfide_interface_scan", "interface")]:
         desc = r._step_description(tool, {tool: {}}, "")
         assert "Unknown tool" not in desc
         assert "Disulfide" in desc and key.split()[0].lower() in desc.lower()
@@ -184,5 +231,6 @@ def test_step_description_real_names_for_disulfide_tools():
 
 def test_disulfide_tools_have_pipeline_icons():
     from tool_router import ToolRouter
-    for tool in ("disulfide_discovery", "disulfide_geometry", "disulfide_scan"):
+    for tool in ("disulfide_discovery", "disulfide_geometry", "disulfide_scan",
+                 "disulfide_interface_scan"):
         assert ToolRouter._TOOL_ICONS.get(tool) and ToolRouter._TOOL_ICONS[tool] != "⚙️"

@@ -354,6 +354,23 @@ class TestStage4cDeviation:
         assert pair_chains(p) == ("A", "A")          # legacy `chain` → same-chain pair
         assert pair_label(p) == "5–9"                # and renders bare (display unchanged)
 
+    def test_disulfide_interface_scan_roundtrip(self):
+        # the inter-chain scan slot survives persistence; pairs carry chain_a != chain_b
+        ds = DesignSession("denovo-x", source="sequence", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        ds.chains["k|1/A"].disulfide_interface_scan = {
+            "pairs": [{"chain_a": "A", "resnum_a": 5, "chain_b": "B", "resnum_b": 8, "score": 0.88}],
+            "best_partner": {"A": {5: 0.88}, "B": {8: 0.88}}, "caveat": "geometric only"}
+        sc = DesignSession.from_dict(ds.to_dict()).chains["k|1/A"].disulfide_interface_scan
+        p = sc["pairs"][0]
+        from disulfide_geometry import pair_chains, pair_label
+        assert pair_chains(p) == ("A", "B") and pair_label(p) == "A:5 ↔ B:8"
+        assert sc["best_partner"]["B"][8] == 0.88
+        # absent → defaults empty
+        ds2 = DesignSession("1", chains={"k|1/A": ChainDesign(
+            "k", "1", "A", [("1", "A")], [AlignedCell(0, 1, "M")])})
+        assert DesignSession.from_dict(ds2.to_dict()).chains["k|1/A"].disulfide_interface_scan == {}
+
     def test_model_color_targets_predicted_model_per_chain(self):
         # red only above-floor residues; run-grouped, reset baseline per chain, #mid spec
         val = lambda ch, rn: ("#e23b3b" if rn in (5, 6) else None)

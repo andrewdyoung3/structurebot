@@ -642,6 +642,10 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                            "Run “Find engineerable disulfide sites” to populate.",
                            ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"],
                            declare=True, caveat=True)
+        self._make_section("I", "Interface disulfide sites — inter-chain scan (find inter-subunit)",
+                           "Run “Find interface disulfide sites” on a folded MULTIMER to populate.",
+                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"],
+                           declare=True, caveat=True)
         self._make_section("C", "Declared-bond fold (Mode C: intervene)",
                            "Use “Declare cysteine bonds and fold” (or Declare below) to record the "
                            "constrained fold here.", None)
@@ -700,8 +704,9 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         row = tbl.currentRow() if tbl is not None else -1
         if not (0 <= row < len(pairs)) or cd is None:
             return
-        p = pairs[row]
-        self._on_declare(cd, (p["resnum_a"], p["resnum_b"]))
+        # pass the FULL pair dict (carries chain_a/chain_b) so an INTERFACE (cross-chain) pair reaches
+        # the cross-chain Mode-C declare; an intra Mode-D pair (chain_a == chain_b) takes the intra path.
+        self._on_declare(cd, pairs[row])
 
     @staticmethod
     def _pair_detail(key: str, p: dict) -> str:
@@ -755,6 +760,20 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                                   or "Geometric compatibility only — a starting point, not a recommendation."))
             sec["caveat"].setVisible(bool(pairs))
         self._fill_table("D", cd, pairs, lambda p: [
+            pair_label(p), f"{p.get('score', 0):.2f}",
+            f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
+            ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}")])
+
+    def populate_interface(self, cd, scan: dict) -> None:
+        """Interface (inter-chain) scan results — the cross-chain analogue of `populate_scan`. Pairs
+        carry chain_a != chain_b, so `pair_label` renders chain:resnum on BOTH members (A:140 ↔ B:88)."""
+        pairs = (scan or {}).get("pairs") or []
+        sec = self._sec["I"]
+        if sec.get("caveat") is not None:
+            sec["caveat"].setText("⚠ " + ((scan or {}).get("caveat")
+                                  or "Geometric compatibility only — a starting point, not a recommendation."))
+            sec["caveat"].setVisible(bool(pairs))
+        self._fill_table("I", cd, pairs, lambda p: [
             pair_label(p), f"{p.get('score', 0):.2f}",
             f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
             ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}")])
@@ -1075,6 +1094,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "this predicted fold — a starting point, NOT a recommendation to "
                                      "mutate. Cheap (geometry, no fold). Needs a folded construct.")
         self._ss_scan_btn.triggered.connect(self._on_disulfide_scan)
+        self._ss_interface_btn = ss_menu.addAction("Find interface disulfide sites (inter-chain scan)…")
+        self._ss_interface_btn.setToolTip("FIND NOVEL INTER-SUBUNIT sites: a CROSS-chain backbone scan "
+                                          "for disulfides that would LOCK the interface between chains "
+                                          "(interface-bounded — only residues close enough across "
+                                          "chains to bond). Geometric compatibility only. Needs a "
+                                          "folded MULTIMER (≥2 chains).")
+        self._ss_interface_btn.triggered.connect(self._on_disulfide_interface_scan)
         ss_menu.addSeparator()
         self._ss_constrain_btn = ss_menu.addAction("Declare cysteine bonds and fold…")
         self._ss_constrain_btn.setToolTip("DECLARE one or more disulfide bonds (introduce Cys at each "
@@ -2113,6 +2139,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not denovo:                                         # (also the pre-`_tabs` __init__ call)
             self._ss_geometry_btn.setEnabled(False)
             self._ss_scan_btn.setEnabled(False)
+            if getattr(self, "_ss_interface_btn", None) is not None:
+                self._ss_interface_btn.setEnabled(False)
             self._ss_constrain_btn.setEnabled(False)
             return
         cd = self._cur_tab().design if self._cur_tab() else None
@@ -2121,6 +2149,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._ss_geometry_btn.setEnabled(folded)               # reads the existing fold's CIF
         self._ss_scan_btn.setEnabled(folded)                   # reads the fold's backbone (no fold)
         self._ss_constrain_btn.setEnabled(folded)              # folds a variant against the T-fold
+        # Interface scan needs a folded MULTIMER (≥2 fold chains) — an inter-chain bond is meaningless
+        # on a monomer; greyed (not a silent no-op) when the construct is a single chain.
+        n_chains = sum(len(c.members) for c in self._design.chains.values())
+        self._ss_interface_btn.setEnabled(folded and n_chains >= 2)
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -2150,6 +2182,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "(Fold construct first).")
             return
         self._status.setText("Scanning the backbone for engineerable disulfide sites "
+                             "(geometric compatibility only — a starting point)…")
+        self.launchRequested.emit(spec)
+
+    def _on_disulfide_interface_scan(self) -> None:
+        spec = self.disulfide_interface_scan_launch_spec()
+        if spec is None:
+            self._status.setText("Find interface sites needs a folded MULTIMER on disk (fold the "
+                                 "construct as an assembly first).")
+            return
+        self._status.setText("Scanning the chain–chain interface for inter-subunit disulfide sites "
                              "(geometric compatibility only — a starting point)…")
         self.launchRequested.emit(spec)
 
@@ -3281,6 +3323,24 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "_align_ukey": self._cur_cd_ukey(),
         }
 
+    def disulfide_interface_scan_launch_spec(self) -> Optional[dict]:
+        """INTERFACE-SCAN spec — cross-chain backbone scan of the construct's EXISTING fold for NOVEL
+        inter-subunit disulfide sites. CHEAP (reads coordinates; NEVER folds). None until the
+        construct is folded as a MULTIMER (≥2 fold chains — an inter-chain bond needs ≥2 chains)."""
+        cd = self._cur_tab().design if self._cur_tab() else None
+        tf = (cd.template_fold if cd else None) or {}
+        cif = tf.get("cif_path")
+        if not cif or self._design is None:
+            return None
+        if sum(len(c.members) for c in self._design.chains.values()) < 2:
+            return None                                                 # monomer → no interface
+        return {
+            "tool": "disulfide_interface_scan", "tool_inputs": {"cif_path": cif},
+            "user_input": "[Workbench] find interface disulfide sites (inter-chain scan, this fold)",
+            "confidence": "high", "refresh": "disulfide_interface_scan",   # cheap + deterministic → no gate
+            "_align_ukey": self._cur_cd_ukey(),
+        }
+
     @staticmethod
     def _col_for_resnum(cd, resnum: int) -> Optional[int]:
         for i, c in enumerate(cd.template_cells):
@@ -3523,6 +3583,27 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.disulfides_tab.populate_scan(cd, cd.disulfide_scan)  # the PERSISTENT ranked list = truth
         self._status.setText(step.get("summary") or "Engineering scan complete.")
 
+    def apply_disulfide_interface_scan_result(self, spec: dict, result: dict) -> None:
+        """INTERFACE SCAN readout — store the inter-chain ranked list on the active cd + populate the
+        persistent Disulfides tab's I section (the source of truth). The found cross-chain pairs feed
+        the PROVEN cross-chain Mode-C declare (a row's Declare → `build_disulfide_introduce_spec`).
+        No heatmap (cross-chain spans chains); the table + 3D highlight + caveat are the surface."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "disulfide_interface_scan"), None)
+        if step is None or not step.get("success"):
+            self._status.setText(f"Interface scan failed: {step.get('error') if step else 'no result'}")
+            return
+        data = step.get("data") or {}
+        cd = self._scan_target_cd(spec)
+        if cd is None:
+            return
+        cd.disulfide_interface_scan = {"pairs": data.get("pairs") or [],
+                                       "best_partner": data.get("best_partner") or {},
+                                       "caveat": data.get("caveat")}
+        self._persist()
+        self.disulfides_tab.populate_interface(cd, cd.disulfide_interface_scan)
+        self._status.setText(step.get("summary") or "Interface scan complete.")
+
     @staticmethod
     def _disulfide_scan_highlight_commands(cd, pair: dict) -> List[str]:
         """ChimeraX commands to HIGHLIGHT a scanned pair on the construct's T-fold: both members'
@@ -3557,20 +3638,29 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     def _declare_disulfide_pair(self, cd, pair) -> None:
         """Declare a bond from a Disulfides-tab table → Mode C. FOCUS the pair's construct tab first
         so the introduce path targets the RIGHT cd (not whatever chain tab is active), then run the
-        SAME `_declare_disulfide_from_scan` loop the menu uses."""
+        SAME `_declare_disulfide_from_scan` loop the menu uses. *pair* is the full pair dict (intra
+        Mode D OR cross-chain interface) or a bare (a,b) tuple — forwarded as-is so the chains survive."""
         self._focus_tab_for_design(cd)
-        self._declare_disulfide_from_scan(tuple(pair))
+        self._declare_disulfide_from_scan(pair)
+
+    @staticmethod
+    def _ss_pair_label(pair) -> str:
+        """Display label for a declared pair — `pair_label` for a dict (cross-chain shows both
+        chains), bare `a–b` for a (a,b) tuple."""
+        return pair_label(pair) if isinstance(pair, dict) else f"{pair[0]}–{pair[1]}"
 
     def _declare_disulfide_from_scan(self, pair) -> None:
         """Feed a scanned pair into the Mode-C introduce→constrain loop (the engineering loop's
-        D→C step) — the SAME path the 'Declare cysteine bonds and fold' menu action uses."""
+        D→C / interface→C step) — the SAME `build_disulfide_introduce_spec` the menu uses, which
+        routes an intra pair to the intra path and a cross-chain pair to the proven cross-chain path."""
         spec = self.build_disulfide_introduce_spec([pair], engine="boltz")
+        lbl = self._ss_pair_label(pair)
         if spec is None:
-            self._status.setText(f"Could not declare a bond at {pair[0]}–{pair[1]} "
+            self._status.setText(f"Could not declare a bond at {lbl} "
                                  f"(check both are valid construct positions).")
             return
         self._persist()
-        self._status.setText(f"Introduced Cys for {pair[0]}–{pair[1]}; folding WITH the declared "
+        self._status.setText(f"Introduced Cys for {lbl}; folding WITH the declared "
                              f"bond (biases toward it, geometry measured on the result)…")
         self.launchRequested.emit(spec)
 
