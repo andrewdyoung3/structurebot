@@ -2774,3 +2774,72 @@ class TestCrossChainModeC:
             {"chain_a": "A", "resnum_a": 3, "chain_b": "A", "resnum_b": 7})
         cons = spec["tool_inputs"]["disulfide_constraints"]
         assert cons == [{"atom1": ["A", 3, "SG"], "atom2": ["A", 7, "SG"]}]   # both atoms on A
+
+    # ── interface scan (fork b): launch spec, gating, apply→section I, declare→step-3, display ──
+    def test_interface_scan_spec_none_on_monomer(self, _app):
+        p, _ = self._denovo_panel()
+        p._add_sequence_construct("mono", "MKVLWAAC")          # single cd, single member
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/m.cif"}
+        assert p.disulfide_interface_scan_launch_spec() is None    # no interface on a monomer
+        p._sync_disulfide_menu_enabled()
+        assert not p._ss_interface_btn.isEnabled()                 # greyed (visibly unavailable)
+
+    def test_interface_scan_spec_on_folded_multimer(self, _app):
+        p, _ = self._denovo_panel()
+        self._homodimer(p)                                         # folded dimer (2 member chains)
+        spec = p.disulfide_interface_scan_launch_spec()
+        assert spec is not None and spec["tool"] == "disulfide_interface_scan"
+        assert spec["refresh"] == "disulfide_interface_scan"
+        assert spec["tool_inputs"]["cif_path"] == "/tmp/dimer.cif"
+        p._sync_disulfide_menu_enabled()
+        assert p._ss_interface_btn.isEnabled()                     # enabled on a folded multimer
+
+    def test_interface_scan_action_reaches_handler(self, _app):
+        p, _ = self._denovo_panel()
+        self._homodimer(p)
+        emitted = []
+        p.launchRequested.connect(lambda s: emitted.append(s))
+        p._ss_interface_btn.trigger()                             # the real menu gesture
+        assert emitted and emitted[-1]["tool"] == "disulfide_interface_scan"
+
+    def _interface_result(self):
+        return {"tool_step_results": [{"tool": "disulfide_interface_scan", "success": True,
+            "summary": "ok", "data": {
+                "pairs": [{"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 7,
+                           "score": 0.82, "ca_ca": 5.6, "cb_cb": 3.9, "orientation": 88.0}],
+                "best_partner": {"A": {3: 0.82}, "B": {7: 0.82}},
+                "caveat": "Geometrically viable … Does NOT imply the X→C mutations are tolerated."}}]}
+
+    def test_apply_interface_result_populates_section_I_chain_labeled(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._homodimer(p)
+        p.apply_disulfide_interface_scan_result({"_align_ukey": p._cur_cd_ukey()}, self._interface_result())
+        assert cd.disulfide_interface_scan["pairs"]               # stored on the cd (persists)
+        tbl = p.disulfides_tab._sec["I"]["table"]
+        assert tbl.rowCount() == 1 and tbl.item(0, 0).text() == "A:3 ↔ B:7"   # CROSS-chain label
+
+    def test_interface_declare_feeds_cross_chain_mode_c(self, _app):
+        p, _ = self._denovo_panel()
+        self._homodimer(p)
+        p.apply_disulfide_interface_scan_result({"_align_ukey": p._cur_cd_ukey()}, self._interface_result())
+        emitted = []
+        p.launchRequested.connect(lambda s: emitted.append(s))
+        p.disulfides_tab._sec["I"]["table"].selectRow(0)
+        p.disulfides_tab._sec["I"]["declare_btn"].click()
+        # the PROVEN step-3 cross-chain declare path — NOT reimplemented
+        cons = emitted[-1]["tool_inputs"]["disulfide_constraints"]
+        assert cons == [{"atom1": ["A", 3, "SG"], "atom2": ["B", 7, "SG"]}]
+
+    def test_interface_row_click_highlights_across_chains(self, _app):
+        p, _ = self._denovo_panel()
+        self._homodimer(p)
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p.apply_disulfide_interface_scan_result({"_align_ukey": p._cur_cd_ukey()}, self._interface_result())
+        pushed.clear()
+        p.disulfides_tab._sec["I"]["table"].cellClicked.emit(0, 0)
+        joined = " ".join(pushed)
+        assert "#7/A:3" in joined and "#7/B:7" in joined          # both members ACROSS chains
+        assert "distance #7/A:3@CB #7/B:7@CB" in joined           # the cross-chain Cβ–Cβ span

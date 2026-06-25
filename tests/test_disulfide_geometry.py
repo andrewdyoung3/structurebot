@@ -283,3 +283,44 @@ def test_pair_label_cross_chain_shows_both_chains():
         == "A:140 ↔ B:88"
     assert g.pair_label({"chain_a": "A", "chain_b": "B", "resnum_a": 140, "resnum_b": 88},
                         cys=True) == "Cys A:140 ↔ Cys B:88"
+
+
+# ── interface (inter-chain) scan: cross-chain only, interface-bounded, shared scoring ─────────
+def _interface_atoms():
+    # chain A and chain B with ONE engineerable interface pair (A:5 ↔ B:5); the other residues are
+    # far from the OTHER chain (non-interface) so they must not surface.
+    return {
+        "A": {5: {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0)},
+              9: {"CA": (40.0, 0.0, 0.0), "CB": (40.0, 1.5, 0.0)}},
+        "B": {5: {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)},      # ~ideal partner of A:5
+              9: {"CA": (80.0, 0.0, 0.0), "CB": (80.0, 1.5, 0.0)}},
+    }
+
+
+def test_interface_scan_emits_only_cross_chain():
+    ranked, _ = g.scan_interface_sites(_interface_atoms())
+    assert ranked
+    assert all(p["chain_a"] != p["chain_b"] for p in ranked)          # every pair spans two chains
+    top = ranked[0]
+    assert {(top["chain_a"], top["resnum_a"]), (top["chain_b"], top["resnum_b"])} == {("A", 5), ("B", 5)}
+
+
+def test_interface_scan_is_interface_bounded():
+    # the Cα gate IS the interface bound — a residue far from the other chain never surfaces
+    ranked, _ = g.scan_interface_sites(_interface_atoms())
+    surfaced = {(p["chain_a"], p["resnum_a"]) for p in ranked} \
+        | {(p["chain_b"], p["resnum_b"]) for p in ranked}
+    assert ("A", 9) not in surfaced and ("B", 9) not in surfaced      # non-interface → excluded
+
+
+def test_interface_scan_reuses_backbone_pair_score():
+    # the convergence point: the SAME scoring as intra Mode D (no new geometry loop)
+    atoms = _interface_atoms()
+    top = g.scan_interface_sites(atoms)[0][0]
+    bp = g.backbone_pair_score(atoms["A"][5], atoms["B"][5])
+    assert top["score"] == bp["score"] and top["ca_ca"] == bp["ca_ca"] and top["cb_cb"] == bp["cb_cb"]
+
+
+def test_interface_scan_empty_on_monomer():
+    ranked, best = g.scan_interface_sites({"A": _interface_atoms()["A"]})
+    assert ranked == [] and best == {}                               # one chain → no cross pairs

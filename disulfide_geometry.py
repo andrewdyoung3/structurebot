@@ -326,3 +326,43 @@ def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]
                 best[(ch, rb)] = max(best.get((ch, rb), 0.0), float(pg["score"]))
     ranked.sort(key=lambda d: -d["score"])
     return ranked, best
+
+
+def scan_interface_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], *,
+                         ca_gate: Optional[float] = CA_CA_PREFILTER_GATE,
+                         min_score: float = SCAN_MIN_SCORE):
+    """CROSS-chain (INTER-subunit) engineerable-disulfide scan: residue pairs whose two members are
+    on DIFFERENT chains. The SAME `backbone_pair_score` Mode D uses scores each pair (NO new geometry
+    loop — the §9 universal-disulfide-mode convergence point, the shared primitive both this and the
+    intra `scan_engineerable_sites` call). The Cα–Cα PREFILTER (*ca_gate*) IS the INTERFACE bound: a
+    pair close enough ACROSS chains to possibly form a disulfide is interface-proximal by definition;
+    a buried-core residue is too far from the other chain to pass, so the output is interface-bounded
+    (NOT the full A×B product). NO `min_seq_sep` — cross-chain residues have no sequence adjacency.
+    Returns ``(ranked_pairs, best_partner)``: each pair carries ``chain_a`` != ``chain_b`` (the
+    two-chain reshape) + ``resnum_a``/``resnum_b``; best_partner ``{(chain, resnum): best score}``.
+    DISTINCT from `scan_engineerable_sites` (intra-chain) — feeds the cross-chain Mode-C declare."""
+    ranked: List[Dict[str, object]] = []
+    best: Dict[tuple, float] = {}
+    chains = sorted(atoms_by_chain or {})
+    for i in range(len(chains)):
+        for j in range(i + 1, len(chains)):               # each unordered chain pair once (A–B, not B–A)
+            cha, chb = chains[i], chains[j]
+            res_a, res_b = atoms_by_chain[cha], atoms_by_chain[chb]
+            for ra in sorted(res_a):
+                ca_a = res_a[ra].get("CA")
+                if not ca_a:
+                    continue
+                for rb in sorted(res_b):
+                    ca_b = res_b[rb].get("CA")
+                    if not ca_b:
+                        continue
+                    if ca_gate is not None and calc_distance(ca_a, ca_b) > ca_gate:
+                        continue                          # INTERFACE bound — too far across chains
+                    pg = backbone_pair_score(res_a[ra], res_b[rb])
+                    if pg is None or pg["score"] < min_score:
+                        continue
+                    ranked.append({"chain_a": cha, "resnum_a": ra, "chain_b": chb, "resnum_b": rb, **pg})
+                    best[(cha, ra)] = max(best.get((cha, ra), 0.0), float(pg["score"]))
+                    best[(chb, rb)] = max(best.get((chb, rb), 0.0), float(pg["score"]))
+    ranked.sort(key=lambda d: -d["score"])
+    return ranked, best

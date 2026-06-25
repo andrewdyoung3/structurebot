@@ -159,6 +159,7 @@ class ToolRouter:
         "disulfide_discovery":     "🔗📊",
         "disulfide_geometry":      "🔗📐",
         "disulfide_scan":          "🔗🔍",
+        "disulfide_interface_scan": "🔗🤝",
         "proline":           "🧪",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
@@ -1838,6 +1839,8 @@ class ToolRouter:
                     "frequency" + (f" ({n} seeds)" if n else "") + " (unconstrained)")
         if tool == "disulfide_geometry":
             return "Disulfide geometry — measure existing Cys-pair geometry (this fold)"
+        if tool == "disulfide_interface_scan":
+            return "Disulfide interface scan — find NOVEL inter-chain sites at the interface (this fold)"
         if tool == "disulfide_scan":
             return ("Disulfide engineering scan — find NOVEL installable sites (backbone, "
                     "geometric compatibility only)")
@@ -2132,6 +2135,8 @@ class ToolRouter:
                 return self._run_disulfide_geometry(inputs)
             if tool == "disulfide_scan":
                 return self._run_disulfide_scan(inputs)
+            if tool == "disulfide_interface_scan":
+                return self._run_disulfide_interface_scan(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3277,6 +3282,42 @@ class ToolRouter:
         return ToolStepResult(
             tool="disulfide_scan", success=True,
             data={"pairs": ranked, "best_partner": best_by_chain, "mode": "engineering_scan",
+                  "caveat": self._DISULFIDE_SCAN_CAVEAT},
+            summary=summary)
+
+    def _run_disulfide_interface_scan(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """INTERFACE SCAN — find NOVEL INTER-CHAIN (inter-subunit) installable disulfide sites: the
+        CROSS-chain analogue of Mode D. Reads a MULTI-chain fold's backbone and scores every residue
+        pair across DIFFERENT chains by the SAME `backbone_pair_score` (the shared primitive — no new
+        geometry loop), bounded to the INTERFACE by the Cα prefilter (a pair close enough across
+        chains to bond IS interface-proximal). CHEAP — reads coordinates, NEVER folds. Surfaces a
+        ranked cross-chain pair list (chain_a≠chain_b) + the load-bearing geometric-only CAVEAT.
+        Found pairs feed the (proven) cross-chain Mode-C declare. Reads `cif_path`; needs ≥2 chains."""
+        import os as _os
+        from disulfide_geometry import parse_backbone_atoms, scan_interface_sites
+        cif = inputs.get("cif_path")
+        if not cif or not _os.path.isfile(cif):
+            return ToolStepResult(tool="disulfide_interface_scan", success=False,
+                                  error="Interface scan needs an existing fold CIF on disk.")
+        atoms = parse_backbone_atoms(cif)
+        if len(atoms) < 2:
+            return ToolStepResult(tool="disulfide_interface_scan", success=False,
+                                  error="Interface scan needs a MULTI-CHAIN fold (≥2 chains).")
+        ranked, best = scan_interface_sites(atoms)
+        best_by_chain: Dict[str, Dict[int, float]] = {}
+        for (ch, rn), sc in best.items():
+            best_by_chain.setdefault(ch, {})[rn] = round(sc, 4)
+        if not ranked:
+            summary = ("Interface scan: no geometrically viable INTER-CHAIN disulfide sites at the "
+                       "interface of this fold. " + self._DISULFIDE_SCAN_CAVEAT)
+        else:
+            head = "; ".join(f"{d['chain_a']}:{d['resnum_a']}–{d['chain_b']}:{d['resnum_b']} "
+                             f"(score {d['score']:.2f})" for d in ranked[:3])
+            summary = (f"Interface scan — {len(ranked)} inter-chain candidate site(s); top: {head}. "
+                       + self._DISULFIDE_SCAN_CAVEAT)
+        return ToolStepResult(
+            tool="disulfide_interface_scan", success=True,
+            data={"pairs": ranked, "best_partner": best_by_chain, "mode": "interface_scan",
                   "caveat": self._DISULFIDE_SCAN_CAVEAT},
             summary=summary)
 
