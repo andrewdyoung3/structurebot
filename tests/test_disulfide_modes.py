@@ -124,3 +124,48 @@ def test_run_boltz_threads_constraints_and_tags_provenance(monkeypatch):
     # provenance tagged on the result data
     assert out.data["constrained"] is True and out.data["disulfide_bonds"] == [(2, 4)]
     assert "SS-constrained" in out.summary
+
+
+def _backbone_cif():
+    # two residues in engineerable backbone geometry (1 & 5) + a far one (9) + adjacent (2)
+    return (
+        "data_model\nloop_\n"
+        "_atom_site.group_PDB\n_atom_site.label_atom_id\n_atom_site.label_comp_id\n"
+        "_atom_site.auth_asym_id\n_atom_site.auth_seq_id\n"
+        "_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n"
+        "ATOM CA ALA A 1 0.0 0.0 0.0\nATOM CB ALA A 1 0.0 1.5 0.0\n"
+        "ATOM CA GLY A 2 2.0 0.0 0.0\n"
+        "ATOM CA VAL A 5 5.5 0.0 0.0\nATOM CB VAL A 5 3.8 1.5 0.0\n"
+        "ATOM CA LEU A 9 40.0 0.0 0.0\nATOM CB LEU A 9 40.0 1.5 0.0\n#\n"
+    )
+
+
+# ── Mode D — engineering scan (reads one fold's backbone; ranked + best-partner + caveat) ──
+def test_engineering_scan_finds_sites_and_carries_caveat():
+    r = _router()
+    r._fold_n_seeds = MagicMock()                  # the scan must NEVER fold (cheap geometry only)
+    out = r._run_disulfide_scan({"cif_path": _write(_backbone_cif())})
+    assert out.success
+    pairs = {(p["resnum_a"], p["resnum_b"]) for p in out.data["pairs"]}
+    assert (1, 5) in pairs                         # the engineerable pair surfaces
+    assert all(9 not in (a, b) for a, b in pairs)  # far residue excluded
+    assert out.data["best_partner"].get("A", {}).get(1) is not None   # heatmap map present
+    # the load-bearing caveat rides with the readout (data AND summary)
+    assert "starting point" in out.data["caveat"] and "does not imply" in out.data["caveat"].lower()
+    assert "starting point" in out.summary.lower()
+    r._fold_n_seeds.assert_not_called()
+
+
+def test_engineering_scan_needs_a_cif():
+    out = _router()._run_disulfide_scan({"cif_path": "/nope/x.cif"})
+    assert out.success is False and "fold cif" in out.error.lower()
+
+
+def test_engineering_scan_empty_when_no_viable_sites():
+    # a chain whose only residues are far apart → no sites, but still a success + the caveat
+    cif = ("data_model\nloop_\n_atom_site.group_PDB\n_atom_site.label_atom_id\n"
+           "_atom_site.label_comp_id\n_atom_site.auth_asym_id\n_atom_site.auth_seq_id\n"
+           "_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n"
+           "ATOM CA ALA A 1 0.0 0.0 0.0\nATOM CA ALA A 9 50.0 0.0 0.0\n#\n")
+    out = _router()._run_disulfide_scan({"cif_path": _write(cif)})
+    assert out.success and out.data["pairs"] == [] and "starting point" in out.summary.lower()

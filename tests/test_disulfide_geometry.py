@@ -142,3 +142,77 @@ def test_parse_cys_atoms_only_cysteines(tmp_path):
     # and the parsed atoms feed pair_geometry end-to-end
     pg = g.pair_geometry(cys["A"][12], cys["A"][45])
     assert pg["sg_sg"] == 2.05 and pg["bonding_compatible"] is True
+
+
+# ── Mode D: backbone engineering scan (residue-agnostic, NO χSS, soft-graded, prefiltered) ──
+def test_backbone_scoring_soft_windows_pinned():
+    # the soft-window scores (graded, never hard cutoffs) pinned at their ideal/neutral points
+    assert g._gauss_score(5.5, g.CA_CA_SCORE_IDEAL, g.CA_CA_SCORE_SIGMA) == 1.0   # Cα–Cα ideal
+    assert abs(g._gauss_score(3.8, g.CB_CB_IDEAL, g.CB_CB_SCORE_SIGMA) - 1.0) < 1e-9  # Cβ–Cβ ideal
+    assert g._orient_score(90.0) == 1.0 and g._orient_score(-90.0) == 1.0         # ±90° ideal
+    assert g._orient_score(0.0) == 0.5                                            # eclipsed → neutral
+    assert g._orient_score(None) == 0.5                                           # Gly → neutral
+
+
+def test_backbone_pair_score_graded_near_beats_off():
+    # graded: a near-ideal geometry scores higher than an off-distance one, BUT both surface
+    # (nothing hard-eliminated — a suggestion surface, not a filter)
+    a = {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0)}
+    near = g.backbone_pair_score(a, {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)})
+    off = g.backbone_pair_score(a, {"CA": (6.5, 0.0, 0.0), "CB": (4.5, 1.5, 0.0)})
+    assert near["ca_score"] == 1.0 and near["cb_score"] == 1.0
+    assert near["score"] > off["score"] > 0      # graded — near ranks higher, off still surfaces
+
+
+def test_backbone_pair_score_far_is_zero():
+    a = {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0)}
+    b = {"CA": (20.0, 0.0, 0.0), "CB": (20.0, 1.5, 0.0)}
+    assert g.backbone_pair_score(a, b)["score"] < 0.001     # too far → ~0 (Cα-dominant)
+
+
+def test_backbone_pair_score_no_chi_ss():
+    # Mode D is BACKBONE-ONLY — it must not compute χSS (no Sγ pre-mutation)
+    a = {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0)}
+    b = {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)}
+    assert "chi_ss" not in g.backbone_pair_score(a, b)
+
+
+def test_backbone_pair_score_glycine_uses_pseudo_cb():
+    # Gly has no Cβ → CA stands in; orientation undefined → neutral, never a crash
+    gly = {"CA": (0.0, 0.0, 0.0)}                           # no CB
+    b = {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)}
+    pg = g.backbone_pair_score(gly, b)
+    assert pg is not None and pg["orientation"] is None and pg["orient_score"] == 0.5
+
+
+def _scan_atoms():
+    return {"A": {
+        1: {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0)},
+        2: {"CA": (2.0, 0.0, 0.0), "CB": (2.0, 1.5, 0.0)},
+        5: {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)},   # an engineerable partner of res 1
+        9: {"CA": (40.0, 0.0, 0.0), "CB": (40.0, 1.5, 0.0)}, # far from everything
+    }}
+
+
+def test_scan_prefilter_output_identical_to_full_scan():
+    # THE prefilter invariant: the Cα gate changes SPEED, not OUTPUT (gated-out pairs are sub-
+    # threshold, so a full scan would drop them too).
+    atoms = _scan_atoms()
+    ranked_gated, best_gated = g.scan_engineerable_sites(atoms)               # prefilter ON
+    ranked_full, best_full = g.scan_engineerable_sites(atoms, ca_gate=None)   # full scan
+    assert ranked_gated == ranked_full and best_gated == best_full
+
+
+def test_scan_excludes_sequence_adjacent_and_far():
+    atoms = _scan_atoms()
+    ranked, best = g.scan_engineerable_sites(atoms)
+    pairs = {(p["resnum_a"], p["resnum_b"]) for p in ranked}
+    assert (1, 2) not in pairs                              # sequence-adjacent → excluded
+    assert all(9 not in (a, b) for a, b in pairs)           # res 9 too far → never surfaces
+
+
+def test_scan_best_partner_map():
+    ranked, best = g.scan_engineerable_sites(_scan_atoms())
+    # each surfaced residue's best-partner score = the max score of any pair it's in
+    assert best.get(("A", 1)) is not None and best[("A", 1)] == best[("A", 5)]
+    assert ("A", 9) not in best                             # far residue never gets a partner

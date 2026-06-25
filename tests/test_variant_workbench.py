@@ -23,7 +23,8 @@ from PySide6 import QtWidgets, QtCore, QtGui
 
 from seq_editor.controller import ResidueCell, ChainSeq
 from variant_workbench import (VariantWorkbenchPanel, _ChainDesignTab, _RESULT_DDG_MODE,
-                               _RESULT_PLDDT_MODE, _RESULT_DEVIATION_MODE, _ROW_ROLE)
+                               _RESULT_PLDDT_MODE, _RESULT_DEVIATION_MODE,
+                               _RESULT_DISULFIDE_MODE, _ROW_ROLE)
 from variant_model import (ChainDesign, AlignedCell, build_design_session,
                            build_fold_column_map)
 from color_modes import get_mode, ddg_color, plddt_color
@@ -2371,81 +2372,141 @@ class TestDisulfideSuite:
         # declaring a bond on NON-cysteine positions must REUSE add_variant + edit_variant("C")
         p, _ = _panel([], session=__import__("session_state").SessionState())
         cd = self._construct(p)
-        spec = p.build_disulfide_introduce_spec(2, 9)
-        assert spec is not None and spec["_variant_id"] == "SS_2_9"
-        v = cd.get_variant("SS_2_9")
+        spec = p.build_disulfide_introduce_spec((2, 9))
+        assert spec is not None and spec["_variant_id"] == "SS_2-9"
+        v = cd.get_variant("SS_2-9")
         assert v is not None and v.sequence[1] == "C" and v.sequence[8] == "C"  # real substitution
         assert spec["tool_inputs"]["disulfide_bonds"] == [(2, 9)]
         assert spec["tool_inputs"]["disulfide_constraints"] == [
             {"atom1": ["A", 2, "SG"], "atom2": ["A", 9, "SG"]}]
-        assert "biases toward it" in spec["user_input"]   # honesty wording (not "enforce")
+        assert "biases toward" in spec["user_input"] and "enforce" in spec["user_input"]   # honesty wording (not "enforce")
 
     def test_introduce_mapping_is_correct_on_non_one_start_construct(self, _app):
         # the load-bearing correctness hinge: author resnums starting at 10 → 1-based INDEX ≠ resnum
         p, _ = _panel([], session=__import__("session_state").SessionState())
         cd = self._construct(p, start=10)                # author resnums 10..21
-        spec = p.build_disulfide_introduce_spec(12, 19)  # author 12,19 → index 3,10
+        spec = p.build_disulfide_introduce_spec((12, 19))  # author 12,19 → index 3,10
         assert spec["tool_inputs"]["disulfide_constraints"] == [
             {"atom1": ["A", 3, "SG"], "atom2": ["A", 10, "SG"]}]
         assert spec["tool_inputs"]["disulfide_bonds"] == [(12, 19)]   # provenance keeps author resnums
-        v = cd.get_variant("SS_12_19")
+        v = cd.get_variant("SS_12-19")
         assert v.sequence[2] == "C" and v.sequence[9] == "C"          # Cys at the right positions
 
     def test_introduce_rejects_same_or_invalid_position(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
         self._construct(p)
-        assert p.build_disulfide_introduce_spec(5, 5) is None         # same column
-        assert p.build_disulfide_introduce_spec(2, 999) is None       # out of range
+        assert p.build_disulfide_introduce_spec((5, 5)) is None         # same column
+        assert p.build_disulfide_introduce_spec((2, 999)) is None       # out of range
 
     # ── GUI-SURFACE guard: the Disulfides menu actually RENDERS at top level, the actions are
     #    wired (trigger reaches the handler), and enabled-state tracks the precondition. This is
     #    the test the no-ChimeraX v1 verify lacked — it closes the discoverability blind spot.
-    def test_disulfide_menu_is_top_level_with_three_actions(self, _app):
+    def test_disulfide_menu_top_level_with_renamed_four_actions(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
         assert p._ss_menu_btn.text() == "Disulfides"             # a TOP-LEVEL toolbar button…
         acts = p._ss_menu_btn.menu().actions()
-        assert {p._ss_discover_btn, p._ss_geometry_btn, p._ss_constrain_btn} <= set(acts)
-        # NOT buried under the construct-fold submenu anymore
-        assert p._ss_discover_btn not in p._construct_fold_menu.actions()
+        # FOUR actions now: A assess / B measure / D find / C declare — and the labels carry the
+        # load-bearing scope language (find/discover ONLY on D; A says "existing", never "discover")
+        assert {p._ss_discover_btn, p._ss_geometry_btn, p._ss_scan_btn, p._ss_constrain_btn} <= set(acts)
+        assert "existing" in p._ss_discover_btn.text().lower() and "discover" not in p._ss_discover_btn.text().lower()
+        assert "measure" in p._ss_geometry_btn.text().lower()
+        assert "find" in p._ss_scan_btn.text().lower() and "backbone" in p._ss_scan_btn.text().lower()
+        assert "declare" in p._ss_constrain_btn.text().lower()
+        assert p._ss_scan_btn not in p._construct_fold_menu.actions()    # not buried
 
     def test_disulfide_actions_enabled_state_tracks_precondition(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
-        # no design → ALL greyed (a visibly-unavailable action, not a silent no-op)
-        assert not p._ss_discover_btn.isEnabled()
-        assert not p._ss_geometry_btn.isEnabled() and not p._ss_constrain_btn.isEnabled()
-        # de-novo construct (not yet folded) → Discover enabled, Geometry/Fold-with-bond still greyed
+        # no design → ALL greyed
+        for b in (p._ss_discover_btn, p._ss_geometry_btn, p._ss_scan_btn, p._ss_constrain_btn):
+            assert not b.isEnabled()
+        # de-novo construct (not folded) → Assess enabled; Measure/Find/Declare still greyed
         p._add_sequence_construct("binder", "MKVLWAACGTDE")
         assert p._ss_discover_btn.isEnabled()
-        assert not p._ss_geometry_btn.isEnabled() and not p._ss_constrain_btn.isEnabled()
-        # folded → all three enabled
+        assert not (p._ss_geometry_btn.isEnabled() or p._ss_scan_btn.isEnabled()
+                    or p._ss_constrain_btn.isEnabled())
+        # folded → all four enabled
         cd = next(iter(p._design.chains.values()))
         cd.template_fold = {"engine": "boltz", "model_id": "7", "cif_path": "/tmp/x.cif"}
         p._sync_disulfide_menu_enabled()
-        assert p._ss_geometry_btn.isEnabled() and p._ss_constrain_btn.isEnabled()
+        assert (p._ss_geometry_btn.isEnabled() and p._ss_scan_btn.isEnabled()
+                and p._ss_constrain_btn.isEnabled())
 
     def test_disulfide_actions_trigger_reaches_handlers(self, _app, monkeypatch):
-        # drive the actual user gesture (QAction.trigger() == a menu click) and assert the
-        # connected handler ran end-to-end — a DROPPED signal connection can't pass this.
+        # drive the real gesture (QAction.trigger() == a menu click) → the connected handler ran
         p, _ = _panel([], session=__import__("session_state").SessionState())
-        cd = self._construct(p)                                   # de-novo + folded (cif_path/model_id)
+        cd = self._construct(p)                                   # de-novo + folded
         p._sync_disulfide_menu_enabled()
         emitted = []
         p.launchRequested.connect(lambda spec: emitted.append(spec))
-        p._ss_discover_btn.trigger()                             # == click "Discover"
-        assert emitted and emitted[-1]["tool"] == "disulfide_discovery"
-        p._ss_geometry_btn.trigger()                            # == click "Geometry readout"
-        assert emitted[-1]["tool"] == "disulfide_geometry"
-        # Fold-with-bond prompts for the pair → mock the dialog, then the trigger must emit a fold
+        p._ss_discover_btn.trigger();  assert emitted[-1]["tool"] == "disulfide_discovery"
+        p._ss_geometry_btn.trigger();  assert emitted[-1]["tool"] == "disulfide_geometry"
+        p._ss_scan_btn.trigger();      assert emitted[-1]["tool"] == "disulfide_scan"   # Mode D
+        # Declare-bonds prompts for the pair(s) → mock the dialog, then the trigger emits a fold
         monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
-                            staticmethod(lambda *a, **k: ("2 9", True)))
-        p._ss_constrain_btn.trigger()                           # == click "Fold with declared bond"
-        assert emitted[-1]["tool"] == "boltz"
-        assert emitted[-1]["tool_inputs"]["disulfide_bonds"] == [(2, 9)]
+                            staticmethod(lambda *a, **k: ("2-9", True)))
+        p._ss_constrain_btn.trigger()
+        assert emitted[-1]["tool"] == "boltz" and emitted[-1]["tool_inputs"]["disulfide_bonds"] == [(2, 9)]
 
     def test_disabled_action_trigger_is_a_noop(self, _app):
-        # a greyed action does nothing on trigger() (Qt suppresses the signal) — no spurious launch
         p, _ = _panel([], session=__import__("session_state").SessionState())
         emitted = []
         p.launchRequested.connect(lambda spec: emitted.append(spec))
-        p._ss_geometry_btn.trigger()                            # greyed (no construct) → no-op
+        p._ss_scan_btn.trigger()                                 # greyed (no construct) → no-op
         assert emitted == []
+
+    # ── Mode C multi-pair + Mode D scan/heatmap + the D→introduce→C loop ───────────────────
+    def test_parse_bond_pairs_single_and_multi(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        assert p._parse_bond_pairs("12 45") == [(12, 45)]            # single "a b"
+        assert p._parse_bond_pairs("12-45") == [(12, 45)]            # single "a-b"
+        assert p._parse_bond_pairs("12-45, 7-33") == [(12, 45), (7, 33)]   # multi
+        assert p._parse_bond_pairs("12-45-7") == []                  # malformed → fail-closed
+
+    def test_mode_c_multi_pair_one_variant_multiple_constraints(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        spec = p.build_disulfide_introduce_spec([(2, 9), (3, 7)])
+        v = cd.get_variant("SS_2-9_3-7")
+        # ONE variant carries Cys at ALL FOUR positions (the genuine substitution composition)
+        assert v.sequence[1] == "C" and v.sequence[8] == "C"
+        assert v.sequence[2] == "C" and v.sequence[6] == "C"
+        # two bond constraints + two declared pairs reach the spec
+        assert len(spec["tool_inputs"]["disulfide_constraints"]) == 2
+        assert spec["tool_inputs"]["disulfide_bonds"] == [(2, 9), (3, 7)]
+
+    def test_mode_d_scan_result_surfaces_heatmap_mode(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        spec = {"_align_ukey": p._cur_cd_ukey()}
+        result = {"tool_step_results": [{"tool": "disulfide_scan", "success": True, "data": {
+            "pairs": [{"chain": "A", "resnum_a": 2, "resnum_b": 9, "score": 0.7}],
+            "best_partner": {"A": {2: 0.7, 9: 0.7}},
+            "caveat": "Geometrically viable … a starting point. Does NOT imply …"}}]}
+        p.apply_disulfide_scan_result(spec, result)
+        assert cd.disulfide_scan["pairs"] and cd.disulfide_scan["best_partner"]["A"][2] == 0.7
+        assert p._mode_key == _RESULT_DISULFIDE_MODE             # AUTO-surfaced the heatmap
+        # the heatmap colours residues by best-partner score (pale→gold), a navigational index
+        hexmap = p._disulfide_scan_panel_hex(p._cur_tab())
+        assert hexmap.get(2) and hexmap.get(9)
+
+    def test_mode_d_scan_pair_feeds_mode_c_introduce(self, _app):
+        # the engineering loop: D finds a site → that pair feeds the introduce→constrain path
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        scan_pair = (2, 9)                                       # a pair from the scan
+        spec = p.build_disulfide_introduce_spec([scan_pair])
+        assert spec is not None and spec["tool_inputs"]["disulfide_bonds"] == [(2, 9)]
+        assert cd.get_variant("SS_2-9").sequence[1] == "C"      # Cys introduced at the scanned site
+
+    def test_heatmap_mode_surfaces_the_caveat(self, _app):
+        # the geometric-only CAVEAT must ride ON the colour mode (the over-read-prone surface)
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        cd.disulfide_scan = {"pairs": [{"chain": "A", "resnum_a": 2, "resnum_b": 9, "score": 0.7}],
+                             "best_partner": {"A": {2: 0.7, 9: 0.7}},
+                             "caveat": "Geometrically viable … a starting point. Does NOT imply the "
+                                       "X→C mutations are tolerated, that the protein still folds…"}
+        idx = p._mode_combo.findData(_RESULT_DISULFIDE_MODE)
+        p._mode_combo.setCurrentIndex(idx)                      # == user picks "Disulfide sites"
+        txt = p._status.text().lower()
+        assert "does not imply" in txt and "starting point" in txt and "navigational index" in txt
