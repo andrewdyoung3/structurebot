@@ -1160,6 +1160,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # The PERSISTENT Disulfides results tab (whole-suite home) — a SEPARATE top-level widget the
         # window adds as a sibling tab (`gui_app` reads `self.disulfides_tab`). It survives top-level
         # tab-switches + panel rebuilds (the old modeless dialog vanished on focus loss; this does not).
+        self._glow_state: Optional[dict] = None       # the prior disulfide GLOW (for non-destructive restore)
         self.disulfides_tab = DisulfidesResultsTab(
             on_highlight=self._highlight_disulfide_pair,
             on_declare=self._declare_disulfide_pair)
@@ -3604,36 +3605,72 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.disulfides_tab.populate_interface(cd, cd.disulfide_interface_scan)
         self._status.setText(step.get("summary") or "Interface scan complete.")
 
+    _GLOW_HUE = "gold"           # the lit hue (sphere + halo); one constant so glow + halo match
+
     @staticmethod
-    def _disulfide_scan_highlight_commands(cd, pair: dict) -> List[str]:
-        """ChimeraX commands to HIGHLIGHT a scanned pair on the construct's T-fold: both members'
-        Cβ as gold spheres + a selection + the Cβ–Cβ distance (the geometry justifying its score).
-        Pure → single source for the click action, the live-verify, and tests. [] if not folded."""
+    def _disulfide_pair_specs(cd, pair: dict):
+        """(mid, a, b, both) ChimeraX specs for a pair on the construct's fold. Chain PER MEMBER
+        (`pair_chains` tolerates the legacy single-`chain` shape); rep chain when absent. SAME-chain
+        collapses to one combined spec, CROSS-chain unions the two members. (None,…) if not folded."""
         mid = (cd.template_fold or {}).get("model_id")
         if not mid or not pair:
-            return []
-        # chain PER MEMBER (pair_chains tolerates the legacy single-`chain` shape); fall back to the
-        # rep chain when absent. SAME-chain collapses to the original combined spec (output identical);
-        # CROSS-chain (step 4) unions the two members' specs.
+            return None, None, None, None
         ca, cb = pair_chains(pair)
         ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
         ra, rb = pair.get("resnum_a"), pair.get("resnum_b")
         a, b = f"#{mid}/{ca}:{ra}", f"#{mid}/{cb}:{rb}"
         both = f"#{mid}/{ca}:{ra},{rb}" if ca == cb else f"{a} {b}"
+        return mid, a, b, both
+
+    @classmethod
+    def _disulfide_scan_highlight_commands(cls, cd, pair: dict) -> List[str]:
+        """GLOW-style highlight of a pair on the construct's fold: bright OPAQUE spheres on the
+        residue(s) (the lit element) + TRANSPARENCY-the-rest of the model (the spotlight cue — the
+        glowed residue is the one solid object in a ghosted scene) + a matching-hue selection HALO,
+        plus the Cβ–Cβ distance. Pure → single source for the click, the live-verify, and tests; []
+        if not folded. The PRIOR glow's RESTORE is `_glow_restore_commands` — the panel orchestrates
+        restore-then-apply (`_highlight_disulfide_pair`) so glows/transparency don't STACK. Static
+        only — no pulse (frame-loop lifecycle deferred to the §9 unified-highlighting item)."""
+        mid, a, b, both = cls._disulfide_pair_specs(cd, pair)
+        if mid is None:
+            return []
+        hue = cls._GLOW_HUE
         return [
-            "~display",                                        # clear any prior highlight first
             f"show {both} atoms",
-            f"style {both}@CB sphere",
-            f"color {both} gold",
+            f"style {both} sphere",                 # whole-residue spheres → a brighter lit blob
+            f"color {both} {hue} target a",         # colour ATOMS only — the cartoon keeps its mode colour
+            f"transparency #{mid} 70 target c",     # ghost the rest of the model (cartoon) → spotlight
+            f"transparency {both} 0 target c",       # keep the glowed residue's own cartoon opaque
+            f"graphics selection color {hue}",      # halo outline — GLOBAL (a nicer permanent default)
+            "graphics selection width 5",
             f"select {both}",
-            f"distance {a}@CB {b}@CB",                         # the Cβ–Cβ measured span
+            f"distance {a}@CB {b}@CB",               # the Cβ–Cβ measured span
+        ]
+
+    @staticmethod
+    def _glow_restore_commands(prev: Optional[dict]) -> List[str]:
+        """RESTORE a prior glow (stored ``{mid, both}``) NON-DESTRUCTIVELY: un-ghost the whole model
+        (transparency → opaque) + return the glowed residue(s) to cartoon (hide their atoms; the
+        cartoon's mode colour shows through, never recoloured) + clear the pair distance. [] if there
+        is nothing to restore. Reused before every new glow so A's spotlight is fully reset before B."""
+        if not prev or not prev.get("mid") or not prev.get("both"):
+            return []
+        mid, both = prev["mid"], prev["both"]
+        return [
+            f"transparency #{mid} 0 target c",       # un-ghost the whole model (was 70%)
+            f"hide {both} atoms",                    # glowed residues back to cartoon
+            "~distance",                              # clear the prior pair's distance label
         ]
 
     def _highlight_disulfide_pair(self, cd, pair: dict) -> None:
-        """Highlight a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes
-        through the EXISTING `_run_commands_bg` selection seam, reusing `_disulfide_scan_highlight_
-        commands` (no new scattered highlighting path; this tab is the convergence surface)."""
-        self._run_commands_bg(self._disulfide_scan_highlight_commands(cd, pair))
+        """Glow a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes through
+        the EXISTING `_run_commands_bg` selection seam (no new scattered highlight path; this tab is
+        the convergence surface). RESTORE the prior glow FIRST (so A un-glows + the scene un-ghosts
+        before B glows — non-destructive, never stacking), apply the new glow, then record its state."""
+        apply = self._disulfide_scan_highlight_commands(cd, pair)
+        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
+        mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
+        self._glow_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
 
     def _declare_disulfide_pair(self, cd, pair) -> None:
         """Declare a bond from a Disulfides-tab table → Mode C. FOCUS the pair's construct tab first
