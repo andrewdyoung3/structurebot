@@ -70,7 +70,7 @@ def main():
     print("C) Declared constraint — folding WITH a Cys3–Cys11 bond…")
     ia = dg.resnum_to_chain_index(list(range(1, len(SEQ) + 1)), cys_positions[0])
     ib = dg.resnum_to_chain_index(list(range(1, len(SEQ) + 1)), cys_positions[1])
-    cons = [dg.bond_constraint("A", ia, ib)]
+    cons = [dg.bond_constraint("A", ia, "A", ib)]
     bridge = r._get_boltz_bridge()
     cres = bridge.predict(CONSTRUCT_CHAINS, seed=0, allow_remote=False, constraints=cons)
     check("Boltz ACCEPTED the constraints: bond YAML (fold succeeded)", bool(cres.get("success")),
