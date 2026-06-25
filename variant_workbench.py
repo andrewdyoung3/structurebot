@@ -793,6 +793,26 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         sec["readout"].setVisible(True)
         sec["placeholder"].setVisible(False)
 
+    def reset(self) -> None:
+        """Clear EVERY section back to its dormant 'Run … to populate' placeholder. The tab itself
+        PERSISTS across a session reset (it is a sibling of the workbench in `gui_app.tabs`), but its
+        content belongs to the PRIOR session — after a Load it would reference a construct no longer
+        loaded (stale-data-wrong). So `_reset_view_for_session` KEEPS the tab and calls this to empty
+        it; the new session's scans repopulate. Parallel to the panel's own `reset()`."""
+        for sec in self._sec.values():
+            sec["cd"], sec["pairs"] = None, []
+            tbl = sec.get("table")
+            if tbl is not None:
+                tbl.setRowCount(0)
+                tbl.setVisible(False)
+            for k in ("caveat", "detail", "readout"):
+                w = sec.get(k)
+                if w is not None:
+                    w.setVisible(False)
+            if sec.get("declare_btn") is not None:
+                sec["declare_btn"].setEnabled(False)
+            sec["placeholder"].setVisible(True)
+
 
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 

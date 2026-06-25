@@ -541,6 +541,34 @@ def test_reset_view_keeps_workbench_tab(_app):
     assert w._grids == {} and reset_calls["n"] == 1
 
 
+def test_reset_view_keeps_and_clears_disulfides_tab(_app):
+    """REGRESSION (layer-spanning): the persistent Disulfides tab is a SIBLING of the workbench in
+    self.tabs — `_reset_view_for_session` must KEEP it (it was being swept out with the chain grids
+    and never re-added, so any Clear/Load/reconnect dropped it permanently) AND CLEAR it (a Load
+    brings a new session; the prior session's pairs reference a construct no longer loaded → stale).
+    Spans the gui_app reset layer + the REAL panel tab — the seam neither the panel persistence test
+    nor `test_reset_view_keeps_workbench_tab` (no disulfides_tab in its harness) crossed."""
+    from variant_workbench import DisulfidesResultsTab
+    tabs = QtWidgets.QTabWidget()
+    wb = QtWidgets.QWidget(); wb.reset = lambda: None
+    dtab = DisulfidesResultsTab(on_highlight=lambda *a, **k: None, on_declare=lambda *a, **k: None)
+    wb.disulfides_tab = dtab
+    grid = QtWidgets.QWidget()
+    tabs.addTab(wb, "Variant Workbench")
+    tabs.addTab(dtab, "Disulfides")                # the sibling, exactly as gui_app.__init__ adds it
+    tabs.addTab(grid, "#1/A")
+    dtab.populate_scan(MagicMock(), {"pairs": [
+        {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9, "score": 0.9}],
+        "best_partner": {}, "caveat": "x"})
+    assert dtab._sec["D"]["table"].rowCount() == 1            # populated BEFORE the reset
+    w = _fakew(tabs=tabs, workbench=wb, _grids={("1", "A"): grid})
+    w._reset_view_for_session()
+    widgets = [tabs.widget(i) for i in range(tabs.count())]
+    assert dtab in widgets and grid not in widgets           # the tab SURVIVES; only the grid drops
+    assert dtab._sec["D"]["table"].rowCount() == 0           # …but CLEARED (no stale pairs)
+    assert not dtab._sec["D"]["placeholder"].isHidden()      # back to the dormant placeholder
+
+
 # ── Reconnect ChimeraX: model-id remap + reopen/relink flow ───────────────────────
 def test_remap_session_model_ids_crystal_and_denovo(_app):
     """remap rewrites structures keys, crystal design keys, AND internal fold refs of a de-novo
