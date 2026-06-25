@@ -603,6 +603,176 @@ class _AddSequenceDialog(QtWidgets.QDialog):
                 for seq_w, spin, _row in self._rows]
 
 
+# ── persistent Disulfides results tab (whole-suite home; replaces the transient dialogs) ──
+
+class DisulfidesResultsTab(QtWidgets.QWidget):
+    """Persistent home for the disulfide suite's results — A (assess existing pairs) / B (measure
+    geometry) / D (engineerable-site scan) / C (declared-bond fold) — replacing the four transient
+    dialogs/status-lines (a modeless dialog VANISHED on focus loss; a tab PERSISTS across top-level
+    tab-switches + panel rebuilds). Each mode has its OWN section: an unrun mode shows a clear
+    'Run … to populate' PLACEHOLDER (dormant, not broken-looking — never a blank table); a run mode
+    shows its table. A row-click on a pair table HIGHLIGHTS both members in 3D through the panel's
+    EXISTING selection seam (`on_highlight`) — this tab is the §9 unified-highlighting convergence
+    surface, built reusing the seam not shadowing it. The tables are the SOURCE OF TRUTH for which
+    residue pairs with which; the 'Disulfide sites' colour mode is a complementary navigational index."""
+
+    def __init__(self, *, on_highlight, on_declare):
+        super().__init__()
+        self._on_highlight = on_highlight        # (cd, pair_dict) -> highlight both members in 3D
+        self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
+        outer = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Disulfide suite results. These tables are the SOURCE OF TRUTH for which residue pairs "
+            "with which; the 'Disulfide sites' colour mode in the Workbench is a complementary "
+            "navigational index (the glow points the eye, the table carries the pairing).")
+        intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
+        outer.addWidget(intro)
+        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
+        body = QtWidgets.QWidget(); self._vl = QtWidgets.QVBoxLayout(body)
+        scroll.setWidget(body); outer.addWidget(scroll, 1)
+        self._sec: Dict[str, dict] = {}
+        self._make_section("A", "Existing Cys pairs — bonding frequency (Mode A: assess existing)",
+                           "Run “Assess existing Cys pairs” to populate.",
+                           ["Pair", "Frequency", "N folds", "median SG–SG (Å)"])
+        self._make_section("B", "Measured pair geometry (Mode B: measure)",
+                           "Run “Measure pair geometry” to populate.",
+                           ["Pair", "SG–SG (Å)", "Cβ–Cβ (Å)", "Cα–Cα (Å)", "χSS (°)", "Compatible"])
+        self._make_section("D", "Engineerable disulfide sites — backbone scan (Mode D: find novel)",
+                           "Run “Find engineerable disulfide sites” to populate.",
+                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"],
+                           declare=True, caveat=True)
+        self._make_section("C", "Declared-bond fold (Mode C: intervene)",
+                           "Use “Declare cysteine bonds and fold” (or Declare below) to record the "
+                           "constrained fold here.", None)
+        self._vl.addStretch(1)
+
+    # ── section scaffolding ────────────────────────────────────────────────────────
+    def _make_section(self, key: str, title: str, placeholder: str,
+                      cols: Optional[List[str]], *, declare: bool = False, caveat: bool = False) -> None:
+        box = QtWidgets.QGroupBox(title)
+        gl = QtWidgets.QVBoxLayout(box)
+        ph = QtWidgets.QLabel(placeholder); ph.setWordWrap(True); ph.setStyleSheet("color:#888;")
+        gl.addWidget(ph)
+        sec = {"box": box, "placeholder": ph, "cols": cols, "cd": None, "pairs": [],
+               "table": None, "caveat": None, "detail": None}
+        if caveat:
+            cav = QtWidgets.QLabel(); cav.setWordWrap(True); cav.setStyleSheet("color:#b36b00;")
+            cav.setVisible(False); gl.addWidget(cav); sec["caveat"] = cav
+        if cols is not None:
+            tbl = QtWidgets.QTableWidget(0, len(cols))
+            tbl.setHorizontalHeaderLabels(cols)
+            tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            tbl.setVisible(False)
+            tbl.cellClicked.connect(lambda r, _c, k=key: self._on_row(k, r))
+            gl.addWidget(tbl); sec["table"] = tbl
+            detail = QtWidgets.QLabel(); detail.setWordWrap(True); detail.setStyleSheet("color:#444;")
+            detail.setVisible(False); gl.addWidget(detail); sec["detail"] = detail
+        else:                                       # readout-only section (Mode C)
+            ro = QtWidgets.QLabel(); ro.setWordWrap(True); ro.setVisible(False)
+            gl.addWidget(ro); sec["readout"] = ro
+        if declare:
+            btn = QtWidgets.QPushButton("Declare bond and fold")
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda _=False, k=key: self._declare(k))
+            gl.addWidget(btn); sec["declare_btn"] = btn
+        self._sec[key] = sec
+        self._vl.addWidget(box)
+
+    # ── row-click → highlight the RIGHT pair on the RIGHT construct (the §9 seam) ─────
+    def _on_row(self, key: str, row: int) -> None:
+        sec = self._sec.get(key) or {}
+        pairs, cd = sec.get("pairs") or [], sec.get("cd")
+        if not (0 <= row < len(pairs)) or cd is None:
+            return
+        p = pairs[row]
+        self._on_highlight(cd, p)                   # routes through the panel's existing seam
+        d = sec.get("detail")
+        if d is not None:
+            d.setText(self._pair_detail(key, p)); d.setVisible(True)
+
+    def _declare(self, key: str) -> None:
+        sec = self._sec.get(key) or {}
+        pairs, cd = sec.get("pairs") or [], sec.get("cd")
+        tbl = sec.get("table")
+        row = tbl.currentRow() if tbl is not None else -1
+        if not (0 <= row < len(pairs)) or cd is None:
+            return
+        p = pairs[row]
+        self._on_declare(cd, (p["resnum_a"], p["resnum_b"]))
+
+    @staticmethod
+    def _pair_detail(key: str, p: dict) -> str:
+        if key == "D":
+            ornt = p.get("orientation")
+            return (f"Cys{p['resnum_a']}–Cys{p['resnum_b']} — score {p.get('score', 0):.2f} "
+                    f"(MEASURED, this fold): Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
+                    f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}. Geometric "
+                    f"compatibility only — installing needs introducing the Cys pair + re-folding "
+                    f"(Declare below).")
+        return f"Cys{p['resnum_a']}–Cys{p['resnum_b']} highlighted in 3D."
+
+    # ── populate (each consumer calls its own) ──────────────────────────────────────
+    def _fill_table(self, key: str, cd, pairs: List[dict], rowvals) -> None:
+        sec = self._sec[key]
+        sec["cd"], sec["pairs"] = cd, list(pairs)
+        tbl = sec["table"]
+        tbl.setRowCount(len(pairs))
+        for i, p in enumerate(pairs):
+            for j, v in enumerate(rowvals(p)):
+                tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        tbl.resizeColumnsToContents()
+        has = len(pairs) > 0
+        sec["placeholder"].setVisible(not has)
+        tbl.setVisible(has)
+        if sec.get("declare_btn") is not None:
+            sec["declare_btn"].setEnabled(has)
+        if has:
+            tbl.selectRow(0); self._on_row(key, 0)         # preselect + highlight the best/first
+
+    def populate_assess(self, cd, pairs: List[dict]) -> None:
+        self._fill_table("A", cd, pairs, lambda p: [
+            f"{p['resnum_a']}–{p['resnum_b']}", f"{p.get('n_compatible', 0)}/{p.get('n_folds', 0)}",
+            str(p.get("n_folds", "")), str(p.get("median_sg_sg", "") if p.get("median_sg_sg") is not None else "—")])
+
+    def populate_geometry(self, cd, pairs: List[dict]) -> None:
+        def _row(p):
+            chi = p.get("chi_ss")
+            return [f"{p['resnum_a']}–{p['resnum_b']}", str(p.get("sg_sg", "—")),
+                    str(p.get("cb_cb", "—")), str(p.get("ca_ca", "—")),
+                    ("—" if chi is None else f"{chi:.0f}"),
+                    "yes" if p.get("bonding_compatible") else "no"]
+        self._fill_table("B", cd, pairs, _row)
+
+    def populate_scan(self, cd, scan: dict) -> None:
+        pairs = (scan or {}).get("pairs") or []
+        sec = self._sec["D"]
+        if sec.get("caveat") is not None:
+            sec["caveat"].setText("⚠ " + ((scan or {}).get("caveat")
+                                  or "Geometric compatibility only — a starting point, not a recommendation."))
+            sec["caveat"].setVisible(bool(pairs))
+        self._fill_table("D", cd, pairs, lambda p: [
+            f"{p['resnum_a']}–{p['resnum_b']}", f"{p.get('score', 0):.2f}",
+            f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
+            ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}")])
+
+    def populate_constraint(self, cd, info: dict) -> None:
+        """Mode C is ADDITIVE — the constrained fold still lands as a model + provenance badge
+        elsewhere; this only RECORDS the readout (declared bonds + the landed model)."""
+        sec = self._sec["C"]
+        bonds = info.get("disulfide_bonds") or []
+        bstr = ", ".join(f"Cys{a}–Cys{b}" for a, b in bonds) or "—"
+        mid = info.get("model_id")
+        sec["cd"] = cd
+        sec["readout"].setText(
+            f"Declared bond(s) {bstr} — folded with the constraint (BIASES toward the bond; does "
+            f"NOT enforce geometry). Result: model #{mid}{(' (' + info['variant_id'] + ')') if info.get('variant_id') else ''}. "
+            f"Measure its geometry with “Measure pair geometry” to read the as-produced bond.")
+        sec["readout"].setVisible(True)
+        sec["placeholder"].setVisible(False)
+
+
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 
 class VariantWorkbenchPanel(QtWidgets.QWidget):
@@ -958,6 +1128,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status = QtWidgets.QLabel("No structure loaded.")
         self._status.setStyleSheet("color:#888;padding:2px 6px;")
         lay.addWidget(self._status)
+
+        # The PERSISTENT Disulfides results tab (whole-suite home) — a SEPARATE top-level widget the
+        # window adds as a sibling tab (`gui_app` reads `self.disulfides_tab`). It survives top-level
+        # tab-switches + panel rebuilds (the old modeless dialog vanished on focus loss; this does not).
+        self.disulfides_tab = DisulfidesResultsTab(
+            on_highlight=self._highlight_disulfide_pair,
+            on_declare=self._declare_disulfide_pair)
 
     def attach_session(self, session) -> None:
         """Re-point the panel at a different SessionState — used on session RESTORE, where the
@@ -3159,19 +3336,35 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         spec["_variant_id"] = vid
         return spec
 
+    def _scan_target_cd(self, spec: dict):
+        """The construct a disulfide result belongs to: the spec's `_align_ukey` cd, else the active."""
+        ukey = (spec or {}).get("_align_ukey")
+        return (self._design.chains.get(ukey) if (self._design and ukey) else None) \
+            or (self._cur_tab().design if self._cur_tab() else None)
+
     def apply_disulfide_discovery_result(self, spec: dict, result: dict) -> None:
-        """MODE A readout — the model's EMPIRICAL pairing prior, measured with N (never asserted)."""
+        """MODE A readout — the model's EMPIRICAL pairing prior, measured with N (never asserted).
+        Populates the persistent Disulfides tab's A section (the source of truth) + status."""
         for step in (result or {}).get("tool_step_results", []) or []:
             if step.get("tool") == "disulfide_discovery":
+                if step.get("success"):
+                    cd = self._scan_target_cd(spec)
+                    if cd is not None:
+                        self.disulfides_tab.populate_assess(cd, (step.get("data") or {}).get("pairs") or [])
                 self._status.setText(step.get("summary") if step.get("success")
                                      else f"Disulfide discovery failed: {step.get('error')}")
                 return
         self._status.setText("Disulfide discovery produced no result.")
 
     def apply_disulfide_geometry_result(self, spec: dict, result: dict) -> None:
-        """MODE B readout — measured geometry of THIS fold (factual, not a bond declaration)."""
+        """MODE B readout — measured geometry of THIS fold (factual, not a bond declaration).
+        Populates the persistent Disulfides tab's B section + status."""
         for step in (result or {}).get("tool_step_results", []) or []:
             if step.get("tool") == "disulfide_geometry":
+                if step.get("success"):
+                    cd = self._scan_target_cd(spec)
+                    if cd is not None:
+                        self.disulfides_tab.populate_geometry(cd, (step.get("data") or {}).get("pairs") or [])
                 self._status.setText(step.get("summary") if step.get("success")
                                      else f"Disulfide geometry failed: {step.get('error')}")
                 return
@@ -3187,9 +3380,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText(f"Engineering scan failed: {step.get('error') if step else 'no result'}")
             return
         data = step.get("data") or {}
-        ukey = (spec or {}).get("_align_ukey")
-        cd = (self._design.chains.get(ukey) if (self._design and ukey) else None) \
-            or (self._cur_tab().design if self._cur_tab() else None)
+        cd = self._scan_target_cd(spec)
         if cd is None:
             return
         cd.disulfide_scan = {"pairs": data.get("pairs") or [],
@@ -3197,12 +3388,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                              "caveat": data.get("caveat")}
         self._persist()
         if cd.disulfide_scan["pairs"]:
-            self._select_result_mode(_RESULT_DISULFIDE_MODE)   # AUTO-SURFACE the heatmap
+            self._select_result_mode(_RESULT_DISULFIDE_MODE)   # AUTO-SURFACE the heatmap (the index)
             tab = self._cur_tab()
             if tab is not None:
                 self._apply_color_to(tab)
                 self._push_3d_color(tab)
-            self._show_disulfide_scan_dialog(cd)               # the ranked list = the source of truth
+        self.disulfides_tab.populate_scan(cd, cd.disulfide_scan)  # the PERSISTENT ranked list = truth
         self._status.setText(step.get("summary") or "Engineering scan complete.")
 
     @staticmethod
@@ -3226,86 +3417,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"distance {a}@CB {b}@CB",                         # the Cβ–Cβ measured span
         ]
 
-    def _show_disulfide_scan_dialog(self, cd) -> None:
-        """The ranked engineering-site list = the SOURCE OF TRUTH (the heatmap is just a navigational
-        index). A MODELESS table of candidate pairs (pair / score / Cα–Cα / Cβ–Cβ / orientation),
-        sorted best-first; clicking a row HIGHLIGHTS both members (Cβ spheres) in 3D + shows the
-        pair's measured geometry; 'Declare bond and fold' feeds the chosen pair into the Mode-C
-        introduce→constrain loop. The load-bearing geometric-only CAVEAT rides at the top."""
-        pairs = (cd.disulfide_scan or {}).get("pairs") or []
-        if not pairs:
-            return
-        prior = getattr(self, "_ss_scan_dialog", None)
-        if prior is not None:
-            prior.close()
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Engineerable disulfide sites (backbone scan)")
-        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        cav = QtWidgets.QLabel("⚠ " + ((cd.disulfide_scan or {}).get("caveat")
-                               or "Geometric compatibility only — a starting point, not a recommendation."))
-        cav.setWordWrap(True); cav.setStyleSheet("color: #b36b00;")
-        lay.addWidget(cav)
-        lay.addWidget(QtWidgets.QLabel("Ranked candidate sites (click a row to highlight both "
-                                       "residues in 3D; this list — not the heatmap — is the data):"))
-        cols = ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"]
-        tbl = QtWidgets.QTableWidget(len(pairs), len(cols))
-        tbl.setHorizontalHeaderLabels(cols)
-        tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        for i, p in enumerate(pairs):
-            ornt = p.get("orientation")
-            vals = [f"{p['resnum_a']}–{p['resnum_b']}", f"{p.get('score', 0):.2f}",
-                    f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
-                    ("—" if ornt is None else f"{ornt:.0f}")]
-            for j, v in enumerate(vals):
-                it = QtWidgets.QTableWidgetItem(v)
-                if j == 0:
-                    it.setData(QtCore.Qt.UserRole, i)          # row → pair index
-                tbl.setItem(i, j, it)
-        tbl.resizeColumnsToContents()
-        lay.addWidget(tbl)
-        geom = QtWidgets.QLabel("Select a candidate to see its measured geometry.")
-        geom.setWordWrap(True); geom.setStyleSheet("color: #444;")
-        lay.addWidget(geom)
+    def _highlight_disulfide_pair(self, cd, pair: dict) -> None:
+        """Highlight a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes
+        through the EXISTING `_run_commands_bg` selection seam, reusing `_disulfide_scan_highlight_
+        commands` (no new scattered highlighting path; this tab is the convergence surface)."""
+        self._run_commands_bg(self._disulfide_scan_highlight_commands(cd, pair))
 
-        def _row_pair(row: int) -> Optional[dict]:
-            return pairs[row] if 0 <= row < len(pairs) else None
-
-        def _on_row(row: int, _col: int = 0) -> None:
-            p = _row_pair(row)
-            if p is None:
-                return
-            self._run_commands_bg(self._disulfide_scan_highlight_commands(cd, p))
-            ornt = p.get("orientation")
-            geom.setText(
-                f"Cys{p['resnum_a']}–Cys{p['resnum_b']} — score {p.get('score', 0):.2f} "
-                f"(MEASURED, this fold): Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
-                f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}. "
-                f"Geometric compatibility only — installing it needs introducing the Cys pair + "
-                f"re-folding (Declare below).")
-        tbl.cellClicked.connect(_on_row)
-
-        bb = QtWidgets.QDialogButtonBox()
-        declare = bb.addButton("Declare bond and fold", QtWidgets.QDialogButtonBox.AcceptRole)
-        bb.addButton("Close", QtWidgets.QDialogButtonBox.RejectRole)
-
-        def _declare() -> None:
-            row = tbl.currentRow()
-            p = _row_pair(row)
-            if p is None:
-                self._status.setText("Select a candidate site first.")
-                return
-            dlg.close()
-            self._declare_disulfide_from_scan((p["resnum_a"], p["resnum_b"]))
-        declare.clicked.connect(_declare)
-        bb.rejected.connect(dlg.close)
-        lay.addWidget(bb)
-        if pairs:
-            tbl.selectRow(0); _on_row(0)                       # preselect + highlight the best site
-        self._ss_scan_dialog = dlg
-        dlg.show()
+    def _declare_disulfide_pair(self, cd, pair) -> None:
+        """Declare a bond from a Disulfides-tab table → Mode C. FOCUS the pair's construct tab first
+        so the introduce path targets the RIGHT cd (not whatever chain tab is active), then run the
+        SAME `_declare_disulfide_from_scan` loop the menu uses."""
+        self._focus_tab_for_design(cd)
+        self._declare_disulfide_from_scan(tuple(pair))
 
     def _declare_disulfide_from_scan(self, pair) -> None:
         """Feed a scanned pair into the Mode-C introduce→constrain loop (the engineering loop's
@@ -3433,6 +3556,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 f"#{f.get('reference_model_id')}, pLDDT-coloured (auto).")
         else:
             self._status.setText(f"{v.id} folded — model #{f.get('model_id')} (pLDDT-coloured, auto).")
+        # MODE C (additive): if this fold was BIASED by a declared disulfide bond, ALSO record the
+        # readout in the persistent Disulfides tab's C section. The model + provenance badge + the
+        # `constrained`/`disulfide_bonds` tags already landed above (unchanged) — this only adds the
+        # tab readout, it does NOT replace the existing surfacing.
+        if f.get("constrained"):
+            self.disulfides_tab.populate_constraint(cd, {
+                "disulfide_bonds": f.get("disulfide_bonds") or [],
+                "model_id": f.get("model_id"), "variant_id": v.id})
 
     # ── Stage 4c: per-residue variant-vs-WT deviation + noise floor ──────────────────
     def deviation_launch_spec(self) -> Optional[dict]:

@@ -156,6 +156,9 @@ class ToolRouter:
         "bio_assembly":             "🏗️",
         "interface_stabilization": "🔗🛡️",
         "disulfide":               "🔗⚗️",
+        "disulfide_discovery":     "🔗📊",
+        "disulfide_geometry":      "🔗📐",
+        "disulfide_scan":          "🔗🔍",
         "proline":           "🧪",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
@@ -1829,6 +1832,15 @@ class ToolRouter:
                 f"Disulfide candidate prediction — #{mid} chains {ca}/{cb} "
                 "(geometry + ESM + DynaMut2)"
             )
+        if tool == "disulfide_discovery":
+            n = (tool_inputs.get("disulfide_discovery", {}) or {}).get("n_seeds")
+            return ("Disulfide discovery — assess existing Cys pairs by multi-fold bonding "
+                    "frequency" + (f" ({n} seeds)" if n else "") + " (unconstrained)")
+        if tool == "disulfide_geometry":
+            return "Disulfide geometry — measure existing Cys-pair geometry (this fold)"
+        if tool == "disulfide_scan":
+            return ("Disulfide engineering scan — find NOVEL installable sites (backbone, "
+                    "geometric compatibility only)")
         if tool == "proline":
             inp   = tool_inputs.get("proline", {})
             mid   = inp.get("model_id") or self._first_model_id()

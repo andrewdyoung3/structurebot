@@ -169,3 +169,20 @@ def test_engineering_scan_empty_when_no_viable_sites():
            "ATOM CA ALA A 1 0.0 0.0 0.0\nATOM CA ALA A 9 50.0 0.0 0.0\n#\n")
     out = _router()._run_disulfide_scan({"cif_path": _write(cif)})
     assert out.success and out.data["pairs"] == [] and "starting point" in out.summary.lower()
+
+
+# ── cosmetic: the pipeline strip shows real tool names (no "Unknown tool") ────────────
+def test_step_description_real_names_for_disulfide_tools():
+    r = _router()
+    for tool, key in [("disulfide_discovery", "discovery"),
+                      ("disulfide_geometry", "geometry"),
+                      ("disulfide_scan", "engineering scan")]:
+        desc = r._step_description(tool, {tool: {}}, "")
+        assert "Unknown tool" not in desc
+        assert "Disulfide" in desc and key.split()[0].lower() in desc.lower()
+
+
+def test_disulfide_tools_have_pipeline_icons():
+    from tool_router import ToolRouter
+    for tool in ("disulfide_discovery", "disulfide_geometry", "disulfide_scan"):
+        assert ToolRouter._TOOL_ICONS.get(tool) and ToolRouter._TOOL_ICONS[tool] != "⚙️"
