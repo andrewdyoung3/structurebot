@@ -48,6 +48,12 @@ def _model_ids():
 
 
 def main():
+    # FAIL-FAST preflight — never lean on auto-start (a verify script hammering auto-start is what
+    # piled up windows + crashed REST). ChimeraX must already be up on :60001; do NOT launch it here.
+    if not bridge.is_running():
+        print("ChimeraX REST not reachable on :60001 — open ChimeraX (or the app) first. "
+              "This script will NOT auto-launch (avoids the process pile-up).")
+        return 1
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = VariantWorkbenchPanel(MagicMock(), session=SessionState(), pool=MagicMock())
     panel._run_commands_bg = lambda cmds: [run(c) for c in cmds]   # synchronous → reaches ChimeraX

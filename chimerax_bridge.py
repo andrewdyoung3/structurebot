@@ -135,7 +135,18 @@ class ChimeraXBridge:
             )
 
         if self.is_running():
-            return True  # already up — just reuse
+            return True  # REST reachable → reuse
+
+        # REST is NOT reachable, but if a ChimeraX PROCESS nonetheless exists it is a zombie /
+        # colliding instance squatting the port — a fresh `remotecontrol rest start port {port}`
+        # would fail to bind and the half-started window would pile up (the process-leak root).
+        # REPLACE it: dedup by PROCESS existence (not only port reachability) — kill all ChimeraX,
+        # wait for the port to free, then spawn ONE clean instance.
+        if self._chimerax_process_exists():
+            self._kill_all_chimerax()
+            kill_deadline = time.time() + 8
+            while time.time() < kill_deadline and self._chimerax_process_exists():
+                time.sleep(0.3)
 
         cmd = [
             self.chimerax_path,
@@ -159,12 +170,18 @@ class ChimeraXBridge:
             # Check if ChimeraX crashed before the server came up
             if self._process.poll() is not None:
                 stderr_out = self._process.stderr.read().decode(errors="replace")
+                code = self._process.returncode
+                self._terminate_spawned()        # already exited; just forget the handle
                 raise RuntimeError(
-                    f"ChimeraX exited prematurely (code {self._process.returncode}).\n"
+                    f"ChimeraX exited prematurely (code {code}).\n"
                     f"stderr: {stderr_out[:500]}"
                 )
             time.sleep(0.75)
 
+        # TIMEOUT — the process we spawned never bound REST. KILL IT before raising: a leaked,
+        # half-started ChimeraX is exactly the window that accumulated (the teardown backstop —
+        # even a triggered spawn must not leak).
+        self._terminate_spawned()
         raise TimeoutError(
             f"ChimeraX REST server did not become reachable within {timeout}s.\n"
             "Try increasing the timeout or check that ChimeraX starts cleanly."
@@ -246,6 +263,46 @@ class ChimeraXBridge:
         except Exception:
             return True
 
+    def _terminate_spawned(self) -> None:
+        """Kill the process THIS bridge spawned via Popen (if still alive) and forget the handle.
+        The teardown BACKSTOP: a `start()` that times out or fails must not leave its half-started
+        ChimeraX running — that per-failure leak is what piled up 20+ windows. Best-effort; never
+        raises. Only touches our own `self._process`, never other ChimeraX instances."""
+        p = self._process
+        self._process = None
+        if p is None:
+            return
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _chimerax_process_exists() -> bool:
+        """True if ANY ChimeraX process is running — visible OR windowless. Used to detect a zombie
+        that holds the REST port but no longer responds, so `start()` REPLACES it rather than spawning
+        a colliding instance that can't bind (dedup by PROCESS, not just port reachability). Distinct
+        from `_visible_chimerax_window_exists` (which only sees instances with a visible window — a
+        windowless REST zombie has none). Best-effort; False on any probe failure → spawn normally."""
+        try:
+            if sys.platform == "win32":
+                out = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq ChimeraX.exe", "/NH"],
+                    capture_output=True, text=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                ).stdout
+                return "chimerax.exe" in (out or "").lower()
+            out = subprocess.run(["pgrep", "-f", "ChimeraX"],
+                                 capture_output=True, text=True).stdout
+            return bool((out or "").strip())
+        except Exception:
+            return False
+
     def _kill_all_chimerax(self) -> None:
         """
         Force-kill every ChimeraX process (Windows). Only called once we have
@@ -311,11 +368,13 @@ class ChimeraXBridge:
         """
         Execute a single ChimeraX command via the REST API.
 
-        Resilient to a dropped REST connection (e.g. after a long-running
-        operation): if the server is unreachable, attempt a single reconnect
-        via ensure_connected() and retry the command once.  If reconnection
-        succeeds the retry proceeds silently; if it fails, a ConnectionError is
-        raised telling the user to check that ChimeraX is still open.
+        Tolerant of a TRANSIENT REST blip (e.g. a momentary stall after a long
+        operation): if the server is unreachable, re-check the connection once
+        (`_try_reconnect`, which does NOT relaunch ChimeraX) and retry the command
+        once. A momentary flicker recovers silently; a genuine drop (ChimeraX closed
+        / REST crashed) raises a ConnectionError pointing the user at the explicit
+        "Reconnect ChimeraX" action. It deliberately does NOT auto-relaunch — that
+        cascade spawned a new colliding instance per failed command (the window pile).
 
         Returns a dict with at least one of:
             {"value": "...", "error": None}   — success
@@ -328,21 +387,26 @@ class ChimeraXBridge:
             if self._try_reconnect():
                 return self._run_command_once(command, timeout)
             raise ConnectionError(
-                f"ChimeraX REST server is not reachable and automatic "
-                f"reconnection failed while running {command!r}.\n"
-                "Check that ChimeraX is still open — the REST server stops when "
-                "ChimeraX is closed.\n"
+                f"ChimeraX connection lost while running {command!r} — and it did not "
+                f"recover on its own.\n"
+                "Check that ChimeraX is still open (the REST server stops when ChimeraX is "
+                "closed), then use “Reconnect ChimeraX” to relaunch and re-link the view. "
+                "StructureBot will NOT auto-relaunch (that used to pile up windows).\n"
                 f"(original error: {exc})"
             ) from exc
 
     def _try_reconnect(self) -> bool:
         """
-        Attempt a single reconnect to the ChimeraX REST server after a dropped
-        connection.  Returns True if the server is reachable afterward.  Never
-        raises (failures are reported via the return value).
+        Re-check the REST connection after a dropped command — WITHOUT spawning a new
+        ChimeraX (``auto_start=False``). A genuine mid-session REST drop must surface as an
+        honest error and route recovery through the explicit "Reconnect ChimeraX" action
+        (a clean kill-all + relaunch via ``ensure_visible_gui``), NOT a silent auto-relaunch
+        on every command — that cascade spawned a NEW colliding ChimeraX per failed command
+        and piled up 20+ windows. Returns True only if REST recovered on its own (a transient
+        blip), so the single command retry still rescues a momentary flicker. Never raises.
         """
         try:
-            return self.ensure_connected(auto_start=True)
+            return self.ensure_connected(auto_start=False)
         except Exception:
             return False
 

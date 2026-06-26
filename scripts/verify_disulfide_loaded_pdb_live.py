@@ -171,6 +171,13 @@ def verify_multimer(r):
 
 
 def main():
+    # FAIL-FAST preflight — never lean on auto-start. ChimeraX must already be up on :60001;
+    # this script will NOT launch it (a verify script repeatedly hitting auto-start is exactly
+    # what piled up 20+ windows and crashed REST). Open the app / ChimeraX first.
+    if not bridge.is_running():
+        print("ChimeraX REST not reachable on :60001 — open ChimeraX (or the app) first. "
+              "This script will NOT auto-launch (avoids the process pile-up).")
+        return 1
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     r = ToolRouter(bridge=MagicMock(), session=SessionState())
     verify_monomer(r)
