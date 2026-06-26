@@ -78,6 +78,82 @@ def test_discovery_fails_loud_when_no_folds():
     assert out.success is False and "no unconstrained folds" in out.error.lower()
 
 
+# ── done-vs-stuck legibility (Mode-A completion-signal fix, observability half) ────────
+def test_fold_n_seeds_emits_per_seed_progress():
+    """A long N-seed fold must ADVANCE visibly: _fold_n_seeds emits a per-seed heartbeat via
+    the status_callback (start + completion per seed) so a healthy long run is never silent —
+    the done-vs-stuck legibility the §9 bug demanded. REAL _fold_n_seeds, fake boltz bridge."""
+    r = _router()
+    fake_boltz = MagicMock()
+    fake_boltz.predict.return_value = {"success": True, "cif_path": _write(_cif(2.0))}
+    r._boltz_bridge = fake_boltz                     # bypass the lazy real-bridge import
+
+    msgs = []
+    r._status_callback = msgs.append               # the seam execute() sets per-run
+
+    paths = r._fold_n_seeds([{"id": "A", "sequence": "MKVCAAACAA"}], 3)
+    assert len(paths) == 3
+    assert fake_boltz.predict.call_count == 3
+    # one "Folding seed k/3" + one "Seed k/3 folded" per seed → 2×N advancing messages
+    assert len(msgs) == 2 * 3, msgs
+    assert any("seed 1/3" in m.lower() for m in msgs)
+    assert any("seed 3/3" in m.lower() for m in msgs)
+    assert any("folded" in m.lower() for m in msgs)   # a completion signal, not just a start
+
+
+def test_fold_n_seeds_no_callback_is_safe():
+    """No status_callback set (e.g. a non-GUI caller) → _fold_n_seeds still folds, no crash."""
+    r = _router()
+    fake_boltz = MagicMock()
+    fake_boltz.predict.return_value = {"success": True, "cif_path": _write(_cif(2.0))}
+    r._boltz_bridge = fake_boltz
+    # _status_callback never assigned → getattr(...None) path
+    paths = r._fold_n_seeds([{"id": "A", "sequence": "MKVCAAACAA"}], 2)
+    assert len(paths) == 2
+
+
+def test_discovery_busy_label_is_named_not_bare():
+    """_long_tools must include disulfide_discovery so the busy label is the NAMED tool, not
+    a bare 'Running ' — the GUI shows this label immediately, so a bare one is the user's
+    'I can't tell what's happening' complaint. Drives the real engine completion path."""
+    from request_engine import RequestEngine
+
+    r = _router()
+    r._fold_n_seeds = MagicMock(return_value=[_write(_cif(2.0))] * 2)
+
+    class _Host:
+        bridge = None                              # → verb-probe skipped (no ChimeraX)
+        def __init__(self, router):
+            self.router = router
+            self.translator = MagicMock()
+            self.session = router.session
+        def _maybe_update_structure_state(self, cmds): pass
+        def _log_exchange(self, *a, **k): pass
+
+    labels = []
+
+    class _Presenter:
+        cancelled = False
+        def running_tools(self, label, eta_s=0.0, needs_timer=False):
+            labels.append(label)
+            class _CM:
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+            return _CM()
+        def confirm(self, c): return "proceed"
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    engine = RequestEngine(_Host(r))
+    engine.handle_tool_request(
+        "disulfide_discovery", {"sequence": "MKVCAAACAA", "n_seeds": 2},
+        "[Workbench] disulfide discovery", _Presenter(), confidence="low",
+    )
+    assert labels, "running_tools was never entered"
+    assert "disulfide_discovery" in labels[0], labels
+    assert labels[0].strip() != "Running", "busy label is the bare 'Running ' (the bug)"
+
+
 # ── Mode B — geometry readout is CHEAP and never triggers Mode A ──────────────────────
 def test_geometry_readout_reads_one_fold_without_folding():
     r = _router()

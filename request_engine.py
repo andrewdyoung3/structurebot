@@ -316,9 +316,20 @@ class RequestEngine:
 
             # 9. Execute extra tools (CamSol, ESM, etc.) if initial phase succeeded
             if success and has_extra:
-                # For long-running pipelines, show elapsed time every 30s
+                # For long-running pipelines, show elapsed time every 30s. The set is also
+                # what builds the busy LABEL (below) — a tool absent from it renders a bare
+                # "Running " with no name. The disulfide SUITE uses real tool names
+                # (disulfide_discovery / _ddg_estimate / _scan / _geometry / _interface_scan),
+                # NOT the legacy "disulfide" — so before this fix the longest tool in the app
+                # (Mode-A discovery, an N-seed fold) got neither the ticker nor a named label.
+                # discovery + ddg_estimate are the genuinely-long ones; the cheap CIF-read
+                # scans are listed only so their label is correct if they ever surface (they
+                # finish well before the 30s ticker, so the timer cost is nil).
                 _long_tools = {"mutation_scan", "disulfide", "rosetta", "colabfold",
-                               "validate_design"}
+                               "validate_design",
+                               "disulfide_discovery", "disulfide_ddg_estimate",
+                               "disulfide_scan", "disulfide_geometry",
+                               "disulfide_interface_scan"}
                 _needs_timer = bool(set(tools_needed) & _long_tools)
                 _ticker_label = (
                     "Running " + "/".join(

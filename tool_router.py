@@ -1941,6 +1941,10 @@ class ToolRouter:
           "pipeline_error"       — first error message, or None
         """
         tools_needed = routed_result.get("tools_needed") or ["chimerax"]
+        # Expose the progress callback to long multi-step tools (e.g. Mode-A discovery's
+        # N-seed fold loop) so a long-but-healthy run advances VISIBLY (seed k/N), instead
+        # of one "Running…" line then hours of silence — the done-vs-stuck legibility half.
+        self._status_callback = status_callback
         # Case-insensitive tool_inputs lookup (mirrors the case-insensitive
         # dispatch) so "CamSol"-keyed inputs still reach the camsol bridge.
         tool_inputs  = {str(k).strip().lower(): v
@@ -3136,15 +3140,23 @@ class ToolRouter:
         scheme, not a forked second path. Returns the cif paths of the folds that SUCCEEDED.
         Mode A calls this UNCONSTRAINED (`constraints=None` — the discovery question is what the
         model thinks UNPROMPTED). Cheap callers (Mode B) must NEVER reach here."""
-        import config as _cfg
+        import config as _cfg, time as _time
         base = int(getattr(_cfg, "BOLTZ_SEED", 0))
         bridge = self._get_boltz_bridge()
+        cb = getattr(self, "_status_callback", None)
+        total = max(1, int(n))
         paths: List[str] = []
-        for s in range(base, base + max(1, int(n))):
+        t0 = _time.perf_counter()
+        for i, s in enumerate(range(base, base + total), start=1):
+            if cb:                                 # per-seed heartbeat: a long run advances VISIBLY
+                cb(f"🔗📊 Folding seed {i}/{total} (unconstrained)…")
             r = bridge.predict(chains, seed=s, allow_remote=False,
                                templates=templates, constraints=constraints)
             if r.get("success") and r.get("cif_path"):
                 paths.append(r["cif_path"])
+            if cb:                                 # …and reports each completion (done-vs-stuck)
+                cb(f"🔗📊 Seed {i}/{total} folded — {len(paths)} ok so far "
+                   f"({_time.perf_counter() - t0:.0f}s elapsed).")
         return paths
 
     def _resolve_disulfide_chains(self, inputs: Dict[str, Any]):

@@ -32,9 +32,20 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional
+
+# Bounded-wait knobs (the Mode-A "running forever" fix). A long fold's WSL subprocess can
+# finish its compute (GPU idle, no Boltz process) yet leave the WINDOWS-side wait blocked:
+# subprocess.run's post-timeout drain waits on stdout EOF that the LINUX-side process tree
+# (unreapable from Windows — those processes live in the WSL VM under init) never delivers.
+# We bound BOTH the tree-kill and the final drain so a timed-out OR hung fold becomes an
+# honest terminal error that RETURNS, never an infinite spinner. See §9 Mode-A completion.
+_WSL_DRAIN_TIMEOUT = 30    # seconds: final stdout drain AFTER the WSL tree is killed
+_WSL_KILL_TIMEOUT  = 30    # seconds: the WSL-side tree-kill helper's own wall
 
 PYROSETTA_PYTHON = "/home/andre/pyrosetta_env/bin/python"
 # ColabFold env (WSL2, Python 3.12, hermetic JAX cuda12). Isolated from
@@ -130,6 +141,9 @@ class WSLBridge:
         self._distribution = distribution or os.environ.get(
             "WSL_DISTRIBUTION", "Ubuntu-24.04"
         )
+        # Instance-overridable so tests can shrink the final-drain wall (the bounded-wait
+        # proof runs in ~1s, not 30s); production uses the module default.
+        self._drain_timeout = _WSL_DRAIN_TIMEOUT
 
     # ── Availability ──────────────────────────────────────────────────────────
 
@@ -179,38 +193,18 @@ class WSLBridge:
                 ),
             }
 
+        # TAG the WSL-side tree so a timeout can reap the LINUX processes by marker. The
+        # export rides in the bash -c string and is inherited by every child (boltz + its
+        # workers), so _kill_wsl_tree can find the WHOLE tree, not just the bash parent.
+        marker = uuid.uuid4().hex
+        tagged = f"export SBWSL_TAG={marker}; {cmd}"
         wsl_args = ["wsl.exe", "--distribution", self._distribution]
         if cwd:
             wsl_args += ["--cd", cwd]
-        wsl_args += ["--exec", "bash", "-c", cmd]
+        wsl_args += ["--exec", "bash", "-c", tagged]
 
         try:
-            proc = subprocess.run(
-                wsl_args,
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-            )
-            return {
-                "ok":         proc.returncode == 0,
-                "returncode": proc.returncode,
-                "stdout":     proc.stdout or "",
-                "stderr":     proc.stderr or "",
-                "error":      None if proc.returncode == 0
-                              else f"Command exited {proc.returncode}: {proc.stderr[:200]}",
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "ok":         False,
-                "returncode": -1,
-                "stdout":     "",
-                "stderr":     "",
-                "error":      f"WSL2 command timed out after {timeout}s: {cmd[:80]}",
-            }
+            proc = self._popen_wsl(wsl_args)
         except Exception as exc:
             return {
                 "ok":         False,
@@ -219,6 +213,110 @@ class WSLBridge:
                 "stderr":     "",
                 "error":      f"WSL2 run_command error: {exc}",
             }
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return {
+                "ok":         proc.returncode == 0,
+                "returncode": proc.returncode,
+                "stdout":     stdout or "",
+                "stderr":     stderr or "",
+                "error":      None if proc.returncode == 0
+                              else f"Command exited {proc.returncode}: {(stderr or '')[:200]}",
+            }
+        except subprocess.TimeoutExpired:
+            # THE Mode-A hang fix: reap the WSL-SIDE tree first (proc.kill() alone leaves the
+            # Linux processes alive, holding stdout open → the post-timeout drain blocks
+            # forever), THEN bound the final drain so run_command can NEVER hang. A finished-
+            # but-not-draining OR genuinely-stuck fold returns an honest timeout error here,
+            # which fires the worker's failed/done signal → the spinner becomes a real verdict.
+            self._kill_wsl_tree(marker)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            stdout, stderr, drained = self._bounded_drain(proc, self._drain_timeout)
+            tail = "drain completed" if drained else "drain abandoned"
+            return {
+                "ok":         False,
+                "returncode": -1,
+                "stdout":     stdout or "",
+                "stderr":     stderr or "",
+                "error":      f"WSL2 command timed out after {timeout}s "
+                              f"(WSL tree killed; {tail}): {cmd[:80]}",
+            }
+        except Exception as exc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return {
+                "ok":         False,
+                "returncode": -1,
+                "stdout":     "",
+                "stderr":     "",
+                "error":      f"WSL2 run_command error: {exc}",
+            }
+
+    # ── bounded-wait helpers (the Mode-A completion-signal fix) ──────────────────
+    def _popen_wsl(self, wsl_args: list) -> "subprocess.Popen":
+        """Spawn the wsl.exe subprocess. A seam so the bounded-wait path is unit-testable
+        (a test injects a fake Popen whose drain never closes)."""
+        return subprocess.Popen(
+            wsl_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def _kill_wsl_tree(self, marker: str) -> None:
+        """Kill the WSL-SIDE process tree of a timed-out command. Killing only the Windows
+        wsl.exe handle does NOT reap the Linux processes (they live in the WSL VM under
+        init), and they hold the stdout pipe open → the post-timeout drain hangs forever.
+        Every process in the tree inherits ``SBWSL_TAG=<marker>`` in its environment, so we
+        walk /proc and SIGKILL every process carrying the marker — the WHOLE tree, not just
+        the bash parent (``pkill -f`` would match only the marker-bearing command line and
+        MISS the children). Best-effort + its own wall: a failed reap must never itself hang."""
+        walk = (
+            "for e in /proc/[0-9]*/environ; do "
+            f"tr '\\0' '\\n' < \"$e\" 2>/dev/null | grep -qx 'SBWSL_TAG={marker}' "
+            "&& kill -9 \"$(basename \"$(dirname \"$e\")\")\" 2>/dev/null; "
+            "done"
+        )
+        try:
+            subprocess.run(
+                ["wsl.exe", "--distribution", self._distribution, "--exec", "bash", "-c", walk],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                text=True,
+                timeout=_WSL_KILL_TIMEOUT,
+            )
+        except Exception:
+            pass
+
+    def _bounded_drain(self, proc, drain_timeout: float):
+        """Collect any remaining output AFTER the tree is killed, but NEVER block forever:
+        run communicate() in a daemon thread and ABANDON it if the pipe still won't close
+        (a leaked daemon is bounded and harmless; an infinite wait is the bug). Returns
+        ``(stdout, stderr, drained)`` — ``drained`` False means the pipe was abandoned."""
+        box = {"out": "", "err": "", "done": False}
+
+        def _drain():
+            try:
+                o, e = proc.communicate()
+                box["out"], box["err"], box["done"] = o or "", e or "", True
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        t.join(drain_timeout)
+        return box["out"], box["err"], box["done"]
 
     # ── Path translation ──────────────────────────────────────────────────────
 

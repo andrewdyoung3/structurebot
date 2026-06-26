@@ -246,6 +246,142 @@ def test_copy_roundtrip_wsl() -> None:
             pass
 
 
+# ── Bounded-wait (Mode-A completion-signal fix) — REAL asserts, WSL not required ──
+#
+# These exercise the bounded-wait path in run_command directly via the _popen_wsl seam,
+# so they prove the fix with NO WSL/GPU. They use plain `assert` (pytest-enforced), unlike
+# the soft _assert helper above, because the bounded-wait guarantee is load-bearing.
+
+import subprocess as _sp
+import threading as _th
+import time as _tm
+
+
+class _FakePopen:
+    """Stand-in for the wsl.exe Popen. *behavior* is called by communicate(); set
+    returncode/raise/block from there to model normal / timeout / never-draining runs."""
+
+    def __init__(self, behavior):
+        self.returncode = None
+        self.killed = False
+        self._behavior = behavior
+        self.calls = 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        return self._behavior(self, timeout)
+
+    def kill(self):
+        self.killed = True
+
+
+def _bridge_with_fake(behavior, *, drain_timeout=0.3):
+    """A WSLBridge whose wsl.exe spawn is a _FakePopen and whose WSL-tree kill is recorded
+    (never spawns real wsl.exe). Returns (bridge, captured)."""
+    bridge = WSLBridge()
+    bridge.is_available = lambda: True                  # bypass the not-installed gate
+    bridge._drain_timeout = drain_timeout
+    captured = {"spawned_args": None, "killed_markers": [], "popen": None}
+
+    def _fake_popen(wsl_args):
+        captured["spawned_args"] = wsl_args
+        p = _FakePopen(behavior)
+        captured["popen"] = p
+        return p
+
+    def _fake_kill(marker):
+        captured["killed_markers"].append(marker)
+
+    bridge._popen_wsl = _fake_popen
+    bridge._kill_wsl_tree = _fake_kill
+    return bridge, captured
+
+
+def test_run_command_normal_path_returns() -> None:
+    """The Popen refactor preserves the success path: communicate → ok/stdout/returncode."""
+    print("\n=== F. bounded-wait: normal path ===")
+
+    def _ok_behavior(p, timeout):
+        p.returncode = 0
+        return ("hello\n", "")
+
+    bridge, _ = _bridge_with_fake(_ok_behavior)
+    r = bridge.run_command("echo hello", timeout=5)
+    assert r["ok"] is True, r
+    assert r["returncode"] == 0
+    assert r["stdout"] == "hello\n"
+    assert r["error"] is None
+    _ok("bounded-wait normal path returns ok+stdout")
+
+
+def test_run_command_bounded_drain_never_hangs() -> None:
+    """THE load-bearing test: a never-draining subprocess (the real Mode-A hang) must NOT
+    hang run_command — it returns an honest 'timed out' terminal error within the wall."""
+    print("\n=== G. bounded-wait: never-draining subprocess ===")
+    _blocked = _th.Event()                              # never set → the drain blocks forever
+
+    def _hang_behavior(p, timeout):
+        if timeout is not None:                         # the main communicate(timeout=…)
+            raise _sp.TimeoutExpired(cmd="wsl", timeout=timeout)
+        _blocked.wait()                                 # the post-kill drain: blocks forever
+        return ("", "")
+
+    bridge, captured = _bridge_with_fake(_hang_behavior, drain_timeout=0.3)
+
+    box = {"r": None}
+
+    def _call():
+        box["r"] = bridge.run_command("boltz predict …", timeout=0.2)
+
+    t = _th.Thread(target=_call, daemon=True)
+    t0 = _tm.perf_counter()
+    t.start()
+    t.join(5.0)                                         # generous wall; the bound is ~0.5s
+    elapsed = _tm.perf_counter() - t0
+
+    assert not t.is_alive(), "run_command HUNG on a never-draining subprocess (the bug)"
+    assert box["r"] is not None
+    assert box["r"]["ok"] is False
+    assert "timed out" in box["r"]["error"].lower()     # _run_failure_message keys on this
+    assert "drain abandoned" in box["r"]["error"]       # the final drain was bounded, not awaited
+    assert captured["killed_markers"], "the WSL-side tree was not reaped (only proc.kill)"
+    assert captured["popen"].killed is True             # the Windows handle was killed too
+    # the spawned command carried the reap marker that _kill_wsl_tree was handed
+    tagged = captured["spawned_args"][-1]
+    assert f"SBWSL_TAG={captured['killed_markers'][0]}" in tagged
+    _ok(f"never-draining subprocess → terminal error in {elapsed:.2f}s (no hang)")
+
+
+def test_run_command_timeout_reaps_then_drains() -> None:
+    """On timeout the WSL-side tree is reaped BEFORE the drain (the ordering that makes the
+    drain actually close), and a drain that DOES complete is reported as 'drain completed'."""
+    print("\n=== H. bounded-wait: reap-then-drain ordering ===")
+    order = []
+
+    def _behavior(p, timeout):
+        if timeout is not None:
+            order.append("communicate_timeout")
+            raise _sp.TimeoutExpired(cmd="wsl", timeout=timeout)
+        order.append("drain")                           # completes promptly this time
+        return ("partial out", "partial err")
+
+    bridge, captured = _bridge_with_fake(_behavior, drain_timeout=2.0)
+
+    def _kill(marker):
+        order.append("kill_tree")
+        captured["killed_markers"].append(marker)
+
+    bridge._kill_wsl_tree = _kill
+    r = bridge.run_command("boltz predict …", timeout=0.2)
+
+    assert r["ok"] is False
+    assert "drain completed" in r["error"], r["error"]
+    assert r["stdout"] == "partial out"                 # a completed drain keeps the output
+    # ordering: timeout → reap the WSL tree → THEN drain (so the pipe can actually close)
+    assert order == ["communicate_timeout", "kill_tree", "drain"], order
+    _ok("timeout reaps WSL tree before the bounded drain; completed drain keeps output")
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -265,6 +401,9 @@ def main() -> int:
     test_status_string_not_installed()
     test_run_command_wsl()
     test_copy_roundtrip_wsl()
+    test_run_command_normal_path_returns()
+    test_run_command_bounded_drain_never_hangs()
+    test_run_command_timeout_reaps_then_drains()
 
     print()
     print("=" * 60)
