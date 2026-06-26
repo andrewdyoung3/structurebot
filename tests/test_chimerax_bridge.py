@@ -135,3 +135,80 @@ def test_run_commands_recovers_mid_list_via_reconnect():
     assert len(results) == 2
     assert all(r["result"].get("error") is None for r in results)
     assert once.call_count == 3                  # cmd1 + (cmd2 fail + cmd2 retry)
+
+
+# ── PROCESS-LEAK FIX (3 compounding flaws) ────────────────────────────────────────────────
+
+def test_start_kills_spawned_process_on_timeout_no_leak():
+    """FLAW 1 — the teardown backstop: a start() whose spawned ChimeraX never binds REST must
+    KILL that process before raising, not leave it running (the per-failure window that piled up)."""
+    bridge = _bridge()
+    proc = MagicMock(); proc.poll.return_value = None          # spawned, still alive
+    with patch.object(bridge, "is_running", MagicMock(return_value=False)), \
+         patch.object(bridge, "_chimerax_process_exists", MagicMock(return_value=False)), \
+         patch("chimerax_bridge.subprocess.Popen", MagicMock(return_value=proc)), \
+         patch("chimerax_bridge.Path") as _path, \
+         patch("chimerax_bridge.time.sleep", MagicMock()), \
+         patch("chimerax_bridge.time.time", MagicMock(side_effect=[0, 0, 100])):  # 0 then past the deadline
+        _path.return_value.is_file.return_value = True
+        with pytest.raises(TimeoutError):
+            bridge.start(timeout=1)
+    proc.terminate.assert_called_once()                        # the leaked process was killed…
+    assert bridge._process is None                             # …and the handle forgotten
+
+
+def test_run_command_drop_does_not_spawn_and_fails_loud():
+    """FLAW 2 — a genuine REST drop surfaces an honest error pointing at Reconnect, and NEVER
+    auto-spawns a ChimeraX (the cascade). _try_reconnect re-checks WITHOUT auto_start."""
+    bridge = _bridge()
+    once = MagicMock(side_effect=ConnectionError("server dropped"))
+    with patch.object(bridge, "_run_command_once", once), \
+         patch.object(bridge, "is_running", MagicMock(return_value=False)), \
+         patch.object(bridge, "start", MagicMock()) as start:
+        with pytest.raises(ConnectionError) as exc:
+            bridge.run_command("color #1 red")
+    start.assert_not_called()                                  # NO new ChimeraX spawned on a drop
+    msg = str(exc.value)
+    assert "ChimeraX is still open" in msg and "Reconnect" in msg   # honest + actionable recovery
+
+
+def test_try_reconnect_never_auto_starts():
+    """FLAW 2 (unit) — _try_reconnect must call ensure_connected with auto_start=False (re-check
+    only), so a dropped command can never relaunch ChimeraX from the command path."""
+    bridge = _bridge()
+    with patch.object(bridge, "ensure_connected", MagicMock(return_value=False)) as ec:
+        assert bridge._try_reconnect() is False
+    ec.assert_called_once_with(auto_start=False)
+
+
+def test_start_replaces_zombie_process_holding_port():
+    """FLAW 3 — REST down on :port BUT a ChimeraX process exists (a zombie squatting the port) →
+    start() REPLACES it (kill-all) before spawning, instead of spawning a 2nd that can't bind."""
+    bridge = _bridge()
+    proc = MagicMock(); proc.poll.return_value = None
+    # is_running: False (port dead) at entry; True after the fresh spawn binds.
+    running = MagicMock(side_effect=[False, True])
+    # process exists at entry (zombie), gone after kill.
+    exists = MagicMock(side_effect=[True, False])
+    with patch.object(bridge, "is_running", running), \
+         patch.object(bridge, "_chimerax_process_exists", exists), \
+         patch.object(bridge, "_kill_all_chimerax", MagicMock()) as kill, \
+         patch("chimerax_bridge.subprocess.Popen", MagicMock(return_value=proc)), \
+         patch("chimerax_bridge.Path") as _path, \
+         patch("chimerax_bridge.time.sleep", MagicMock()):
+        _path.return_value.is_file.return_value = True
+        assert bridge.start(timeout=5) is True
+    kill.assert_called_once()                                  # the zombie was replaced, not collided with
+
+
+def test_start_reuses_reachable_rest_no_spawn():
+    """A REST server already reachable on the port → reuse it, never spawn or kill."""
+    bridge = _bridge()
+    with patch.object(bridge, "is_running", MagicMock(return_value=True)), \
+         patch("chimerax_bridge.subprocess.Popen", MagicMock()) as popen, \
+         patch("chimerax_bridge.Path") as _path, \
+         patch.object(bridge, "_kill_all_chimerax", MagicMock()) as kill:
+        _path.return_value.is_file.return_value = True
+        assert bridge.start() is True
+    popen.assert_not_called()
+    kill.assert_not_called()
