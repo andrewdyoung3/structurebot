@@ -916,7 +916,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # The menu entries are QActions wired to the SAME handlers the old buttons used —
         # no parallel UI path. (State read elsewhere — _scan_set_lbl.text(), _fold_vis_btn/
         # _show_fold_cb/_show_ref_cb .isChecked()/.setChecked() — works identically on QAction.)
-        bar = QtWidgets.QHBoxLayout()
+        # A QToolBar (not a bare QHBoxLayout) so the pill row OVERFLOWS into a native ">>" chevron
+        # popup when the window is narrow, instead of forcing the whole window's minimum width to the
+        # sum of every pill (the resize floor the user hit). The toolbar's minimum width collapses to
+        # ~one button + the chevron (~190 px) while every action stays reachable via the popup.
+        bar = QtWidgets.QToolBar()
+        bar.setMovable(False)
+        bar.setFloatable(False)
         bar.setContentsMargins(6, 4, 6, 0)
         self._add_btn = QtWidgets.QPushButton("+ Add variant")
         self._add_btn.clicked.connect(self._add_variant)
@@ -928,7 +934,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "(no loaded structure). Fold it as a mono/di/tri/tetramer.")
         self._add_seq_btn.clicked.connect(self._on_add_sequence)
         bar.addWidget(self._add_seq_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
         bar.addWidget(QtWidgets.QLabel("Substitute →"))
         self._aa_combo = QtWidgets.QComboBox()
         self._aa_combo.addItems(list(_AA_ORDER))
@@ -936,7 +942,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._apply_btn = QtWidgets.QPushButton("Apply")
         self._apply_btn.clicked.connect(self._apply_substitution)
         bar.addWidget(self._apply_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
 
         # Tools ▾ — Stage-3b LAUNCH (Scan / Run ProteinMPNN, through the engine spine) +
         # Stage-3a cached-result IMPORT + the scan-set status/clear.
@@ -968,7 +974,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._clear_scan_btn.triggered.connect(self._clear_scan_set)
         self._tools_btn.setMenu(tools_menu)
         bar.addWidget(self._tools_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
 
         # Stage 4a: per-variant action buttons (act on the ACTIVE variant row).
         # Stability runs the 4-axis voter on the variant's EXACT mutations through the
@@ -983,7 +989,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "template (instant, local).")
         self._sol_btn.clicked.connect(self._on_test_solubility)
         bar.addWidget(self._sol_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
 
         # Fold ▾ — Stage-4b fold the ACTIVE variant (engine picker; ESMFold local) +
         # fold/reference visibility + the tile escape-hatch.
@@ -1135,7 +1141,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._show_align_ref_cb.toggled.connect(self._on_align_ref_overlay_toggle)
         self._fold_menu_btn.setMenu(fold_menu)
         bar.addWidget(self._fold_menu_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
 
         # Disulfides ▾ — TOP-LEVEL (sibling of Fold ▾, not buried) so the cysteine/disulfide suite
         # is discoverable. Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
@@ -1190,7 +1196,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
         self._ss_menu_btn.setMenu(ss_menu)
         bar.addWidget(self._ss_menu_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
         self._sync_disulfide_menu_enabled()           # initial precondition state (greyed until ready)
 
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
@@ -1203,7 +1209,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "an engine folds the WT reference + its noise floor (cached).")
         self._dev_btn.clicked.connect(self._on_deviation_clicked)
         bar.addWidget(self._dev_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
 
         # Stage 3: structurally align the DE-NOVO construct's fold onto a chosen PDB,
         # SEQUENCE-INDEPENDENTLY (US-align, LOCAL-ONLY) — the case ChimeraX matchmaker can't
@@ -1215,7 +1221,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                    "fold the construct first.")
         self._align_btn.clicked.connect(self._on_align_clicked)
         bar.addWidget(self._align_btn)
-        bar.addSpacing(12)
+        bar.addSeparator()
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
@@ -1226,13 +1232,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("Disulfide sites", _RESULT_DISULFIDE_MODE)  # Mode D engineerability
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
-        bar.addStretch(1)
-        lay.addLayout(bar)
+        # No trailing stretch: a QToolBar left-aligns its items and surfaces the overflow chevron on
+        # the right when they don't fit — a stretch would just push the chevron off-screen.
+        lay.addWidget(bar)
 
         self._tabs = QtWidgets.QTabWidget()
         self._tabs.currentChanged.connect(self._on_tab_changed)
         lay.addWidget(self._tabs)
+        # Word-wrap + a tiny minimum so a long status string WRAPS (and the label yields) instead of
+        # holding one line and forcing the panel/window minimum width (the other half of the floor).
         self._status = QtWidgets.QLabel("No structure loaded.")
+        self._status.setWordWrap(True)
+        self._status.setMinimumWidth(0)
         self._status.setStyleSheet("color:#888;padding:2px 6px;")
         lay.addWidget(self._status)
 
