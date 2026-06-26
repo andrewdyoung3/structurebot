@@ -572,7 +572,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if refresh in ("stability", "fold", "deviation", "construct_fold", "structural_align",
                        "construct_fold_guided", "template_assist", "align_folds",
                        "disulfide_discovery", "disulfide_geometry", "disulfide_scan",
-                       "disulfide_interface_scan"):
+                       "disulfide_interface_scan", "disulfide_ddg"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -675,6 +675,13 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_disulfide_interface_scan_result(spec, result)
                 else:
                     self.presenter.dim("Interface scan cancelled — no result to attach.")
+            elif refresh == "disulfide_ddg":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_disulfide_ddg_result(spec, result)
+                else:
+                    self.presenter.dim("ΔΔG estimate cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None

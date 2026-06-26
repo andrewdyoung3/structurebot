@@ -617,10 +617,11 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
     surface, built reusing the seam not shadowing it. The tables are the SOURCE OF TRUTH for which
     residue pairs with which; the 'Disulfide sites' colour mode is a complementary navigational index."""
 
-    def __init__(self, *, on_highlight, on_declare):
+    def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None):
         super().__init__()
         self._on_highlight = on_highlight        # (cd, pair_dict) -> highlight both members in 3D
         self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
+        self._on_estimate_ddg = on_estimate_ddg  # (cd, pair_dict) -> ΔΔG escalation (legacy bridge)
         outer = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
             "Disulfide suite results. These tables are the SOURCE OF TRUTH for which residue pairs "
@@ -644,8 +645,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                            declare=True, caveat=True)
         self._make_section("I", "Interface disulfide sites — inter-chain scan (find inter-subunit)",
                            "Run “Find interface disulfide sites” on a folded MULTIMER to populate.",
-                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"],
-                           declare=True, caveat=True)
+                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)", "ΔΔG (kcal/mol)"],
+                           declare=True, caveat=True, escalate=True)
         self._make_section("C", "Declared-bond fold (Mode C: intervene)",
                            "Use “Declare cysteine bonds and fold” (or Declare below) to record the "
                            "constrained fold here.", None)
@@ -653,7 +654,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
 
     # ── section scaffolding ────────────────────────────────────────────────────────
     def _make_section(self, key: str, title: str, placeholder: str,
-                      cols: Optional[List[str]], *, declare: bool = False, caveat: bool = False) -> None:
+                      cols: Optional[List[str]], *, declare: bool = False, caveat: bool = False,
+                      escalate: bool = False) -> None:
         box = QtWidgets.QGroupBox(title)
         gl = QtWidgets.QVBoxLayout(box)
         ph = QtWidgets.QLabel(placeholder); ph.setWordWrap(True); ph.setStyleSheet("color:#888;")
@@ -682,6 +684,15 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             btn.setEnabled(False)
             btn.clicked.connect(lambda _=False, k=key: self._declare(k))
             gl.addWidget(btn); sec["declare_btn"] = btn
+        if escalate:
+            # ΔΔG-escalation: an energetic read for the SELECTED geometric hit via the legacy bridge —
+            # explicit, per-row, long-running (PyRosetta minutes × 2 mutations); NEVER auto-run.
+            eb = QtWidgets.QPushButton("Estimate ΔΔG (legacy)")
+            eb.setEnabled(False)
+            eb.setToolTip("Energetic estimate (uncalibrated — ranking/sign only) for the selected pair. "
+                          "Runs the legacy ΔΔG bridge on the X→C mutations; minutes per pair.")
+            eb.clicked.connect(lambda _=False, k=key: self._estimate(k))
+            gl.addWidget(eb); sec["escalate_btn"] = eb
         self._sec[key] = sec
         self._vl.addWidget(box)
 
@@ -708,8 +719,18 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         # the cross-chain Mode-C declare; an intra Mode-D pair (chain_a == chain_b) takes the intra path.
         self._on_declare(cd, pairs[row])
 
-    @staticmethod
-    def _pair_detail(key: str, p: dict) -> str:
+    def _estimate(self, key: str) -> None:
+        """ΔΔG-escalate the SELECTED interface row → the panel's legacy-bridge route. Per-row, explicit."""
+        sec = self._sec.get(key) or {}
+        pairs, cd = sec.get("pairs") or [], sec.get("cd")
+        tbl = sec.get("table")
+        row = tbl.currentRow() if tbl is not None else -1
+        if not (0 <= row < len(pairs)) or cd is None or self._on_estimate_ddg is None:
+            return
+        self._on_estimate_ddg(cd, pairs[row])
+
+    @classmethod
+    def _pair_detail(cls, key: str, p: dict) -> str:
         lbl = pair_label(p, cys=True)
         if key == "D":
             ornt = p.get("orientation")
@@ -718,6 +739,20 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                     f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}. Geometric "
                     f"compatibility only — installing needs introducing the Cys pair + re-folding "
                     f"(Declare below).")
+        if key == "I":
+            ornt = p.get("orientation")
+            base = (f"{lbl} — score {p.get('score', 0):.2f} (geometric, this structure): "
+                    f"Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
+                    f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}.")
+            da, db = p.get("ddg_a"), p.get("ddg_b")
+            if da is None or db is None:
+                return base + " ΔΔG not yet estimated — “Estimate ΔΔG (legacy)” for an energetic read."
+            be = p.get("ddg_backend")
+            ddg = (f" ΔΔG (legacy{f', {be}' if be else ''}): {p.get('from_aa_a','')}{p.get('resnum_a')}C "
+                   f"{da:+.2f}, {p.get('from_aa_b','')}{p.get('resnum_b')}C {db:+.2f} kcal/mol. " + cls._DDG_CAVEAT)
+            if p.get("ddg_source") == "denovo":
+                ddg += " " + cls._DDG_DENOVO_LAYER
+            return base + ddg
         return f"{lbl} highlighted in 3D."
 
     # ── populate (each consumer calls its own) ──────────────────────────────────────
@@ -735,6 +770,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         tbl.setVisible(has)
         if sec.get("declare_btn") is not None:
             sec["declare_btn"].setEnabled(has)
+        if sec.get("escalate_btn") is not None:
+            sec["escalate_btn"].setEnabled(has)
         if has:
             tbl.selectRow(0); self._on_row(key, 0)         # preselect + highlight the best/first
 
@@ -776,7 +813,27 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         self._fill_table("I", cd, pairs, lambda p: [
             pair_label(p), f"{p.get('score', 0):.2f}",
             f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
-            ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}")])
+            ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}"),
+            self._ddg_cell(p)])
+
+    # ── ΔΔG-escalation display (the energetic read attached to a geometric interface hit) ─────
+    @staticmethod
+    def _ddg_cell(p: dict) -> str:
+        """The ΔΔG table cell for an interface row — '—' until escalated, else the two per-position
+        X→C values (the geometric score stays the PRIMARY column; ΔΔG is additional, never a verdict)."""
+        da, db = p.get("ddg_a"), p.get("ddg_b")
+        if da is None or db is None:
+            return "—"
+        return f"{da:+.1f} / {db:+.1f}"
+
+    # The base ΔΔG caveat (display) + the de-novo extra layer. Mirrors the router's text so the
+    # readout is honest whether the user reads the cell, the detail line, or the status.
+    _DDG_CAVEAT = ("ΔΔG estimate (legacy, uncalibrated — ranking/sign only, ~±2.7 kcal/mol). A second "
+                   "soft signal on the geometric suggestion — not confirmation the bond will form. "
+                   "Validate by declaring → re-folding → measuring.")
+    _DDG_DENOVO_LAYER = ("DE-NOVO fold: this ΔΔG sits on a PREDICTED structure (Boltz coordinate error) "
+                         "UNDER an already-uncalibrated ΔΔG — an estimate on an estimate. Treat as a "
+                         "weak directional hint only.")
 
     def populate_constraint(self, cd, info: dict) -> None:
         """Mode C is ADDITIVE — the constrained fold still lands as a model + provenance badge
@@ -811,6 +868,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                     w.setVisible(False)
             if sec.get("declare_btn") is not None:
                 sec["declare_btn"].setEnabled(False)
+            if sec.get("escalate_btn") is not None:
+                sec["escalate_btn"].setEnabled(False)
             sec["placeholder"].setVisible(True)
 
 
@@ -1183,7 +1242,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._glow_state: Optional[dict] = None       # the prior disulfide GLOW (for non-destructive restore)
         self.disulfides_tab = DisulfidesResultsTab(
             on_highlight=self._highlight_disulfide_pair,
-            on_declare=self._declare_disulfide_pair)
+            on_declare=self._declare_disulfide_pair,
+            on_estimate_ddg=self._estimate_ddg_pair)
 
     def attach_session(self, session) -> None:
         """Re-point the panel at a different SessionState — used on session RESTORE, where the
@@ -2219,6 +2279,125 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText(f"Model #{mid} produced no structure file — is it still open?")
             return None
         return tmp
+
+    def _save_structure_pdb(self, mid) -> Optional[str]:
+        """Save a LIVE ChimeraX model to a FRESH temp **PDB** (for the legacy ΔΔG path: PyRosetta's
+        `cleanATOM` is PDB-only, so the mmCIF from `_active_structure` won't do here). Same fresh-save
+        discipline as `_save_loaded_model_cif` (delete-prior-then-save → never stale), fail-CLOSED to
+        None when the model is closed/unsaveable so the caller never scores absent coordinates."""
+        mid = str(mid).lstrip("#").strip()
+        tmp = os.path.join(tempfile.gettempdir(), f"ss_ddg_{mid.replace('.', '_')}.pdb")
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)                                 # never serve a prior save's coordinates
+        except OSError:
+            pass
+        try:
+            self._c._run(f'save "{Path(tmp).as_posix()}" models #{mid}')
+        except Exception as exc:
+            self._status.setText(f"Could not read model #{mid} for ΔΔG estimate: {exc}")
+            return None
+        if not os.path.isfile(tmp):
+            self._status.setText(f"Model #{mid} produced no PDB — is it still open?")
+            return None
+        return tmp
+
+    def _from_aa_for(self, chain, resnum) -> Optional[str]:
+        """The WT residue letter at (chain, resnum), recovered from the DESIGN (template_cells) of the
+        cd that OWNS that chain — the cross-chain own-chain discipline (same as cross-chain Mode C):
+        `_chain_to_cd` resolves each member to ITS OWN chain's cd, so an A-side and a B-side position
+        read their from_aa from the RIGHT chain. The router VERIFIES this against the scored structure
+        (fail-closed mismatch) — recovering here is design-intent, verified there is ground-truth."""
+        cd = self._chain_to_cd().get(str(chain))
+        if cd is None:
+            return None
+        for c in cd.template_cells:
+            if (not c.is_gap) and c.resnum is not None and int(c.resnum) == int(resnum):
+                return c.aa
+        return None
+
+    def build_disulfide_ddg_spec(self, pair: dict) -> Optional[dict]:
+        """ΔΔG-escalation spec for ONE interface pair → the legacy ΔΔG bridge (refresh='disulfide_ddg').
+        Saves the LIVE structure to PDB (PyRosetta needs PDB), recovers each member's WT residue with
+        the own-chain discipline, and tags the source so the router gate can block a de-novo web upload
+        and the readout can carry the de-novo two-layer caveat. None (caller explains) when there is no
+        readable structure, a from_aa can't be recovered, or the PDB save fails — never a silent
+        score of the wrong/absent mutation."""
+        if self._design is None:
+            return None
+        src = self._active_structure()
+        if src is None:
+            return None
+        cha, chb = pair_chains(pair)
+        ra, rb = pair.get("resnum_a"), pair.get("resnum_b")
+        if cha is None or chb is None or ra is None or rb is None:
+            return None
+        aa_a, aa_b = self._from_aa_for(cha, ra), self._from_aa_for(chb, rb)
+        if aa_a is None or aa_b is None:
+            return None
+        pdb = self._save_structure_pdb(src["model_id"])
+        if not pdb:
+            return None
+        source = "denovo" if self._design.source == "sequence" else "loaded"
+        return {
+            "tool": "disulfide_ddg_estimate",
+            "tool_inputs": {"pdb_path": pdb,
+                            "chain_a": str(cha), "resnum_a": int(ra), "from_aa_a": aa_a,
+                            "chain_b": str(chb), "resnum_b": int(rb), "from_aa_b": aa_b,
+                            "source": source},
+            "user_input": f"[Workbench] estimate ΔΔG (legacy) for interface pair {pair_label(pair)}",
+            "confidence": "low", "refresh": "disulfide_ddg",
+            "_align_ukey": self._cur_cd_ukey(),
+            "_ss_pair": {"chain_a": str(cha), "resnum_a": int(ra),
+                         "chain_b": str(chb), "resnum_b": int(rb)},
+        }
+
+    def _estimate_ddg_pair(self, cd, pair: dict) -> None:
+        """Escalate a geometric interface hit to an energetic ΔΔG read (legacy bridge). FOCUS the
+        pair's cd tab first (so the structure/from_aa resolve against the RIGHT design), build the
+        spec, and launch on the worker seam (long-running — minutes per pair — so it awaits off the
+        UI thread via the standard launch path; NEVER auto-run across a scan)."""
+        self._focus_tab_for_design(cd)
+        spec = self.build_disulfide_ddg_spec(pair)
+        if spec is None:
+            self._status.setText("Can't estimate ΔΔG — needs a readable structure and recoverable WT "
+                                 "residues for both positions (re-scan if the structure changed).")
+            return
+        self._status.setText(f"Estimating ΔΔG (legacy, uncalibrated) for {pair_label(pair)} — "
+                             "X→C at both positions; minutes per pair…")
+        self.launchRequested.emit(spec)
+
+    def apply_disulfide_ddg_result(self, spec: dict, result: dict) -> None:
+        """Attach the escalated ΔΔG onto the MATCHING interface pair (by chain+resnum from the spec)
+        and re-render the I section (ΔΔG column + per-row caveat). Fail-LOUD: a failed/aborted estimate
+        (e.g. from_aa-mismatch guard, de-novo web-upload block, backend unavailable) shows its reason;
+        it never writes a fabricated number."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "disulfide_ddg_estimate"), None)
+        if step is None:
+            self._status.setText("ΔΔG estimate produced no result.")
+            return
+        if not step.get("success"):
+            self._status.setText(f"ΔΔG estimate: {step.get('error') or 'failed'}")
+            return
+        cd = self._scan_target_cd(spec)
+        want = (spec or {}).get("_ss_pair") or {}
+        data = step.get("data") or {}
+        pairs = ((cd.disulfide_interface_scan or {}).get("pairs") if cd else None) or []
+        target = next((p for p in pairs
+                       if str(pair_chains(p)[0]) == str(want.get("chain_a"))
+                       and str(pair_chains(p)[1]) == str(want.get("chain_b"))
+                       and p.get("resnum_a") == want.get("resnum_a")
+                       and p.get("resnum_b") == want.get("resnum_b")), None)
+        if target is None:
+            self._status.setText("ΔΔG came back but its interface pair is no longer listed (re-scan).")
+            return
+        target.update({"ddg_a": data.get("ddg_a"), "ddg_b": data.get("ddg_b"),
+                       "ddg_mean": data.get("ddg_mean"), "ddg_backend": data.get("backend"),
+                       "ddg_source": data.get("source")})
+        self._persist()
+        self.disulfides_tab.populate_interface(cd, cd.disulfide_interface_scan)
+        self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
 
     def _sync_disulfide_menu_enabled(self) -> None:
         """Enable each Disulfides action by its REAL precondition so an unavailable action is VISIBLY

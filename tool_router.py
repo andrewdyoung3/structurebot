@@ -42,7 +42,7 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chimerax_bridge import ChimeraXBridge
@@ -160,6 +160,7 @@ class ToolRouter:
         "disulfide_geometry":      "🔗📐",
         "disulfide_scan":          "🔗🔍",
         "disulfide_interface_scan": "🔗🤝",
+        "disulfide_ddg_estimate":  "🔗⚡",
         "proline":           "🧪",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
@@ -1844,6 +1845,9 @@ class ToolRouter:
         if tool == "disulfide_scan":
             return ("Disulfide engineering scan — find NOVEL installable sites (backbone, "
                     "geometric compatibility only)")
+        if tool == "disulfide_ddg_estimate":
+            return ("Disulfide ΔΔG estimate (legacy) — energetic read for ONE flagged interface "
+                    "pair (uncalibrated; ranking/sign only)")
         if tool == "proline":
             inp   = tool_inputs.get("proline", {})
             mid   = inp.get("model_id") or self._first_model_id()
@@ -2137,6 +2141,8 @@ class ToolRouter:
                 return self._run_disulfide_scan(inputs)
             if tool == "disulfide_interface_scan":
                 return self._run_disulfide_interface_scan(inputs)
+            if tool == "disulfide_ddg_estimate":
+                return self._run_disulfide_ddg_estimate(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3319,6 +3325,114 @@ class ToolRouter:
             tool="disulfide_interface_scan", success=True,
             data={"pairs": ranked, "best_partner": best_by_chain, "mode": "interface_scan",
                   "caveat": self._DISULFIDE_SCAN_CAVEAT},
+            summary=summary)
+
+    # The ΔΔG-escalation caveat — rides with EVERY escalated readout. ΔΔG is a SECOND soft signal on
+    # the geometric suggestion, NOT confirmation the bond forms; our ddG path is uncalibrated (§7:
+    # ranking/sign only, ~±2.7 kcal/mol). The de-novo two-layer note is appended display-side.
+    _DISULFIDE_DDG_CAVEAT = (
+        "ΔΔG estimate (legacy, uncalibrated — ranking/sign only, ~±2.7 kcal/mol). A second soft "
+        "signal on the geometric suggestion — not confirmation the bond will form. Validate by "
+        "declaring the bond, re-folding, and measuring the as-produced geometry."
+    )
+
+    @staticmethod
+    def _ddg_escalation_gate(backend: str, source: str, wsl_ok: bool) -> Tuple[bool, str]:
+        """PURE escalation gate (testable, no IO). Decide whether a ΔΔG escalation may proceed given
+        the resolved stability *backend*, the structure *source* ('denovo'|'loaded'), and whether the
+        local PyRosetta/WSL path is available. Two boundaries:
+          • LOCAL-ONLY analog — DynaMut2 is a WEB service (biosig.lab.uq.edu.au). Escalating a DE-NOVO
+            design over it would UPLOAD possibly-unpublished coordinates to a third party → BLOCK
+            (default to local PyRosetta). A loaded PDB (already public) is allowed over the web.
+          • local backend with no WSL/PyRosetta → BLOCK (else `_score_stability` silently returns 0.0,
+            a fabricated 'neutral' for scoring that never ran)."""
+        be = (backend or "").strip().lower()
+        if be == "dynamut2" and source == "denovo":
+            return False, ("ΔΔG escalation is blocked: the active stability backend is DynaMut2 (a web "
+                           "service, biosig.lab.uq.edu.au) and this is a DE-NOVO design — running it "
+                           "would upload your unpublished coordinates off-machine. Set "
+                           "ROSETTA_BACKEND=local (PyRosetta/WSL2) to estimate ΔΔG locally.")
+        if be == "local" and not wsl_ok:
+            return False, ("ΔΔG escalation needs the local PyRosetta path (ROSETTA_BACKEND=local), but "
+                           "WSL2/PyRosetta is not available. Configure it, or this stays a "
+                           "geometry-only suggestion.")
+        return True, ""
+
+    def _run_disulfide_ddg_estimate(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """ΔΔG-ESCALATION — an energetic read for ONE geometrically-flagged interface pair (the §9
+        analysis-side convergence: the fold-based suite acquires an energetic estimate WITHOUT merging
+        into the legacy candidate-finding tool). Reuses the legacy ΔΔG engine via
+        `DisulfideBridge._score_stability` (the NARROW primitive); NEVER `disulfide_bridge.analyze`
+        (its 4.5 Å Cβ / ESM / ddG filters could silently DROP the very pair the user clicked).
+
+        Inputs: ``pdb_path`` (a PDB on disk — PyRosetta `cleanATOM` is PDB-only, so the caller saves
+        the LIVE model to PDB, not the mmCIF), ``chain_a/resnum_a/from_aa_a`` + the b-side, and
+        ``source`` ('denovo'|'loaded'). Correctness gates, fail-CLOSED:
+          1. from_aa VERIFICATION — the claimed WT residue (recovered design-side from template_cells)
+             must match the residue AT THAT (chain, resnum) in the EXACT PDB being scored. A mismatch
+             (off-by-one / wrong chain / stale-after-edit) would silently score a DIFFERENT mutation
+             and return a plausible-but-wrong ΔΔG → abort.
+          2. backend gate (`_ddg_escalation_gate`) — no de-novo web upload; local needs WSL."""
+        from disulfide_bridge import _three_to_one, parse_pdb_atoms
+        pdb = inputs.get("pdb_path")
+        ca, ra, aa_a = inputs.get("chain_a"), inputs.get("resnum_a"), inputs.get("from_aa_a")
+        cb, rb, aa_b = inputs.get("chain_b"), inputs.get("resnum_b"), inputs.get("from_aa_b")
+        source = (inputs.get("source") or "loaded").strip().lower()
+        if not pdb or not Path(pdb).is_file():
+            return ToolStepResult(tool="disulfide_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs a structure (PDB) on disk.")
+        if None in (ca, ra, aa_a, cb, rb, aa_b):
+            return ToolStepResult(tool="disulfide_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs both positions with their WT residue (chain, resnum, from_aa).")
+        ca, cb, ra, rb = str(ca), str(cb), int(ra), int(rb)
+        aa_a, aa_b = str(aa_a).upper(), str(aa_b).upper()
+
+        # 1) VERIFY each from_aa against the EXACT structure being scored (silent-wrong-residue guard)
+        atoms = parse_pdb_atoms(pdb)
+        for ch, rn, claimed in ((ca, ra, aa_a), (cb, rb, aa_b)):
+            res = (atoms.get(ch) or {}).get(rn)
+            if res is None:
+                return ToolStepResult(tool="disulfide_ddg_estimate", success=False,
+                                      error=f"ΔΔG estimate: residue {ch}:{rn} not found in the scored structure.")
+            struct_aa = _three_to_one(res.get("resname", "UNK"))
+            if struct_aa != claimed:
+                return ToolStepResult(tool="disulfide_ddg_estimate", success=False,
+                                      error=(f"ΔΔG estimate ABORTED — residue mismatch at {ch}:{rn}: the design says "
+                                             f"{claimed} but the structure has {struct_aa}. Scoring would target the "
+                                             f"wrong mutation (off-by-one / wrong chain / stale edit). Re-scan first."))
+
+        # 2) backend gate (fail-closed BEFORE any compute/upload)
+        from rosetta_bridge import _select_backend
+        backend = _select_backend()
+        wsl_ok = False
+        if backend == "local":
+            try:
+                from wsl_bridge import WSLBridge
+                _w = WSLBridge()
+                wsl_ok = bool(_w.is_available() and _w.check_pyrosetta())
+            except Exception:
+                wsl_ok = False
+        ok, reason = self._ddg_escalation_gate(backend, source, wsl_ok)
+        if not ok:
+            return ToolStepResult(tool="disulfide_ddg_estimate", success=False, error=reason)
+
+        # 3) score EXACTLY this pair via the narrow primitive (per-chain X→C ddG; never analyze())
+        bridge = self._get_disulfide_bridge()
+        cand = [{"chain_a_residue": ra, "chain_b_residue": rb,
+                 "chain_a_aa": aa_a, "chain_b_aa": aa_b}]
+        scored = bridge._score_stability(cand, pdb, ca, cb)
+        c0 = scored[0] if scored else {}
+        ddg_a, ddg_b = c0.get("ddg_a"), c0.get("ddg_b")
+        ddg_mean = None if (ddg_a is None or ddg_b is None) else round((ddg_a + ddg_b) / 2.0, 3)
+        summary = (f"ΔΔG (legacy, {backend}) for {ca}:{ra}{aa_a}→C / {cb}:{rb}{aa_b}→C — "
+                   f"{aa_a}{ra}C {ddg_a:+.2f}, {aa_b}{rb}C {ddg_b:+.2f} kcal/mol "
+                   f"(mean {ddg_mean:+.2f}). {self._DISULFIDE_DDG_CAVEAT}")
+        return ToolStepResult(
+            tool="disulfide_ddg_estimate", success=True,
+            data={"chain_a": ca, "resnum_a": ra, "from_aa_a": aa_a,
+                  "chain_b": cb, "resnum_b": rb, "from_aa_b": aa_b,
+                  "ddg_a": ddg_a, "ddg_b": ddg_b, "ddg_mean": ddg_mean,
+                  "backend": backend, "source": source, "caveat": self._DISULFIDE_DDG_CAVEAT},
             summary=summary)
 
     def _resolve_boltz_templates(

@@ -2999,3 +2999,143 @@ class TestDisulfideLoadedPdbSource:
         cmds = " ".join(p._disulfide_scan_highlight_commands(cd, {"chain_a": "A", "resnum_a": 3,
                                                                   "chain_b": "A", "resnum_b": 7}))
         assert "#2/A:3,7" in cmds and "distance #2/A:3@CB #2/A:7@CB" in cmds
+
+
+class TestDisulfideDdgEscalation:
+    """Analysis-side §9 convergence: escalate a geometric interface hit → the legacy ΔΔG bridge.
+    from_aa recovered own-chain (cross-chain discipline); the energetic read attaches to the clicked
+    pair with the honest caveat (base + de-novo two-layer); fail-loud, never a fabricated number."""
+
+    def _session(self):
+        from session_state import SessionState
+        return SessionState()
+
+    @staticmethod
+    def _install_save(c):
+        """ChimeraX `save … .pdb models #mid` side-effect → write a stub file at the saved path."""
+        def _run(cmd):
+            m = re.search(r'save "([^"]+)"', cmd or "")
+            if m:
+                Path(m.group(1)).write_text("REMARK stub\nEND\n")
+        c._run.side_effect = _run
+
+    def _folded_hetero(self, seqA="MKVLWAAC", seqB="WYFGTDEC"):
+        """De-novo 2-chain assembly (A=seqA, B=seqB), folded; an interface scan result loaded into I."""
+        p, c = _panel([], session=self._session())
+        self._install_save(c)
+        p._add_sequence_construct("cplx", [(seqA, 1), (seqB, 1)])
+        spec = p.construct_fold_launch_spec("boltz", 1)
+        pa = {i: 90.0 for i in range(1, len(seqA) + 1)}
+        pb = {i: 90.0 for i in range(1, len(seqB) + 1)}
+        p.apply_construct_fold_result(spec, {"tool_step_results": [{"tool": "boltz", "data": {
+            "engine": "boltz", "new_model_id": "7", "target": "assembly", "mean_plddt": 80.0,
+            "chain_ids": ["A", "B"], "plddt_by_chain": {"A": pa, "B": pb},
+            "cif_path": "/tmp/cplx.cif"}}]})
+        return p, c
+
+    def _load_iface(self, p, pair):
+        cd = next(iter(p._design.chains.values()))
+        p.apply_disulfide_interface_scan_result(
+            {"_align_ukey": p._cur_cd_ukey()},
+            {"tool_step_results": [{"tool": "disulfide_interface_scan", "success": True, "summary": "ok",
+                                    "data": {"pairs": [pair], "best_partner": {}, "caveat": "geom only"}}]})
+        return cd
+
+    # ── from_aa recovery — own-chain (the silent-wrong-residue risk lives here) ─────────────
+    def test_from_aa_recovered_per_own_chain(self, _app):
+        p, _ = self._folded_hetero(seqA="MKVLWAAC", seqB="WYFGTDEC")
+        assert p._from_aa_for("A", 3) == "V"        # seqA[2]
+        assert p._from_aa_for("B", 5) == "T"        # seqB[4] — from B's OWN chain, not A's
+        assert p._from_aa_for("A", 99) is None      # out of range → None (caller refuses, not guesses)
+
+    # ── the escalation spec — pdb saved, own-chain from_aa, source tagged ───────────────────
+    def test_ddg_spec_carries_own_chain_from_aa_and_pdb(self, _app):
+        p, _ = self._folded_hetero(seqA="MKVLWAAC", seqB="WYFGTDEC")
+        pair = {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5, "score": 0.8}
+        spec = p.build_disulfide_ddg_spec(pair)
+        assert spec is not None and spec["tool"] == "disulfide_ddg_estimate"
+        assert spec["refresh"] == "disulfide_ddg"
+        ti = spec["tool_inputs"]
+        assert ti["from_aa_a"] == "V" and ti["from_aa_b"] == "T"        # own-chain residues
+        assert ti["chain_a"] == "A" and ti["chain_b"] == "B"
+        assert ti["source"] == "denovo"                                # a Boltz fold → de-novo
+        assert ti["pdb_path"].endswith(".pdb") and Path(ti["pdb_path"]).is_file()  # PDB, not the mmCIF
+
+    def test_ddg_spec_none_when_from_aa_unrecoverable(self, _app):
+        p, _ = self._folded_hetero()
+        pair = {"chain_a": "A", "resnum_a": 999, "chain_b": "B", "resnum_b": 5}
+        assert p.build_disulfide_ddg_spec(pair) is None                 # refuse rather than guess
+
+    def test_ddg_spec_loaded_source_tag(self, _app):
+        # a LOADED multimer → source 'loaded' (router then allows even a web backend)
+        p, c = _panel([_chainseq("2", "A", "MKVCAAC"), _chainseq("2", "B", "WYFGTDE")],
+                      session=self._session())
+        self._install_save(c)
+        p.load_model("2")
+        spec = p.build_disulfide_ddg_spec({"chain_a": "A", "resnum_a": 4, "chain_b": "B", "resnum_b": 3})
+        assert spec is not None and spec["tool_inputs"]["source"] == "loaded"
+        assert spec["tool_inputs"]["from_aa_a"] == "C" and spec["tool_inputs"]["from_aa_b"] == "F"
+
+    # ── the escalate button — enabled after a scan, reaches the handler, per-row ────────────
+    def test_escalate_button_enables_and_reaches_handler(self, _app):
+        p, _ = self._folded_hetero()
+        self._load_iface(p, {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5, "score": 0.8})
+        eb = p.disulfides_tab._sec["I"]["escalate_btn"]
+        assert eb.isEnabled()
+        emitted = []
+        p.launchRequested.connect(lambda s: emitted.append(s))
+        p.disulfides_tab._sec["I"]["table"].selectRow(0)
+        eb.click()
+        assert emitted and emitted[-1]["tool"] == "disulfide_ddg_estimate"
+
+    # ── apply — the ΔΔG attaches to the RIGHT pair + the column renders ─────────────────────
+    def _ddg_result(self, source="loaded", da=1.2, db=0.4):
+        return {"tool_step_results": [{"tool": "disulfide_ddg_estimate", "success": True,
+                "summary": "ddg ok", "data": {
+                    "chain_a": "A", "resnum_a": 3, "from_aa_a": "V",
+                    "chain_b": "B", "resnum_b": 5, "from_aa_b": "T",
+                    "ddg_a": da, "ddg_b": db, "ddg_mean": round((da + db) / 2, 3),
+                    "backend": "pyrosetta", "source": source}}]}
+
+    def test_apply_ddg_attaches_to_pair_and_renders_column(self, _app):
+        p, _ = self._folded_hetero()
+        cd = self._load_iface(p, {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5, "score": 0.8})
+        spec = {"_align_ukey": p._cur_cd_ukey(),
+                "_ss_pair": {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5}}
+        p.apply_disulfide_ddg_result(spec, self._ddg_result(da=1.2, db=0.4))
+        pair = cd.disulfide_interface_scan["pairs"][0]
+        assert pair["ddg_a"] == 1.2 and pair["ddg_b"] == 0.4 and pair["ddg_backend"] == "pyrosetta"
+        tbl = p.disulfides_tab._sec["I"]["table"]
+        assert tbl.columnCount() == 6 and tbl.item(0, 5).text() == "+1.2 / +0.4"   # ΔΔG column
+
+    def test_apply_ddg_failure_no_fabricated_number(self, _app):
+        p, _ = self._folded_hetero()
+        cd = self._load_iface(p, {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5, "score": 0.8})
+        spec = {"_align_ukey": p._cur_cd_ukey(),
+                "_ss_pair": {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5}}
+        p.apply_disulfide_ddg_result(spec, {"tool_step_results": [{"tool": "disulfide_ddg_estimate",
+            "success": False, "error": "residue mismatch at A:3"}]})
+        pair = cd.disulfide_interface_scan["pairs"][0]
+        assert "ddg_a" not in pair                                  # no fabricated number on failure
+        assert "mismatch" in p._status.text().lower()
+
+    # ── honesty: base caveat always; de-novo adds the estimate-on-estimate layer ────────────
+    def test_pair_detail_caveat_base_and_denovo_layers(self, _app):
+        from variant_workbench import DisulfidesResultsTab as T
+        loaded = {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5, "score": 0.8,
+                  "ca_ca": 5.6, "cb_cb": 3.9, "orientation": 88.0,
+                  "ddg_a": 1.2, "ddg_b": 0.4, "from_aa_a": "V", "from_aa_b": "T",
+                  "ddg_backend": "pyrosetta", "ddg_source": "loaded"}
+        det_loaded = T._pair_detail("I", loaded)
+        assert "uncalibrated" in det_loaded and "not confirmation" in det_loaded   # base caveat
+        assert "estimate on an estimate" not in det_loaded                         # loaded → no extra layer
+        denovo = dict(loaded, ddg_source="denovo")
+        det_denovo = T._pair_detail("I", denovo)
+        assert "estimate on an estimate" in det_denovo and "predicted structure" in det_denovo.lower()
+
+    def test_pair_detail_no_ddg_prompts_escalation(self, _app):
+        from variant_workbench import DisulfidesResultsTab as T
+        bare = {"chain_a": "A", "resnum_a": 3, "chain_b": "B", "resnum_b": 5, "score": 0.8,
+                "ca_ca": 5.6, "cb_cb": 3.9, "orientation": 88.0}
+        det = T._pair_detail("I", bare)
+        assert "not yet estimated" in det.lower() and "ΔΔG" in det
