@@ -232,5 +232,120 @@ def test_step_description_real_names_for_disulfide_tools():
 def test_disulfide_tools_have_pipeline_icons():
     from tool_router import ToolRouter
     for tool in ("disulfide_discovery", "disulfide_geometry", "disulfide_scan",
-                 "disulfide_interface_scan"):
+                 "disulfide_interface_scan", "disulfide_ddg_estimate"):
         assert ToolRouter._TOOL_ICONS.get(tool) and ToolRouter._TOOL_ICONS[tool] != "⚙️"
+
+
+# ── ΔΔG-escalation (route a flagged interface pair into the legacy ΔΔG bridge) ────────────
+def _pdb_atom(serial, atom, resname, chain, resnum, x, y, z):
+    """One fixed-column PDB ATOM record (the legacy `parse_pdb_atoms` reads PDB, not mmCIF)."""
+    aname = f"{(' ' + atom) if len(atom) < 4 else atom:<4}"
+    return (f"ATOM  {serial:>5} {aname}{' '}{resname:>3} {chain}{resnum:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}\n")
+
+
+def _two_chain_pdb() -> str:
+    """A:12 = VAL, B:30 = LEU (each CA+CB) — a cross-chain pair with DISTINCT WT residues per chain."""
+    return (
+        _pdb_atom(1, "CA", "VAL", "A", 12, 0.0, 0.0, 0.0)
+        + _pdb_atom(2, "CB", "VAL", "A", 12, 0.0, 1.5, 0.0)
+        + _pdb_atom(3, "CA", "LEU", "B", 30, 5.5, 0.0, 0.0)
+        + _pdb_atom(4, "CB", "LEU", "B", 30, 3.8, 1.5, 0.0)
+        + "END\n"
+    )
+
+
+def _pdb(text: str) -> str:
+    f = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w")
+    f.write(text); f.close()
+    return f.name
+
+
+def _ddg_inputs(pdb, *, aa_a="V", aa_b="L", source="loaded"):
+    return {"pdb_path": pdb, "chain_a": "A", "resnum_a": 12, "from_aa_a": aa_a,
+            "chain_b": "B", "resnum_b": 30, "from_aa_b": aa_b, "source": source}
+
+
+def _mock_stability(r, ddg_a=1.2, ddg_b=0.4):
+    """Stand in for the legacy ddG bridge: fill ddg on the one-element candidate, record the call."""
+    bridge = MagicMock()
+    def _score(cands, pdb_path, ca, cb, *a, **k):
+        cands[0]["ddg_a"], cands[0]["ddg_b"] = ddg_a, ddg_b
+        return cands
+    bridge._score_stability.side_effect = _score
+    r._disulfide_bridge = bridge                    # pre-seed so _get_disulfide_bridge returns it
+    return bridge
+
+
+def test_ddg_escalation_gate_matrix():
+    from tool_router import ToolRouter as T
+    assert T._ddg_escalation_gate("dynamut2", "denovo", False)[0] is False   # no de-novo web upload
+    assert T._ddg_escalation_gate("dynamut2", "loaded", False)[0] is True    # loaded PDB is public
+    assert T._ddg_escalation_gate("local", "loaded", False)[0] is False      # local needs WSL
+    assert T._ddg_escalation_gate("local", "denovo", True)[0] is True
+    assert T._ddg_escalation_gate("pyrosetta", "denovo", False)[0] is True   # local import path
+
+
+def test_ddg_estimate_scores_the_clicked_pair(monkeypatch):
+    import rosetta_bridge
+    monkeypatch.setattr(rosetta_bridge, "_select_backend", lambda: "pyrosetta")
+    r = _router()
+    bridge = _mock_stability(r, ddg_a=1.2, ddg_b=0.4)
+    out = r._run_disulfide_ddg_estimate(_ddg_inputs(_pdb(_two_chain_pdb())))
+    assert out.success
+    d = out.data
+    assert d["ddg_a"] == 1.2 and d["ddg_b"] == 0.4 and d["ddg_mean"] == 0.8
+    assert d["chain_a"] == "A" and d["resnum_a"] == 12 and d["chain_b"] == "B" and d["resnum_b"] == 30
+    # the NARROW primitive scored EXACTLY this pair — never the full analyze() find/filter pipeline
+    bridge._score_stability.assert_called_once()
+    bridge.analyze.assert_not_called()
+    cand = bridge._score_stability.call_args.args[0][0]
+    assert cand["chain_a_residue"] == 12 and cand["chain_a_aa"] == "V"      # own-chain from_aa threaded
+    assert cand["chain_b_residue"] == 30 and cand["chain_b_aa"] == "L"
+
+
+def test_ddg_estimate_verifies_from_aa_fail_closed(monkeypatch):
+    # claim G at A:12 (the structure has V) → ABORT, never score the wrong mutation
+    import rosetta_bridge
+    monkeypatch.setattr(rosetta_bridge, "_select_backend", lambda: "pyrosetta")
+    r = _router()
+    bridge = _mock_stability(r)
+    out = r._run_disulfide_ddg_estimate(_ddg_inputs(_pdb(_two_chain_pdb()), aa_a="G"))
+    assert out.success is False and "mismatch" in out.error.lower()
+    bridge._score_stability.assert_not_called()                            # no scoring of a wrong target
+
+
+def test_ddg_estimate_blocks_denovo_web_upload(monkeypatch):
+    import rosetta_bridge
+    monkeypatch.setattr(rosetta_bridge, "_select_backend", lambda: "dynamut2")
+    r = _router()
+    bridge = _mock_stability(r)
+    out = r._run_disulfide_ddg_estimate(_ddg_inputs(_pdb(_two_chain_pdb()), source="denovo"))
+    assert out.success is False and ("upload" in out.error.lower() or "dynamut2" in out.error.lower())
+    bridge._score_stability.assert_not_called()                            # nothing left the machine
+
+
+def test_ddg_estimate_allows_loaded_over_web(monkeypatch):
+    import rosetta_bridge
+    monkeypatch.setattr(rosetta_bridge, "_select_backend", lambda: "dynamut2")
+    r = _router()
+    _mock_stability(r)
+    out = r._run_disulfide_ddg_estimate(_ddg_inputs(_pdb(_two_chain_pdb()), source="loaded"))
+    assert out.success                                                      # a public loaded PDB may use the web
+
+
+def test_ddg_estimate_local_needs_wsl(monkeypatch):
+    import rosetta_bridge, wsl_bridge
+    monkeypatch.setattr(rosetta_bridge, "_select_backend", lambda: "local")
+    wb = MagicMock(); wb.return_value.is_available.return_value = False
+    monkeypatch.setattr(wsl_bridge, "WSLBridge", wb)
+    r = _router()
+    bridge = _mock_stability(r)
+    out = r._run_disulfide_ddg_estimate(_ddg_inputs(_pdb(_two_chain_pdb())))
+    assert out.success is False and "wsl" in out.error.lower()
+    bridge._score_stability.assert_not_called()
+
+
+def test_ddg_estimate_needs_a_pdb():
+    out = _router()._run_disulfide_ddg_estimate(_ddg_inputs("/nope/x.pdb"))
+    assert out.success is False and "pdb" in out.error.lower()
