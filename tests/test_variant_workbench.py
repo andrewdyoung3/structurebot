@@ -3321,6 +3321,98 @@ class TestProlineMode:
         assert t._tbl.rowCount() == 0 and not t._tbl.isVisible()
 
 
+class TestCavityMode:
+    """The panel-based cavity-filling mode (the third stabilization peer; same shape as proline)."""
+
+    def _construct(self, p, seq="MKVLWAAGTDER"):
+        p._add_sequence_construct("binder", seq)
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        return cd
+
+    def _scan(self):
+        return {"candidates": [
+            {"chain": "A", "position": 3, "from_aa": "V", "to_aa": "I", "cavity_id": 1,
+             "void_volume": 60.0, "fill_fraction": 0.40, "reach_score": 0.66, "clash": False, "score": 0.26},
+            {"chain": "A", "position": 7, "from_aa": "A", "to_aa": "V", "cavity_id": 1,
+             "void_volume": 60.0, "fill_fraction": 0.30, "reach_score": 0.33, "clash": True, "score": 0.06}],
+            "best_partner": {"A": {3: 0.26, 7: 0.06}},
+            "cavities": [{"cavity_id": 1, "volume": 60.0, "centroid": (0.0, 0.0, 0.0),
+                          "n_lining": 4, "lining_labels": ["A3", "A7"], "is_interface": False}],
+            "caveat": "Geometric suggestion only — does not confirm."}
+
+    def test_scan_launch_spec_reads_the_structure(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._construct(p)
+        spec = p.cavity_scan_launch_spec()
+        assert spec["tool"] == "cavity_scan" and spec["refresh"] == "cavity_scan"
+        assert spec["tool_inputs"]["cif_path"] == "/tmp/binder.cif"
+
+    def test_apply_populates_tab_and_surfaces_heatmap(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._run_commands_bg = lambda c: None
+        cd = self._construct(p)
+        p.apply_cavity_scan_result(
+            {"_align_ukey": p._cur_cd_ukey()},
+            {"tool_step_results": [{"tool": "cavity_scan", "success": True,
+                                    "data": self._scan(), "summary": "ok"}]})
+        assert len((cd.cavity_scan or {}).get("candidates", [])) == 2
+        assert p._mode_key == "result:cavity_scan"                 # auto-surfaced
+        tbl = p.cavity_tab._tbl
+        assert tbl.rowCount() == 2 and tbl.item(0, 0).text() == "V3I"
+        assert tbl.item(0, 4).text() == "ok" and tbl.item(1, 4).text() == "⚠"   # clash flag
+        # heatmap paints the rep chain by best fill score
+        assert len(p._cavity_scan_panel_hex(p._cur_tab())) == 2
+
+    def test_row_click_highlights_residue_through_glow_seam(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        pushed = []
+        p._run_commands_bg = lambda c: pushed.extend(c)
+        cd = self._construct(p)
+        p.cavity_tab.populate(cd, self._scan())
+        pushed.clear()
+        p.cavity_tab._tbl.cellClicked.emit(0, 0)                    # click the top row (V3)
+        joined = " ".join(pushed)
+        assert "#7/A:3" in joined and "transparency #7 70 target c" in joined   # glow recipe
+        assert p._glow_state == {"mid": "7", "both": "#7/A:3"}
+        assert p.cavity_tab._clear_glow_btn.isEnabled()            # glow active → Clear lit
+
+    def test_color_mode_registered(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        items = [p._mode_combo.itemData(i) for i in range(p._mode_combo.count())]
+        assert "result:cavity_scan" in items
+
+    def test_ddg_spec_verifies_carries_target_and_blocks(self, _app):
+        # build_cavity_ddg_spec recovers from_aa own-chain, carries the VARIABLE to_aa, tags the source
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._active_structure = lambda: {"cif_path": "/tmp/b.cif", "model_id": "7"}
+        p._save_structure_pdb = lambda mid: "/tmp/b.pdb"
+        p._from_aa_for = lambda ch, rn: "V"
+        spec = p.build_cavity_ddg_spec({"chain": "A", "position": 3, "to_aa": "I"})
+        assert spec["tool"] == "cavity_ddg_estimate" and spec["tool_inputs"]["from_aa"] == "V"
+        assert spec["tool_inputs"]["to_aa"] == "I"                 # the variable fill target
+        assert spec["tool_inputs"]["source"] == "denovo"          # de-novo → the gate can block web upload
+        assert spec["tool_inputs"]["resnum"] == 3
+
+    def test_add_to_basket_normalizes_entry(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_cavity_to_basket(cd, self._scan()["candidates"][0])
+        assert len(p.design_basket.entries) == 1
+        e = p.design_basket.entries[0]
+        assert e["cls"] == "Cavity" and e["subs"][0]["to_aa"] == "I" and e["subs"][0]["from_aa"] == "V"
+
+    def test_tab_reset_clears(self, _app):
+        from variant_workbench import CavityResultsTab
+        t = CavityResultsTab(on_highlight=lambda *a, **k: None)
+        t.populate(MagicMock(), self._scan())
+        assert t._tbl.rowCount() == 2
+        t.reset()
+        assert t._tbl.rowCount() == 0 and not t._tbl.isVisible()
+
+
 class TestDesignBasket:
     """The cross-strategy substitution-staging panel: curate picks → compose ONE variant."""
 

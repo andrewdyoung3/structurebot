@@ -205,6 +205,28 @@ def proline_compat_color(score: Optional[float]) -> Optional[str]:
     return _hex(rgb)
 
 
+# ── cavity-filling heatmap (per-residue best small→larger FILL score in [0,1]) ────────────────────
+# A cavity-lining residue's colour = its best fill score (void-fill fraction × rotamer reach-into-void,
+# soft-demoted on clash). NAVIGATIONAL INDEX into the ranked candidate list (the data); the caveat
+# rides on the mode. Teal (a just-viable lining fill) → gold (a best fill glows strongest) — distinct
+# from the disulfide gold-only ramp and the proline magenta. The threshold matches the scan's surfacing
+# floor so a fill that didn't surface is never painted.
+_CAV_SCAN_MIN = 0.02                 # below this = no viable surfaced fill → neutral (no colour)
+_CAV_TEAL = (0x2c, 0xa0, 0xa0)       # teal (a just-viable lining fill)
+_CAV_GOLD = (0xf2, 0xa6, 0x1c)       # saturated gold (a best fill glows strongest)
+
+
+def cavity_compat_color(score: Optional[float]) -> Optional[str]:
+    """Per-residue cavity-fill favourability (best fill score 0–1) → teal→gold hex. None when *score*
+    is None or below the surfacing threshold (no viable fill → no colour, never painted as a result).
+    The best void-filling sites saturate the gold."""
+    if score is None or score < _CAV_SCAN_MIN:
+        return None
+    t = min(1.0, (score - _CAV_SCAN_MIN) / (1.0 - _CAV_SCAN_MIN))
+    rgb = tuple(_CAV_TEAL[i] + t * (_CAV_GOLD[i] - _CAV_TEAL[i]) for i in range(3))
+    return _hex(rgb)
+
+
 # Cα-lDDT disruption ramp — by lDDT VALUE (1 = locally conserved … 0 = fully changed), so the
 # scale is INVERTED vs deviation: LOWER lDDT = MORE disrupted = warmer. Floor-gated like the
 # deviation ramp (lDDT ≥ floor → neutral: changed no more than the WT does across seeds).
