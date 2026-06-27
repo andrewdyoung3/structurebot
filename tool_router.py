@@ -3265,8 +3265,12 @@ class ToolRouter:
     # heatmap is the most over-read-prone surface; the caveat must never separate from it).
     _DISULFIDE_SCAN_CAVEAT = (
         "Geometrically viable disulfide-engineering sites in THIS predicted fold — a starting "
-        "point. Does NOT imply the X→C mutations are tolerated, that the protein still folds, or "
-        "that the bond will form. Validate by introducing the Cys pair and re-folding."
+        "point. Ranked by ROTAMER Sγ-REACHABILITY (idealized Cys sidechains placed over a χ1 sweep: "
+        "can the two Sγ reach ~2.05 Å at a good χSS), with a rigid-backbone clash flag. The geometry "
+        "PERMITS a disulfide; it does NOT confirm the X→C mutations are tolerated, that packing "
+        "accommodates the Cys after repacking (the clash check is on the FIXED backbone — repacking "
+        "may relieve a flagged clash, or introduce a new one), that the protein still folds, or that "
+        "the bond will form. Validate by introducing the Cys pair and re-folding (Mode C)."
     )
 
     def _run_disulfide_scan(self, inputs: Dict[str, Any]) -> "ToolStepResult":
@@ -3278,13 +3282,17 @@ class ToolRouter:
         ranked candidate list (source of truth) + a per-residue best-partner map (the heatmap index)
         + the load-bearing geometric-only CAVEAT. Reads `cif_path`."""
         import os as _os
-        from disulfide_geometry import parse_backbone_atoms, scan_engineerable_sites
+        from disulfide_geometry import (parse_backbone_atoms, parse_heavy_atoms,
+                                        scan_engineerable_sites, ClashGrid)
         cif = inputs.get("cif_path")
         if not cif or not _os.path.isfile(cif):
             return ToolStepResult(tool="disulfide_scan", success=False,
                                   error="Engineering scan needs an existing fold CIF on disk.")
         atoms = parse_backbone_atoms(cif)
-        ranked, best = scan_engineerable_sites(atoms)
+        # Tier (b): a heavy-atom clash grid (built once) so each surfaced site's best-reach Sγ is
+        # tested for vdW overlap — flags + softly demotes a sulfur-reachable-but-clashing site.
+        grid = ClashGrid(parse_heavy_atoms(cif))
+        ranked, best = scan_engineerable_sites(atoms, clash_grid=grid)
         # best_partner keyed by (chain, resnum); flatten to {chain: {resnum: score}} for the heatmap.
         best_by_chain: Dict[str, Dict[int, float]] = {}
         for (ch, rn), sc in best.items():
@@ -3312,7 +3320,8 @@ class ToolRouter:
         ranked cross-chain pair list (chain_a≠chain_b) + the load-bearing geometric-only CAVEAT.
         Found pairs feed the (proven) cross-chain Mode-C declare. Reads `cif_path`; needs ≥2 chains."""
         import os as _os
-        from disulfide_geometry import parse_backbone_atoms, scan_interface_sites
+        from disulfide_geometry import (parse_backbone_atoms, parse_heavy_atoms,
+                                        scan_interface_sites, ClashGrid)
         cif = inputs.get("cif_path")
         if not cif or not _os.path.isfile(cif):
             return ToolStepResult(tool="disulfide_interface_scan", success=False,
@@ -3321,7 +3330,9 @@ class ToolRouter:
         if len(atoms) < 2:
             return ToolStepResult(tool="disulfide_interface_scan", success=False,
                                   error="Interface scan needs a MULTI-CHAIN fold (≥2 chains).")
-        ranked, best = scan_interface_sites(atoms)
+        # Tier (b): heavy-atom clash grid (built once) for the surfaced cross-chain candidates.
+        grid = ClashGrid(parse_heavy_atoms(cif))
+        ranked, best = scan_interface_sites(atoms, clash_grid=grid)
         best_by_chain: Dict[str, Dict[int, float]] = {}
         for (ch, rn), sc in best.items():
             best_by_chain.setdefault(ch, {})[rn] = round(sc, 4)

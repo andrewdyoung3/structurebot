@@ -641,11 +641,13 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                            ["Pair", "SG–SG (Å)", "Cβ–Cβ (Å)", "Cα–Cα (Å)", "χSS (°)", "Compatible"])
         self._make_section("D", "Engineerable disulfide sites — backbone scan (Mode D: find novel)",
                            "Run “Find engineerable disulfide sites” to populate.",
-                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)"],
+                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)",
+                            "Sγ–Sγ (Å)", "χSS (°)", "Clash", "Orientation (°)"],
                            declare=True, caveat=True)
         self._make_section("I", "Interface disulfide sites — inter-chain scan (find inter-subunit)",
                            "Run “Find interface disulfide sites” on a folded MULTIMER to populate.",
-                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)", "Orientation (°)", "ΔΔG (kcal/mol)"],
+                           ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)",
+                            "Sγ–Sγ (Å)", "χSS (°)", "Clash", "Orientation (°)", "ΔΔG (kcal/mol)"],
                            declare=True, caveat=True, escalate=True)
         self._make_section("C", "Declared-bond fold (Mode C: intervene)",
                            "Use “Declare cysteine bonds and fold” (or Declare below) to record the "
@@ -729,21 +731,29 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             return
         self._on_estimate_ddg(cd, pairs[row])
 
+    @staticmethod
+    def _reach_detail(p: dict) -> str:
+        """The reachability clause shared by the D/I detail lines — the rotamer Sγ readout (best
+        achievable Sγ–Sγ + χSS) + the rigid-backbone clash, with the orientation now a measured aside."""
+        sg, chi, clash = p.get("best_sg_sg"), p.get("best_chi_ss"), p.get("clash")
+        ornt = p.get("orientation")
+        reach = ("Sγ-reachability n/a (no backbone N)" if sg is None
+                 else f"best Sγ–Sγ {sg:.2f} Å at χSS {chi:.0f}° (rotamer-placed)")
+        clash_s = "" if clash is None else (" — ⚠ rigid-backbone CLASH" if clash else " — clash-free")
+        ornt_s = "n/a (Gly)" if ornt is None else f"{ornt:.0f}°"
+        return f"{reach}{clash_s}; backbone orientation {ornt_s} (measured, no longer ranked)"
+
     @classmethod
     def _pair_detail(cls, key: str, p: dict) -> str:
         lbl = pair_label(p, cys=True)
         if key == "D":
-            ornt = p.get("orientation")
-            return (f"{lbl} — score {p.get('score', 0):.2f} "
-                    f"(MEASURED, this fold): Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
-                    f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}. Geometric "
-                    f"compatibility only — installing needs introducing the Cys pair + re-folding "
-                    f"(Declare below).")
+            return (f"{lbl} — score {p.get('score', 0):.2f} (MEASURED, this fold): "
+                    f"Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å; "
+                    f"{cls._reach_detail(p)}. Geometry permits a disulfide — installing needs "
+                    f"introducing the Cys pair + re-folding (Declare below).")
         if key == "I":
-            ornt = p.get("orientation")
             base = (f"{lbl} — score {p.get('score', 0):.2f} (geometric, this structure): "
-                    f"Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å, "
-                    f"orientation {'n/a (Gly)' if ornt is None else f'{ornt:.0f}°'}.")
+                    f"Cα–Cα {p.get('ca_ca')} Å, Cβ–Cβ {p.get('cb_cb')} Å; {cls._reach_detail(p)}.")
             da, db = p.get("ddg_a"), p.get("ddg_b")
             if da is None or db is None:
                 return base + " ΔΔG not yet estimated — “Estimate ΔΔG (legacy)” for an energetic read."
@@ -789,6 +799,17 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                     "yes" if p.get("bonding_compatible") else "no"]
         self._fill_table("B", cd, pairs, _row)
 
+    @staticmethod
+    def _reach_cells(p: dict) -> List[str]:
+        """The shared reachability columns (Sγ–Sγ, χSS, Clash) for a Mode-D / interface scan row —
+        the rotamer-placement readout that REPLACED the backbone-orientation proxy in the ranking."""
+        sg, chi, clash = p.get("best_sg_sg"), p.get("best_chi_ss"), p.get("clash")
+        return [
+            ("—" if sg is None else f"{sg:.2f}"),
+            ("—" if chi is None else f"{chi:.0f}"),
+            ("—" if clash is None else ("clash" if clash else "ok")),
+        ]
+
     def populate_scan(self, cd, scan: dict) -> None:
         pairs = (scan or {}).get("pairs") or []
         sec = self._sec["D"]
@@ -799,6 +820,7 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         self._fill_table("D", cd, pairs, lambda p: [
             pair_label(p), f"{p.get('score', 0):.2f}",
             f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
+            *self._reach_cells(p),
             ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}")])
 
     def populate_interface(self, cd, scan: dict) -> None:
@@ -813,6 +835,7 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         self._fill_table("I", cd, pairs, lambda p: [
             pair_label(p), f"{p.get('score', 0):.2f}",
             f"{p.get('ca_ca', '')}", f"{p.get('cb_cb', '')}",
+            *self._reach_cells(p),
             ("—" if p.get("orientation") is None else f"{p['orientation']:.0f}"),
             self._ddg_cell(p)])
 
