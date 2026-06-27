@@ -227,6 +227,28 @@ def cavity_compat_color(score: Optional[float]) -> Optional[str]:
     return _hex(rgb)
 
 
+# ── salt-bridge heatmap (per-residue best charge-pair score in [0,1]) ──────────────────────────────
+# A residue's colour = its best salt-bridge score (existing-pair quality OR novel charge-pair
+# engineerability — geometry × burial). NAVIGATIONAL INDEX into the ranked tables (the data); the
+# context-dependent desolvation caveat rides on the mode. Pale → saturated ELECTRIC BLUE — reads as
+# "charge / electrostatic", distinct from the disulfide/cavity gold, the proline magenta, the cavity
+# teal. The threshold matches the scan's surfacing floor so a sub-threshold residue is never painted.
+_SB_SCAN_MIN = 0.05                  # below this = not salt-bridge-favourable → neutral (no colour)
+_SB_PALE = (0xc8, 0xd8, 0xf2)        # pale blue (a just-favourable site)
+_SB_BLUE = (0x1e, 0x46, 0xd8)        # saturated electric blue (a best charge-pair site glows strongest)
+
+
+def saltbridge_compat_color(score: Optional[str]) -> Optional[str]:
+    """Per-residue salt-bridge favourability (best charge-pair score 0–1) → pale→electric-blue hex.
+    None when *score* is None or below the surfacing threshold (not favourable → no colour, never
+    painted as a result). The best buried, clash-free, ideal-geometry sites saturate the blue."""
+    if score is None or score < _SB_SCAN_MIN:
+        return None
+    t = min(1.0, (score - _SB_SCAN_MIN) / (1.0 - _SB_SCAN_MIN))
+    rgb = tuple(_SB_PALE[i] + t * (_SB_BLUE[i] - _SB_PALE[i]) for i in range(3))
+    return _hex(rgb)
+
+
 # Cα-lDDT disruption ramp — by lDDT VALUE (1 = locally conserved … 0 = fully changed), so the
 # scale is INVERTED vs deviation: LOWER lDDT = MORE disrupted = warmer. Floor-gated like the
 # deviation ramp (lDDT ≥ floor → neutral: changed no more than the WT does across seeds).

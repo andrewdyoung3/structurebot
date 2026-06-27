@@ -329,7 +329,8 @@ class RequestEngine:
                                "validate_design",
                                "disulfide_discovery", "disulfide_ddg_estimate",
                                "disulfide_scan", "disulfide_geometry",
-                               "disulfide_interface_scan", "cavity_ddg_estimate"}
+                               "disulfide_interface_scan", "cavity_ddg_estimate",
+                               "saltbridge_ddg_estimate", "saltbridge_scan"}
                 _needs_timer = bool(set(tools_needed) & _long_tools)
                 _ticker_label = (
                     "Running " + "/".join(

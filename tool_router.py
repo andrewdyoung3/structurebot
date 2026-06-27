@@ -166,6 +166,8 @@ class ToolRouter:
         "proline_ddg_estimate": "🧪⚡",
         "cavity_scan":       "🕳️🔍",
         "cavity_ddg_estimate": "🕳️⚡",
+        "saltbridge_scan":      "🧂🔍",
+        "saltbridge_ddg_estimate": "🧂⚡",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
         "netnglyc":          "🔬🍬",
@@ -1864,6 +1866,12 @@ class ToolRouter:
         if tool == "cavity_ddg_estimate":
             return ("Cavity-fill ΔΔG estimate (legacy) — energetic read for ONE flagged fill "
                     "(uncalibrated; ranking/sign only)")
+        if tool == "saltbridge_scan":
+            return ("Salt-bridge scan — assess existing Asp/Glu↔Arg/Lys pairs + rank NOVEL "
+                    "complementary charge-pair sites (geometry × burial; this structure)")
+        if tool == "saltbridge_ddg_estimate":
+            return ("Salt-bridge ΔΔG estimate (legacy) — energetic read for ONE flagged "
+                    "charge-pair (two positions; uncalibrated; ranking/sign only)")
         if tool == "proline":
             inp   = tool_inputs.get("proline", {})
             mid   = inp.get("model_id") or self._first_model_id()
@@ -2171,6 +2179,10 @@ class ToolRouter:
                 return self._run_cavity_scan(inputs)
             if tool == "cavity_ddg_estimate":
                 return self._run_cavity_ddg_estimate(inputs)
+            if tool == "saltbridge_scan":
+                return self._run_saltbridge_scan(inputs)
+            if tool == "saltbridge_ddg_estimate":
+                return self._run_saltbridge_ddg_estimate(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3735,6 +3747,172 @@ class ToolRouter:
             tool="cavity_ddg_estimate", success=True,
             data={"chain": ch, "resnum": rn, "from_aa": aa, "to_aa": to_aa, "ddg": ddg,
                   "backend": backend, "source": source, "caveat": self._CAVITY_DDG_CAVEAT},
+            summary=summary)
+
+    # ── Salt-bridge scan (panel-primary; the legacy NL `salt_bridge`/SaltBridgeBridge stays parallel) ──
+    # The load-bearing caveat — rides with EVERY salt-bridge readout. CONTEXT-DEPENDENT and honest to the
+    # subtle literature: a salt bridge is favourable when good geometry COINCIDES with partial burial and
+    # a complementary environment, but carries a DESOLVATION penalty — surface bridges are often only
+    # marginally stabilizing or neutral, and a continuum analysis (Hendsch & Tidor 1994) found a majority
+    # DEstabilizing once desolvation is counted (Kumar & Nussinov 1999: most stabilizing but geometry +
+    # burial-dependent). The geometric scan CANNOT resolve the electrostatic/desolvation balance.
+    _SALTBRIDGE_SCAN_CAVEAT = (
+        "Salt bridges are CONTEXT-DEPENDENT stabilizers. Favourable when good geometry (closest "
+        "carboxyl-O↔basic-N ≤4 Å, Barlow & Thornton 1983) coincides with partial burial and a "
+        "complementary environment; but burying charges costs a DESOLVATION penalty, so surface salt "
+        "bridges are often only marginally stabilizing or even neutral, and a continuum-electrostatics "
+        "analysis (Hendsch & Tidor 1994) found a majority DEstabilizing once desolvation is counted "
+        "(Kumar & Nussinov 1999: most stabilizing, but geometry- and burial-dependent). This scan ranks "
+        "by geometry × a burial factor and surfaces geometric candidates — it CANNOT resolve the full "
+        "electrostatic/desolvation balance: you judge whether the context is favourable; the re-fold "
+        "validates. Novel reach uses a χ1 charged-group reach model (an approximation, not a full rotamer "
+        "library). Does NOT confirm the substitution is tolerated, that the protein still folds, or that "
+        "it stabilizes. Validate by substituting both positions → re-folding (NO constraint — charged "
+        "residues fold natively) → comparing; the ΔΔG is a second soft signal."
+    )
+    SB_NOVEL_TOP_N = 100        # cap the displayed novel shortlist (the heatmap best_partner keeps ALL);
+                                # salt bridges are geometrically easy to introduce, so bound the table
+
+    def _run_saltbridge_scan(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """SALT-BRIDGE SCAN — two halves on ONE existing structure (de-novo fold OR a LOADED crystal/
+        model, multimers native): (1) ASSESS existing Asp/Glu↔Arg/Lys pairs (closest carboxyl-O↔basic-N
+        + H-bond flag + burial; 4–5 Å near-misses flagged optimizable — pure measurement); (2) suggest
+        NOVEL complementary charge-pair sites (place acid+base over a χ1 reach-ring, ROTAMER-AWARE clash,
+        intra + inter-chain). CHEAP — reads the CIF, NEVER folds. Geometry × a FreeSASA burial factor.
+        The correct FRESH version (real geometry + reachability), DISTINCT from the legacy NL
+        `salt_bridge`/SaltBridgeBridge (proximity + SASA proxy — kept parallel, §9). Returns the existing
+        + novel ranked lists (source of truth) + a per-residue best-score heatmap map + the load-bearing
+        context-dependent CAVEAT. Reads `cif_path`."""
+        import os as _os
+        from disulfide_geometry import ClashGrid, parse_heavy_atoms
+        import saltbridge_geometry as sbg
+        cif = inputs.get("cif_path")
+        if not cif or not _os.path.isfile(cif):
+            return ToolStepResult(tool="saltbridge_scan", success=False,
+                                  error="Salt-bridge scan needs an existing structure CIF on disk.")
+        residues = sbg.parse_residues(cif)
+        sasa = sbg.compute_sasa_map(cif)         # FreeSASA (declared dep); {} → NEUTRAL burial (geometry-only)
+        existing, _ex_best = sbg.scan_existing_pairs(residues, sasa_map=sasa)
+        grid = ClashGrid(parse_heavy_atoms(cif))
+        novel, best = sbg.scan_novel_sites(residues, clash_grid=grid, sasa_map=sasa)
+        if len(residues) >= 2:                   # multimer → also the cross-chain interface scan
+            inovel, ibest = sbg.scan_novel_interface(residues, clash_grid=grid, sasa_map=sasa)
+            novel = sorted(novel + inovel, key=lambda d: -d["score"])
+            for k, v in ibest.items():
+                best[k] = max(best.get(k, 0.0), v)
+        n_novel_total = len(novel)
+        novel = novel[:self.SB_NOVEL_TOP_N]      # cap the TABLE; best_partner (heatmap) keeps all
+        best_by_chain: Dict[str, Dict[int, float]] = {}
+        for (ch, rn), sc in best.items():
+            best_by_chain.setdefault(ch, {})[rn] = round(sc, 4)
+        burial_note = "" if sasa else " (burial unavailable — geometry-only score; the burial factor needs FreeSASA)"
+        cap_note = (f" (showing top {self.SB_NOVEL_TOP_N} of {n_novel_total})"
+                    if n_novel_total > self.SB_NOVEL_TOP_N else "")
+        parts = [f"Salt-bridge scan — {len(existing)} existing pair(s), {n_novel_total} novel candidate(s){cap_note}"]
+        if existing:
+            e = existing[0]
+            parts.append(f"; top existing {e['type']} {e['chain_a']}:{e['resnum_a']}↔{e['chain_b']}:{e['resnum_b']} "
+                         f"{e['on_dist']}Å" + (" (optimizable)" if e.get("optimizable") else ""))
+        if novel:
+            c = novel[0]
+            parts.append(f"; top novel {c['from_aa_a']}{c['resnum_a']}{c['to_aa_a']}+{c['from_aa_b']}{c['resnum_b']}{c['to_aa_b']} "
+                         f"(score {c['score']:.2f})")
+        summary = "".join(parts) + burial_note + ". " + self._SALTBRIDGE_SCAN_CAVEAT
+        return ToolStepResult(
+            tool="saltbridge_scan", success=True,
+            data={"existing": existing, "novel": novel, "best_partner": best_by_chain,
+                  "n_novel_total": n_novel_total, "burial_available": bool(sasa),
+                  "caveat": self._SALTBRIDGE_SCAN_CAVEAT, "mode": "saltbridge_scan"},
+            summary=summary)
+
+    _SALTBRIDGE_DDG_CAVEAT = (
+        "Salt-bridge ΔΔG (legacy, uncalibrated — ranking/sign only, ~±2.7 kcal/mol). The two positions "
+        "are scored as INDEPENDENT single mutations (not the cooperative pair energy), and ΔΔG does NOT "
+        "model the desolvation/electrostatic balance — a SOFT signal on the geometric suggestion. "
+        "Validate by substituting both → re-folding (no constraint) → comparing."
+    )
+
+    def _run_saltbridge_ddg_estimate(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """ΔΔG-ESCALATION for ONE novel salt-bridge candidate — the `disulfide_ddg_estimate` pattern for
+        a 2-residue change, but the targets are VARIABLE (to_aa_a/to_aa_b = the chosen acid/base, not a
+        fixed 'C'). A DIRECT two-mutation `RosettaBridge.analyze`. Each from_aa is VERIFIED against the
+        residue AT (chain, resnum) in the EXACT PDB scored (silent-wrong-mutation guard, BOTH positions);
+        de-novo + web backend BLOCKED (no off-machine upload). Inputs: ``pdb_path``, ``chain_a/resnum_a/
+        from_aa_a/to_aa_a`` + the b-side, ``source`` ('denovo'|'loaded')."""
+        from disulfide_bridge import _three_to_one, parse_pdb_atoms
+        pdb = inputs.get("pdb_path")
+        ca, ra, aa_a, ta = (inputs.get("chain_a"), inputs.get("resnum_a"),
+                            inputs.get("from_aa_a"), inputs.get("to_aa_a"))
+        cb, rb, aa_b, tb = (inputs.get("chain_b"), inputs.get("resnum_b"),
+                            inputs.get("from_aa_b"), inputs.get("to_aa_b"))
+        source = (inputs.get("source") or "loaded").strip().lower()
+        if not pdb or not Path(pdb).is_file():
+            return ToolStepResult(tool="saltbridge_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs a structure (PDB) on disk.")
+        if None in (ca, ra, aa_a, ta, cb, rb, aa_b, tb):
+            return ToolStepResult(tool="saltbridge_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs both positions with their WT + target residue "
+                                        "(chain, resnum, from_aa, to_aa).")
+        ca, cb, ra, rb = str(ca), str(cb), int(ra), int(rb)
+        aa_a, aa_b, ta, tb = aa_a.upper(), aa_b.upper(), ta.upper(), tb.upper()
+        # 1) VERIFY each from_aa against the EXACT scored structure (silent-wrong-residue guard, BOTH)
+        atoms = parse_pdb_atoms(pdb)
+        for ch, rn, claimed in ((ca, ra, aa_a), (cb, rb, aa_b)):
+            res = (atoms.get(ch) or {}).get(rn)
+            if res is None:
+                return ToolStepResult(tool="saltbridge_ddg_estimate", success=False,
+                                      error=f"ΔΔG estimate: residue {ch}:{rn} not found in the scored structure.")
+            struct_aa = _three_to_one(res.get("resname", "UNK"))
+            if struct_aa != claimed:
+                return ToolStepResult(tool="saltbridge_ddg_estimate", success=False,
+                                      error=(f"ΔΔG estimate ABORTED — residue mismatch at {ch}:{rn}: the scan says "
+                                             f"{claimed} but the structure has {struct_aa}. Scoring would target the "
+                                             f"wrong mutation (off-by-one / wrong chain / stale edit). Re-scan first."))
+        # 2) backend gate (fail-closed BEFORE any compute/upload) — reuses the shared escalation gate
+        from rosetta_bridge import _select_backend, RosettaBridge
+        backend = _select_backend()
+        wsl_ok = False
+        if backend == "local":
+            try:
+                from wsl_bridge import WSLBridge
+                _w = WSLBridge()
+                wsl_ok = bool(_w.is_available() and _w.check_pyrosetta())
+            except Exception:
+                wsl_ok = False
+        ok, reason = self._ddg_escalation_gate(backend, source, wsl_ok)
+        if not ok:
+            return ToolStepResult(tool="saltbridge_ddg_estimate", success=False, error=reason)
+        # 3) score the two mutations (independent single-mutation ΔΔG each — the legacy engine's unit)
+        bridge = RosettaBridge()
+        r = bridge.analyze(pdb_path=pdb,
+                           mutations=[{"chain": ca, "position": ra, "from_aa": aa_a, "to_aa": ta},
+                                      {"chain": cb, "position": rb, "from_aa": aa_b, "to_aa": tb}])
+        ddg_a = ddg_b = None
+        if getattr(r, "success", False):
+            for key, v in (r.data.get("ddg_scores", {}) or {}).items():
+                m = re.match(r"[A-Z](\d+)([A-Z])", str(key))      # from-aa, POSITION, TO-aa
+                if not m:
+                    continue
+                pos, to = int(m.group(1)), m.group(2)
+                # disambiguate by (position, target): a salt bridge always pairs an ACID with a BASE,
+                # so ta != tb — this stays correct even for a cross-chain pair that shares a resnum.
+                if pos == ra and to == ta and ddg_a is None:
+                    ddg_a = float(v)
+                elif pos == rb and to == tb and ddg_b is None:
+                    ddg_b = float(v)
+        if ddg_a is None or ddg_b is None:
+            return ToolStepResult(tool="saltbridge_ddg_estimate", success=False,
+                                  error=f"ΔΔG estimate produced no score for {aa_a}{ra}{ta} / {aa_b}{rb}{tb} ({backend}).")
+        ddg_mean = round((ddg_a + ddg_b) / 2.0, 3)
+        summary = (f"Salt-bridge ΔΔG (legacy, {backend}) for {ca}:{ra}{aa_a}→{ta} / {cb}:{rb}{aa_b}→{tb} — "
+                   f"{aa_a}{ra}{ta} {ddg_a:+.2f}, {aa_b}{rb}{tb} {ddg_b:+.2f} kcal/mol (mean {ddg_mean:+.2f}). "
+                   + self._SALTBRIDGE_DDG_CAVEAT)
+        return ToolStepResult(
+            tool="saltbridge_ddg_estimate", success=True,
+            data={"chain_a": ca, "resnum_a": ra, "from_aa_a": aa_a, "to_aa_a": ta,
+                  "chain_b": cb, "resnum_b": rb, "from_aa_b": aa_b, "to_aa_b": tb,
+                  "ddg_a": ddg_a, "ddg_b": ddg_b, "ddg_mean": ddg_mean,
+                  "backend": backend, "source": source, "caveat": self._SALTBRIDGE_DDG_CAVEAT},
             summary=summary)
 
     def _resolve_boltz_templates(
