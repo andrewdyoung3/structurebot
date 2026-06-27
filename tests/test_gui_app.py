@@ -569,6 +569,34 @@ def test_reset_view_keeps_and_clears_disulfides_tab(_app):
     assert not dtab._sec["D"]["placeholder"].isHidden()      # back to the dormant placeholder
 
 
+def test_reset_view_keeps_and_clears_proline_tab(_app):
+    """The Proline tab is a SIBLING peer of the Disulfides tab — same layer-spanning contract:
+    `_reset_view_for_session` must KEEP it (not sweep it out with the chain grids) AND CLEAR it
+    (a Load brings a new session; the prior candidates reference a construct no longer loaded)."""
+    from variant_workbench import DisulfidesResultsTab, ProlineResultsTab
+    tabs = QtWidgets.QTabWidget()
+    wb = QtWidgets.QWidget(); wb.reset = lambda: None
+    dtab = DisulfidesResultsTab(on_highlight=lambda *a, **k: None, on_declare=lambda *a, **k: None)
+    ptab = ProlineResultsTab(on_highlight=lambda *a, **k: None)
+    wb.disulfides_tab = dtab
+    wb.proline_tab = ptab
+    grid = QtWidgets.QWidget()
+    tabs.addTab(wb, "Variant Workbench")
+    tabs.addTab(dtab, "Disulfides")
+    tabs.addTab(ptab, "Proline")
+    tabs.addTab(grid, "#1/A")
+    ptab.populate(MagicMock(), {"candidates": [
+        {"chain": "A", "position": 5, "from_aa": "W", "phi": -63.0, "psi": -35.0,
+         "score": 0.99, "hbond_donates": False}], "existing": [], "caveat": "x"})
+    assert ptab._tbl.rowCount() == 1                          # populated BEFORE the reset
+    w = _fakew(tabs=tabs, workbench=wb, _grids={("1", "A"): grid})
+    w._reset_view_for_session()
+    widgets = [tabs.widget(i) for i in range(tabs.count())]
+    assert ptab in widgets and grid not in widgets           # SURVIVES; only the grid drops
+    assert ptab._tbl.rowCount() == 0                         # …but CLEARED (no stale candidates)
+    assert not ptab._placeholder.isHidden()                 # back to the dormant placeholder
+
+
 # ── Reconnect ChimeraX: model-id remap + reopen/relink flow ───────────────────────
 def test_remap_session_model_ids_crystal_and_denovo(_app):
     """remap rewrites structures keys, crystal design keys, AND internal fold refs of a de-novo

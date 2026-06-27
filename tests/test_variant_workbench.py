@@ -3229,3 +3229,93 @@ class TestDisulfideDdgEscalation:
                 "ca_ca": 5.6, "cb_cb": 3.9, "orientation": 88.0}
         det = T._pair_detail("I", bare)
         assert "not yet estimated" in det.lower() and "ΔΔG" in det
+
+
+class TestProlineMode:
+    """The panel-based proline-stabilization mode (parallel to the disulfide suite)."""
+
+    def _construct(self, p, seq="MKVLWAAGTDER"):
+        p._add_sequence_construct("binder", seq)
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        return cd
+
+    def _scan(self):
+        return {"candidates": [
+            {"chain": "A", "position": 5, "from_aa": "W", "phi": -63.0, "psi": -35.0,
+             "phi_score": 1.0, "psi_score": 1.0, "hbond_donates": False, "score": 0.99},
+            {"chain": "A", "position": 9, "from_aa": "T", "phi": -60.0, "psi": -40.0,
+             "phi_score": 0.99, "psi_score": 1.0, "hbond_donates": True, "score": 0.30}],
+            "best_partner": {"A": {5: 0.99, 9: 0.30}},
+            "existing": [["A", 3]], "caveat": "Geometric suggestion only — does not confirm."}
+
+    def test_scan_launch_spec_reads_the_structure(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._construct(p)
+        spec = p.proline_scan_launch_spec()
+        assert spec["tool"] == "proline_scan" and spec["refresh"] == "proline_scan"
+        assert spec["tool_inputs"]["cif_path"] == "/tmp/binder.cif"
+
+    def test_apply_populates_tab_and_surfaces_heatmap(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._run_commands_bg = lambda c: None
+        cd = self._construct(p)
+        p.apply_proline_scan_result(
+            {"_align_ukey": p._cur_cd_ukey()},
+            {"tool_step_results": [{"tool": "proline_scan", "success": True,
+                                    "data": self._scan(), "summary": "ok"}]})
+        assert len((cd.proline_scan or {}).get("candidates", [])) == 2
+        assert p._mode_key == "result:proline_scan"                # auto-surfaced
+        tbl = p.proline_tab._tbl
+        assert tbl.rowCount() == 2 and tbl.item(0, 0).text() == "W5P"
+        assert tbl.item(0, 4).text() == "—" and tbl.item(1, 4).text() == "donor"   # H-bond donor flag
+        # heatmap paints the rep chain by score
+        assert len(p._proline_scan_panel_hex(p._cur_tab())) == 2
+
+    def test_row_click_highlights_residue_through_glow_seam(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        pushed = []
+        p._run_commands_bg = lambda c: pushed.extend(c)
+        cd = self._construct(p)
+        p.proline_tab.populate(cd, self._scan())
+        pushed.clear()
+        p.proline_tab._tbl.cellClicked.emit(0, 0)                  # click the top row (W5)
+        joined = " ".join(pushed)
+        assert "#7/A:5" in joined and "transparency #7 70 target c" in joined   # glow recipe
+        assert p._glow_state == {"mid": "7", "both": "#7/A:5"}
+        assert p.proline_tab._clear_glow_btn.isEnabled()          # glow active → Clear lit
+
+    def test_show_existing_prolines_highlights_them(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        pushed = []
+        p._run_commands_bg = lambda c: pushed.extend(c)
+        cd = self._construct(p)
+        cd.proline_scan = self._scan()
+        p._show_existing_prolines(cd)
+        assert any("#7/A:3" in c for c in pushed)                  # the existing proline at A:3
+
+    def test_color_mode_registered(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        items = [p._mode_combo.itemData(i) for i in range(p._mode_combo.count())]
+        assert "result:proline_scan" in items
+
+    def test_ddg_spec_verifies_and_blocks(self, _app):
+        # build_proline_ddg_spec recovers from_aa own-chain and tags the source for the gate
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._active_structure = lambda: {"cif_path": "/tmp/b.cif", "model_id": "7"}
+        p._save_structure_pdb = lambda mid: "/tmp/b.pdb"
+        p._from_aa_for = lambda ch, rn: "W"
+        spec = p.build_proline_ddg_spec({"chain": "A", "position": 5})
+        assert spec["tool"] == "proline_ddg_estimate" and spec["tool_inputs"]["from_aa"] == "W"
+        assert spec["tool_inputs"]["source"] == "denovo"          # de-novo → the gate can block web upload
+        assert spec["tool_inputs"]["resnum"] == 5
+
+    def test_tab_reset_clears(self, _app):
+        from variant_workbench import ProlineResultsTab
+        t = ProlineResultsTab(on_highlight=lambda *a, **k: None)
+        t.populate(MagicMock(), self._scan())
+        assert t._tbl.rowCount() == 2
+        t.reset()
+        assert t._tbl.rowCount() == 0 and not t._tbl.isVisible()

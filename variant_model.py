@@ -139,6 +139,11 @@ class ChainDesign:
     # (the cross-chain analogue of disulfide_scan). Same shape {pairs, best_partner, caveat}; each
     # pair carries chain_a != chain_b. Feeds the cross-chain Mode-C declare. Multimer constructs only.
     disulfide_interface_scan: Dict[str, Any] = field(default_factory=dict)
+    # Proline-stabilization scan: per-residue X→Pro candidates ranked by backbone φ/ψ proline-
+    # compatibility with a backbone-H-bond-donor penalty (proline_geometry.scan_proline_sites). Shape:
+    # {candidates:[ranked per-residue dicts], best_partner:{chain:{resnum:score}}, existing:[(chain,
+    # resnum)], caveat}. The ranked list is the source of truth; best_partner feeds the heatmap mode.
+    proline_scan: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -376,6 +381,7 @@ class DesignSession:
                 structural_align = dict(cd.get("structural_align") or {}),
                 disulfide_scan   = dict(cd.get("disulfide_scan") or {}),
                 disulfide_interface_scan = dict(cd.get("disulfide_interface_scan") or {}),
+                proline_scan   = dict(cd.get("proline_scan") or {}),
                 guided_fold    = dict(cd.get("guided_fold") or {}),
                 template_assist = dict(cd.get("template_assist") or {}),
             )
