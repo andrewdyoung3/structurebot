@@ -407,6 +407,14 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             self.split.restoreState(_saved_split)
         self.setCentralWidget(self.split)
 
+        # Design basket — a QDockWidget on the RIGHT (native Qt docking: resizable / float / close,
+        # doesn't fight the central splitter or the resizable-window work). The CROSS-STRATEGY
+        # substitution-staging panel: collect Disulfides/Proline picks → enact one variant.
+        self.basket_dock = QtWidgets.QDockWidget("Design basket", self)
+        self.basket_dock.setObjectName("designBasketDock")
+        self.basket_dock.setWidget(self.workbench.design_basket)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.basket_dock)
+
         tb = self.addToolBar("main")
         self.cancel_action = tb.addAction("Cancel", self._on_cancel)
         self.cancel_action.setEnabled(False)
@@ -956,6 +964,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         try:
             if proline is not None:
                 proline.reset()
+        except Exception:
+            pass
+        try:
+            basket = getattr(self.workbench, "design_basket", None)
+            if basket is not None:
+                basket.reset()                       # stale picks reference the gone session's design
         except Exception:
             pass
 

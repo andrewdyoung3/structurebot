@@ -3319,3 +3319,93 @@ class TestProlineMode:
         assert t._tbl.rowCount() == 2
         t.reset()
         assert t._tbl.rowCount() == 0 and not t._tbl.isVisible()
+
+
+class TestDesignBasket:
+    """The cross-strategy substitution-staging panel: curate picks → compose ONE variant."""
+
+    def _construct(self, p, seq="MKVLWAAGTDER"):
+        p._add_sequence_construct("binder", seq)        # no existing Cys; resnums 1..len
+        cd = next(iter(p._design.chains.values()))
+        cd.rep_model, cd.rep_chain = "7", "A"
+        cd.template_fold = {"engine": "boltz", "model_id": "7", "cif_path": "/tmp/x.cif"}
+        p._from_aa_for = lambda ch, rn: seq[rn - 1]      # own-chain WT recovery
+        p._run_commands_bg = lambda c: None
+        return cd
+
+    def _proline(self, pos, donor=False):
+        return {"chain": "A", "position": pos, "from_aa": "MKVLWAAGTDER"[pos - 1],
+                "phi": -63.0, "psi": -35.0, "hbond_donates": donor, "score": 0.95}
+
+    def _disulfide(self, a, b, clash=False):
+        return {"chain_a": "A", "resnum_a": a, "chain_b": "A", "resnum_b": b,
+                "best_sg_sg": 2.04, "best_chi_ss": -88.0, "clash": clash, "score": 0.9}
+
+    def test_proline_entry_shape_and_metrics(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_proline_to_basket(cd, self._proline(3, donor=True))
+        e = p.design_basket.entries[0]
+        assert e["cls"] == "Proline"
+        assert e["subs"] == [{"chain": "A", "position": 3, "from_aa": "V", "to_aa": "P"}]
+        assert "φ" in e["metrics_text"] and "H-bond donor" in e["metrics_text"]   # class-specific detail
+
+    def test_disulfide_entry_two_subs_with_recovered_from_aa(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_disulfide_to_basket(cd, self._disulfide(5, 8))
+        e = p.design_basket.entries[0]
+        assert e["cls"] == "Disulfide" and len(e["subs"]) == 2           # a pair = TWO positions→Cys
+        assert {(s["position"], s["from_aa"], s["to_aa"]) for s in e["subs"]} == {(5, "W", "C"), (8, "G", "C")}
+        assert "Sγ–Sγ" in e["metrics_text"]                              # disulfide-specific detail
+
+    def test_disulfide_add_fails_loud_without_from_aa(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._from_aa_for = lambda ch, rn: None                            # recovery fails
+        p._add_disulfide_to_basket(cd, self._disulfide(5, 8))
+        assert p.design_basket.entries == []                            # not staged (no silent wrong WT)
+
+    def test_add_remove_and_dedup(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_proline_to_basket(cd, self._proline(3))
+        p._add_disulfide_to_basket(cd, self._disulfide(5, 8))
+        assert len(p.design_basket.entries) == 2
+        p._add_proline_to_basket(cd, self._proline(3))                  # identical → deduped
+        assert len(p.design_basket.entries) == 2
+        p.design_basket._list.selectRow(0); p.design_basket._remove_selected()
+        assert len(p.design_basket.entries) == 1 and p.design_basket.entries[0]["cls"] == "Disulfide"
+
+    def test_same_residue_conflict_flags_and_blocks_enact(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_proline_to_basket(cd, self._proline(3))                  # A:3 → P
+        assert p.design_basket._enact_btn.isEnabled()
+        p._add_disulfide_to_basket(cd, self._disulfide(3, 10))          # A:3 → C  (collision)
+        assert p.design_basket._conflicts()                            # flagged
+        assert p.design_basket._conflict.text() and not p.design_basket._enact_btn.isEnabled()   # blocked
+        p.design_basket._list.selectRow(1); p.design_basket._remove_selected()                    # drop the collision
+        assert not p.design_basket._conflicts() and p.design_basket._enact_btn.isEnabled()
+
+    def test_enact_composes_one_variant_from_n_subs(self, _app):
+        # THE seam: N substitutions across strategies → ONE variant with N mutations
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_proline_to_basket(cd, self._proline(3))                  # V3P
+        p._add_disulfide_to_basket(cd, self._disulfide(5, 8))          # W5C + G8C
+        n0 = len(cd.variants)
+        p.design_basket._enact()
+        assert len(cd.variants) == n0 + 1                              # ONE new variant
+        v = cd.variants[-1]
+        assert sorted((m.resnum, m.to_aa) for m in v.mutations) == [(3, "P"), (5, "C"), (8, "C")]
+        assert p._cur_tab().active_row_id == v.id                      # handed to the variant flow (active)
+        assert p.design_basket.entries == []                          # basket consumed after enact
+
+    def test_basket_reset_clears(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_proline_to_basket(cd, self._proline(3))
+        assert p.design_basket.entries
+        p.design_basket.reset()
+        assert p.design_basket.entries == [] and not p.design_basket._list.isVisible()
