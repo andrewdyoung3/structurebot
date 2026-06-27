@@ -36,7 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from color_modes import (all_modes, cavity_compat_color, combined_disruption_color, ddg_color,
-                         disulfide_compat_color, get_mode, plddt_color, proline_compat_color)
+                         disulfide_compat_color, get_mode, plddt_color, proline_compat_color,
+                         saltbridge_compat_color)
 from disulfide_geometry import pair_chains, pair_label
 from seq_library import (build_numbering_header_content,
                          build_numbering_header_with_insertions)
@@ -57,6 +58,7 @@ _RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα 
 _RESULT_DISULFIDE_MODE = "result:disulfide_scan"  # Mode D best-partner engineerability heatmap
 _RESULT_PROLINE_MODE = "result:proline_scan"      # proline-stabilization favourability heatmap
 _RESULT_CAVITY_MODE = "result:cavity_scan"        # cavity-filling best-fill heatmap (lining→gold)
+_RESULT_SALTBRIDGE_MODE = "result:saltbridge_scan"  # salt-bridge best charge-pair heatmap (pale→blue)
 _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
 _LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
 _DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
@@ -1290,6 +1292,214 @@ class CavityResultsTab(_StabilizationResultsTab):
         self.set_glow_active(False)
 
 
+class SaltBridgeResultsTab(_StabilizationResultsTab):
+    """Persistent home for the SALT-BRIDGE scan — the fourth peer of Disulfides / Proline / Cavity
+    (built on the shared `_StabilizationResultsTab` base). Salt-bridge is PAIRWISE (like disulfide), so
+    it carries TWO ranked PAIR tables: (1) EXISTING Asp/Glu↔Arg/Lys pairs (assessment — pure measurement;
+    row-click highlights both members; 4–5 Å near-misses flagged optimizable), and (2) NOVEL complementary
+    charge-pair sites (engineering — row-click highlights both, + Substitute-both-and-validate, Estimate-
+    ΔΔG, Add-to-design). Each row is a two-chain pair (chain_a/resnum_a + chain_b/resnum_b — intra OR
+    inter-chain via `pair_label`). The context-dependent desolvation caveat rides in `_make_caveat`.
+    Persists across tab-switch + session reset (keep-and-clear)."""
+
+    def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
+                 on_add_to_basket=None):
+        super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
+                         on_add_to_basket=on_add_to_basket)
+        self._on_declare = on_declare              # (cd, cand) -> substitute BOTH positions + validate
+        self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> 2-residue ΔΔG escalation (legacy bridge)
+        self._cd = None
+        self._existing: List[dict] = []
+        self._novel: List[dict] = []
+        self._add_header(
+            "Salt-bridge candidates. Existing Asp/Glu↔Arg/Lys pairs (assessed by closest carboxyl-O↔"
+            "basic-N distance + burial) and NOVEL complementary charge-pair sites (geometry × burial). "
+            "The tables are the SOURCE OF TRUTH; the 'Salt-bridge sites' colour mode is a complementary "
+            "navigational index. Salt bridges are context-dependent: favourable when geometry + burial "
+            "align, marginal/destabilizing at the surface (desolvation) — YOU judge the context, the "
+            "re-fold validates.",
+            "Clear salt-bridge view (un-ghost)",
+            "Restore the normal representation: un-ghost the structure and remove the pair spotlight. "
+            "Enabled while a glow is active.")
+
+        self._caveat = self._make_caveat()
+        self._outer.addWidget(self._caveat)
+
+        # ── EXISTING pairs (assessment) ──
+        ex_box = QtWidgets.QGroupBox("Existing salt bridges (assessed)")
+        exl = QtWidgets.QVBoxLayout(ex_box)
+        self._ex_placeholder = QtWidgets.QLabel("Run “Find salt-bridge sites” to populate.")
+        self._ex_placeholder.setWordWrap(True); self._ex_placeholder.setStyleSheet("color:#888;")
+        exl.addWidget(self._ex_placeholder)
+        self._ex_tbl = self._make_ranked_table(
+            ["Pair", "Type", "O–N (Å)", "H-bond", "Burial", "Score"],
+            lambda r, _c: self._on_existing_row(r))
+        exl.addWidget(self._ex_tbl)
+        self._outer.addWidget(ex_box)
+
+        # ── NOVEL sites (engineering) ──
+        nv_box = QtWidgets.QGroupBox("Novel salt-bridge sites (ranked)")
+        nvl = QtWidgets.QVBoxLayout(nv_box)
+        self._nv_placeholder = QtWidgets.QLabel("Run “Find salt-bridge sites” to populate.")
+        self._nv_placeholder.setWordWrap(True); self._nv_placeholder.setStyleSheet("color:#888;")
+        nvl.addWidget(self._nv_placeholder)
+        self._nv_tbl = self._make_ranked_table(
+            ["Substitutions", "Pair", "O–N (Å)", "Cβ–Cβ", "H-bond", "Burial", "Clash", "Score",
+             "ΔΔG (kcal/mol)"],
+            lambda r, _c: self._on_novel_row(r))
+        nvl.addWidget(self._nv_tbl)
+        self._detail = QtWidgets.QLabel(); self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color:#444;"); self._detail.setVisible(False)
+        nvl.addWidget(self._detail)
+        row = QtWidgets.QHBoxLayout()
+        self._declare_btn = QtWidgets.QPushButton("Substitute → charge pair and validate")
+        self._declare_btn.setToolTip("Substitute BOTH positions to the complementary charged residues "
+                                     "on a new variant and validate by re-folding (no constraint — "
+                                     "charged residues fold natively) + comparing — the real test.")
+        self._declare_btn.setEnabled(False)
+        self._declare_btn.clicked.connect(self._declare)
+        row.addWidget(self._declare_btn)
+        self._escalate_btn = QtWidgets.QPushButton("Estimate ΔΔG (legacy)")
+        self._escalate_btn.setToolTip("Energetic estimate (uncalibrated — ranking/sign only) for the "
+                                      "selected charge-pair (both positions); minutes.")
+        self._escalate_btn.setEnabled(False)
+        self._escalate_btn.clicked.connect(self._estimate)
+        row.addWidget(self._escalate_btn)
+        self._basket_btn = QtWidgets.QPushButton("Add to design")
+        self._basket_btn.setToolTip("Stage the selected charge-pair substitution (both positions) into "
+                                    "the Design basket (collect picks across strategies, then enact).")
+        self._basket_btn.setEnabled(False)
+        self._basket_btn.clicked.connect(self._add_to_basket)
+        row.addWidget(self._basket_btn)
+        nvl.addLayout(row)
+        self._outer.addWidget(nv_box)
+        self._outer.addStretch(1)
+
+    # ── row handlers ──
+    def _on_existing_row(self, r: int) -> None:
+        if not (0 <= r < len(self._existing)) or self._cd is None:
+            return
+        self._nv_tbl.clearSelection()
+        self._on_highlight(self._cd, self._existing[r])
+        self._detail.setText(self._existing_detail(self._existing[r])); self._detail.setVisible(True)
+
+    def _on_novel_row(self, r: int) -> None:
+        if not (0 <= r < len(self._novel)) or self._cd is None:
+            return
+        self._ex_tbl.clearSelection()
+        c = self._novel[r]
+        self._on_highlight(self._cd, c)
+        self._detail.setText(self._novel_detail(c)); self._detail.setVisible(True)
+        has = self._cd is not None
+        self._declare_btn.setEnabled(has)
+        self._escalate_btn.setEnabled(has)
+        self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
+
+    @staticmethod
+    def _existing_detail(p: dict) -> str:
+        opt = (" — ⚠ a 4–5 Å OPTIMIZABLE near-miss (tightening the rotamers/substitution could form a "
+               "full bridge)") if p.get("optimizable") else (" — within the ≤4 Å salt-bridge cutoff")
+        hb = " It is also an H-bond (≤3.5 Å — the strongest sub-class)." if p.get("hbond_like") else ""
+        bur = ("buried" if p.get("buried") else "surface") if p.get("buried") is not None else "burial unknown"
+        return (f"{pair_label(p)} ({p.get('type','')}) — closest O–N {p.get('on_dist')} Å{opt}.{hb} "
+                f"Context: {bur} (score {p.get('score', 0):.2f}). Salt bridges are context-dependent — "
+                f"buried bridges are typically stabilizing; surface ones are marginal (desolvation).")
+
+    @staticmethod
+    def _novel_detail(c: dict) -> str:
+        clash = (" — ⚠ no reaching rotamer pair dodges a clash (over-pack risk on the rigid backbone; "
+                 "soft-demoted, validate)") if c.get("clash") else " — a clash-free placement reaches the bridge"
+        bur = ("buried" if c.get("buried") else "surface") if c.get("buried") is not None else "burial unknown"
+        ddg = c.get("ddg_mean")
+        ddg_s = (f" ΔΔG (legacy): mean {ddg:+.2f} kcal/mol." if ddg is not None
+                 else " ΔΔG not yet estimated — “Estimate ΔΔG (legacy)”.")
+        return (f"{c.get('from_aa_a','')}{c.get('resnum_a')}{c.get('to_aa_a','')} + "
+                f"{c.get('from_aa_b','')}{c.get('resnum_b')}{c.get('to_aa_b','')} "
+                f"({pair_label(c)}) — score {c.get('score', 0):.2f}: closest O–N {c.get('best_on')} Å, "
+                f"Cβ–Cβ {c.get('cb_cb')} Å, {bur}{clash}.{ddg_s} Validate by substituting both → "
+                f"re-folding (no constraint) → comparing.")
+
+    def _add_to_basket(self) -> None:
+        r = self._nv_tbl.currentRow()
+        if 0 <= r < len(self._novel) and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, self._novel[r])
+
+    def _declare(self) -> None:
+        r = self._nv_tbl.currentRow()
+        if 0 <= r < len(self._novel) and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, self._novel[r])
+
+    def _estimate(self) -> None:
+        r = self._nv_tbl.currentRow()
+        if 0 <= r < len(self._novel) and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, self._novel[r])
+
+    @staticmethod
+    def _burial_cell(p: dict) -> str:
+        b = p.get("buried")
+        return "—" if b is None else ("buried" if b else "surface")
+
+    @staticmethod
+    def _ddg_cell(c: dict) -> str:
+        da, db = c.get("ddg_a"), c.get("ddg_b")
+        if da is None or db is None:
+            return "—"
+        return f"{da:+.1f} / {db:+.1f}"
+
+    def populate(self, cd, scan: dict) -> None:
+        """Fill both tables from a salt-bridge scan ({existing, novel, caveat})."""
+        existing = (scan or {}).get("existing") or []
+        novel = (scan or {}).get("novel") or []
+        self._cd, self._existing, self._novel = cd, list(existing), list(novel)
+        self._caveat.setText("⚠ " + ((scan or {}).get("caveat") or "Geometric suggestion only."))
+        self._caveat.setVisible(bool(existing or novel))
+        # existing table
+        self._ex_tbl.setRowCount(len(existing))
+        for i, p in enumerate(existing):
+            on = f"{p.get('on_dist')}" + (" (opt)" if p.get("optimizable") else "")
+            cells = [pair_label(p), p.get("type", ""), on,
+                     ("H-bond" if p.get("hbond_like") else "—"), self._burial_cell(p),
+                     f"{p.get('score', 0):.2f}"]
+            for j, v in enumerate(cells):
+                self._ex_tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        self._ex_tbl.resizeColumnsToContents()
+        self._ex_tbl.setVisible(bool(existing))
+        self._ex_placeholder.setVisible(not existing)
+        # novel table
+        self._nv_tbl.setRowCount(len(novel))
+        for i, c in enumerate(novel):
+            sub = (f"{c.get('from_aa_a','')}{c.get('resnum_a')}{c.get('to_aa_a','')}+"
+                   f"{c.get('from_aa_b','')}{c.get('resnum_b')}{c.get('to_aa_b','')}")
+            cells = [sub, pair_label(c), f"{c.get('best_on')}", f"{c.get('cb_cb')}",
+                     ("H-bond" if c.get("hbond_like") else "—"), self._burial_cell(c),
+                     ("⚠" if c.get("clash") else "ok"), f"{c.get('score', 0):.2f}", self._ddg_cell(c)]
+            for j, v in enumerate(cells):
+                self._nv_tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        self._nv_tbl.resizeColumnsToContents()
+        has_nv = bool(novel)
+        self._nv_tbl.setVisible(has_nv)
+        self._nv_placeholder.setVisible(not has_nv)
+        self._declare_btn.setEnabled(has_nv)
+        self._escalate_btn.setEnabled(has_nv)
+        self._basket_btn.setEnabled(has_nv and self._on_add_to_basket is not None)
+        if has_nv:
+            self._nv_tbl.selectRow(0); self._on_novel_row(0)
+        elif existing:
+            self._ex_tbl.selectRow(0); self._on_existing_row(0)
+
+    def reset(self) -> None:
+        """Clear back to the dormant placeholders (keep-and-clear on session reset — the tab PERSISTS as
+        a sibling, its content belongs to the prior session)."""
+        self._cd, self._existing, self._novel = None, [], []
+        for tbl, ph in ((self._ex_tbl, self._ex_placeholder), (self._nv_tbl, self._nv_placeholder)):
+            tbl.setRowCount(0); tbl.setVisible(False); ph.setVisible(True)
+        self._caveat.setVisible(False); self._detail.setVisible(False)
+        self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
+        if getattr(self, "_basket_btn", None) is not None:
+            self._basket_btn.setEnabled(False)
+        self.set_glow_active(False)
+
+
 class DesignBasketPanel(QtWidgets.QWidget):
     """The CROSS-STRATEGY substitution-staging panel — the framework centerpiece. The designer
     collects suggested substitutions from the strategy tabs (Disulfides, Proline, … any future
@@ -1757,6 +1967,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                       "cavity matters. Cheap (no fold). Needs a folded construct or a "
                                       "loaded structure.")
         self._cav_scan_btn.triggered.connect(self._on_cavity_scan)
+        # Salt-bridge scan — the fourth peer strategy in the SAME Stabilize ▾ menu. Assess existing
+        # Asp/Glu↔Arg/Lys pairs + suggest novel complementary charge-pair sites. Cheap (reads
+        # coordinates, no fold); works on a de-novo fold OR a loaded crystal/model, intra + inter-chain.
+        self._sb_scan_btn = pro_menu.addAction("Find salt-bridge sites…")
+        self._sb_scan_btn.setToolTip("FIND salt-bridge stabilization sites: assess existing Asp/Glu↔"
+                                     "Arg/Lys pairs (closest carboxyl-O↔basic-N + burial) and rank NOVEL "
+                                     "complementary charge-pair substitutions (geometry × burial, rotamer-"
+                                     "aware, intra + inter-chain). Salt bridges are CONTEXT-DEPENDENT "
+                                     "(favourable buried, marginal at the surface via desolvation) — "
+                                     "geometric suggestion only, you judge the context. Cheap (no fold). "
+                                     "Needs a folded construct or a loaded structure.")
+        self._sb_scan_btn.triggered.connect(self._on_saltbridge_scan)
         self._pro_menu_btn.setMenu(pro_menu)
         bar.addWidget(self._pro_menu_btn)
         bar.addSeparator()
@@ -1795,6 +2017,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("Disulfide sites", _RESULT_DISULFIDE_MODE)  # Mode D engineerability
         self._mode_combo.addItem("Proline sites", _RESULT_PROLINE_MODE)      # proline stabilization
         self._mode_combo.addItem("Cavity sites", _RESULT_CAVITY_MODE)        # cavity-filling best-fill
+        self._mode_combo.addItem("Salt-bridge sites", _RESULT_SALTBRIDGE_MODE)  # salt-bridge charge-pair
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
         # No trailing stretch: a QToolBar left-aligns its items and surfaces the overflow chevron on
@@ -1835,6 +2058,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_estimate_ddg=self._estimate_cavity_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
             on_add_to_basket=self._add_cavity_to_basket)
+        self.saltbridge_tab = SaltBridgeResultsTab(
+            on_highlight=self._highlight_saltbridge_pair,    # pairwise glow (reuses the disulfide seam)
+            on_declare=self._declare_saltbridge,
+            on_estimate_ddg=self._estimate_saltbridge_ddg,
+            on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
+            on_add_to_basket=self._add_saltbridge_to_basket)
         # The CROSS-STRATEGY design basket — the framework centerpiece (gui_app docks it on the right).
         self.design_basket = DesignBasketPanel(on_enact=self._enact_basket)
 
@@ -3022,6 +3251,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._pro_scan_btn.setEnabled(has_struct)          # reads the backbone (no fold), like D
         if getattr(self, "_cav_scan_btn", None) is not None:
             self._cav_scan_btn.setEnabled(has_struct)          # reads coordinates (no fold), like proline
+        if getattr(self, "_sb_scan_btn", None) is not None:
+            self._sb_scan_btn.setEnabled(has_struct)           # reads coordinates (no fold), like cavity
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -3072,6 +3303,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         self._status.setText("Scanning for cavity-filling sites (internal voids + rotamer-aware fills, "
                              "geometric suggestion only — you judge which cavity matters)…")
+        self.launchRequested.emit(spec)
+
+    def _on_saltbridge_scan(self) -> None:
+        spec = self.saltbridge_scan_launch_spec()
+        if spec is None:
+            self._status.setText("Salt-bridge scan needs a readable structure — fold the construct, or "
+                                 "check the loaded model is still open.")
+            return
+        self._status.setText("Scanning for salt-bridge sites (existing Asp/Glu↔Arg/Lys pairs + novel "
+                             "charge-pair geometry × burial; context-dependent — you judge the context)…")
         self.launchRequested.emit(spec)
 
     def _on_disulfide_interface_scan(self) -> None:
@@ -3359,6 +3600,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             cav = (tab.design.disulfide_scan or {}).get("caveat") or ""
             self._status.setText("Disulfide sites heatmap (each residue = its BEST-partner score; a "
                                  "navigational index into the ranked list). " + cav)
+        elif self._mode_key == _RESULT_SALTBRIDGE_MODE:
+            cav = (tab.design.saltbridge_scan or {}).get("caveat") or ""
+            self._status.setText("Salt-bridge sites heatmap (each residue = its best charge-pair score; "
+                                 "a navigational index into the ranked tables). " + cav)
         else:
             self._status.setText(f"Color: {get_mode(self._mode_key).label} — "
                                  f"3D follows the active row ({tab.active_row_id}).")
@@ -4105,6 +4350,229 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.cavity_tab.populate(cd, cd.cavity_scan)
         self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
 
+    # ── Salt-bridge scan: launch / apply / heatmap / pair-glow / basket / declare / ΔΔG ──────────
+    def saltbridge_scan_launch_spec(self) -> Optional[dict]:
+        """Salt-bridge-scan spec — assess existing + suggest novel charge pairs on the active design's
+        EXISTING structure (de-novo fold OR a LOADED crystal/model, via `_active_structure`). CHEAP
+        (reads coordinates; NEVER folds). None until there is a structure to read."""
+        src = self._active_structure()
+        if src is None:
+            return None
+        return {
+            "tool": "saltbridge_scan", "tool_inputs": {"cif_path": src["cif_path"]},
+            "user_input": "[Workbench] find salt-bridge sites (existing pairs + novel charge-pair scan, this structure)",
+            "confidence": "high", "refresh": "saltbridge_scan",        # cheap + deterministic → no gate
+            "_align_ukey": self._cur_cd_ukey(),
+        }
+
+    def apply_saltbridge_scan_result(self, spec: dict, result: dict) -> None:
+        """Store the salt-bridge scan on the active cd (existing + novel ranked lists = source of truth +
+        best-score heatmap map) and AUTO-SURFACE the 'Salt-bridge sites' colour mode. The context-
+        dependent desolvation CAVEAT rides on the tab + status."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "saltbridge_scan"), None)
+        if step is None or not step.get("success"):
+            self._status.setText(f"Salt-bridge scan failed: {step.get('error') if step else 'no result'}")
+            return
+        data = step.get("data") or {}
+        cd = self._scan_target_cd(spec)
+        if cd is None:
+            return
+        cd.saltbridge_scan = {"existing": data.get("existing") or [],
+                              "novel": data.get("novel") or [],
+                              "best_partner": data.get("best_partner") or {},
+                              "caveat": data.get("caveat")}
+        self._persist()
+        if cd.saltbridge_scan["best_partner"]:
+            self._select_result_mode(_RESULT_SALTBRIDGE_MODE)          # AUTO-SURFACE the heatmap
+            tab = self._cur_tab()
+            if tab is not None:
+                self._apply_color_to(tab)
+                self._push_3d_color(tab)
+        self.saltbridge_tab.populate(cd, cd.saltbridge_scan)
+        self._status.setText(step.get("summary") or "Salt-bridge scan complete.")
+
+    def _active_saltbridge_scan(self, tab: _ChainDesignTab) -> Dict[int, float]:
+        """{author_resnum: best salt-bridge score} for the active cd's scan, rep chain only. Empty when
+        no scan has run. The heatmap colours each residue by its best charge-pair score — the
+        NAVIGATIONAL INDEX into the ranked tables (the source of truth)."""
+        cd = tab.design
+        best = ((cd.saltbridge_scan or {}).get("best_partner") or {})
+        chain_best = best.get(cd.rep_chain)
+        if chain_best is None and len(best) == 1:
+            chain_best = next(iter(best.values()))
+        return {int(rn): float(sc) for rn, sc in (chain_best or {}).items()}
+
+    def _saltbridge_scan_panel_hex(self, tab: _ChainDesignTab) -> Dict[int, str]:
+        """{author_resnum: hex} for the salt-bridge heatmap (best score → pale→electric-blue)."""
+        out: Dict[int, str] = {}
+        for rn, sc in self._active_saltbridge_scan(tab).items():
+            hexc = saltbridge_compat_color(sc)
+            if hexc:
+                out[rn] = hexc
+        return out
+
+    def _highlight_saltbridge_pair(self, cd, pair: dict) -> None:
+        """Glow a salt-bridge pair's two members — REUSES the disulfide pair-glow seam (same two-chain
+        pair shape), through the shared `_glow_state` (restore-then-apply, never stacking). Works for an
+        intra-chain pair AND a cross-chain one (`_disulfide_pair_specs` reads chain_a/chain_b)."""
+        apply = self._disulfide_scan_highlight_commands(cd, pair)
+        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
+        mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
+        self._glow_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
+        self._sync_glow_clear_button()
+
+    def _add_saltbridge_to_basket(self, cd, cand: dict) -> None:
+        """Normalize a NOVEL salt-bridge candidate → a basket entry (TWO positions → the complementary
+        charged residues). The candidate carries from_aa + to_aa for BOTH members (basket-aware-shaped,
+        unlike disulfide which recovers from_aa) — so the 2-substitution entry drops straight in."""
+        ca, cb = pair_chains(cand)
+        ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
+        ra, rb = cand.get("resnum_a"), cand.get("resnum_b")
+        ta, tb = cand.get("to_aa_a"), cand.get("to_aa_b")
+        aa_a, aa_b = cand.get("from_aa_a"), cand.get("from_aa_b")
+        if None in (ra, rb) or not ta or not tb or aa_a is None or aa_b is None:
+            self._status.setText("Can't add — the candidate is missing residue/target info (re-scan).")
+            return
+        bur = ("buried" if cand.get("buried") else "surface" if cand.get("buried") is False else "burial n/a")
+        entry = {
+            "cls": "Salt bridge", "score": float(cand.get("score", 0.0)),
+            "subs": [{"chain": str(ca), "position": int(ra), "from_aa": aa_a, "to_aa": str(ta)},
+                     {"chain": str(cb), "position": int(rb), "from_aa": aa_b, "to_aa": str(tb)}],
+            "metrics_text": (f"O–N {cand.get('best_on')}Å Cβ–Cβ {cand.get('cb_cb')}Å; {bur}; "
+                             + ("⚠ clash" if cand.get("clash") else "clash-free")),
+        }
+        self.design_basket.add_entry(entry)
+        self._status.setText(f"Added {pair_label(cand)} ({aa_a}{ra}{ta}+{aa_b}{rb}{tb}) to the design basket.")
+
+    def _declare_saltbridge(self, cd, cand: dict) -> None:
+        """Substitute BOTH positions to the complementary charged residues on a NEW variant — validation
+        is the EXISTING fold/deviation flow (charged residues fold NATIVELY, no constraint — SIMPLER than
+        disulfide's bond-constrained fold). One click does both substitutions; the user Folds to validate.
+        A CROSS-chain pair applies each position on ITS OWN chain-design (the `_enact_basket` seam)."""
+        if self._design is None:
+            self._status.setText("Can't substitute — no active design.")
+            return
+        cd_map = self._chain_to_cd()
+        ca, cb = pair_chains(cand)
+        ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
+        subs = [(str(ca), cand.get("resnum_a"), cand.get("to_aa_a")),
+                (str(cb), cand.get("resnum_b"), cand.get("to_aa_b"))]
+        by_cd: Dict[int, tuple] = {}
+        for ch, pos, to_aa in subs:
+            tcd = cd_map.get(ch)
+            if tcd is None or pos is None or not to_aa:
+                self._status.setText("Can't substitute — a position isn't on the active design (re-scan).")
+                return
+            by_cd.setdefault(id(tcd), (tcd, []))[1].append((int(pos), str(to_aa)))
+        made: List[tuple] = []
+        for tcd, plist in by_cd.values():
+            vid = self._design.new_variant_id()
+            tcd.add_variant(vid)
+            n = 0
+            for pos, to_aa in plist:
+                col = self._col_for_resnum(tcd, pos)
+                if col is None:
+                    continue
+                tcd.edit_variant(vid, col, to_aa)
+                n += 1
+            made.append((tcd, vid, n))
+        if not made or all(m[2] == 0 for m in made):
+            self._status.setText("Substitution failed — no positions mapped to the design.")
+            return
+        made.sort(key=lambda m: -m[2])
+        primary_cd, primary_vid, _ = made[0]
+        tab = self._focus_tab_for_design(primary_cd)
+        msg = (f"{primary_vid}: {pair_label(cand)} charge pair substituted "
+               f"({'across 2 chains' if len(made) > 1 else 'both positions'}). Fold this variant to "
+               f"VALIDATE (re-fold + deviation — charged residues fold natively, no constraint).")
+        if tab is not None:
+            self._after_variant_edit(tab, primary_vid, msg)
+        else:
+            self._persist()
+            self._status.setText(msg)
+
+    def _estimate_saltbridge_ddg(self, cd, cand: dict) -> None:
+        """2-residue ΔΔG escalation for ONE novel salt-bridge candidate (the disulfide-escalation pattern,
+        two variable targets). FOCUS the cd's tab so from_aa resolves against the RIGHT design, build the
+        spec, launch on the worker seam (long-running; never auto-run across a scan)."""
+        self._focus_tab_for_design(cd)
+        spec = self.build_saltbridge_ddg_spec(cand)
+        if spec is None:
+            self._status.setText("Can't estimate ΔΔG — needs a readable structure and recoverable WT "
+                                 "residues for both positions (re-scan if the structure changed).")
+            return
+        self._status.setText(f"Estimating ΔΔG (legacy, uncalibrated) for {pair_label(cand)} charge pair "
+                             "— both positions; minutes…")
+        self.launchRequested.emit(spec)
+
+    def build_saltbridge_ddg_spec(self, cand: dict) -> Optional[dict]:
+        """ΔΔG-escalation spec for ONE novel salt-bridge candidate → the legacy ΔΔG bridge
+        (refresh='saltbridge_ddg'). Saves the LIVE structure to PDB (PyRosetta needs PDB), recovers EACH
+        member's WT residue own-chain (cross-chain discipline), carries each position's target charged
+        residue, tags the source so the router gate blocks a de-novo web upload. None when there's no
+        readable structure / a from_aa can't be recovered / PDB save fails — never a silent wrong score."""
+        if self._design is None:
+            return None
+        src = self._active_structure()
+        if src is None:
+            return None
+        ca, cb = pair_chains(cand)
+        ra, rb = cand.get("resnum_a"), cand.get("resnum_b")
+        ta, tb = cand.get("to_aa_a"), cand.get("to_aa_b")
+        if ca is None or cb is None or ra is None or rb is None or not ta or not tb:
+            return None
+        aa_a, aa_b = self._from_aa_for(ca, ra), self._from_aa_for(cb, rb)
+        if aa_a is None or aa_b is None:
+            return None
+        pdb = self._save_structure_pdb(src["model_id"])
+        if not pdb:
+            return None
+        source = "denovo" if self._design.source == "sequence" else "loaded"
+        return {
+            "tool": "saltbridge_ddg_estimate",
+            "tool_inputs": {"pdb_path": pdb,
+                            "chain_a": str(ca), "resnum_a": int(ra), "from_aa_a": aa_a, "to_aa_a": str(ta),
+                            "chain_b": str(cb), "resnum_b": int(rb), "from_aa_b": aa_b, "to_aa_b": str(tb),
+                            "source": source},
+            "user_input": f"[Workbench] estimate ΔΔG (legacy) for salt-bridge pair {pair_label(cand)}",
+            "confidence": "low", "refresh": "saltbridge_ddg",
+            "_align_ukey": self._cur_cd_ukey(),
+            "_sb_cand": {"chain_a": str(ca), "resnum_a": int(ra),
+                         "chain_b": str(cb), "resnum_b": int(rb)},
+        }
+
+    def apply_saltbridge_ddg_result(self, spec: dict, result: dict) -> None:
+        """Attach the escalated 2-residue ΔΔG onto the MATCHING novel candidate (by chain+resnum) and
+        re-render the tab. Fail-LOUD: a failed/aborted estimate shows its reason, never a fabricated
+        number."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "saltbridge_ddg_estimate"), None)
+        if step is None:
+            self._status.setText("ΔΔG estimate produced no result.")
+            return
+        if not step.get("success"):
+            self._status.setText(f"ΔΔG estimate: {step.get('error') or 'failed'}")
+            return
+        cd = self._scan_target_cd(spec)
+        want = (spec or {}).get("_sb_cand") or {}
+        data = step.get("data") or {}
+        novel = ((cd.saltbridge_scan or {}).get("novel") if cd else None) or []
+        target = next((c for c in novel
+                       if str(pair_chains(c)[0]) == str(want.get("chain_a"))
+                       and str(pair_chains(c)[1]) == str(want.get("chain_b"))
+                       and c.get("resnum_a") == want.get("resnum_a")
+                       and c.get("resnum_b") == want.get("resnum_b")), None)
+        if target is None:
+            self._status.setText("ΔΔG came back but its candidate is no longer listed (re-scan).")
+            return
+        target.update({"ddg_a": data.get("ddg_a"), "ddg_b": data.get("ddg_b"),
+                       "ddg_mean": data.get("ddg_mean"), "ddg_backend": data.get("backend"),
+                       "ddg_source": data.get("source")})
+        self._persist()
+        self.saltbridge_tab.populate(cd, cd.saltbridge_scan)
+        self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
+
     def _add_cavity_to_basket(self, cd, cand: dict) -> None:
         """Normalize a cavity-fill candidate → a basket entry (one position → the larger fill residue).
         Cavity rows already carry `from_aa` + `to_aa` (basket-aware-shaped)."""
@@ -4218,6 +4686,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             _RESULT_DISULFIDE_MODE: bool(self._active_disulfide_scan(tab)),
             _RESULT_PROLINE_MODE:   bool(self._active_proline_scan(tab)),
             _RESULT_CAVITY_MODE:    bool(self._active_cavity_scan(tab)),
+            _RESULT_SALTBRIDGE_MODE: bool(self._active_saltbridge_scan(tab)),
         }
         model = self._mode_combo.model()
         for i in range(self._mode_combo.count()):
@@ -4244,6 +4713,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.set_result_coloring(tab.active_row_id, self._proline_scan_panel_hex(tab))
         elif self._mode_key == _RESULT_CAVITY_MODE:
             tab.set_result_coloring(tab.active_row_id, self._cavity_scan_panel_hex(tab))
+        elif self._mode_key == _RESULT_SALTBRIDGE_MODE:
+            tab.set_result_coloring(tab.active_row_id, self._saltbridge_scan_panel_hex(tab))
         else:
             tab.set_color_mode(get_mode(self._mode_key))
 
@@ -5071,7 +5542,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         glow seam (`_glow_state`) is SHARED across the Disulfides + Proline tabs (one spotlight at a
         time), so both Clear controls track the one state."""
         active = bool(getattr(self, "_glow_state", None))
-        for tab_name in ("disulfides_tab", "proline_tab", "cavity_tab"):
+        for tab_name in ("disulfides_tab", "proline_tab", "cavity_tab", "saltbridge_tab"):
             tab = getattr(self, tab_name, None)
             if tab is not None:
                 tab.set_glow_active(active)
@@ -5836,6 +6307,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return build_model_color_commands(
                 mid, {rep: sorted(best)},
                 lambda ch, rn: disulfide_compat_color(best.get(int(rn))))
+        if self._mode_key == _RESULT_SALTBRIDGE_MODE:
+            # The salt-bridge heatmap colours the construct's T-FOLD model by each residue's best
+            # charge-pair score (pale→electric-blue) — a navigational index into the ranked tables.
+            best = self._active_saltbridge_scan(tab)
+            tf = tab.design.template_fold or {}
+            mid = tf.get("model_id")
+            if not best or not mid:
+                return []
+            rep = tab.design.rep_chain
+            return build_model_color_commands(
+                mid, {rep: sorted(best)},
+                lambda ch, rn: saltbridge_compat_color(best.get(int(rn))))
         mode = get_mode(self._mode_key)
         if mode.fn is None:
             return []

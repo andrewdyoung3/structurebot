@@ -149,6 +149,13 @@ class ChainDesign:
     # Shape: {candidates:[ranked fill dicts], best_partner:{chain:{resnum:score}}, cavities:[per-void
     # summary], caveat}. The ranked list is the source of truth; best_partner feeds the heatmap mode.
     cavity_scan: Dict[str, Any] = field(default_factory=dict)
+    # Salt-bridge scan: existing Asp/Glu↔Arg/Lys pairs (assessed) + NOVEL complementary charge-pair
+    # sites (saltbridge_geometry). Shape: {existing:[pair dicts], novel:[candidate dicts],
+    # best_partner:{chain:{resnum:score}}, caveat}. Each pair/candidate carries chain_a/resnum_a +
+    # chain_b/resnum_b (intra → chain_a == chain_b; interface → chain_a != chain_b — the disulfide
+    # pair shape, read via disulfide_geometry.pair_chains). The lists are the source of truth;
+    # best_partner feeds the heatmap colour mode.
+    saltbridge_scan: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -388,6 +395,7 @@ class DesignSession:
                 disulfide_interface_scan = dict(cd.get("disulfide_interface_scan") or {}),
                 proline_scan   = dict(cd.get("proline_scan") or {}),
                 cavity_scan    = dict(cd.get("cavity_scan") or {}),
+                saltbridge_scan = dict(cd.get("saltbridge_scan") or {}),
                 guided_fold    = dict(cd.get("guided_fold") or {}),
                 template_assist = dict(cd.get("template_assist") or {}),
             )

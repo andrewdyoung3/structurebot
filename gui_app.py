@@ -379,6 +379,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.workbench.proline_tab, "Proline")
         # PERSISTENT Cavity-filling results tab — the third peer strategy. Same contract.
         self.tabs.addTab(self.workbench.cavity_tab, "Cavity")
+        # PERSISTENT Salt-bridge results tab — the fourth peer strategy. Same contract.
+        self.tabs.addTab(self.workbench.saltbridge_tab, "Salt bridges")
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(
@@ -587,7 +589,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                        "disulfide_discovery", "disulfide_geometry", "disulfide_scan",
                        "disulfide_interface_scan", "disulfide_ddg",
                        "proline_scan", "proline_ddg",
-                       "cavity_scan", "cavity_ddg"):
+                       "cavity_scan", "cavity_ddg",
+                       "saltbridge_scan", "saltbridge_ddg"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -725,6 +728,20 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_cavity_ddg_result(spec, result)
                 else:
                     self.presenter.dim("Cavity ΔΔG estimate cancelled — no result to attach.")
+            elif refresh == "saltbridge_scan":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_saltbridge_scan_result(spec, result)
+                else:
+                    self.presenter.dim("Salt-bridge scan cancelled — no result to attach.")
+            elif refresh == "saltbridge_ddg":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_saltbridge_ddg_result(spec, result)
+                else:
+                    self.presenter.dim("Salt-bridge ΔΔG estimate cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None
@@ -963,9 +980,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         disulfides = getattr(self.workbench, "disulfides_tab", None)
         proline = getattr(self.workbench, "proline_tab", None)
         cavity = getattr(self.workbench, "cavity_tab", None)
+        saltbridge = getattr(self.workbench, "saltbridge_tab", None)
         for i in range(self.tabs.count() - 1, -1, -1):
             w = self.tabs.widget(i)
-            if w not in (self.workbench, disulfides, proline, cavity):
+            if w not in (self.workbench, disulfides, proline, cavity, saltbridge):
                 self.tabs.removeTab(i)
         self._grids.clear()
         try:
@@ -987,6 +1005,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         try:
             if cavity is not None:
                 cavity.reset()
+        except Exception:
+            pass
+        try:
+            if saltbridge is not None:
+                saltbridge.reset()
         except Exception:
             pass
         try:
