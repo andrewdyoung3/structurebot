@@ -2594,6 +2594,71 @@ class TestDisulfideSuite:
         p._highlight_disulfide_pair(cd, {"resnum_a": 1, "resnum_b": 4})
         assert pushed == [] and p._glow_state is None
 
+    def test_glow_restore_deselects(self, _app):
+        # the restore fully clears the VISIBLE glow incl. the pair selection (gold outline)
+        cmds = VariantWorkbenchPanel._glow_restore_commands({"mid": "7", "both": "#7/A:5,9"})
+        assert "transparency #7 0 target c" in cmds   # un-ghost
+        assert "hide #7/A:5,9 atoms" in cmds          # spheres back to cartoon
+        assert "~select" in cmds                       # drop the selection → its gold outline goes
+        assert VariantWorkbenchPanel._glow_restore_commands(None) == []   # nothing to restore
+
+    def test_color_mode_clears_glow_first(self, _app):
+        # THE fix: switching to a colour mode (any _push_3d_color) restores the glow BEFORE the new
+        # colours → no hybrid (new colours + leftover disulfide transparency)
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)                                  # model #7
+        p._highlight_disulfide_pair(cd, {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9})
+        assert p._glow_state == {"mid": "7", "both": "#7/A:5,9"}
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._push_3d_color(p._cur_tab())                          # a different visual mode takes over
+        assert "transparency #7 0 target c" in pushed          # un-ghost FIRST (glow cleared)
+        assert "~select" in pushed                              # highlight dropped
+        assert p._glow_state is None                            # state cleared — no longer tracked
+        # the un-ghost precedes any colour/visibility command (restore-before-apply)
+        assert pushed.index("transparency #7 0 target c") == 0
+
+    def test_explicit_clear_disulfide_glow(self, _app):
+        # the manual escape: 'Clear disulfide view' restores the normal representation, no new mode
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._highlight_disulfide_pair(cd, {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9})
+        pushed = []
+        p._run_commands_bg = lambda cmds: pushed.extend(cmds)
+        p._clear_disulfide_glow()
+        assert "transparency #7 0 target c" in pushed and "~select" in pushed
+        assert p._glow_state is None
+        # idempotent: clearing again with nothing active emits nothing
+        pushed.clear()
+        p._clear_disulfide_glow()
+        assert pushed == []
+
+    def test_clear_glow_button_lit_only_while_glowing(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        btn = p.disulfides_tab._clear_glow_btn
+        assert not btn.isEnabled()                              # nothing glowing yet
+        p._run_commands_bg = lambda cmds: None
+        p._highlight_disulfide_pair(cd, {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9})
+        assert btn.isEnabled()                                  # lit while glowing
+        p._clear_disulfide_glow()
+        assert not btn.isEnabled()                              # dim after clear
+        # a colour-mode switch also dims it
+        p._highlight_disulfide_pair(cd, {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9})
+        assert btn.isEnabled()
+        p._push_3d_color(p._cur_tab())
+        assert not btn.isEnabled()
+
+    def test_reset_clears_glow_state(self, _app):
+        # a session reset has no live model → drop the glow state + dim the Clear control
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._run_commands_bg = lambda cmds: None
+        p._highlight_disulfide_pair(cd, {"chain_a": "A", "resnum_a": 5, "chain_b": "A", "resnum_b": 9})
+        assert p._glow_state is not None and p.disulfides_tab._clear_glow_btn.isEnabled()
+        p.reset()
+        assert p._glow_state is None and not p.disulfides_tab._clear_glow_btn.isEnabled()
+
     # ── the PERSISTENT Disulfides tab (whole-suite home; replaces the vanishing dialog) ─────
     def test_disulfides_tab_exists_as_a_widget(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())

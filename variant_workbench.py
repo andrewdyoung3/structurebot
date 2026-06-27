@@ -617,11 +617,12 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
     surface, built reusing the seam not shadowing it. The tables are the SOURCE OF TRUTH for which
     residue pairs with which; the 'Disulfide sites' colour mode is a complementary navigational index."""
 
-    def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None):
+    def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None, on_clear_glow=None):
         super().__init__()
         self._on_highlight = on_highlight        # (cd, pair_dict) -> highlight both members in 3D
         self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
         self._on_estimate_ddg = on_estimate_ddg  # (cd, pair_dict) -> ΔΔG escalation (legacy bridge)
+        self._on_clear_glow = on_clear_glow      # ()              -> restore the normal 3D representation
         outer = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
             "Disulfide suite results. These tables are the SOURCE OF TRUTH for which residue pairs "
@@ -629,6 +630,16 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             "navigational index (the glow points the eye, the table carries the pairing).")
         intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
         outer.addWidget(intro)
+        # Explicit escape from the pair-click spotlight: restore the normal representation (un-ghost
+        # the structure + drop the highlight). LIT only while a pair is glowing (something to clear).
+        # The common case — switching to another colour mode — clears the glow automatically; this is
+        # the manual control for "turn it off without picking a different mode".
+        self._clear_glow_btn = QtWidgets.QPushButton("Clear disulfide view (un-ghost)")
+        self._clear_glow_btn.setToolTip("Restore the normal representation: un-ghost the structure and "
+                                        "remove the pair spotlight. Enabled while a pair glow is active.")
+        self._clear_glow_btn.setEnabled(False)
+        self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
+        outer.addWidget(self._clear_glow_btn)
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
         body = QtWidgets.QWidget(); self._vl = QtWidgets.QVBoxLayout(body)
         scroll.setWidget(body); outer.addWidget(scroll, 1)
@@ -894,6 +905,13 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             if sec.get("escalate_btn") is not None:
                 sec["escalate_btn"].setEnabled(False)
             sec["placeholder"].setVisible(True)
+        self.set_glow_active(False)              # a reset 3D scene has no active glow to clear
+
+    def set_glow_active(self, active: bool) -> None:
+        """Enable the 'Clear disulfide view' control only while a pair glow is active (lit = there is
+        a spotlight to restore). The panel calls this when it applies / clears a glow."""
+        if getattr(self, "_clear_glow_btn", None) is not None:
+            self._clear_glow_btn.setEnabled(bool(active))
 
 
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
@@ -1277,7 +1295,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.disulfides_tab = DisulfidesResultsTab(
             on_highlight=self._highlight_disulfide_pair,
             on_declare=self._declare_disulfide_pair,
-            on_estimate_ddg=self._estimate_ddg_pair)
+            on_estimate_ddg=self._estimate_ddg_pair,
+            on_clear_glow=self._clear_disulfide_glow)
 
     def attach_session(self, session) -> None:
         """Re-point the panel at a different SessionState — used on session RESTORE, where the
@@ -1293,6 +1312,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._design = None
         self._edit_target = None
         self._scan_cols.clear()
+        self._glow_state = None                  # the 3D scene is being cleared/replaced → no glow to track
+        self._sync_glow_clear_button()
         self._update_scan_label()
         self._render()
         self._status.setText("No structure loaded.")
@@ -3181,6 +3202,11 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         cmds = self.untile_commands() if restore else []
         if restore:
             self._tiled = False
+        # A different visual mode is taking over → clear any ACTIVE disulfide glow FIRST (un-ghost +
+        # un-highlight) so we never get the hybrid (new colours + leftover disulfide transparency).
+        # Same restore-before-apply discipline the glow uses within the disulfide flow, now triggered
+        # when a colour/visibility push runs. No-op (empty) when nothing glows.
+        cmds = self._consume_glow_restore() + cmds
         cmds += self.fold_visibility_commands(tab) + self.color_commands_for(tab)
         if restore:
             cmds.append("view")          # frame the restored overlay (after show/hide)
@@ -3956,8 +3982,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     def _glow_restore_commands(prev: Optional[dict]) -> List[str]:
         """RESTORE a prior glow (stored ``{mid, both}``) NON-DESTRUCTIVELY: un-ghost the whole model
         (transparency → opaque) + return the glowed residue(s) to cartoon (hide their atoms; the
-        cartoon's mode colour shows through, never recoloured) + clear the pair distance. [] if there
-        is nothing to restore. Reused before every new glow so A's spotlight is fully reset before B."""
+        cartoon's mode colour shows through, never recoloured) + clear the pair distance + DESELECT
+        (so the gold selection outline disappears — the full visible reset). [] if there is nothing to
+        restore. Reused before every new glow so A's spotlight is fully reset before B AND when a
+        different visual mode takes over (so the glow never bleeds into the new view)."""
         if not prev or not prev.get("mid") or not prev.get("both"):
             return []
         mid, both = prev["mid"], prev["both"]
@@ -3965,7 +3993,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"transparency #{mid} 0 target c",       # un-ghost the whole model (was 70%)
             f"hide {both} atoms",                    # glowed residues back to cartoon
             "~distance",                              # clear the prior pair's distance label
+            "~select",                                # drop the pair selection → its gold outline goes
         ]
+
+    def _consume_glow_restore(self) -> List[str]:
+        """Return the restore commands for any ACTIVE disulfide glow AND clear its state + the tab's
+        Clear button — the single 'turn the glow off' primitive. Reused by `_push_3d_color` (a
+        different visual mode is taking over) and the explicit Clear action. [] when nothing glows."""
+        cmds = self._glow_restore_commands(getattr(self, "_glow_state", None))
+        if cmds:
+            self._glow_state = None
+            self._sync_glow_clear_button()
+        return cmds
+
+    def _clear_disulfide_glow(self) -> None:
+        """Explicit 'Clear disulfide view' — restore the normal representation (un-ghost + un-highlight)
+        WITHOUT applying a new colour mode. The manual escape from the pair-click spotlight."""
+        self._run_commands_bg(self._consume_glow_restore())
+
+    def _sync_glow_clear_button(self) -> None:
+        """Light the Disulfides tab's 'Clear disulfide view' control iff a glow is currently active."""
+        if getattr(self, "disulfides_tab", None) is not None:
+            self.disulfides_tab.set_glow_active(bool(getattr(self, "_glow_state", None)))
 
     def _highlight_disulfide_pair(self, cd, pair: dict) -> None:
         """Glow a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes through
@@ -3976,6 +4025,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
         mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
         self._glow_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
+        self._sync_glow_clear_button()              # lit while glowing, dim when nothing to clear
 
     def _declare_disulfide_pair(self, cd, pair) -> None:
         """Declare a bond from a Disulfides-tab table → Mode C. FOCUS the pair's construct tab first
