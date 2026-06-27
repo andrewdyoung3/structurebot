@@ -618,12 +618,14 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
     surface, built reusing the seam not shadowing it. The tables are the SOURCE OF TRUTH for which
     residue pairs with which; the 'Disulfide sites' colour mode is a complementary navigational index."""
 
-    def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None, on_clear_glow=None):
+    def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None, on_clear_glow=None,
+                 on_add_to_basket=None):
         super().__init__()
         self._on_highlight = on_highlight        # (cd, pair_dict) -> highlight both members in 3D
         self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
         self._on_estimate_ddg = on_estimate_ddg  # (cd, pair_dict) -> ΔΔG escalation (legacy bridge)
         self._on_clear_glow = on_clear_glow      # ()              -> restore the normal 3D representation
+        self._on_add_to_basket = on_add_to_basket  # (cd, pair_dict) -> stage both→Cys into the basket
         outer = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
             "Disulfide suite results. These tables are the SOURCE OF TRUTH for which residue pairs "
@@ -655,12 +657,12 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                            "Run “Find engineerable disulfide sites” to populate.",
                            ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)",
                             "Sγ–Sγ (Å)", "χSS (°)", "Clash", "Orientation (°)"],
-                           declare=True, caveat=True)
+                           declare=True, caveat=True, basket=True)
         self._make_section("I", "Interface disulfide sites — inter-chain scan (find inter-subunit)",
                            "Run “Find interface disulfide sites” on a folded MULTIMER to populate.",
                            ["Pair", "Score", "Cα–Cα (Å)", "Cβ–Cβ (Å)",
                             "Sγ–Sγ (Å)", "χSS (°)", "Clash", "Orientation (°)", "ΔΔG (kcal/mol)"],
-                           declare=True, caveat=True, escalate=True)
+                           declare=True, caveat=True, escalate=True, basket=True)
         self._make_section("C", "Declared-bond fold (Mode C: intervene)",
                            "Use “Declare cysteine bonds and fold” (or Declare below) to record the "
                            "constrained fold here.", None)
@@ -669,7 +671,7 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
     # ── section scaffolding ────────────────────────────────────────────────────────
     def _make_section(self, key: str, title: str, placeholder: str,
                       cols: Optional[List[str]], *, declare: bool = False, caveat: bool = False,
-                      escalate: bool = False) -> None:
+                      escalate: bool = False, basket: bool = False) -> None:
         box = QtWidgets.QGroupBox(title)
         gl = QtWidgets.QVBoxLayout(box)
         ph = QtWidgets.QLabel(placeholder); ph.setWordWrap(True); ph.setStyleSheet("color:#888;")
@@ -707,8 +709,23 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                           "Runs the legacy ΔΔG bridge on the X→C mutations; minutes per pair.")
             eb.clicked.connect(lambda _=False, k=key: self._estimate(k))
             gl.addWidget(eb); sec["escalate_btn"] = eb
+        if basket:
+            bb = QtWidgets.QPushButton("Add to design")
+            bb.setToolTip("Stage the selected disulfide (both residues → Cys) into the Design basket "
+                          "(collect picks across strategies, then enact one variant).")
+            bb.setEnabled(False)
+            bb.clicked.connect(lambda _=False, k=key: self._add_to_basket(k))
+            gl.addWidget(bb); sec["basket_btn"] = bb
         self._sec[key] = sec
         self._vl.addWidget(box)
+
+    def _add_to_basket(self, key: str) -> None:
+        sec = self._sec.get(key) or {}
+        pairs, cd = sec.get("pairs") or [], sec.get("cd")
+        tbl = sec.get("table")
+        row = tbl.currentRow() if tbl is not None else -1
+        if 0 <= row < len(pairs) and cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(cd, pairs[row])
 
     # ── row-click → highlight the RIGHT pair on the RIGHT construct (the §9 seam) ─────
     def _on_row(self, key: str, row: int) -> None:
@@ -794,6 +811,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             sec["declare_btn"].setEnabled(has)
         if sec.get("escalate_btn") is not None:
             sec["escalate_btn"].setEnabled(has)
+        if sec.get("basket_btn") is not None:
+            sec["basket_btn"].setEnabled(has and self._on_add_to_basket is not None)
         if has:
             tbl.selectRow(0); self._on_row(key, 0)         # preselect + highlight the best/first
 
@@ -905,6 +924,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
                 sec["declare_btn"].setEnabled(False)
             if sec.get("escalate_btn") is not None:
                 sec["escalate_btn"].setEnabled(False)
+            if sec.get("basket_btn") is not None:
+                sec["basket_btn"].setEnabled(False)
             sec["placeholder"].setVisible(True)
         self.set_glow_active(False)              # a reset 3D scene has no active glow to clear
 
@@ -925,13 +946,14 @@ class ProlineResultsTab(QtWidgets.QWidget):
     Persists across tab-switch + session reset (keep-and-clear, the disulfide-tab lesson)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_show_existing=None):
+                 on_show_existing=None, on_add_to_basket=None):
         super().__init__()
         self._on_highlight = on_highlight          # (cd, cand) -> glow the residue in 3D
         self._on_declare = on_declare              # (cd, cand) -> substitute→Pro + validate (fold/compare)
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> X→Pro ΔΔG escalation (legacy bridge)
         self._on_clear_glow = on_clear_glow        # ()         -> restore the normal 3D representation
         self._on_show_existing = on_show_existing  # (cd)       -> highlight the existing prolines
+        self._on_add_to_basket = on_add_to_basket  # (cd, cand) -> stage this X→Pro into the design basket
         self._cd = None
         self._cands: List[dict] = []
         outer = QtWidgets.QVBoxLayout(self)
@@ -990,9 +1012,20 @@ class ProlineResultsTab(QtWidgets.QWidget):
         self._escalate_btn.setEnabled(False)
         self._escalate_btn.clicked.connect(self._estimate)
         row.addWidget(self._escalate_btn)
+        self._basket_btn = QtWidgets.QPushButton("Add to design")
+        self._basket_btn.setToolTip("Stage the selected X→Pro substitution into the Design basket "
+                                    "(collect picks across strategies, then enact one variant).")
+        self._basket_btn.setEnabled(False)
+        self._basket_btn.clicked.connect(self._add_to_basket)
+        row.addWidget(self._basket_btn)
         gl.addLayout(row)
         outer.addWidget(box)
         outer.addStretch(1)
+
+    def _add_to_basket(self) -> None:
+        r = self._tbl.currentRow()
+        if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, self._cands[r])
 
     def set_glow_active(self, active: bool) -> None:
         if getattr(self, "_clear_glow_btn", None) is not None:
@@ -1055,6 +1088,7 @@ class ProlineResultsTab(QtWidgets.QWidget):
         self._tbl.setVisible(has)
         self._declare_btn.setEnabled(has)
         self._escalate_btn.setEnabled(has)
+        self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
         if has:
             self._tbl.selectRow(0); self._on_row(0)
 
@@ -1072,7 +1106,121 @@ class ProlineResultsTab(QtWidgets.QWidget):
         self._detail.setVisible(False); self._placeholder.setVisible(True)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
         self._existing_btn.setEnabled(False)
+        if getattr(self, "_basket_btn", None) is not None:
+            self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
+
+
+class DesignBasketPanel(QtWidgets.QWidget):
+    """The CROSS-STRATEGY substitution-staging panel — the framework centerpiece. The designer
+    collects suggested substitutions from the strategy tabs (Disulfides, Proline, … any future
+    geometric-scan strategy) into ONE basket, then ENACTS them into a single new variant that flows
+    into the EXISTING variant machinery (fold / compare / deviation / template-overlay — all opt-in,
+    unchanged). The basket COMPOSES the variant; the variant system VALIDATES it — the fold reveals
+    combination effects, so the basket does NOT proxy spatial interference (only certain same-residue
+    conflicts are flagged). Docks as a QDockWidget; persists across tab-switch + session reset
+    (keep-and-clear). Each entry = ``{cls, label, score, subs:[{chain,position,from_aa,to_aa}],
+    metrics_text}`` — a substitution targets 1+ positions (proline → one→Pro; disulfide → two→Cys)."""
+
+    def __init__(self, *, on_enact=None):
+        super().__init__()
+        self._on_enact = on_enact                  # (entries) -> compose a variant via the existing path
+        self.entries: List[dict] = []
+        outer = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Design basket — collect substitutions across strategy tabs, then Enact one variant. The "
+            "basket composes the variant; fold/compare it as you would any variant (the FOLD reveals "
+            "combination effects — the basket does not predict them).")
+        intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
+        outer.addWidget(intro)
+        self._conflict = QtWidgets.QLabel(); self._conflict.setWordWrap(True)
+        self._conflict.setStyleSheet("color:#c0392b;"); self._conflict.setVisible(False)
+        outer.addWidget(self._conflict)
+        self._placeholder = QtWidgets.QLabel('Empty — use "Add to design" on a Disulfides or Proline row.')
+        self._placeholder.setWordWrap(True); self._placeholder.setStyleSheet("color:#888;")
+        outer.addWidget(self._placeholder)
+        self._list = QtWidgets.QTableWidget(0, 4)
+        self._list.setHorizontalHeaderLabels(["Class", "Substitution", "Score", "Detail"])
+        self._list.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._list.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._list.setVisible(False)
+        outer.addWidget(self._list, 1)
+        row = QtWidgets.QHBoxLayout()
+        self._remove_btn = QtWidgets.QPushButton("Remove selected")
+        self._remove_btn.setEnabled(False); self._remove_btn.clicked.connect(self._remove_selected)
+        row.addWidget(self._remove_btn)
+        self._clear_btn = QtWidgets.QPushButton("Clear basket")
+        self._clear_btn.setEnabled(False); self._clear_btn.clicked.connect(self.reset)
+        row.addWidget(self._clear_btn)
+        self._enact_btn = QtWidgets.QPushButton("Enact → variant")
+        self._enact_btn.setToolTip("Compose ALL basket substitutions into one new variant (per chain), "
+                                   "ready to fold / compare in the Variant Workbench.")
+        self._enact_btn.setEnabled(False); self._enact_btn.clicked.connect(self._enact)
+        row.addWidget(self._enact_btn)
+        outer.addLayout(row)
+
+    def add_entry(self, entry: dict) -> None:
+        """Stage one strategy pick. Idempotent-ish: an IDENTICAL entry (same subs) is not duplicated."""
+        sig = tuple((s["chain"], s["position"], s["to_aa"]) for s in entry.get("subs", []))
+        if any(tuple((s["chain"], s["position"], s["to_aa"]) for s in e.get("subs", [])) == sig
+               for e in self.entries):
+            return
+        self.entries.append(entry)
+        self._refresh()
+
+    def _remove_selected(self) -> None:
+        r = self._list.currentRow()
+        if 0 <= r < len(self.entries):
+            del self.entries[r]
+            self._refresh()
+
+    def _enact(self) -> None:
+        if self._on_enact is not None and self.entries and not self._conflicts():
+            self._on_enact(list(self.entries))
+
+    def _conflicts(self) -> List[str]:
+        """(chain, position) targeted by 2+ entries with DIFFERENT substitutions — you can't make one
+        residue two things. CERTAIN conflicts only (no spatial-proximity / interference prediction —
+        that's the designer's call + the re-fold; the fold reveals combination effects honestly)."""
+        seen: Dict[tuple, str] = {}
+        clashes: List[str] = []
+        for e in self.entries:
+            for s in e.get("subs", []):
+                key = (s["chain"], s["position"])
+                if key in seen and seen[key] != s["to_aa"]:
+                    clashes.append(f"{s['chain']}:{s['position']} (→{seen[key]} and →{s['to_aa']})")
+                seen.setdefault(key, s["to_aa"])
+        return sorted(set(clashes))
+
+    def _refresh(self) -> None:
+        n = len(self.entries)
+        self._list.setRowCount(n)
+        for i, e in enumerate(self.entries):
+            sub_s = ", ".join(f"{s['from_aa']}{s['position']}{s['to_aa']}" for s in e["subs"])
+            for j, v in enumerate([e["cls"], sub_s, f"{e.get('score', 0):.2f}", e.get("metrics_text", "")]):
+                self._list.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        self._list.resizeColumnsToContents()
+        has = n > 0
+        self._placeholder.setVisible(not has)
+        self._list.setVisible(has)
+        self._remove_btn.setEnabled(has)
+        self._clear_btn.setEnabled(has)
+        conflicts = self._conflicts()
+        if conflicts:
+            self._conflict.setText("⚠ Same-residue conflict — two picks target the same position: "
+                                   + "; ".join(conflicts) + ". Remove one before enacting "
+                                   "(one residue can't be two substitutions).")
+        self._conflict.setVisible(bool(conflicts))
+        # block enact on a HARD conflict (the apply seam would silently let the last edit win → a
+        # wrong variant). Spatial interference is NOT blocked — that's the fold's job.
+        self._enact_btn.setEnabled(has and not conflicts)
+
+    def reset(self) -> None:
+        """Empty the basket (Clear button + session reset — keep-and-clear: the dock PERSISTS as a
+        sibling, its contents belong to the prior curation session)."""
+        self.entries = []
+        self._refresh()
 
 
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
@@ -1480,13 +1628,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_highlight=self._highlight_disulfide_pair,
             on_declare=self._declare_disulfide_pair,
             on_estimate_ddg=self._estimate_ddg_pair,
-            on_clear_glow=self._clear_disulfide_glow)
+            on_clear_glow=self._clear_disulfide_glow,
+            on_add_to_basket=self._add_disulfide_to_basket)
         self.proline_tab = ProlineResultsTab(
             on_highlight=self._highlight_proline_residue,
             on_declare=self._declare_proline,
             on_estimate_ddg=self._estimate_proline_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
-            on_show_existing=self._show_existing_prolines)
+            on_show_existing=self._show_existing_prolines,
+            on_add_to_basket=self._add_proline_to_basket)
+        # The CROSS-STRATEGY design basket — the framework centerpiece (gui_app docks it on the right).
+        self.design_basket = DesignBasketPanel(on_enact=self._enact_basket)
 
     def attach_session(self, session) -> None:
         """Re-point the panel at a different SessionState — used on session RESTORE, where the
@@ -1504,6 +1656,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._scan_cols.clear()
         self._glow_state = None                  # the 3D scene is being cleared/replaced → no glow to track
         self._sync_glow_clear_button()
+        if getattr(self, "design_basket", None) is not None:
+            self.design_basket.reset()           # the prior session's picks reference a gone design
         self._update_scan_label()
         self._render()
         self._status.setText("No structure loaded.")
@@ -3558,6 +3712,91 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._persist()
         self.proline_tab.populate(cd, cd.proline_scan)
         self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
+
+    # ── Design basket: stage strategy picks → compose ONE variant via the existing path ───────
+    def _add_proline_to_basket(self, cd, cand: dict) -> None:
+        """Normalize a proline candidate → a basket entry (one position → Pro). Proline rows already
+        carry `from_aa` (basket-aware-shaped)."""
+        psi = cand.get("psi")
+        entry = {
+            "cls": "Proline", "score": float(cand.get("score", 0.0)),
+            "subs": [{"chain": str(cand.get("chain") or cd.rep_chain), "position": int(cand["position"]),
+                      "from_aa": cand.get("from_aa", "X"), "to_aa": "P"}],
+            "metrics_text": (f"φ {cand.get('phi')}° ψ {'n/a' if psi is None else f'{psi}°'}; "
+                             + ("H-bond donor (penalized)" if cand.get("hbond_donates")
+                                else "no backbone H-bond donor")),
+        }
+        self.design_basket.add_entry(entry)
+        self._status.setText(f"Added {cand.get('from_aa','')}{cand.get('position')}→P to the design basket.")
+
+    def _add_disulfide_to_basket(self, cd, pair: dict) -> None:
+        """Normalize a disulfide pair → a basket entry (TWO positions → Cys). Disulfide rows are
+        residue-AGNOSTIC (no `from_aa`), so recover each WT residue own-chain via `_from_aa_for`
+        (the retrofit — same recovery the ΔΔG escalation uses)."""
+        ca, cb = pair_chains(pair)
+        ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
+        ra, rb = pair.get("resnum_a"), pair.get("resnum_b")
+        aa_a, aa_b = self._from_aa_for(ca, ra), self._from_aa_for(cb, rb)
+        if aa_a is None or aa_b is None or ra is None or rb is None:
+            self._status.setText("Can't add — couldn't recover the WT residue for the pair "
+                                 "(re-scan if the structure changed).")
+            return
+        sg, chi = pair.get("best_sg_sg"), pair.get("best_chi_ss")
+        clash = pair.get("clash")
+        entry = {
+            "cls": "Disulfide", "score": float(pair.get("score", 0.0)),
+            "subs": [{"chain": str(ca), "position": int(ra), "from_aa": aa_a, "to_aa": "C"},
+                     {"chain": str(cb), "position": int(rb), "from_aa": aa_b, "to_aa": "C"}],
+            "metrics_text": (f"Sγ–Sγ {sg if sg is not None else '—'}Å χSS {chi if chi is not None else '—'}°; "
+                             + ("⚠ clash" if clash else "clash-free" if clash is False else "geometric")),
+        }
+        self.design_basket.add_entry(entry)
+        self._status.setText(f"Added {pair_label(pair)} (both→Cys) to the design basket.")
+
+    def _enact_basket(self, entries: List[dict]) -> None:
+        """Compose ALL basket substitutions into one new variant PER chain-design (the proven seam:
+        `add_variant` + N×`edit_variant`), then hand off to the EXISTING variant machinery — the
+        designer folds / compares / overlays-template the variant as any variant (those stay opt-in).
+        The basket COMPOSES; the variant system VALIDATES (the fold reveals the combination's effect —
+        not proxied here). Same-residue conflicts are blocked upstream by the basket panel."""
+        if self._design is None or not entries:
+            return
+        cd_map = self._chain_to_cd()
+        by_cd: Dict[int, tuple] = {}                  # id(cd) -> (cd, [subs]) — group atoms by owner cd
+        for e in entries:
+            for s in e.get("subs", []):
+                tcd = cd_map.get(s["chain"])
+                if tcd is None:
+                    continue
+                by_cd.setdefault(id(tcd), (tcd, []))[1].append(s)
+        if not by_cd:
+            self._status.setText("Enact failed — the basket's chains aren't on the active design.")
+            return
+        made: List[tuple] = []                        # (cd, vid, n_applied)
+        for tcd, subs in by_cd.values():
+            vid = self._design.new_variant_id()
+            tcd.add_variant(vid)
+            n = 0
+            for s in subs:
+                col = self._col_for_resnum(tcd, s["position"])
+                if col is None:
+                    continue
+                tcd.edit_variant(vid, col, s["to_aa"])
+                n += 1
+            made.append((tcd, vid, n))
+        made.sort(key=lambda m: -m[2])                # refresh on the most-substituted cd's new variant
+        primary_cd, primary_vid, _ = made[0]
+        total = sum(m[2] for m in made)
+        msg = (f"Enacted {len(entries)} pick(s) → variant {primary_vid} ({total} substitution(s)"
+               + (f" across {len(made)} chains" if len(made) > 1 else "")
+               + "). Fold it to VALIDATE (the fold reveals the combination's effect).")
+        tab = self._focus_tab_for_design(primary_cd)
+        if tab is not None:
+            self._after_variant_edit(tab, primary_vid, msg)
+        else:
+            self._persist()
+            self._status.setText(msg)
+        self.design_basket.reset()                    # the picks have flowed into the variant — consume
 
     def _refresh_color_mode_availability(self, tab: _ChainDesignTab) -> None:
         """Grey out a RESULT colour mode (ddG / pLDDT / Deviation vs WT) when the ACTIVE

@@ -597,6 +597,28 @@ def test_reset_view_keeps_and_clears_proline_tab(_app):
     assert not ptab._placeholder.isHidden()                 # back to the dormant placeholder
 
 
+def test_reset_view_clears_the_design_basket(_app):
+    """The Design basket (a QDockWidget, owned by the panel) must be EMPTIED on session reset —
+    its staged picks reference the prior session's design (keep-and-clear, layer-spanning through
+    gui_app's `_reset_view_for_session`)."""
+    from variant_workbench import DesignBasketPanel
+    tabs = QtWidgets.QTabWidget()
+    wb = QtWidgets.QWidget()
+    basket = DesignBasketPanel()
+    wb.design_basket = basket
+    wb.reset = lambda: None                                  # isolate the gui_app reset path
+    grid = QtWidgets.QWidget()
+    tabs.addTab(wb, "Variant Workbench")
+    tabs.addTab(grid, "#1/A")
+    basket.add_entry({"cls": "Proline", "score": 0.9,
+                      "subs": [{"chain": "A", "position": 3, "from_aa": "V", "to_aa": "P"}],
+                      "metrics_text": "x"})
+    assert basket.entries                                    # staged BEFORE the reset
+    w = _fakew(tabs=tabs, workbench=wb, _grids={("1", "A"): grid})
+    w._reset_view_for_session()
+    assert basket.entries == []                              # …emptied (keep-and-clear)
+
+
 # ── Reconnect ChimeraX: model-id remap + reopen/relink flow ───────────────────────
 def test_remap_session_model_ids_crystal_and_denovo(_app):
     """remap rewrites structures keys, crystal design keys, AND internal fold refs of a de-novo
