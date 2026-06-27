@@ -136,10 +136,63 @@ def parse_cys_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
 
 
 def parse_backbone_atoms(cif_path: str) -> Dict[str, Dict[int, Dict[str, Vec3]]]:
-    """CA/CB of ALL residues from a fold's mmCIF → ``{chain: {resnum: {"CA","CB"}}}`` (Mode D —
-    the residue-agnostic backbone scan). Glycine has no CB; its entry holds CA only (the scan
-    falls back to CA as a pseudo-Cβ, standard disulfide-engineering practice)."""
-    return _parse_atom_site(cif_path, ("CA", "CB"), comp_id=None)
+    """N/CA/CB/C of ALL residues from a fold's mmCIF → ``{chain: {resnum: {"N","CA","CB","C"}}}``
+    (Mode D — the residue-agnostic backbone scan). N and C are carried for the rotamer Sγ-reachability
+    proxy: N anchors the Cys χ1 placement (N–CA–CB–Sγ), and C lets a Gly Cβ be reconstructed
+    (`build_cb`) so Gly sites are scored too. Glycine's entry lacks CB; reachability builds one."""
+    return _parse_atom_site(cif_path, ("N", "CA", "CB", "C"), comp_id=None)
+
+
+def parse_heavy_atoms(cif_path: str) -> List[Tuple[str, int, str, Vec3]]:
+    """ALL heavy atoms (element ≠ H) of every residue → a flat ``[(chain, resnum, element, xyz)]``
+    list for the clash grid (tier b of the reachability proxy). Element from the mmCIF
+    ``type_symbol`` column when present, else inferred from the atom-name's leading letters.
+    ONE `_atom_site` pass; tolerant of column order. PURE-ish (file read)."""
+    cols: List[str] = []
+    in_loop = False
+    out: List[Tuple[str, int, str, Vec3]] = []
+    try:
+        with open(cif_path) as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("_atom_site."):
+                    cols.append(s); in_loop = True; continue
+                if in_loop and s.startswith(("ATOM", "HETATM")):
+                    parts = s.split()
+                    if len(parts) < len(cols):
+                        continue
+                    col = {c.split(".")[1]: parts[i] for i, c in enumerate(cols)}
+                    atom = col.get("label_atom_id") or ""
+                    el = (col.get("type_symbol") or "").upper() or _element_from_atom_name(atom)
+                    if el == "H":
+                        continue                         # heavy atoms only
+                    ch = col.get("auth_asym_id") or col.get("label_asym_id")
+                    rid = col.get("auth_seq_id") or col.get("label_seq_id")
+                    if ch is None or rid is None:
+                        continue
+                    try:
+                        xyz = (float(col["Cartn_x"]), float(col["Cartn_y"]), float(col["Cartn_z"]))
+                        out.append((ch, int(rid), el, xyz))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                elif in_loop and s and not s.startswith(("ATOM", "HETATM", "_atom_site.")):
+                    if out:
+                        break
+    except OSError:
+        return []
+    return out
+
+
+def _element_from_atom_name(atom: str) -> str:
+    """Element from a PDB atom name when `type_symbol` is absent: the leading non-digit letters,
+    special-cased so CA/CB/CG… read as carbon (not calcium) and SG/SD as sulfur."""
+    a = atom.strip().lstrip("0123456789")
+    if not a:
+        return "C"
+    two = a[:2].upper()
+    if two in ("SE", "FE", "ZN", "MG", "MN", "CL", "NA"):
+        return two
+    return a[0].upper()
 
 
 # ── pair geometry + window membership (the shared measurement Modes A/B/C report) ─────────
@@ -231,72 +284,263 @@ def pair_geometry(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3]) -> Dict[str, o
 
 
 # ── Mode D: backbone disulfide-ENGINEERING scan (find NOVEL installable sites) ──────────────
-# Residue-agnostic backbone geometry — NO χSS (no Sγ exists pre-mutation). Soft-graded windows,
-# never hard cutoffs (a SUGGESTION surface, not a filter). The combine is a PRODUCT of the three
-# axes, so the Cα–Cα distance dominates: a far-apart pair scores ~0 (physically — too far = no
-# disulfide regardless of orientation). That same property makes the Cα PREFILTER lossless.
+# Residue-agnostic geometry. The score is a PRODUCT of Cα–Cα × Cβ–Cβ × ROTAMER Sγ-REACHABILITY —
+# the reachability term REPLACES the old backbone-orientation proxy (Cα-Cβ-Cβ-Cα dihedral) in the
+# ranking: instead of surrogating "can the sulfurs reach a good χSS," we place idealized Cys Sγ at
+# both backbones over a fine χ1 sweep and measure DIRECTLY whether any rotamer pair brings the two
+# Sγ to ~2.05 Å at an acceptable χSS (the real disulfide determinant). The orientation dihedral is
+# still MEASURED + displayed (transparency), it just no longer drives rank. Soft-graded, never a
+# hard cutoff (a SUGGESTION surface). Cα–Cα stays the cheap, lossless PREFILTER.
 CA_CA_SCORE_IDEAL, CA_CA_SCORE_SIGMA = 5.5, 1.0     # Cα–Cα soft window (Å)
 CB_CB_SCORE_SIGMA = 0.6                              # Cβ–Cβ soft window σ (centre = CB_CB_IDEAL 3.8)
-ORIENT_IDEAL_D, ORIENT_CUTOFF_D = 90.0, 135.0       # |Cα-Cβ-Cβ-Cα| dihedral: ±90° ideal
 CA_CA_PREFILTER_GATE = 9.0     # Cα–Cα beyond this → ca-score < 0.0022 → sub-threshold; skip scoring
 SCAN_MIN_SEQ_SEP = 2           # exclude sequence-adjacent residues (cannot form a disulfide)
 SCAN_MIN_SCORE = 0.05          # pairs below this aren't engineerable-enough to surface (gate is
                                # conservative vs THIS default, so the prefilter is output-lossless)
+
+# Cys sidechain placement (rotamer Sγ-reachability) — validated vs real CYS (n=24: CB–SG 1.818 Å,
+# CA–CB–SG 114.0°) and Gly Cβ reconstruction vs real residues (n=112: CA–CB 1.530 Å, N–CA–CB 110.6°,
+# C–N–CA–CB −122.3°). A Cys sidechain has ONE rotatable bond (χ1; Sγ is terminal pre-bond), so a
+# single-dihedral placement + a fine χ1 sweep fully spans the reachable Sγ positions.
+CYS_CB_SG_BOND, CYS_CA_CB_SG_ANGLE = 1.81, 114.0
+CB_CA_BOND, CB_N_CA_ANGLE, CB_C_N_CA_DIHEDRAL = 1.53, 110.6, -122.3
+CHI1_SWEEP_STEP = 15.0         # χ1 sweep granularity (deg) — FINE, so "unreachable" means NO rotamer
+                               # reaches, not "none of 3 staggered did" (the honesty hinge)
+SG_SG_REACH_SIGMA = 0.45       # σ of the soft Gaussian on best Sγ–Sγ vs SG_SG_IDEAL (the reach score)
+CHI_OUT_FACTOR = 0.5           # multiplier when the best Sγ-pair's χSS is OUTSIDE [60,120]° (proximity
+                               # without canonical handedness — softened, never hard-zeroed)
+REACH_NEUTRAL = 0.5            # fallback when Sγ can't be placed (N absent) — neutral, never a veto
+
+# Clash check (tier b) — vdW overlap of the placed Sγ (+ a built Gly Cβ) against surrounding heavy
+# atoms. A clash flags + softly DEMOTES a site ("sulfurs could meet, but the Cys collides"), never
+# hard-eliminates it (suite discipline). Radii: standard vdW (Å).
+HEAVY_VDW = {"C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80, "P": 1.80, "SE": 1.90,
+             "FE": 1.80, "ZN": 1.39, "MG": 1.73, "MN": 1.80, "CL": 1.75, "NA": 2.27}
+CLASH_TOLERANCE = 0.5          # allowed vdW overlap (Å) before a contact counts as a clash
+CLASH_PENALTY = 0.4            # score multiplier applied to a clashing candidate (soft demotion)
+CLASH_GRID_CELL = 4.0          # spatial-hash cell size (≥ max vdW-sum − tol, so ±1 cell suffices)
 
 
 def _gauss_score(x: float, mu: float, sigma: float) -> float:
     return math.exp(-((x - mu) ** 2) / (2.0 * sigma * sigma))
 
 
-def _orient_score(dihedral_deg: Optional[float]) -> float:
-    """Soft raised-cosine on |dev from ±90°|: 1.0 at ±90°, 0.5 at 0/180°, 0 beyond the cutoff.
-    None (a Gly pseudo-Cβ → orientation undefined) → 0.5 neutral. Soft, never a hard cutoff
-    except the far-deviation floor."""
-    if dihedral_deg is None:
-        return 0.5
-    dev = min(abs(dihedral_deg - ORIENT_IDEAL_D), abs(dihedral_deg + ORIENT_IDEAL_D))
-    if dev >= ORIENT_CUTOFF_D:
-        return 0.0
-    return (1.0 + math.cos(dev * math.pi / 180.0)) / 2.0
+def place_from_internal(a: Vec3, b: Vec3, c: Vec3,
+                        bond: float, angle_deg: float, dihedral_deg: float) -> Vec3:
+    """Place atom D in Cartesian space from three reference atoms A–B–C and internal coordinates:
+    the C–D bond length, the B–C–D bond angle, and the A–B–C–D dihedral (the NeRF / Z-matrix
+    construction). Used to put a Cys Sγ at (N, CA, CB) over χ1, and to reconstruct a Gly Cβ from
+    (C, N, CA). PURE."""
+    ang, dih = math.radians(angle_deg), math.radians(dihedral_deg)
+
+    def _sub(u, v): return (u[0] - v[0], u[1] - v[1], u[2] - v[2])
+    def _dot(u, v): return u[0]*v[0] + u[1]*v[1] + u[2]*v[2]
+    def _cross(u, v): return (u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0])
+
+    def _norm(u):
+        m = math.sqrt(_dot(u, u)) or 1.0
+        return (u[0]/m, u[1]/m, u[2]/m)
+
+    bc = _norm(_sub(c, b))
+    n  = _norm(_cross(_sub(b, a), bc))
+    m  = _cross(n, bc)
+    d2 = (-bond*math.cos(ang), bond*math.sin(ang)*math.cos(dih), bond*math.sin(ang)*math.sin(dih))
+    return (c[0] + bc[0]*d2[0] + m[0]*d2[1] + n[0]*d2[2],
+            c[1] + bc[1]*d2[0] + m[1]*d2[1] + n[1]*d2[2],
+            c[2] + bc[2]*d2[0] + m[2]*d2[1] + n[2]*d2[2])
 
 
-def backbone_pair_score(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3]) -> Optional[Dict[str, object]]:
-    """Soft-graded engineerability of INSTALLING a disulfide between two residues (residue-agnostic;
-    CA + CB, Gly → CA as a pseudo-Cβ). NO χSS. Returns the measured backbone geometry (Cα–Cα,
-    Cβ–Cβ, Cα-Cβ-Cβ-Cα orientation) + per-axis soft scores + a combined ``score`` in [0,1] (the
-    PRODUCT — graded, Cα-distance-dominant; near-misses score lower but are NEVER hard-eliminated).
-    None if either residue lacks a Cα. PURE."""
+def build_cb(n: Vec3, ca: Vec3, c: Vec3) -> Vec3:
+    """Reconstruct an idealized Cβ for a residue lacking one (Gly) from its N, CA, C — ideal
+    L-amino-acid geometry (CA–CB 1.53 Å, N–CA–CB 110.6°, dihedral C–N–CA–CB −122.3°, validated
+    against real residues). So a Gly→Cys engineering site is scored, not silently dropped. PURE."""
+    return place_from_internal(c, n, ca, CB_CA_BOND, CB_N_CA_ANGLE, CB_C_N_CA_DIHEDRAL)
+
+
+def _chi1_grid() -> List[float]:
+    """The χ1 sweep samples over (−180, 180] at `CHI1_SWEEP_STEP`. FINE by design — the reachability
+    answer must be 'no rotamer can reach', not 'none of a few staggered χ1 reached'."""
+    n = int(round(360.0 / CHI1_SWEEP_STEP))
+    return [-180.0 + CHI1_SWEEP_STEP * i for i in range(n)]
+
+
+def _place_sg(n: Vec3, ca: Vec3, cb: Vec3, chi1: float) -> Vec3:
+    """Place a Cys Sγ at this backbone for rotamer χ1 = N–CA–CB–Sγ (bond/angle from real CYS)."""
+    return place_from_internal(n, ca, cb, CYS_CB_SG_BOND, CYS_CA_CB_SG_ANGLE, chi1)
+
+
+def sg_rotamers(n: Vec3, ca: Vec3, cb: Vec3) -> List[Vec3]:
+    """The Sγ position for every χ1 in the sweep — placed ONCE per residue, reused across all its
+    candidate pairs in a scan (the cross-product of two residues' rotamer sets is the per-pair work)."""
+    return [_place_sg(n, ca, cb, chi) for chi in _chi1_grid()]
+
+
+def sg_reachability(cb_a: Vec3, sgs_a: List[Vec3], cb_b: Vec3, sgs_b: List[Vec3]) -> Dict[str, object]:
+    """The DIRECT disulfide determinant the backbone-orientation term only proxied: over both
+    residues' Sγ rotamer sets (ONE sweep), find the pair whose Sγ–Sγ is closest to the bonding
+    distance AT an acceptable χSS. Returns ``{reach_score, best_sg_sg, best_chi_ss, sg_a, sg_b}`` —
+    reach_score = the max over rotamer pairs of ``Gaussian(Sγ–Sγ, 2.05, σ) × (1 if |χSS|∈[60,120]°
+    else CHI_OUT_FACTOR)``; the reported geometry + the ``sg_a``/``sg_b`` placement (for the clash
+    probe) are that maximizing pair's. Soft (never hard-zero). PURE."""
+    best_q, best_d, best_chi, best_sg = -1.0, None, None, (sgs_a[0], sgs_b[0])
+    for sga in sgs_a:
+        for sgb in sgs_b:
+            d = calc_distance(sga, sgb)
+            chi = calc_dihedral(cb_a, sga, sgb, cb_b)
+            in_win = CHI_SS_MIN <= abs(chi) <= CHI_SS_MAX
+            q = _gauss_score(d, SG_SG_IDEAL, SG_SG_REACH_SIGMA) * (1.0 if in_win else CHI_OUT_FACTOR)
+            if q > best_q:
+                best_q, best_d, best_chi, best_sg = q, d, chi, (sga, sgb)
+                if best_q >= 0.999:                  # essentially ideal — no rotamer can do better
+                    break
+        else:
+            continue
+        break
+    return {"reach_score": round(best_q, 4),
+            "best_sg_sg": (None if best_d is None else round(best_d, 3)),
+            "best_chi_ss": (None if best_chi is None else round(best_chi, 1)),
+            "sg_a": best_sg[0], "sg_b": best_sg[1]}
+
+
+def backbone_pair_score(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3], *,
+                        min_surface_score: Optional[float] = None) -> Optional[Dict[str, object]]:
+    """Soft-graded engineerability of INSTALLING a disulfide between two residues (residue-agnostic).
+    ``score = Cα–Cα Gaussian × Cβ–Cβ Gaussian × ROTAMER Sγ-REACHABILITY`` — reachability takes the
+    slot the weak backbone-orientation proxy held. Returns the measured backbone geometry (Cα–Cα,
+    Cβ–Cβ, the Cα-Cβ-Cβ-Cα orientation dihedral — MEASURED + displayed, no longer scored) PLUS the
+    reachability readout (best achievable Sγ–Sγ + χSS over the χ1 sweep) and, under ``_placed``, the
+    best-rotamer Sγ coords for an optional downstream clash check (the scan pops it; not persisted).
+    Builds a Gly Cβ (`build_cb`) so Gly→Cys is scored. If N is absent (Sγ unplaceable) reachability
+    falls back to REACH_NEUTRAL. *min_surface_score* (the scan passes its `min_score`) SKIPS the
+    expensive reachability sweep when Cα×Cβ alone can't clear it (reach ≤ 1, so the pair can't
+    surface) — a LOSSLESS speed gate. None if either residue lacks a Cα. PURE (no IO)."""
     ca1, ca2 = res_a.get("CA"), res_b.get("CA")
     if not (ca1 and ca2):
         return None
-    cb1 = res_a.get("CB") or ca1                     # Gly: CA stands in as the pseudo-Cβ
-    cb2 = res_b.get("CB") or ca2
-    has_cb = bool(res_a.get("CB") and res_b.get("CB"))
+    # Cβ: real, or reconstructed for Gly (needs N+C); else CA pseudo-Cβ (last-resort, no reach).
+    cb1, built1 = _resolve_cb(res_a, ca1)
+    cb2, built2 = _resolve_cb(res_b, ca2)
+    has_real_cb = bool(res_a.get("CB") and res_b.get("CB"))
     ca = calc_distance(ca1, ca2)
     cb = calc_distance(cb1, cb2)
-    dih = calc_dihedral(ca1, cb1, cb2, ca2) if has_cb else None
-    ca_sc, cb_sc = _gauss_score(ca, CA_CA_SCORE_IDEAL, CA_CA_SCORE_SIGMA), _gauss_score(cb, CB_CB_IDEAL, CB_CB_SCORE_SIGMA)
-    or_sc = _orient_score(dih)
+    # Orientation dihedral — MEASURED for display only when BOTH Cβ are real (a built/pseudo Cβ is
+    # not a measured backbone feature). No longer in the score.
+    dih = calc_dihedral(ca1, cb1, cb2, ca2) if has_real_cb else None
+    ca_sc = _gauss_score(ca, CA_CA_SCORE_IDEAL, CA_CA_SCORE_SIGMA)
+    cb_sc = _gauss_score(cb, CB_CB_IDEAL, CB_CB_SCORE_SIGMA)
+
+    # Rotamer Sγ-reachability (the ranking term). Needs N + a real-or-built Cβ at both positions to
+    # place Sγ; if either Cβ is the last-resort CA pseudo-Cβ (no N/C to build), reach falls back.
+    n1, n2 = res_a.get("N"), res_b.get("N")
+    skip_sweep = (min_surface_score is not None and ca_sc * cb_sc < min_surface_score)
+    if not skip_sweep and n1 and n2 and cb1 is not ca1 and cb2 is not ca2:
+        sgs_a, sgs_b = sg_rotamers(n1, ca1, cb1), sg_rotamers(n2, ca2, cb2)
+        reach = sg_reachability(cb1, sgs_a, cb2, sgs_b)
+        reach_sc = float(reach["reach_score"])
+        placed = {"sg_a": reach["sg_a"], "sg_b": reach["sg_b"],
+                  "cb_a": (cb1 if built1 is not None else None),
+                  "cb_b": (cb2 if built2 is not None else None)}
+    else:
+        reach = {"reach_score": REACH_NEUTRAL, "best_sg_sg": None, "best_chi_ss": None}
+        reach_sc, placed = REACH_NEUTRAL, None
+
     return {
         "ca_ca": round(ca, 3), "cb_cb": round(cb, 3),
         "orientation": (None if dih is None else round(dih, 1)),
-        "ca_score": round(ca_sc, 4), "cb_score": round(cb_sc, 4), "orient_score": round(or_sc, 4),
-        "score": round(ca_sc * cb_sc * or_sc, 4),
+        "ca_score": round(ca_sc, 4), "cb_score": round(cb_sc, 4),
+        "reach_score": round(reach_sc, 4),
+        "best_sg_sg": reach["best_sg_sg"], "best_chi_ss": reach["best_chi_ss"],
+        "clash": None,                                   # set by the scan when a clash grid is given
+        "score": round(ca_sc * cb_sc * reach_sc, 4),
+        "_placed": placed,                               # internal: clash probe; popped before persist
     }
+
+
+def _resolve_cb(res: Dict[str, Vec3], ca: Vec3) -> Tuple[Vec3, Optional[Vec3]]:
+    """Return ``(cb, built)`` for a residue: the real Cβ (built=None), else a reconstructed Gly Cβ
+    from N+CA+C (built=the same coord — flags it was built), else CA as a last-resort pseudo-Cβ
+    (built=None, signalled by ``cb is ca``) when N or C is missing."""
+    cb = res.get("CB")
+    if cb is not None:
+        return cb, None
+    n, c = res.get("N"), res.get("C")
+    if n and c:
+        built = build_cb(n, ca, c)
+        return built, built
+    return ca, None                                      # pseudo-Cβ (can't build) — reach falls back
+
+
+# ── clash grid (tier b — local vdW overlap of the placed rotamer) ──────────────────────────
+class ClashGrid:
+    """A spatial hash of a structure's heavy atoms (built ONCE per scan) so each candidate's placed
+    Sγ/built-Cβ can be clash-tested in O(1) against only its ~27 neighbouring cells. `any_clash`
+    excludes the two mutated residues' own atoms (their sidechains are replaced by the Cys, and the
+    two Sγ are the intended bonding partners — not a clash with each other)."""
+
+    def __init__(self, atoms: List[Tuple[str, int, str, Vec3]], cell: float = CLASH_GRID_CELL):
+        self.cell = cell
+        self.grid: Dict[Tuple[int, int, int], List[Tuple[str, int, str, Vec3]]] = {}
+        for rec in atoms:
+            self.grid.setdefault(self._key(rec[3]), []).append(rec)
+
+    def _key(self, xyz: Vec3) -> Tuple[int, int, int]:
+        c = self.cell
+        return (int(math.floor(xyz[0]/c)), int(math.floor(xyz[1]/c)), int(math.floor(xyz[2]/c)))
+
+    def any_clash(self, probes: List[Tuple[Vec3, str]], exclude: set) -> bool:
+        """True if any probe ``(xyz, element)`` overlaps a heavy atom (vdW sum − tolerance) NOT in an
+        excluded ``(chain, resnum)`` residue. Checks the probe's cell + its 26 neighbours only."""
+        for xyz, el in probes:
+            pr = HEAVY_VDW.get(el, 1.70)
+            ci, cj, ck = self._key(xyz)
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    for dk in (-1, 0, 1):
+                        for (ch, rn, ael, axyz) in self.grid.get((ci+di, cj+dj, ck+dk), ()):
+                            if (ch, rn) in exclude:
+                                continue
+                            if calc_distance(xyz, axyz) < (pr + HEAVY_VDW.get(ael, 1.70) - CLASH_TOLERANCE):
+                                return True
+        return False
+
+
+def _finalize_pair(pg: Dict[str, object], cha: str, ra: int, chb: str, rb: int,
+                   clash_grid: Optional["ClashGrid"]) -> Dict[str, object]:
+    """Pop the internal best-rotamer Sγ coords (never persisted) and, if a clash grid is supplied
+    (tier b), probe the placed Sγ (+ any built Gly Cβ) for vdW overlap against surrounding heavy
+    atoms — set the ``clash`` flag and SOFTLY demote a clashing site (× CLASH_PENALTY), never
+    hard-eliminate it. Without a grid (tier a), ``clash`` stays None (not evaluated). The min_score
+    gate upstream runs on the CLASH-FREE score, so a clash demotes rank but never hides a site."""
+    placed = pg.pop("_placed", None)
+    if clash_grid is None or placed is None:
+        pg["clash"] = None
+        return pg
+    probes: List[Tuple[Vec3, str]] = [(placed["sg_a"], "S"), (placed["sg_b"], "S")]
+    if placed.get("cb_a"):
+        probes.append((placed["cb_a"], "C"))
+    if placed.get("cb_b"):
+        probes.append((placed["cb_b"], "C"))
+    clash = clash_grid.any_clash(probes, exclude={(cha, ra), (chb, rb)})
+    pg["clash"] = bool(clash)
+    if clash:
+        pg["score"] = round(float(pg["score"]) * CLASH_PENALTY, 4)
+    return pg
 
 
 def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], *,
                             min_seq_sep: int = SCAN_MIN_SEQ_SEP,
                             ca_gate: Optional[float] = CA_CA_PREFILTER_GATE,
-                            min_score: float = SCAN_MIN_SCORE):
+                            min_score: float = SCAN_MIN_SCORE,
+                            clash_grid: Optional["ClashGrid"] = None):
     """INTRACHAIN all-pairs backbone scan for NOVEL installable disulfide sites. Per chain, every
-    residue pair separated by ≥ *min_seq_sep* in sequence is scored by `backbone_pair_score`; a
-    cheap conservative Cα–Cα PREFILTER (*ca_gate*) skips pairs too far to clear *min_score* BEFORE
-    the dihedral compute — SPEED only, the OUTPUT is identical to a full scan (gated-out pairs are
-    sub-threshold). Returns ``(ranked_pairs, best_partner)``: ranked_pairs sorted by score desc,
-    each carrying ``chain_a``/``chain_b`` (equal here — intrachain) + ``resnum_a``/``resnum_b``;
-    best_partner ``{(chain, resnum): best score}`` for the heatmap (a residue's colour = its best
-    available partner's score). Pass ``ca_gate=None`` for an un-prefiltered full scan."""
+    residue pair separated by ≥ *min_seq_sep* in sequence is scored by `backbone_pair_score` (Cα–Cα
+    × Cβ–Cβ × rotamer Sγ-reachability); a cheap conservative Cα–Cα PREFILTER (*ca_gate*) skips pairs
+    too far to clear *min_score* BEFORE the (more expensive) reachability sweep — SPEED only, the
+    OUTPUT is identical to a full scan (gated-out pairs are sub-threshold). With *clash_grid* (tier
+    b) each surfaced candidate is clash-checked (flag + soft demotion). Returns ``(ranked_pairs,
+    best_partner)``: ranked_pairs sorted by final score desc, each carrying ``chain_a``/``chain_b``
+    (equal here — intrachain) + ``resnum_a``/``resnum_b``; best_partner ``{(chain, resnum): best
+    score}`` for the heatmap. Pass ``ca_gate=None`` for an un-prefiltered full scan."""
     ranked: List[Dict[str, object]] = []
     best: Dict[tuple, float] = {}
     for ch, residues in (atoms_by_chain or {}).items():
@@ -315,9 +559,10 @@ def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]
                     continue
                 if ca_gate is not None and calc_distance(ca_a, ca_b) > ca_gate:
                     continue                          # PREFILTER — too far; skip the full score
-                pg = backbone_pair_score(residues[ra], residues[rb])
-                if pg is None or pg["score"] < min_score:
+                pg = backbone_pair_score(residues[ra], residues[rb], min_surface_score=min_score)
+                if pg is None or pg["score"] < min_score:   # gate on the CLASH-FREE score
                     continue
+                pg = _finalize_pair(pg, ch, ra, ch, rb, clash_grid)
                 # INTRACHAIN: both members are on `ch`, so the two-chain pair shape collapses to
                 # chain_a == chain_b here (no cross-chain enumeration until step 4). best_partner is
                 # keyed per MEMBER by ITS OWN chain — already the cross-chain-correct form.
@@ -330,7 +575,8 @@ def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]
 
 def scan_interface_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], *,
                          ca_gate: Optional[float] = CA_CA_PREFILTER_GATE,
-                         min_score: float = SCAN_MIN_SCORE):
+                         min_score: float = SCAN_MIN_SCORE,
+                         clash_grid: Optional["ClashGrid"] = None):
     """CROSS-chain (INTER-subunit) engineerable-disulfide scan: residue pairs whose two members are
     on DIFFERENT chains. The SAME `backbone_pair_score` Mode D uses scores each pair (NO new geometry
     loop — the §9 universal-disulfide-mode convergence point, the shared primitive both this and the
@@ -338,6 +584,7 @@ def scan_interface_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], 
     pair close enough ACROSS chains to possibly form a disulfide is interface-proximal by definition;
     a buried-core residue is too far from the other chain to pass, so the output is interface-bounded
     (NOT the full A×B product). NO `min_seq_sep` — cross-chain residues have no sequence adjacency.
+    With *clash_grid* (tier b) each surfaced candidate is clash-checked (flag + soft demotion).
     Returns ``(ranked_pairs, best_partner)``: each pair carries ``chain_a`` != ``chain_b`` (the
     two-chain reshape) + ``resnum_a``/``resnum_b``; best_partner ``{(chain, resnum): best score}``.
     DISTINCT from `scan_engineerable_sites` (intra-chain) — feeds the cross-chain Mode-C declare."""
@@ -358,9 +605,10 @@ def scan_interface_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], 
                         continue
                     if ca_gate is not None and calc_distance(ca_a, ca_b) > ca_gate:
                         continue                          # INTERFACE bound — too far across chains
-                    pg = backbone_pair_score(res_a[ra], res_b[rb])
-                    if pg is None or pg["score"] < min_score:
+                    pg = backbone_pair_score(res_a[ra], res_b[rb], min_surface_score=min_score)
+                    if pg is None or pg["score"] < min_score:   # gate on the CLASH-FREE score
                         continue
+                    pg = _finalize_pair(pg, cha, ra, chb, rb, clash_grid)
                     ranked.append({"chain_a": cha, "resnum_a": ra, "chain_b": chb, "resnum_b": rb, **pg})
                     best[(cha, ra)] = max(best.get((cha, ra), 0.0), float(pg["score"]))
                     best[(chb, rb)] = max(best.get((chb, rb), 0.0), float(pg["score"]))

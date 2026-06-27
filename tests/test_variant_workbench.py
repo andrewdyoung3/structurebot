@@ -2622,6 +2622,30 @@ class TestDisulfideSuite:
         assert t._sec["A"]["table"].isHidden()                        # no blank table shown
         assert not t._sec["A"]["placeholder"].isHidden()             # the "Run … to populate" hint IS shown
 
+    def test_scan_renders_reachability_columns(self, _app):
+        # the rotamer Sγ-reachability readout (Sγ–Sγ, χSS, Clash) renders in the D table, with the
+        # orientation now the LAST (de-emphasized) column; a legacy pair with no reach fields → "—"
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        cd.disulfide_scan = {"pairs": [
+            {"chain": "A", "resnum_a": 5, "resnum_b": 9, "score": 0.95, "ca_ca": 5.5, "cb_cb": 3.8,
+             "orientation": 88.0, "best_sg_sg": 2.04, "best_chi_ss": -89.7, "clash": False},
+            {"chain": "A", "resnum_a": 6, "resnum_b": 12, "score": 0.30, "ca_ca": 5.6, "cb_cb": 3.9,
+             "orientation": None, "best_sg_sg": 2.06, "best_chi_ss": 110.0, "clash": True}],
+            "best_partner": {"A": {5: 0.95}}, "caveat": "x"}
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        tbl = p.disulfides_tab._sec["D"]["table"]
+        # cols: Pair, Score, Cα–Cα, Cβ–Cβ, Sγ–Sγ(4), χSS(5), Clash(6), Orientation(7)
+        assert tbl.columnCount() == 8
+        assert tbl.item(0, 4).text() == "2.04" and tbl.item(0, 5).text() == "-90"
+        assert tbl.item(0, 6).text() == "ok" and tbl.item(0, 7).text() == "88"
+        assert tbl.item(1, 6).text() == "clash" and tbl.item(1, 7).text() == "—"   # Gly orient → —
+        # legacy pair (no reach fields) → reach cells show "—", never a crash
+        cd.disulfide_scan["pairs"].append({"chain": "A", "resnum_a": 7, "resnum_b": 20, "score": 0.2,
+                                           "ca_ca": 5.5, "cb_cb": 3.8, "orientation": 80.0})
+        p.disulfides_tab.populate_scan(cd, cd.disulfide_scan)
+        assert tbl.item(2, 4).text() == "—" and tbl.item(2, 6).text() == "—"
+
     def test_tab_persists_across_a_tab_switch_with_content_intact(self, _app):
         # THE bug: the dialog vanished. The tab must survive switching away + back with its rows.
         from PySide6 import QtWidgets as _W
@@ -3106,7 +3130,8 @@ class TestDisulfideDdgEscalation:
         pair = cd.disulfide_interface_scan["pairs"][0]
         assert pair["ddg_a"] == 1.2 and pair["ddg_b"] == 0.4 and pair["ddg_backend"] == "pyrosetta"
         tbl = p.disulfides_tab._sec["I"]["table"]
-        assert tbl.columnCount() == 6 and tbl.item(0, 5).text() == "+1.2 / +0.4"   # ΔΔG column
+        # cols: Pair, Score, Cα–Cα, Cβ–Cβ, Sγ–Sγ, χSS, Clash, Orientation, ΔΔG → ΔΔG is the last (8)
+        assert tbl.columnCount() == 9 and tbl.item(0, 8).text() == "+1.2 / +0.4"   # ΔΔG column
 
     def test_apply_ddg_failure_no_fabricated_number(self, _app):
         p, _ = self._folded_hetero()

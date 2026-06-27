@@ -154,12 +154,45 @@ def test_parse_cys_atoms_only_cysteines(tmp_path):
 
 # ── Mode D: backbone engineering scan (residue-agnostic, NO χSS, soft-graded, prefiltered) ──
 def test_backbone_scoring_soft_windows_pinned():
-    # the soft-window scores (graded, never hard cutoffs) pinned at their ideal/neutral points
+    # the soft-window distance scores (graded, never hard cutoffs) pinned at their ideal points
     assert g._gauss_score(5.5, g.CA_CA_SCORE_IDEAL, g.CA_CA_SCORE_SIGMA) == 1.0   # Cα–Cα ideal
     assert abs(g._gauss_score(3.8, g.CB_CB_IDEAL, g.CB_CB_SCORE_SIGMA) - 1.0) < 1e-9  # Cβ–Cβ ideal
-    assert g._orient_score(90.0) == 1.0 and g._orient_score(-90.0) == 1.0         # ±90° ideal
-    assert g._orient_score(0.0) == 0.5                                            # eclipsed → neutral
-    assert g._orient_score(None) == 0.5                                           # Gly → neutral
+    # the dead ORIENT_CUTOFF_D branch was REMOVED — orientation no longer drives the score
+    assert not hasattr(g, "_orient_score")
+    assert not hasattr(g, "ORIENT_CUTOFF_D")
+
+
+def test_placement_primitive_reproduces_internal_coords():
+    # place_from_internal must reproduce the requested bond / angle / dihedral EXACTLY
+    import math
+    N, CA, CB = (0.0, 0.0, 0.0), (1.46, 0.0, 0.0), (1.95, 1.42, 0.0)
+    for chi1 in (-65.0, 60.0, 180.0):
+        sg = g.place_from_internal(N, CA, CB, g.CYS_CB_SG_BOND, g.CYS_CA_CB_SG_ANGLE, chi1)
+        assert abs(g.calc_distance(CB, sg) - g.CYS_CB_SG_BOND) < 1e-6        # CB–SG bond
+        assert abs(g.calc_dihedral(N, CA, CB, sg) - chi1) < 1e-4             # N–CA–CB–SG dihedral = χ1
+    # χSS from two placed Sγ matches chi_ss(cb,sg,sg,cb)
+    sg1 = g.place_from_internal(N, CA, CB, g.CYS_CB_SG_BOND, g.CYS_CA_CB_SG_ANGLE, -60.0)
+    N2, CA2, CB2 = (5.0, 0.0, 0.0), (4.0, 1.0, 0.0), (3.5, 2.0, 0.0)
+    sg2 = g.place_from_internal(N2, CA2, CB2, g.CYS_CB_SG_BOND, g.CYS_CA_CB_SG_ANGLE, 60.0)
+    assert abs(g.chi_ss(CB, sg1, sg2, CB2) - g.calc_dihedral(CB, sg1, sg2, CB2)) < 1e-9
+
+
+def test_reachability_fine_sweep_beats_three_staggered():
+    # a geometry where the REACHABLE rotamer sits BETWEEN the staggered χ1 values: a fine sweep
+    # finds it, a 3-staggered set (−60/60/180) would miss it (the honesty hinge).
+    a = {"N": (0.0, 0.0, 0.0), "CA": (1.46, 0.0, 0.0), "CB": (1.95, 1.42, 0.0)}
+    sgs_a = g.sg_rotamers(a["N"], a["CA"], a["CB"])
+    # place B's backbone so the IDEAL Sγ–Sγ is hit at a non-staggered χ1 for A
+    b = {"N": (1.0, 5.5, 0.0), "CA": (2.0, 4.8, 0.0), "CB": (2.6, 3.6, 0.0)}
+    sgs_b = g.sg_rotamers(b["N"], b["CA"], b["CB"])
+    fine = g.sg_reachability(a["CB"], sgs_a, b["CB"], sgs_b)
+    # the 3-staggered approximation: only −60/60/180 on each side
+    stag = [-60.0, 60.0, 180.0]
+    sa = [g._place_sg(a["N"], a["CA"], a["CB"], c) for c in stag]
+    sb = [g._place_sg(b["N"], b["CA"], b["CB"], c) for c in stag]
+    coarse = g.sg_reachability(a["CB"], sa, b["CB"], sb)
+    assert fine["reach_score"] >= coarse["reach_score"]      # fine never worse
+    assert fine["best_sg_sg"] is not None
 
 
 def test_backbone_pair_score_graded_near_beats_off():
@@ -185,12 +218,44 @@ def test_backbone_pair_score_no_chi_ss():
     assert "chi_ss" not in g.backbone_pair_score(a, b)
 
 
-def test_backbone_pair_score_glycine_uses_pseudo_cb():
-    # Gly has no Cβ → CA stands in; orientation undefined → neutral, never a crash
-    gly = {"CA": (0.0, 0.0, 0.0)}                           # no CB
+def test_backbone_pair_score_glycine_no_n_falls_back():
+    # Gly with NO N/C to build a Cβ → last-resort CA pseudo-Cβ; orientation undefined, reachability
+    # falls back to neutral (Sγ unplaceable), never a crash
+    gly = {"CA": (0.0, 0.0, 0.0)}                           # no CB, no N, no C
     b = {"CA": (5.5, 0.0, 0.0), "CB": (3.8, 1.5, 0.0)}
     pg = g.backbone_pair_score(gly, b)
-    assert pg is not None and pg["orientation"] is None and pg["orient_score"] == 0.5
+    assert pg is not None and pg["orientation"] is None
+    assert pg["reach_score"] == g.REACH_NEUTRAL and pg["best_sg_sg"] is None
+    assert "orient_score" not in pg                        # the orientation term is gone from the score
+
+
+def test_backbone_pair_score_glycine_builds_cb_and_scores():
+    # Gly WITH N+C → Cβ is reconstructed (build_cb) so the Gly→Cys site is SCORED via reachability,
+    # not silently dropped. orientation stays None (built Cβ isn't a measured backbone feature).
+    gly = {"N": (0.0, 1.46, 0.0), "CA": (0.0, 0.0, 0.0), "C": (1.4, -0.5, 0.0)}   # no CB → build it
+    b = {"N": (4.6, 5.0, 0.0), "CA": (5.0, 4.0, 0.0), "CB": (4.2, 3.0, 0.0)}
+    pg = g.backbone_pair_score(gly, b)
+    assert pg is not None
+    assert pg["orientation"] is None                       # built Cβ → orientation not "measured"
+    assert pg["best_sg_sg"] is not None                    # but reachability WAS computed (Cβ built)
+    assert pg["reach_score"] != g.REACH_NEUTRAL            # a real reach value, not the fallback
+
+
+def test_build_cb_matches_real_residue():
+    # the reconstructed Cβ lands close to a real Cβ — validated against a real fold's residues
+    import os
+    cif = os.path.join(os.path.dirname(__file__), "..", "cache", "1C9O.cif")
+    if not os.path.isfile(cif):
+        return                                             # cache not present → skip silently
+    atoms = g._parse_atom_site(cif, ("N", "CA", "C", "CB"), comp_id=None)
+    checked = 0
+    for ch, residues in atoms.items():
+        for rn, a in residues.items():
+            if all(k in a for k in ("N", "CA", "C", "CB")):
+                built = g.build_cb(a["N"], a["CA"], a["C"])
+                assert g.calc_distance(built, a["CB"]) < 0.3   # within 0.3 Å of the real Cβ
+                checked += 1
+    assert checked > 10
 
 
 def _scan_atoms():
@@ -224,6 +289,67 @@ def test_scan_best_partner_map():
     # each surfaced residue's best-partner score = the max score of any pair it's in
     assert best.get(("A", 1)) is not None and best[("A", 1)] == best[("A", 5)]
     assert ("A", 9) not in best                             # far residue never gets a partner
+
+
+# ── reachability replaces orientation in the RANKING + the clash check (tier b) ──────────────
+def _reach_atoms():
+    """Two residues whose Sγ CAN reach a disulfide (close, well-oriented) and one whose backbone is
+    oriented so the sulfurs can't reach a good χSS at the same Cα/Cβ distances. Real N/CA/CB so the
+    rotamer sweep runs."""
+    return {"A": {
+        1:  {"N": (0.0, 1.46, 0.0),  "CA": (0.0, 0.0, 0.0),  "CB": (0.5, -1.2, 0.6)},
+        5:  {"N": (4.4, 1.4, 0.0),   "CA": (4.6, 0.0, 0.0),  "CB": (4.1, -1.2, 0.6)},   # faces res 1
+        9:  {"N": (4.4, 1.4, 5.0),   "CA": (4.6, 0.0, 5.0),  "CB": (5.3, 1.0, 5.6)},    # CB faces AWAY
+    }}
+
+
+def test_reachability_drives_score_not_orientation():
+    # a reachability-good pair must rank via reach_score; the score = ca*cb*reach (no orient term)
+    atoms = _reach_atoms()
+    pg = g.backbone_pair_score(atoms["A"][1], atoms["A"][5])
+    assert pg["best_sg_sg"] is not None and pg["reach_score"] > 0
+    expected = pg["ca_score"] * pg["cb_score"] * pg["reach_score"]
+    assert abs(pg["score"] - expected) < 2e-4             # score is ca×cb×reach (within 4-dp rounding)
+    assert "orientation" in pg                             # orientation still MEASURED + displayed
+    assert pg["orientation"] is not None
+
+
+def test_reachable_pair_outscores_unreachable_at_similar_distance():
+    # res1↔res5 (sulfurs reach) should reach-score higher than res5↔res9 (Cβ points away) — the
+    # signal orientation only weakly proxied
+    atoms = _reach_atoms()
+    reachable = g.backbone_pair_score(atoms["A"][1], atoms["A"][5])
+    away = g.backbone_pair_score(atoms["A"][5], atoms["A"][9])
+    assert reachable["reach_score"] > away["reach_score"]
+
+
+def test_clash_flag_set_when_sg_overlaps_neighbor():
+    # the placed Sγ of a candidate sitting ON a neighbour heavy atom → clash flag True + demotion;
+    # a clear candidate → clash False, undemoted
+    atoms = _reach_atoms()
+    # neighbour atoms FAR from everything → no clash
+    clear_grid = g.ClashGrid([("A", 100, "C", (50.0, 50.0, 50.0))])
+    rc, _ = g.scan_engineerable_sites(atoms, clash_grid=clear_grid)
+    top_clear = rc[0]
+    assert top_clear["clash"] is False
+    # now drop a carbon RIGHT where the best-reach Sγ lands (recover it from a no-grid run)
+    pg = g.backbone_pair_score(atoms["A"][1], atoms["A"][5])  # _placed carries the Sγ coords
+    sg = pg["_placed"]["sg_a"]
+    clash_grid = g.ClashGrid([("A", 100, "C", sg)])           # a C atom ON the Sγ (residue 100 ≠ 1/5)
+    rk, _ = g.scan_engineerable_sites(atoms, clash_grid=clash_grid)
+    hit = next(p for p in rk if {p["resnum_a"], p["resnum_b"]} == {1, 5})
+    assert hit["clash"] is True
+    assert hit["score"] < top_clear["score"]                  # clashing site is softly DEMOTED
+
+
+def test_clash_excludes_the_two_mutated_residues():
+    # the candidate's OWN residue atoms must not count as a clash (their sidechains become the Cys)
+    atoms = _reach_atoms()
+    # a grid containing ONLY the two candidate residues' backbone atoms → must NOT clash
+    grid = g.ClashGrid([("A", 1, "C", atoms["A"][1]["CA"]), ("A", 5, "C", atoms["A"][5]["CA"])])
+    rk, _ = g.scan_engineerable_sites(atoms, clash_grid=grid)
+    hit = next(p for p in rk if {p["resnum_a"], p["resnum_b"]} == {1, 5})
+    assert hit["clash"] is False                              # excluded → no self-clash
 
 
 # ── pair-shape reshape: two-chain container, intra-chain only (no cross-chain leakage) ───

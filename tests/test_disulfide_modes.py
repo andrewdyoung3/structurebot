@@ -227,9 +227,40 @@ def test_engineering_scan_finds_sites_and_carries_caveat():
     assert all(9 not in (a, b) for a, b in pairs)  # far residue excluded
     assert out.data["best_partner"].get("A", {}).get(1) is not None   # heatmap map present
     # the load-bearing caveat rides with the readout (data AND summary)
-    assert "starting point" in out.data["caveat"] and "does not imply" in out.data["caveat"].lower()
+    assert "starting point" in out.data["caveat"] and "does not confirm" in out.data["caveat"].lower()
     assert "starting point" in out.summary.lower()
     r._fold_n_seeds.assert_not_called()
+
+
+def _backbone_cif_full():
+    # two residues with FULL backbone (N/CA/CB/C) ~5.5 Å apart so the rotamer Sγ-reachability sweep
+    # runs (needs N) — exercises the tier (a)+(b) path end-to-end through the router
+    return (
+        "data_model\nloop_\n"
+        "_atom_site.group_PDB\n_atom_site.type_symbol\n_atom_site.label_atom_id\n"
+        "_atom_site.label_comp_id\n_atom_site.auth_asym_id\n_atom_site.auth_seq_id\n"
+        "_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n"
+        "ATOM N N ALA A 1 0.0 1.46 0.0\nATOM C CA ALA A 1 0.0 0.0 0.0\n"
+        "ATOM C CB ALA A 1 0.5 -1.2 0.6\nATOM C C ALA A 1 1.4 -0.5 0.0\n"
+        "ATOM N N VAL A 5 4.4 1.4 0.0\nATOM C CA VAL A 5 4.6 0.0 0.0\n"
+        "ATOM C CB VAL A 5 4.1 -1.2 0.6\nATOM C C VAL A 5 5.9 -0.4 0.0\n#\n"
+    )
+
+
+def test_engineering_scan_carries_reachability_and_clash_columns():
+    # the router scan surfaces the rotamer Sγ-reachability readout + the clash flag (tier a+b),
+    # and the orientation is still MEASURED (the displayed column)
+    r = _router()
+    out = r._run_disulfide_scan({"cif_path": _write(_backbone_cif_full())})
+    assert out.success and out.data["pairs"]
+    top = out.data["pairs"][0]
+    assert {top["resnum_a"], top["resnum_b"]} == {1, 5}
+    assert top["best_sg_sg"] is not None and top["best_chi_ss"] is not None  # reachability computed
+    assert top["reach_score"] > 0
+    assert top["clash"] in (True, False)                # clash grid ran (tier b), a real flag
+    assert "orientation" in top                         # orientation still displayed (measured)
+    assert "_placed" not in top                          # internal coords stripped before persist
+    assert "orient_score" not in top                     # orientation no longer in the score
 
 
 def test_engineering_scan_needs_a_cif():
@@ -274,7 +305,7 @@ def test_interface_scan_finds_cross_chain_sites_and_carries_caveat():
     surfaced = {(p["chain_a"], p["resnum_a"]) for p in out.data["pairs"]} \
         | {(p["chain_b"], p["resnum_b"]) for p in out.data["pairs"]}
     assert ("A", 9) not in surfaced and ("B", 9) not in surfaced  # non-interface → interface-bounded
-    assert out.data["caveat"] and "does not imply" in out.data["caveat"].lower()
+    assert out.data["caveat"] and "does not confirm" in out.data["caveat"].lower()
     r._fold_n_seeds.assert_not_called()
 
 
