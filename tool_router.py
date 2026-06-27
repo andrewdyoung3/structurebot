@@ -162,6 +162,8 @@ class ToolRouter:
         "disulfide_interface_scan": "🔗🤝",
         "disulfide_ddg_estimate":  "🔗⚡",
         "proline":           "🧪",
+        "proline_scan":      "🧪🔍",
+        "proline_ddg_estimate": "🧪⚡",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
         "netnglyc":          "🔬🍬",
@@ -1848,6 +1850,12 @@ class ToolRouter:
         if tool == "disulfide_ddg_estimate":
             return ("Disulfide ΔΔG estimate (legacy) — energetic read for ONE flagged interface "
                     "pair (uncalibrated; ranking/sign only)")
+        if tool == "proline_scan":
+            return ("Proline-stabilization scan — rank X→Pro sites by backbone φ/ψ proline-"
+                    "compatibility + a backbone-H-bond-donor penalty (this structure)")
+        if tool == "proline_ddg_estimate":
+            return ("Proline ΔΔG estimate (legacy) — energetic read for ONE flagged X→Pro site "
+                    "(uncalibrated; ranking/sign only)")
         if tool == "proline":
             inp   = tool_inputs.get("proline", {})
             mid   = inp.get("model_id") or self._first_model_id()
@@ -2147,6 +2155,10 @@ class ToolRouter:
                 return self._run_disulfide_interface_scan(inputs)
             if tool == "disulfide_ddg_estimate":
                 return self._run_disulfide_ddg_estimate(inputs)
+            if tool == "proline_scan":
+                return self._run_proline_scan(inputs)
+            if tool == "proline_ddg_estimate":
+                return self._run_proline_ddg_estimate(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3456,6 +3468,127 @@ class ToolRouter:
                   "chain_b": cb, "resnum_b": rb, "from_aa_b": aa_b,
                   "ddg_a": ddg_a, "ddg_b": ddg_b, "ddg_mean": ddg_mean,
                   "backend": backend, "source": source, "caveat": self._DISULFIDE_DDG_CAVEAT},
+            summary=summary)
+
+    # ── Proline-stabilization scan (panel-primary; the legacy NL `proline`/ProlineBridge stays parallel) ──
+    # The load-bearing caveat — rides with EVERY proline-scan readout (measured-not-promised).
+    _PROLINE_SCAN_CAVEAT = (
+        "Geometrically favourable proline-substitution sites in THIS predicted/loaded structure — a "
+        "starting point. Ranked by backbone φ/ψ proline-compatibility, with a backbone-H-bond-donor "
+        "flag (proline has no amide H, so it cannot DONATE the N–H···O bond loops tolerate but helices/"
+        "sheets rely on — flagged + soft-penalized, NOT excluded; H-bond detection on a predicted/rigid "
+        "backbone is uncertain). Geometry PERMITS a stabilizing proline; it does NOT confirm the X→Pro "
+        "mutation is tolerated, that the protein still folds, or that it stabilizes. Validate by "
+        "substituting → re-folding (no constraint) → comparing; the X→Pro ΔΔG is a second soft signal."
+    )
+
+    def _run_proline_scan(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """PROLINE-STABILIZATION SCAN — per-residue X→Pro candidates ranked by backbone φ/ψ proline-
+        compatibility × a backbone-H-bond-donor penalty (`proline_geometry`). CHEAP — reads the CIF,
+        NEVER folds; works on a de-novo fold OR a LOADED crystal/model (multimers native). The correct
+        FRESH version (real geometric DSSP-style H-bond detection + a SOFT penalty), DISTINCT from the
+        legacy NL `proline`/`ProlineBridge` (BioPython/PDB + ESM/DynaMut2 console path — kept parallel,
+        §9). Returns a ranked candidate list (source of truth) + a per-residue best-score heatmap map +
+        the existing prolines + the load-bearing CAVEAT. Reads `cif_path`."""
+        import os as _os
+        from proline_geometry import parse_backbone_with_names, scan_proline_sites, existing_prolines
+        cif = inputs.get("cif_path")
+        if not cif or not _os.path.isfile(cif):
+            return ToolStepResult(tool="proline_scan", success=False,
+                                  error="Proline scan needs an existing structure CIF on disk.")
+        atoms = parse_backbone_with_names(cif)
+        ranked, best = scan_proline_sites(atoms)
+        existing = [list(p) for p in existing_prolines(atoms)]
+        best_by_chain: Dict[str, Dict[int, float]] = {}
+        for (ch, rn), sc in best.items():
+            best_by_chain.setdefault(ch, {})[rn] = round(sc, 4)
+        if not ranked:
+            summary = ("Proline scan: no proline-favourable sites in this structure. "
+                       + self._PROLINE_SCAN_CAVEAT)
+        else:
+            head = "; ".join(
+                f"{d['from_aa']}{d['position']}→P (score {d['score']:.2f}"
+                + (", H-bond donor" if d['hbond_donates'] else "") + ")" for d in ranked[:3])
+            summary = (f"Proline scan — {len(ranked)} candidate site(s); top: {head}. "
+                       + self._PROLINE_SCAN_CAVEAT)
+        return ToolStepResult(
+            tool="proline_scan", success=True,
+            data={"candidates": ranked, "best_partner": best_by_chain, "existing": existing,
+                  "caveat": self._PROLINE_SCAN_CAVEAT, "mode": "proline_scan"},
+            summary=summary)
+
+    _PROLINE_DDG_CAVEAT = (
+        "X→Pro ΔΔG (legacy, uncalibrated — ranking/sign only, ~±2.7 kcal/mol). The stabilization "
+        "estimate itself, but a SOFT signal — not confirmation the mutation stabilizes or that the "
+        "protein still folds. Validate by substituting → re-folding → comparing."
+    )
+
+    def _run_proline_ddg_estimate(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """ΔΔG-ESCALATION for ONE proline candidate — the `disulfide_ddg_estimate` pattern with
+        ``to_aa='P'``. A DIRECT single-mutation `RosettaBridge.analyze` (NOT the legacy
+        `full_proline_scan` pipeline — no SASA/ESM/interface machinery). from_aa is VERIFIED against
+        the residue AT (chain, resnum) in the EXACT PDB scored (silent-wrong-mutation guard); de-novo
+        + web backend BLOCKED (no off-machine upload). X→Pro ΔΔG IS the stabilization estimate.
+        Inputs: ``pdb_path``, ``chain``/``resnum``/``from_aa``, ``source`` ('denovo'|'loaded')."""
+        from disulfide_bridge import _three_to_one, parse_pdb_atoms
+        pdb = inputs.get("pdb_path")
+        ch, rn, aa = inputs.get("chain"), inputs.get("resnum"), inputs.get("from_aa")
+        source = (inputs.get("source") or "loaded").strip().lower()
+        if not pdb or not Path(pdb).is_file():
+            return ToolStepResult(tool="proline_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs a structure (PDB) on disk.")
+        if None in (ch, rn, aa):
+            return ToolStepResult(tool="proline_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs the position with its WT residue (chain, resnum, from_aa).")
+        ch, rn, aa = str(ch), int(rn), str(aa).upper()
+        if aa == "P":
+            return ToolStepResult(tool="proline_ddg_estimate", success=False,
+                                  error="That position is already proline — X→Pro is a no-op.")
+        # 1) VERIFY from_aa against the EXACT scored structure (silent-wrong-residue guard)
+        atoms = parse_pdb_atoms(pdb)
+        res = (atoms.get(ch) or {}).get(rn)
+        if res is None:
+            return ToolStepResult(tool="proline_ddg_estimate", success=False,
+                                  error=f"ΔΔG estimate: residue {ch}:{rn} not found in the scored structure.")
+        struct_aa = _three_to_one(res.get("resname", "UNK"))
+        if struct_aa != aa:
+            return ToolStepResult(tool="proline_ddg_estimate", success=False,
+                                  error=(f"ΔΔG estimate ABORTED — residue mismatch at {ch}:{rn}: the scan says {aa} "
+                                         f"but the structure has {struct_aa}. Scoring would target the wrong mutation "
+                                         f"(off-by-one / wrong chain / stale edit). Re-scan first."))
+        # 2) backend gate (fail-closed BEFORE any compute/upload) — reuses the disulfide gate
+        from rosetta_bridge import _select_backend, RosettaBridge
+        backend = _select_backend()
+        wsl_ok = False
+        if backend == "local":
+            try:
+                from wsl_bridge import WSLBridge
+                _w = WSLBridge()
+                wsl_ok = bool(_w.is_available() and _w.check_pyrosetta())
+            except Exception:
+                wsl_ok = False
+        ok, reason = self._ddg_escalation_gate(backend, source, wsl_ok)
+        if not ok:
+            return ToolStepResult(tool="proline_ddg_estimate", success=False, error=reason)
+        # 3) score EXACTLY this X→Pro mutation (single mutation; NOT the legacy full pipeline)
+        bridge = RosettaBridge()
+        r = bridge.analyze(pdb_path=pdb,
+                           mutations=[{"chain": ch, "position": rn, "from_aa": aa, "to_aa": "P"}])
+        ddg = None
+        if getattr(r, "success", False):
+            for key, v in (r.data.get("ddg_scores", {}) or {}).items():
+                m = re.match(r"[A-Z](\d+)[A-Z]", str(key))
+                if m and int(m.group(1)) == rn:
+                    ddg = float(v); break
+        if ddg is None:
+            return ToolStepResult(tool="proline_ddg_estimate", success=False,
+                                  error=f"ΔΔG estimate produced no score for {aa}{rn}P ({backend}).")
+        summary = (f"X→Pro ΔΔG (legacy, {backend}) for {ch}:{aa}{rn}P — {ddg:+.2f} kcal/mol. "
+                   + self._PROLINE_DDG_CAVEAT)
+        return ToolStepResult(
+            tool="proline_ddg_estimate", success=True,
+            data={"chain": ch, "resnum": rn, "from_aa": aa, "ddg": ddg,
+                  "backend": backend, "source": source, "caveat": self._PROLINE_DDG_CAVEAT},
             summary=summary)
 
     def _resolve_boltz_templates(

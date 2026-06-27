@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from color_modes import (all_modes, combined_disruption_color, ddg_color,
-                         disulfide_compat_color, get_mode, plddt_color)
+                         disulfide_compat_color, get_mode, plddt_color, proline_compat_color)
 from disulfide_geometry import pair_chains, pair_label
 from seq_library import (build_numbering_header_content,
                          build_numbering_header_with_insertions)
@@ -55,6 +55,7 @@ _RESULT_DDG_MODE = "result:ddg"             # S4a result-backed color mode (per-
 _RESULT_PLDDT_MODE = "result:plddt"         # S4b result-backed color mode (per-residue pLDDT)
 _RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα deviation
 _RESULT_DISULFIDE_MODE = "result:disulfide_scan"  # Mode D best-partner engineerability heatmap
+_RESULT_PROLINE_MODE = "result:proline_scan"      # proline-stabilization favourability heatmap
 _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
 _LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
 _DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
@@ -914,6 +915,166 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             self._clear_glow_btn.setEnabled(bool(active))
 
 
+class ProlineResultsTab(QtWidgets.QWidget):
+    """Persistent home for the PROLINE-stabilization scan — a peer of the Disulfides tab (stabilization
+    is the program's core; the strategies are first-class peers). ONE ranked table (X→Pro candidates by
+    backbone φ/ψ proline-compatibility × a backbone-H-bond-donor penalty), an existing-prolines line
+    (the 'see what's already there' design-context half), the measured-not-promised caveat, and the
+    Clear-disulfide-style 'Clear view' control. A row-click HIGHLIGHTS the residue in 3D through the
+    panel's EXISTING glow seam; per-row Declare-and-validate (substitute→fold→compare) + Estimate-ΔΔG.
+    Persists across tab-switch + session reset (keep-and-clear, the disulfide-tab lesson)."""
+
+    def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
+                 on_show_existing=None):
+        super().__init__()
+        self._on_highlight = on_highlight          # (cd, cand) -> glow the residue in 3D
+        self._on_declare = on_declare              # (cd, cand) -> substitute→Pro + validate (fold/compare)
+        self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> X→Pro ΔΔG escalation (legacy bridge)
+        self._on_clear_glow = on_clear_glow        # ()         -> restore the normal 3D representation
+        self._on_show_existing = on_show_existing  # (cd)       -> highlight the existing prolines
+        self._cd = None
+        self._cands: List[dict] = []
+        outer = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Proline-stabilization candidates. X→Pro sites ranked by backbone φ/ψ proline-compatibility "
+            "with a backbone-H-bond-donor penalty (proline can't donate the N–H···O bond helices/sheets "
+            "rely on, so stabilizing prolines live in loops/turns). The table is the SOURCE OF TRUTH; "
+            "the 'Proline sites' colour mode is a complementary navigational index.")
+        intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
+        outer.addWidget(intro)
+        self._clear_glow_btn = QtWidgets.QPushButton("Clear proline view (un-ghost)")
+        self._clear_glow_btn.setToolTip("Restore the normal representation: un-ghost the structure and "
+                                        "remove the residue spotlight. Enabled while a residue glow is active.")
+        self._clear_glow_btn.setEnabled(False)
+        self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
+        outer.addWidget(self._clear_glow_btn)
+
+        box = QtWidgets.QGroupBox("Proline-substitution sites (ranked)")
+        gl = QtWidgets.QVBoxLayout(box)
+        self._caveat = QtWidgets.QLabel(); self._caveat.setWordWrap(True)
+        self._caveat.setStyleSheet("color:#b36b00;"); self._caveat.setVisible(False)
+        gl.addWidget(self._caveat)
+        self._existing_lbl = QtWidgets.QLabel(); self._existing_lbl.setWordWrap(True)
+        self._existing_lbl.setStyleSheet("color:#777;"); self._existing_lbl.setVisible(False)
+        gl.addWidget(self._existing_lbl)
+        self._placeholder = QtWidgets.QLabel("Run “Find proline-stabilization sites” to populate.")
+        self._placeholder.setWordWrap(True); self._placeholder.setStyleSheet("color:#888;")
+        gl.addWidget(self._placeholder)
+        cols = ["Residue", "φ (°)", "ψ (°)", "Score", "H-bond donor", "ΔΔG (kcal/mol)"]
+        self._tbl = QtWidgets.QTableWidget(0, len(cols))
+        self._tbl.setHorizontalHeaderLabels(cols)
+        self._tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._tbl.setVisible(False)
+        self._tbl.cellClicked.connect(lambda r, _c: self._on_row(r))
+        gl.addWidget(self._tbl)
+        self._detail = QtWidgets.QLabel(); self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color:#444;"); self._detail.setVisible(False)
+        gl.addWidget(self._detail)
+        row = QtWidgets.QHBoxLayout()
+        self._existing_btn = QtWidgets.QPushButton("Show existing prolines")
+        self._existing_btn.setEnabled(False)
+        self._existing_btn.clicked.connect(lambda: self._on_show_existing(self._cd)
+                                           if (self._on_show_existing and self._cd) else None)
+        row.addWidget(self._existing_btn)
+        self._declare_btn = QtWidgets.QPushButton("Substitute → Pro and validate")
+        self._declare_btn.setToolTip("Substitute the selected residue to proline and validate by "
+                                     "re-folding (no constraint) + comparing — the real test.")
+        self._declare_btn.setEnabled(False)
+        self._declare_btn.clicked.connect(self._declare)
+        row.addWidget(self._declare_btn)
+        self._escalate_btn = QtWidgets.QPushButton("Estimate ΔΔG (legacy)")
+        self._escalate_btn.setToolTip("Energetic estimate (uncalibrated — ranking/sign only) for the "
+                                      "selected X→Pro mutation; minutes.")
+        self._escalate_btn.setEnabled(False)
+        self._escalate_btn.clicked.connect(self._estimate)
+        row.addWidget(self._escalate_btn)
+        gl.addLayout(row)
+        outer.addWidget(box)
+        outer.addStretch(1)
+
+    def set_glow_active(self, active: bool) -> None:
+        if getattr(self, "_clear_glow_btn", None) is not None:
+            self._clear_glow_btn.setEnabled(bool(active))
+
+    def _on_row(self, r: int) -> None:
+        if not (0 <= r < len(self._cands)) or self._cd is None:
+            return
+        c = self._cands[r]
+        self._on_highlight(self._cd, c)
+        self._detail.setText(self._cand_detail(c)); self._detail.setVisible(True)
+
+    @staticmethod
+    def _cand_detail(c: dict) -> str:
+        psi = c.get("psi")
+        don = (" — ⚠ its backbone amide N–H DONATES a backbone H-bond (helix/sheet); a proline here "
+               "would break it (soft-penalized, validate)") if c.get("hbond_donates") else \
+              " — does not donate a backbone H-bond (loop/turn-like — a favourable proline site)"
+        ddg = c.get("ddg")
+        ddg_s = (f" ΔΔG (legacy): {c.get('from_aa','')}{c.get('position')}P {ddg:+.2f} kcal/mol."
+                 if ddg is not None else " ΔΔG not yet estimated — “Estimate ΔΔG (legacy)”.")
+        return (f"{c.get('from_aa','')}{c.get('position')}→P (chain {c.get('chain')}) — score "
+                f"{c.get('score', 0):.2f}: φ {c.get('phi')}°, ψ {'n/a' if psi is None else f'{psi}°'}"
+                f"{don}.{ddg_s} Validate by substituting → re-folding → comparing.")
+
+    def _declare(self) -> None:
+        r = self._tbl.currentRow()
+        if 0 <= r < len(self._cands) and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, self._cands[r])
+
+    def _estimate(self) -> None:
+        r = self._tbl.currentRow()
+        if 0 <= r < len(self._cands) and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, self._cands[r])
+
+    def populate(self, cd, scan: dict) -> None:
+        """Fill the ranked table from a proline scan ({candidates, existing, caveat})."""
+        cands = (scan or {}).get("candidates") or []
+        self._cd, self._cands = cd, list(cands)
+        self._caveat.setText("⚠ " + ((scan or {}).get("caveat") or "Geometric suggestion only."))
+        self._caveat.setVisible(bool(cands))
+        existing = (scan or {}).get("existing") or []
+        self._existing_lbl.setText(
+            f"Existing prolines in this structure: {len(existing)}"
+            + (" — " + ", ".join(f"{ch}:{rn}" for ch, rn in existing[:12]) + ("…" if len(existing) > 12 else "")
+               if existing else "."))
+        self._existing_lbl.setVisible(True)
+        self._existing_btn.setEnabled(bool(existing))
+        self._tbl.setRowCount(len(cands))
+        for i, c in enumerate(cands):
+            psi = c.get("psi")
+            cells = [f"{c.get('from_aa','')}{c.get('position')}P", f"{c.get('phi')}",
+                     ("—" if psi is None else f"{psi}"), f"{c.get('score', 0):.2f}",
+                     ("donor" if c.get("hbond_donates") else "—"), self._ddg_cell(c)]
+            for j, v in enumerate(cells):
+                self._tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        self._tbl.resizeColumnsToContents()
+        has = len(cands) > 0
+        self._placeholder.setVisible(not has)
+        self._tbl.setVisible(has)
+        self._declare_btn.setEnabled(has)
+        self._escalate_btn.setEnabled(has)
+        if has:
+            self._tbl.selectRow(0); self._on_row(0)
+
+    @staticmethod
+    def _ddg_cell(c: dict) -> str:
+        ddg = c.get("ddg")
+        return "—" if ddg is None else f"{ddg:+.2f}"
+
+    def reset(self) -> None:
+        """Clear back to the dormant placeholder (keep-and-clear on session reset — the disulfide-tab
+        lesson: the tab PERSISTS as a sibling, but its content belongs to the prior session)."""
+        self._cd, self._cands = None, []
+        self._tbl.setRowCount(0); self._tbl.setVisible(False)
+        self._caveat.setVisible(False); self._existing_lbl.setVisible(False)
+        self._detail.setVisible(False); self._placeholder.setVisible(True)
+        self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
+        self._existing_btn.setEnabled(False)
+        self.set_glow_active(False)
+
+
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 
 class VariantWorkbenchPanel(QtWidgets.QWidget):
@@ -1238,6 +1399,28 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._ss_menu_btn.setMenu(ss_menu)
         bar.addWidget(self._ss_menu_btn)
         bar.addSeparator()
+
+        # Stabilize ▾ — TOP-LEVEL peer of Disulfides (stabilization is the program's core; the
+        # strategies are first-class peers). Proline-stabilization scan: per-residue X→Pro sites by
+        # backbone φ/ψ proline-compatibility + a backbone-H-bond-donor penalty. Cheap (reads the
+        # structure, no fold); works on a de-novo fold OR a loaded crystal/model.
+        self._pro_menu_btn = QtWidgets.QToolButton()
+        self._pro_menu_btn.setText("Stabilize")
+        self._pro_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._pro_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        pro_menu = QtWidgets.QMenu(self._pro_menu_btn)
+        pro_menu.setToolTipsVisible(True)
+        self._pro_scan_btn = pro_menu.addAction("Find proline-stabilization sites…")
+        self._pro_scan_btn.setToolTip("FIND X→Pro stabilizing sites: rank residues by backbone φ/ψ "
+                                      "proline-compatibility with a backbone-H-bond-donor penalty "
+                                      "(proline can't donate the N–H···O bond helices/sheets rely on, so "
+                                      "stabilizing prolines live in loops/turns). Geometric suggestion "
+                                      "only — a starting point, NOT a recommendation to mutate. Cheap "
+                                      "(no fold). Needs a folded construct or a loaded structure.")
+        self._pro_scan_btn.triggered.connect(self._on_proline_scan)
+        self._pro_menu_btn.setMenu(pro_menu)
+        bar.addWidget(self._pro_menu_btn)
+        bar.addSeparator()
         self._sync_disulfide_menu_enabled()           # initial precondition state (greyed until ready)
 
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
@@ -1271,6 +1454,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("pLDDT (result)", _RESULT_PLDDT_MODE)  # S4b fold confidence
         self._mode_combo.addItem("Deviation vs WT", _RESULT_DEVIATION_MODE)  # S4c floor-gated dev
         self._mode_combo.addItem("Disulfide sites", _RESULT_DISULFIDE_MODE)  # Mode D engineerability
+        self._mode_combo.addItem("Proline sites", _RESULT_PROLINE_MODE)      # proline stabilization
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
         # No trailing stretch: a QToolBar left-aligns its items and surfaces the overflow chevron on
@@ -1297,6 +1481,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_declare=self._declare_disulfide_pair,
             on_estimate_ddg=self._estimate_ddg_pair,
             on_clear_glow=self._clear_disulfide_glow)
+        self.proline_tab = ProlineResultsTab(
+            on_highlight=self._highlight_proline_residue,
+            on_declare=self._declare_proline,
+            on_estimate_ddg=self._estimate_proline_ddg,
+            on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
+            on_show_existing=self._show_existing_prolines)
 
     def attach_session(self, session) -> None:
         """Re-point the panel at a different SessionState — used on session RESTORE, where the
@@ -2476,6 +2666,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if getattr(self, "_ss_interface_btn", None) is not None:
             n_chains = sum(len(c.members) for c in self._design.chains.values()) if self._design else 0
             self._ss_interface_btn.setEnabled(has_struct and n_chains >= 2)
+        if getattr(self, "_pro_scan_btn", None) is not None:
+            self._pro_scan_btn.setEnabled(has_struct)          # reads the backbone (no fold), like D
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -2506,6 +2698,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         self._status.setText("Scanning the backbone for engineerable disulfide sites "
                              "(geometric compatibility only — a starting point)…")
+        self.launchRequested.emit(spec)
+
+    def _on_proline_scan(self) -> None:
+        spec = self.proline_scan_launch_spec()
+        if spec is None:
+            self._status.setText("Proline scan needs a readable structure — fold the construct, or "
+                                 "check the loaded model is still open.")
+            return
+        self._status.setText("Scanning for proline-stabilization sites (backbone φ/ψ + H-bond, "
+                             "geometric suggestion only — a starting point)…")
         self.launchRequested.emit(spec)
 
     def _on_disulfide_interface_scan(self) -> None:
@@ -3156,6 +3358,207 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 out[rn] = hexc
         return out
 
+    def _active_proline_scan(self, tab: _ChainDesignTab) -> Dict[int, float]:
+        """{author_resnum: proline-favourability score} for the active cd's proline scan, rep chain
+        only. Empty when no scan has run. The heatmap colours each residue by its X→Pro score — the
+        NAVIGATIONAL INDEX into the ranked candidate list (the source of truth)."""
+        cd = tab.design
+        best = ((cd.proline_scan or {}).get("best_partner") or {})
+        chain_best = best.get(cd.rep_chain)
+        if chain_best is None and len(best) == 1:
+            chain_best = next(iter(best.values()))
+        return {int(rn): float(sc) for rn, sc in (chain_best or {}).items()}
+
+    def _proline_scan_panel_hex(self, tab: _ChainDesignTab) -> Dict[int, str]:
+        """{author_resnum: hex} for the proline heatmap (favourability → pale→magenta)."""
+        out: Dict[int, str] = {}
+        for rn, sc in self._active_proline_scan(tab).items():
+            hexc = proline_compat_color(sc)
+            if hexc:
+                out[rn] = hexc
+        return out
+
+    # ── Proline-stabilization scan: launch / apply / highlight / declare / ΔΔG ─────────────
+    def proline_scan_launch_spec(self) -> Optional[dict]:
+        """Proline-scan spec — per-residue X→Pro scan of the active design's EXISTING structure (de-novo
+        fold OR a LOADED crystal/model, via `_active_structure`). CHEAP (reads coordinates; NEVER
+        folds). None until there is a structure to read."""
+        src = self._active_structure()
+        if src is None:
+            return None
+        return {
+            "tool": "proline_scan", "tool_inputs": {"cif_path": src["cif_path"]},
+            "user_input": "[Workbench] find proline-stabilization sites (φ/ψ + H-bond scan, this structure)",
+            "confidence": "high", "refresh": "proline_scan",           # cheap + deterministic → no gate
+            "_align_ukey": self._cur_cd_ukey(),
+        }
+
+    def apply_proline_scan_result(self, spec: dict, result: dict) -> None:
+        """Store the proline scan on the active cd (ranked list = source of truth + best-score heatmap
+        map + existing prolines) and AUTO-SURFACE the 'Proline sites' colour mode. The geometric-only
+        CAVEAT rides on the tab + status."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "proline_scan"), None)
+        if step is None or not step.get("success"):
+            self._status.setText(f"Proline scan failed: {step.get('error') if step else 'no result'}")
+            return
+        data = step.get("data") or {}
+        cd = self._scan_target_cd(spec)
+        if cd is None:
+            return
+        cd.proline_scan = {"candidates": data.get("candidates") or [],
+                           "best_partner": data.get("best_partner") or {},
+                           "existing": data.get("existing") or [],
+                           "caveat": data.get("caveat")}
+        self._persist()
+        if cd.proline_scan["candidates"]:
+            self._select_result_mode(_RESULT_PROLINE_MODE)             # AUTO-SURFACE the heatmap
+            tab = self._cur_tab()
+            if tab is not None:
+                self._apply_color_to(tab)
+                self._push_3d_color(tab)
+        self.proline_tab.populate(cd, cd.proline_scan)
+        self._status.setText(step.get("summary") or "Proline scan complete.")
+
+    def _proline_residue_spec(self, cd, cand: dict):
+        """(mid, spec) for a candidate residue on the design's LIVE structure, or (None, None) when
+        there is no real rendered id (an unfolded de-novo construct's synthetic id is not a target)."""
+        mid = (cd.template_fold or {}).get("model_id") or cd.rep_model
+        if mid and str(mid).startswith("denovo-"):
+            mid = None
+        ch, pos = (cand.get("chain") or cd.rep_chain), cand.get("position")
+        if not mid or pos is None:
+            return None, None
+        return str(mid), f"#{mid}/{ch}:{pos}"
+
+    def _highlight_proline_residue(self, cd, cand: dict) -> None:
+        """Glow ONE proline candidate residue — the single-residue analog of the disulfide pair glow,
+        through the SAME `_glow_state`/`_consume_glow_restore` seam (restore prior glow first so it
+        never stacks; the Clear-view control + any colour-mode switch clear it)."""
+        mid, spec = self._proline_residue_spec(cd, cand)
+        if mid is None:
+            self._glow_state = None
+            self._sync_glow_clear_button()
+            return
+        hue = self._GLOW_HUE
+        apply = [
+            f"show {spec} atoms", f"style {spec} sphere", f"color {spec} {hue} target a",
+            f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
+            f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
+        ]
+        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
+        self._glow_state = {"mid": mid, "both": spec}
+        self._sync_glow_clear_button()
+
+    def _show_existing_prolines(self, cd) -> None:
+        """Highlight the EXISTING prolines in 3D (the 'see what's already there' design-context half) —
+        a simple distinct colouring, NOT the glow spotlight (this is context, not a candidate)."""
+        existing = ((cd.proline_scan or {}).get("existing")) or []
+        mid = (cd.template_fold or {}).get("model_id") or cd.rep_model
+        if not mid or str(mid).startswith("denovo-") or not existing:
+            self._status.setText("No existing prolines to show (or no live model).")
+            return
+        specs = " ".join(f"#{mid}/{ch}:{rn}" for ch, rn in existing)
+        self._run_commands_bg([f"color {specs} medium purple", f"show {specs} atoms",
+                               f"style {specs} stick"])
+        self._status.setText(f"Existing prolines ({len(existing)}) shown in purple.")
+
+    def _declare_proline(self, cd, cand: dict) -> None:
+        """Substitute the selected residue to proline on a NEW variant — the validation path is the
+        EXISTING fold/deviation flow (proline folds NATIVELY, no constraints): one click does the
+        substitution; the user Folds the variant to validate (re-fold + compare). No new fold-
+        orchestration machinery (the locked decision)."""
+        tab = self._focus_tab_for_design(cd)
+        if tab is None or self._design is None:
+            self._status.setText("Can't substitute — the candidate's chain tab isn't available.")
+            return
+        col = self._col_for_resnum(cd, cand.get("position"))
+        if col is None:
+            self._status.setText(f"Can't substitute — residue {cand.get('position')} not on the axis.")
+            return
+        vid = self._design.new_variant_id()
+        cd.add_variant(vid)
+        try:
+            cd.edit_variant(vid, col, "P")
+        except Exception as exc:
+            self._status.setText(f"Substitution failed: {type(exc).__name__}: {exc}")
+            return
+        self._after_variant_edit(
+            tab, vid, f"{vid}: {cand.get('from_aa','')}{cand.get('position')}→P substituted. "
+                      f"Fold this variant to VALIDATE (re-fold + deviation — proline folds natively, "
+                      f"no constraint).")
+
+    def _estimate_proline_ddg(self, cd, cand: dict) -> None:
+        """X→Pro ΔΔG escalation for ONE candidate (the disulfide-escalation pattern, to_aa='P'). FOCUS
+        the cd's tab so from_aa resolves against the RIGHT design, build the spec, launch on the worker
+        seam (long-running; never auto-run across a scan)."""
+        self._focus_tab_for_design(cd)
+        spec = self.build_proline_ddg_spec(cand)
+        if spec is None:
+            self._status.setText("Can't estimate ΔΔG — needs a readable structure and a recoverable WT "
+                                 "residue (re-scan if the structure changed).")
+            return
+        self._status.setText(f"Estimating ΔΔG (legacy, uncalibrated) for "
+                             f"{cand.get('from_aa','')}{cand.get('position')}P — minutes…")
+        self.launchRequested.emit(spec)
+
+    def build_proline_ddg_spec(self, cand: dict) -> Optional[dict]:
+        """ΔΔG-escalation spec for ONE proline candidate → the legacy ΔΔG bridge (refresh='proline_ddg').
+        Saves the LIVE structure to PDB (PyRosetta needs PDB), recovers the WT residue own-chain, tags
+        the source so the router gate blocks a de-novo web upload. None when there's no readable
+        structure / from_aa can't be recovered / PDB save fails — never a silent wrong-mutation score."""
+        if self._design is None:
+            return None
+        src = self._active_structure()
+        if src is None:
+            return None
+        ch, pos = (cand.get("chain") or self._cur_tab().design.rep_chain), cand.get("position")
+        if ch is None or pos is None:
+            return None
+        aa = self._from_aa_for(ch, pos)
+        if aa is None:
+            return None
+        pdb = self._save_structure_pdb(src["model_id"])
+        if not pdb:
+            return None
+        source = "denovo" if self._design.source == "sequence" else "loaded"
+        return {
+            "tool": "proline_ddg_estimate",
+            "tool_inputs": {"pdb_path": pdb, "chain": str(ch), "resnum": int(pos),
+                            "from_aa": aa, "source": source},
+            "user_input": f"[Workbench] estimate ΔΔG (legacy) for {aa}{pos}P",
+            "confidence": "low", "refresh": "proline_ddg",
+            "_align_ukey": self._cur_cd_ukey(),
+            "_pro_cand": {"chain": str(ch), "position": int(pos)},
+        }
+
+    def apply_proline_ddg_result(self, spec: dict, result: dict) -> None:
+        """Attach the escalated X→Pro ΔΔG onto the MATCHING candidate (by chain+position) and re-render
+        the proline table. Fail-LOUD: a failed/aborted estimate shows its reason, never a fabricated
+        number."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "proline_ddg_estimate"), None)
+        if step is None:
+            self._status.setText("ΔΔG estimate produced no result.")
+            return
+        if not step.get("success"):
+            self._status.setText(f"ΔΔG estimate: {step.get('error') or 'failed'}")
+            return
+        cd = self._scan_target_cd(spec)
+        want = (spec or {}).get("_pro_cand") or {}
+        data = step.get("data") or {}
+        cands = ((cd.proline_scan or {}).get("candidates") if cd else None) or []
+        target = next((c for c in cands if str(c.get("chain")) == str(want.get("chain"))
+                       and c.get("position") == want.get("position")), None)
+        if target is None:
+            self._status.setText("ΔΔG came back but its candidate is no longer listed (re-scan).")
+            return
+        target.update({"ddg": data.get("ddg"), "ddg_backend": data.get("backend"),
+                       "ddg_source": data.get("source")})
+        self._persist()
+        self.proline_tab.populate(cd, cd.proline_scan)
+        self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
+
     def _refresh_color_mode_availability(self, tab: _ChainDesignTab) -> None:
         """Grey out a RESULT colour mode (ddG / pLDDT / Deviation vs WT) when the ACTIVE
         variant has no such result yet — so e.g. selecting 'Color: Deviation vs WT' can't be
@@ -3167,6 +3570,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             _RESULT_PLDDT_MODE:     bool(self._active_plddt_map(tab)),
             _RESULT_DEVIATION_MODE: bool(self._active_deviation(tab)),
             _RESULT_DISULFIDE_MODE: bool(self._active_disulfide_scan(tab)),
+            _RESULT_PROLINE_MODE:   bool(self._active_proline_scan(tab)),
         }
         model = self._mode_combo.model()
         for i in range(self._mode_combo.count()):
@@ -3189,6 +3593,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.set_result_coloring(tab.active_row_id, self._deviation_panel_hex(tab))
         elif self._mode_key == _RESULT_DISULFIDE_MODE:
             tab.set_result_coloring(tab.active_row_id, self._disulfide_scan_panel_hex(tab))
+        elif self._mode_key == _RESULT_PROLINE_MODE:
+            tab.set_result_coloring(tab.active_row_id, self._proline_scan_panel_hex(tab))
         else:
             tab.set_color_mode(get_mode(self._mode_key))
 
@@ -4012,9 +4418,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._run_commands_bg(self._consume_glow_restore())
 
     def _sync_glow_clear_button(self) -> None:
-        """Light the Disulfides tab's 'Clear disulfide view' control iff a glow is currently active."""
-        if getattr(self, "disulfides_tab", None) is not None:
-            self.disulfides_tab.set_glow_active(bool(getattr(self, "_glow_state", None)))
+        """Light the Clear-view control on EVERY stabilization tab iff a glow is currently active. The
+        glow seam (`_glow_state`) is SHARED across the Disulfides + Proline tabs (one spotlight at a
+        time), so both Clear controls track the one state."""
+        active = bool(getattr(self, "_glow_state", None))
+        for tab_name in ("disulfides_tab", "proline_tab"):
+            tab = getattr(self, tab_name, None)
+            if tab is not None:
+                tab.set_glow_active(active)
 
     def _highlight_disulfide_pair(self, cd, pair: dict) -> None:
         """Glow a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes through

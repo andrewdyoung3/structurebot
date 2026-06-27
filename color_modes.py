@@ -185,6 +185,26 @@ def disulfide_compat_color(score: Optional[float]) -> Optional[str]:
     return _hex(rgb)
 
 
+# ── proline-stabilization heatmap (per-residue X→Pro favourability score in [0,1]) ────────────────
+# A residue's colour = its proline-substitution score (φ/ψ proline-compatibility × H-bond-donor
+# penalty). NAVIGATIONAL INDEX into the ranked candidate list (the data); the caveat rides on the
+# mode. Pale→magenta (proline's traditional highlight hue, distinct from the disulfide gold).
+_PRO_SCAN_MIN = 0.05                 # below this = not proline-favourable → neutral (no colour)
+_PRO_PALE = (0xe8, 0xd0, 0xe8)       # faint magenta (a just-favourable site)
+_PRO_MAGENTA = (0xc0, 0x1c, 0xc0)    # saturated magenta (a best proline site glows strongest)
+
+
+def proline_compat_color(score: Optional[float]) -> Optional[str]:
+    """Per-residue proline-stabilization favourability (score 0–1) → pale→magenta hex. None when
+    *score* is None or below the surfacing threshold (not favourable → no colour, never painted as a
+    result). The best φ/ψ-compatible non-H-bond-donor sites saturate the magenta."""
+    if score is None or score < _PRO_SCAN_MIN:
+        return None
+    t = min(1.0, (score - _PRO_SCAN_MIN) / (1.0 - _PRO_SCAN_MIN))
+    rgb = tuple(_PRO_PALE[i] + t * (_PRO_MAGENTA[i] - _PRO_PALE[i]) for i in range(3))
+    return _hex(rgb)
+
+
 # Cα-lDDT disruption ramp — by lDDT VALUE (1 = locally conserved … 0 = fully changed), so the
 # scale is INVERTED vs deviation: LOWER lDDT = MORE disrupted = warmer. Floor-gated like the
 # deviation ramp (lDDT ≥ floor → neutral: changed no more than the WT does across seeds).

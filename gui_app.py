@@ -374,6 +374,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # PERSISTENT Disulfides results tab (whole-suite home) — a sibling top-level tab. It survives
         # switching back to "Variant Workbench" + panel rebuilds (the old modeless dialog vanished).
         self.tabs.addTab(self.workbench.disulfides_tab, "Disulfides")
+        # PERSISTENT Proline results tab — a peer of Disulfides (stabilization strategies are first-class
+        # peers). Same survive-tab-switch + keep-and-clear-on-reset contract.
+        self.tabs.addTab(self.workbench.proline_tab, "Proline")
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(
@@ -572,7 +575,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         if refresh in ("stability", "fold", "deviation", "construct_fold", "structural_align",
                        "construct_fold_guided", "template_assist", "align_folds",
                        "disulfide_discovery", "disulfide_geometry", "disulfide_scan",
-                       "disulfide_interface_scan", "disulfide_ddg"):
+                       "disulfide_interface_scan", "disulfide_ddg",
+                       "proline_scan", "proline_ddg"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -682,6 +686,20 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_disulfide_ddg_result(spec, result)
                 else:
                     self.presenter.dim("ΔΔG estimate cancelled — no result to attach.")
+            elif refresh == "proline_scan":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_proline_scan_result(spec, result)
+                else:
+                    self.presenter.dim("Proline scan cancelled — no result to attach.")
+            elif refresh == "proline_ddg":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_proline_ddg_result(spec, result)
+                else:
+                    self.presenter.dim("Proline ΔΔG estimate cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None
@@ -918,9 +936,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # a sibling, not the workbench, so it was being swept out with the chain grids and never
         # re-added). Drop only the chain-grid tabs.
         disulfides = getattr(self.workbench, "disulfides_tab", None)
+        proline = getattr(self.workbench, "proline_tab", None)
         for i in range(self.tabs.count() - 1, -1, -1):
             w = self.tabs.widget(i)
-            if w is not self.workbench and w is not disulfides:
+            if w is not self.workbench and w is not disulfides and w is not proline:
                 self.tabs.removeTab(i)
         self._grids.clear()
         try:
@@ -932,6 +951,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         try:
             if disulfides is not None:
                 disulfides.reset()
+        except Exception:
+            pass
+        try:
+            if proline is not None:
+                proline.reset()
         except Exception:
             pass
 
