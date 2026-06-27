@@ -16,6 +16,9 @@ Confirms:
      reachability values populated (not "—").
   3. The rank is driven by score = Cα×Cβ×reachability — a sulfur-reachable clean pair outranks a
      clashing one; the displayed orientation column is present but no longer the ranking signal.
+     The clash check is ROTAMER-AWARE (2026-06-27): the flag rate is sensible (dodgeable pairs clear,
+     genuinely-unviable ones stay flagged), and the displayed Sγ–Sγ/χSS are the clash-free reaching
+     conformation a real disulfide adopts.
   4. A row-click highlights both members ACROSS chains in REAL ChimeraX.
   5. The geometric-only caveat (now naming reachability + rigid-backbone clash) rides with the table.
 
@@ -79,19 +82,30 @@ def main():
     has_clash = any(p.get("clash") in (True, False) for p in pairs)
     check("top candidate carries the rotamer reachability readout (best Sγ–Sγ + χSS)", has_reach,
           f"best_sg_sg={top.get('best_sg_sg')} χSS={top.get('best_chi_ss')} reach={top.get('reach_score')}")
-    check("a clash flag was evaluated (tier b ran)", has_clash,
-          f"clashing {sum(1 for p in pairs if p.get('clash'))}/{len(pairs)}")
+    nclash = sum(1 for p in pairs if p.get("clash"))
+    check("a clash flag was evaluated (tier b ran)", has_clash, f"clashing {nclash}/{len(pairs)}")
+    # ROTAMER-AWARE: the flag rate is SENSIBLE — some clear (a reaching rotamer dodges), some stay
+    # flagged (every reaching rotamer collides). Not 0 (the flag still fires on genuine cases) and
+    # not all (the dodgeable ones cleared — the whole point of the fix vs the old reach-optimal check).
+    check("rotamer-aware flag rate is sensible (some dodge, some genuinely flagged)",
+          0 < nclash < len(pairs), f"{nclash}/{len(pairs)} flagged (reach-optimal over-flagged ~10/17)")
     check("score = Cα×Cβ×reachability (orientation NOT a factor)",
           abs(top["score"] - top["ca_score"] * top["cb_score"] * top["reach_score"]) < 2e-4,
           f"score={top['score']} ca={top['ca_score']} cb={top['cb_score']} reach={top['reach_score']}")
-    # a clean pair should be able to outrank a clashing one of similar reach (the tier-b payoff)
+    # the top-ranked site is clash-free AND a REACHING rotamer (its displayed Sγ–Sγ is in the bonding
+    # window) — top sites are reach-good-and-clash-free, the clash-free conformation, not a colliding one
+    check("top-ranked site is clash-free + reaching (displayed Sγ–Sγ in the bonding window)",
+          top.get("clash") is False and 1.8 <= top["best_sg_sg"] <= 2.5,
+          f"top {top['chain_a']}:{top['resnum_a']}-{top['chain_b']}:{top['resnum_b']} "
+          f"clash={top['clash']} Sγ–Sγ={top['best_sg_sg']}")
+    # a flagged pair still shows a REACHING geometry (a real disulfide that collides), honestly demoted
     clash_pairs = [p for p in pairs if p.get("clash")]
-    clean_pairs = [p for p in pairs if p.get("clash") is False]
-    if clash_pairs and clean_pairs:
-        check("a clash-free candidate can outrank a clashing one (soft demotion works)",
-              clean_pairs[0]["score"] >= clash_pairs[0]["score"]
-              or clean_pairs[0]["reach_score"] <= clash_pairs[0]["reach_score"],
-              f"top clean {clean_pairs[0]['score']:.2f} vs top clashing {clash_pairs[0]['score']:.2f}")
+    if clash_pairs:
+        fc = clash_pairs[0]
+        check("a flagged pair shows its reaching-but-colliding geometry, ranked below the clean top",
+              1.8 <= fc["best_sg_sg"] <= 2.5 and fc["score"] <= top["score"],
+              f"top flagged {fc['chain_a']}:{fc['resnum_a']}-{fc['chain_b']}:{fc['resnum_b']} "
+              f"Sγ–Sγ={fc['best_sg_sg']} score={fc['score']:.2f} vs clean top {top['score']:.2f}")
 
     # 2) open the dimer in REAL ChimeraX + seed the panel as a loaded structure ─────────────
     print("2) Open the dimer in REAL ChimeraX + seed the loaded-structure panel…")
