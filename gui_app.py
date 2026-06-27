@@ -377,6 +377,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # PERSISTENT Proline results tab — a peer of Disulfides (stabilization strategies are first-class
         # peers). Same survive-tab-switch + keep-and-clear-on-reset contract.
         self.tabs.addTab(self.workbench.proline_tab, "Proline")
+        # PERSISTENT Cavity-filling results tab — the third peer strategy. Same contract.
+        self.tabs.addTab(self.workbench.cavity_tab, "Cavity")
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(
@@ -584,7 +586,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                        "construct_fold_guided", "template_assist", "align_folds",
                        "disulfide_discovery", "disulfide_geometry", "disulfide_scan",
                        "disulfide_interface_scan", "disulfide_ddg",
-                       "proline_scan", "proline_ddg"):
+                       "proline_scan", "proline_ddg",
+                       "cavity_scan", "cavity_ddg"):
             # S4a/S4b: capture the EXECUTED result off the engine seam (not the shared
             # session cache) so it lands in the variant's ResultSlots. Runs on the worker
             # thread; consumed on the UI thread in _on_tool_done.
@@ -708,6 +711,20 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                     self.workbench.apply_proline_ddg_result(spec, result)
                 else:
                     self.presenter.dim("Proline ΔΔG estimate cancelled — no result to attach.")
+            elif refresh == "cavity_scan":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_cavity_scan_result(spec, result)
+                else:
+                    self.presenter.dim("Cavity scan cancelled — no result to attach.")
+            elif refresh == "cavity_ddg":
+                result = getattr(self, "_captured_result", None)
+                spec = getattr(self, "_launch_spec", None)
+                if result is not None and spec is not None:
+                    self.workbench.apply_cavity_ddg_result(spec, result)
+                else:
+                    self.presenter.dim("Cavity ΔΔG estimate cancelled — no result to attach.")
         except Exception as exc:
             self.presenter.warn(f"Workbench refresh failed: {exc}")
         self._captured_result = None
@@ -945,9 +962,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         # re-added). Drop only the chain-grid tabs.
         disulfides = getattr(self.workbench, "disulfides_tab", None)
         proline = getattr(self.workbench, "proline_tab", None)
+        cavity = getattr(self.workbench, "cavity_tab", None)
         for i in range(self.tabs.count() - 1, -1, -1):
             w = self.tabs.widget(i)
-            if w is not self.workbench and w is not disulfides and w is not proline:
+            if w not in (self.workbench, disulfides, proline, cavity):
                 self.tabs.removeTab(i)
         self._grids.clear()
         try:
@@ -964,6 +982,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         try:
             if proline is not None:
                 proline.reset()
+        except Exception:
+            pass
+        try:
+            if cavity is not None:
+                cavity.reset()
         except Exception:
             pass
         try:

@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from color_modes import (all_modes, combined_disruption_color, ddg_color,
+from color_modes import (all_modes, cavity_compat_color, combined_disruption_color, ddg_color,
                          disulfide_compat_color, get_mode, plddt_color, proline_compat_color)
 from disulfide_geometry import pair_chains, pair_label
 from seq_library import (build_numbering_header_content,
@@ -56,6 +56,7 @@ _RESULT_PLDDT_MODE = "result:plddt"         # S4b result-backed color mode (per-
 _RESULT_DEVIATION_MODE = "result:deviation" # S4c floor-gated variant-vs-WT Cα deviation
 _RESULT_DISULFIDE_MODE = "result:disulfide_scan"  # Mode D best-partner engineerability heatmap
 _RESULT_PROLINE_MODE = "result:proline_scan"      # proline-stabilization favourability heatmap
+_RESULT_CAVITY_MODE = "result:cavity_scan"        # cavity-filling best-fill heatmap (lining→gold)
 _DEVIATION_FLOOR_MIN_A = 0.25               # mirrors ToolRouter._DEVIATION_FLOOR_MIN_A (gate floor)
 _LDDT_NEUTRAL_CAP = 0.9                      # mirrors ToolRouter._LDDT_NEUTRAL_CAP (lDDT gate cap)
 _DDM_FLOOR_MIN_A = 0.5                       # mirrors ToolRouter._DDM_FLOOR_MIN_A (dRMSD gate floor)
@@ -605,9 +606,72 @@ class _AddSequenceDialog(QtWidgets.QDialog):
                 for seq_w, spin, _row in self._rows]
 
 
+# ── shared base for the persistent stabilization-strategy results tabs ─────────────────────
+class _StabilizationResultsTab(QtWidgets.QWidget):
+    """Shared base for the persistent stabilization-strategy results tabs — Disulfides / Proline /
+    Cavity, the framework's first-class peer strategies. Factors the plumbing every strategy tab
+    repeats so the third one (Cavity) doesn't clone it a third time (the consolidation debt, paid at
+    the natural moment before it grows to four):
+      • the intro header + the 'Clear <strategy> view (un-ghost)' control and its `set_glow_active`
+        enable-state — the glow seam is SHARED (ONE `_glow_state` across all tabs; each Clear control
+        tracks the one spotlight, lit only while something glows);
+      • `_make_ranked_table` — the standard NoEdit / SelectRows / Single-selection / hidden-until-
+        populated / cellClicked→row table every tab builds;
+      • `_make_caveat` — the measured-not-promised caveat label (amber, hidden until there are rows).
+    Subclasses build their OWN body on top (the Disulfides multi-section A/B/D/I/C layout vs the
+    Proline/Cavity single ranked table) — the base owns the COMMON mechanics, NOT the table shape, so
+    each tab's behaviour is unchanged. Persists across tab-switch + session reset (keep-and-clear: the
+    subclass `reset()` empties content, the tab lives on as a sibling in `gui_app.tabs`)."""
+
+    def __init__(self, *, on_highlight, on_clear_glow=None, on_add_to_basket=None):
+        super().__init__()
+        self._on_highlight = on_highlight          # (cd, item) -> glow it in 3D (the shared seam)
+        self._on_clear_glow = on_clear_glow        # ()         -> restore the normal 3D representation
+        self._on_add_to_basket = on_add_to_basket  # (cd, item) -> stage the pick into the design basket
+        self._outer = QtWidgets.QVBoxLayout(self)
+
+    def _add_header(self, intro_text: str, clear_label: str, clear_tooltip: str) -> None:
+        """Build the intro label + the Clear-view (un-ghost) control into the tab's outer layout.
+        Subclasses call this first, then add their own body widgets to ``self._outer``."""
+        intro = QtWidgets.QLabel(intro_text)
+        intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
+        self._outer.addWidget(intro)
+        self._clear_glow_btn = QtWidgets.QPushButton(clear_label)
+        self._clear_glow_btn.setToolTip(clear_tooltip)
+        self._clear_glow_btn.setEnabled(False)
+        self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
+        self._outer.addWidget(self._clear_glow_btn)
+
+    def set_glow_active(self, active: bool) -> None:
+        """Enable the Clear-view control only while a glow is active (lit = a spotlight to restore).
+        The panel calls this on every stabilization tab when it applies / clears the shared glow."""
+        if getattr(self, "_clear_glow_btn", None) is not None:
+            self._clear_glow_btn.setEnabled(bool(active))
+
+    @staticmethod
+    def _make_ranked_table(cols: List[str], on_cell_clicked) -> "QtWidgets.QTableWidget":
+        """The standard ranked-results table: read-only, whole-row single-selection, hidden until
+        populated, row-click → *on_cell_clicked(row, col)*. The one factory all three tabs use."""
+        tbl = QtWidgets.QTableWidget(0, len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        tbl.setVisible(False)
+        tbl.cellClicked.connect(on_cell_clicked)
+        return tbl
+
+    @staticmethod
+    def _make_caveat() -> "QtWidgets.QLabel":
+        """The measured-not-promised caveat label (amber, word-wrapped, hidden until there are rows)."""
+        cav = QtWidgets.QLabel(); cav.setWordWrap(True)
+        cav.setStyleSheet("color:#b36b00;"); cav.setVisible(False)
+        return cav
+
+
 # ── persistent Disulfides results tab (whole-suite home; replaces the transient dialogs) ──
 
-class DisulfidesResultsTab(QtWidgets.QWidget):
+class DisulfidesResultsTab(_StabilizationResultsTab):
     """Persistent home for the disulfide suite's results — A (assess existing pairs) / B (measure
     geometry) / D (engineerable-site scan) / C (declared-bond fold) — replacing the four transient
     dialogs/status-lines (a modeless dialog VANISHED on focus loss; a tab PERSISTS across top-level
@@ -620,32 +684,24 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
 
     def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None, on_clear_glow=None,
                  on_add_to_basket=None):
-        super().__init__()
-        self._on_highlight = on_highlight        # (cd, pair_dict) -> highlight both members in 3D
+        super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
+                         on_add_to_basket=on_add_to_basket)
         self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
         self._on_estimate_ddg = on_estimate_ddg  # (cd, pair_dict) -> ΔΔG escalation (legacy bridge)
-        self._on_clear_glow = on_clear_glow      # ()              -> restore the normal 3D representation
-        self._on_add_to_basket = on_add_to_basket  # (cd, pair_dict) -> stage both→Cys into the basket
-        outer = QtWidgets.QVBoxLayout(self)
-        intro = QtWidgets.QLabel(
-            "Disulfide suite results. These tables are the SOURCE OF TRUTH for which residue pairs "
-            "with which; the 'Disulfide sites' colour mode in the Workbench is a complementary "
-            "navigational index (the glow points the eye, the table carries the pairing).")
-        intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
-        outer.addWidget(intro)
         # Explicit escape from the pair-click spotlight: restore the normal representation (un-ghost
         # the structure + drop the highlight). LIT only while a pair is glowing (something to clear).
         # The common case — switching to another colour mode — clears the glow automatically; this is
         # the manual control for "turn it off without picking a different mode".
-        self._clear_glow_btn = QtWidgets.QPushButton("Clear disulfide view (un-ghost)")
-        self._clear_glow_btn.setToolTip("Restore the normal representation: un-ghost the structure and "
-                                        "remove the pair spotlight. Enabled while a pair glow is active.")
-        self._clear_glow_btn.setEnabled(False)
-        self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
-        outer.addWidget(self._clear_glow_btn)
+        self._add_header(
+            "Disulfide suite results. These tables are the SOURCE OF TRUTH for which residue pairs "
+            "with which; the 'Disulfide sites' colour mode in the Workbench is a complementary "
+            "navigational index (the glow points the eye, the table carries the pairing).",
+            "Clear disulfide view (un-ghost)",
+            "Restore the normal representation: un-ghost the structure and remove the pair spotlight. "
+            "Enabled while a pair glow is active.")
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
         body = QtWidgets.QWidget(); self._vl = QtWidgets.QVBoxLayout(body)
-        scroll.setWidget(body); outer.addWidget(scroll, 1)
+        scroll.setWidget(body); self._outer.addWidget(scroll, 1)
         self._sec: Dict[str, dict] = {}
         self._make_section("A", "Existing Cys pairs — bonding frequency (Mode A: assess existing)",
                            "Run “Assess existing Cys pairs” to populate.",
@@ -679,16 +735,9 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
         sec = {"box": box, "placeholder": ph, "cols": cols, "cd": None, "pairs": [],
                "table": None, "caveat": None, "detail": None}
         if caveat:
-            cav = QtWidgets.QLabel(); cav.setWordWrap(True); cav.setStyleSheet("color:#b36b00;")
-            cav.setVisible(False); gl.addWidget(cav); sec["caveat"] = cav
+            cav = self._make_caveat(); gl.addWidget(cav); sec["caveat"] = cav
         if cols is not None:
-            tbl = QtWidgets.QTableWidget(0, len(cols))
-            tbl.setHorizontalHeaderLabels(cols)
-            tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-            tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-            tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-            tbl.setVisible(False)
-            tbl.cellClicked.connect(lambda r, _c, k=key: self._on_row(k, r))
+            tbl = self._make_ranked_table(cols, lambda r, _c, k=key: self._on_row(k, r))
             gl.addWidget(tbl); sec["table"] = tbl
             detail = QtWidgets.QLabel(); detail.setWordWrap(True); detail.setStyleSheet("color:#444;")
             detail.setVisible(False); gl.addWidget(detail); sec["detail"] = detail
@@ -929,14 +978,8 @@ class DisulfidesResultsTab(QtWidgets.QWidget):
             sec["placeholder"].setVisible(True)
         self.set_glow_active(False)              # a reset 3D scene has no active glow to clear
 
-    def set_glow_active(self, active: bool) -> None:
-        """Enable the 'Clear disulfide view' control only while a pair glow is active (lit = there is
-        a spotlight to restore). The panel calls this when it applies / clears a glow."""
-        if getattr(self, "_clear_glow_btn", None) is not None:
-            self._clear_glow_btn.setEnabled(bool(active))
 
-
-class ProlineResultsTab(QtWidgets.QWidget):
+class ProlineResultsTab(_StabilizationResultsTab):
     """Persistent home for the PROLINE-stabilization scan — a peer of the Disulfides tab (stabilization
     is the program's core; the strategies are first-class peers). ONE ranked table (X→Pro candidates by
     backbone φ/ψ proline-compatibility × a backbone-H-bond-donor penalty), an existing-prolines line
@@ -947,34 +990,25 @@ class ProlineResultsTab(QtWidgets.QWidget):
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
                  on_show_existing=None, on_add_to_basket=None):
-        super().__init__()
-        self._on_highlight = on_highlight          # (cd, cand) -> glow the residue in 3D
+        super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
+                         on_add_to_basket=on_add_to_basket)
         self._on_declare = on_declare              # (cd, cand) -> substitute→Pro + validate (fold/compare)
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> X→Pro ΔΔG escalation (legacy bridge)
-        self._on_clear_glow = on_clear_glow        # ()         -> restore the normal 3D representation
         self._on_show_existing = on_show_existing  # (cd)       -> highlight the existing prolines
-        self._on_add_to_basket = on_add_to_basket  # (cd, cand) -> stage this X→Pro into the design basket
         self._cd = None
         self._cands: List[dict] = []
-        outer = QtWidgets.QVBoxLayout(self)
-        intro = QtWidgets.QLabel(
+        self._add_header(
             "Proline-stabilization candidates. X→Pro sites ranked by backbone φ/ψ proline-compatibility "
             "with a backbone-H-bond-donor penalty (proline can't donate the N–H···O bond helices/sheets "
             "rely on, so stabilizing prolines live in loops/turns). The table is the SOURCE OF TRUTH; "
-            "the 'Proline sites' colour mode is a complementary navigational index.")
-        intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
-        outer.addWidget(intro)
-        self._clear_glow_btn = QtWidgets.QPushButton("Clear proline view (un-ghost)")
-        self._clear_glow_btn.setToolTip("Restore the normal representation: un-ghost the structure and "
-                                        "remove the residue spotlight. Enabled while a residue glow is active.")
-        self._clear_glow_btn.setEnabled(False)
-        self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
-        outer.addWidget(self._clear_glow_btn)
+            "the 'Proline sites' colour mode is a complementary navigational index.",
+            "Clear proline view (un-ghost)",
+            "Restore the normal representation: un-ghost the structure and remove the residue spotlight. "
+            "Enabled while a residue glow is active.")
 
         box = QtWidgets.QGroupBox("Proline-substitution sites (ranked)")
         gl = QtWidgets.QVBoxLayout(box)
-        self._caveat = QtWidgets.QLabel(); self._caveat.setWordWrap(True)
-        self._caveat.setStyleSheet("color:#b36b00;"); self._caveat.setVisible(False)
+        self._caveat = self._make_caveat()
         gl.addWidget(self._caveat)
         self._existing_lbl = QtWidgets.QLabel(); self._existing_lbl.setWordWrap(True)
         self._existing_lbl.setStyleSheet("color:#777;"); self._existing_lbl.setVisible(False)
@@ -983,13 +1017,7 @@ class ProlineResultsTab(QtWidgets.QWidget):
         self._placeholder.setWordWrap(True); self._placeholder.setStyleSheet("color:#888;")
         gl.addWidget(self._placeholder)
         cols = ["Residue", "φ (°)", "ψ (°)", "Score", "H-bond donor", "ΔΔG (kcal/mol)"]
-        self._tbl = QtWidgets.QTableWidget(0, len(cols))
-        self._tbl.setHorizontalHeaderLabels(cols)
-        self._tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self._tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self._tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self._tbl.setVisible(False)
-        self._tbl.cellClicked.connect(lambda r, _c: self._on_row(r))
+        self._tbl = self._make_ranked_table(cols, lambda r, _c: self._on_row(r))
         gl.addWidget(self._tbl)
         self._detail = QtWidgets.QLabel(); self._detail.setWordWrap(True)
         self._detail.setStyleSheet("color:#444;"); self._detail.setVisible(False)
@@ -1019,17 +1047,13 @@ class ProlineResultsTab(QtWidgets.QWidget):
         self._basket_btn.clicked.connect(self._add_to_basket)
         row.addWidget(self._basket_btn)
         gl.addLayout(row)
-        outer.addWidget(box)
-        outer.addStretch(1)
+        self._outer.addWidget(box)
+        self._outer.addStretch(1)
 
     def _add_to_basket(self) -> None:
         r = self._tbl.currentRow()
         if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
             self._on_add_to_basket(self._cd, self._cands[r])
-
-    def set_glow_active(self, active: bool) -> None:
-        if getattr(self, "_clear_glow_btn", None) is not None:
-            self._clear_glow_btn.setEnabled(bool(active))
 
     def _on_row(self, r: int) -> None:
         if not (0 <= r < len(self._cands)) or self._cd is None:
@@ -1106,6 +1130,161 @@ class ProlineResultsTab(QtWidgets.QWidget):
         self._detail.setVisible(False); self._placeholder.setVisible(True)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
         self._existing_btn.setEnabled(False)
+        if getattr(self, "_basket_btn", None) is not None:
+            self._basket_btn.setEnabled(False)
+        self.set_glow_active(False)
+
+
+class CavityResultsTab(_StabilizationResultsTab):
+    """Persistent home for the CAVITY-FILLING scan — the third peer of Disulfides / Proline (built on
+    the shared `_StabilizationResultsTab` base, the consolidation paid at the third instance). ONE
+    ranked table (small→larger hydrophobic fills of detected internal voids, by void-fill fraction ×
+    rotamer reach-into-void, clash-demoted), a detected-cavities summary line, the context-dependent
+    caveat (cavity-filling is modest for generic thermostability but powerful for CONFORMATIONAL locks
+    — the RSV prefusion-F lesson — and the geometric scan can't tell which a void is), and the shared
+    Clear-view control. Row-click HIGHLIGHTS the residue through the SAME glow seam; per-row Substitute-
+    and-validate (substitute→fold→compare, no constraint) + Estimate-ΔΔG + Add-to-design. Persists
+    across tab-switch + session reset (keep-and-clear)."""
+
+    def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
+                 on_add_to_basket=None):
+        super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
+                         on_add_to_basket=on_add_to_basket)
+        self._on_declare = on_declare              # (cd, cand) -> substitute→fill + validate (fold/compare)
+        self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> fill ΔΔG escalation (legacy bridge)
+        self._cd = None
+        self._cands: List[dict] = []
+        self._add_header(
+            "Cavity-filling candidates. Small→larger hydrophobic fills of detected INTERNAL voids, "
+            "ranked by void-fill fraction × how well a rotamer reaches into the void clash-free. The "
+            "table is the SOURCE OF TRUTH; the 'Cavity sites' colour mode is a complementary "
+            "navigational index. Cavity-filling is modest for generic thermostability but a proven "
+            "CONFORMATIONAL-locking tool (the RSV prefusion-F lesson) — the scan finds geometrically-"
+            "viable fills; YOU judge whether a cavity is strategically important.",
+            "Clear cavity view (un-ghost)",
+            "Restore the normal representation: un-ghost the structure and remove the residue spotlight. "
+            "Enabled while a residue glow is active.")
+
+        box = QtWidgets.QGroupBox("Cavity-filling sites (ranked)")
+        gl = QtWidgets.QVBoxLayout(box)
+        self._caveat = self._make_caveat()
+        gl.addWidget(self._caveat)
+        self._cavities_lbl = QtWidgets.QLabel(); self._cavities_lbl.setWordWrap(True)
+        self._cavities_lbl.setStyleSheet("color:#777;"); self._cavities_lbl.setVisible(False)
+        gl.addWidget(self._cavities_lbl)
+        self._placeholder = QtWidgets.QLabel("Run “Find cavity-filling sites” to populate.")
+        self._placeholder.setWordWrap(True); self._placeholder.setStyleSheet("color:#888;")
+        gl.addWidget(self._placeholder)
+        cols = ["Substitution", "Cavity", "Void (Å³)", "Fill", "Clash", "Score", "ΔΔG (kcal/mol)"]
+        self._tbl = self._make_ranked_table(cols, lambda r, _c: self._on_row(r))
+        gl.addWidget(self._tbl)
+        self._detail = QtWidgets.QLabel(); self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color:#444;"); self._detail.setVisible(False)
+        gl.addWidget(self._detail)
+        row = QtWidgets.QHBoxLayout()
+        self._declare_btn = QtWidgets.QPushButton("Substitute → fill and validate")
+        self._declare_btn.setToolTip("Substitute the selected residue to the larger fill residue and "
+                                     "validate by re-folding (no constraint) + comparing — the real test.")
+        self._declare_btn.setEnabled(False)
+        self._declare_btn.clicked.connect(self._declare)
+        row.addWidget(self._declare_btn)
+        self._escalate_btn = QtWidgets.QPushButton("Estimate ΔΔG (legacy)")
+        self._escalate_btn.setToolTip("Energetic estimate (uncalibrated — ranking/sign only) for the "
+                                      "selected fill mutation; minutes.")
+        self._escalate_btn.setEnabled(False)
+        self._escalate_btn.clicked.connect(self._estimate)
+        row.addWidget(self._escalate_btn)
+        self._basket_btn = QtWidgets.QPushButton("Add to design")
+        self._basket_btn.setToolTip("Stage the selected fill substitution into the Design basket "
+                                    "(collect picks across strategies, then enact one variant).")
+        self._basket_btn.setEnabled(False)
+        self._basket_btn.clicked.connect(self._add_to_basket)
+        row.addWidget(self._basket_btn)
+        gl.addLayout(row)
+        self._outer.addWidget(box)
+        self._outer.addStretch(1)
+
+    def _add_to_basket(self) -> None:
+        r = self._tbl.currentRow()
+        if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, self._cands[r])
+
+    def _on_row(self, r: int) -> None:
+        if not (0 <= r < len(self._cands)) or self._cd is None:
+            return
+        c = self._cands[r]
+        self._on_highlight(self._cd, c)
+        self._detail.setText(self._cand_detail(c)); self._detail.setVisible(True)
+
+    @staticmethod
+    def _cand_detail(c: dict) -> str:
+        clash = (" — ⚠ every reaching rotamer CLASHES the walls (over-pack/strain risk on the rigid "
+                 "backbone; soft-demoted, validate)") if c.get("clash") else \
+                " — a clash-free rotamer fills the void"
+        ddg = c.get("ddg")
+        ddg_s = (f" ΔΔG (legacy): {c.get('from_aa','')}{c.get('position')}{c.get('to_aa','')} {ddg:+.2f} "
+                 f"kcal/mol." if ddg is not None else " ΔΔG not yet estimated — “Estimate ΔΔG (legacy)”.")
+        return (f"{c.get('from_aa','')}{c.get('position')}→{c.get('to_aa','')} (chain {c.get('chain')}) — "
+                f"score {c.get('score', 0):.2f}: cavity {c.get('cavity_id')}, void {c.get('void_volume', 0):.0f} Å³, "
+                f"fills {c.get('fill_fraction', 0):.0%}, reach {c.get('reach_score', 0):.0%}{clash}."
+                f"{ddg_s} Validate by substituting → re-folding → comparing.")
+
+    def _declare(self) -> None:
+        r = self._tbl.currentRow()
+        if 0 <= r < len(self._cands) and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, self._cands[r])
+
+    def _estimate(self) -> None:
+        r = self._tbl.currentRow()
+        if 0 <= r < len(self._cands) and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, self._cands[r])
+
+    def populate(self, cd, scan: dict) -> None:
+        """Fill the ranked table from a cavity scan ({candidates, cavities, caveat})."""
+        cands = (scan or {}).get("candidates") or []
+        self._cd, self._cands = cd, list(cands)
+        self._caveat.setText("⚠ " + ((scan or {}).get("caveat") or "Geometric suggestion only."))
+        self._caveat.setVisible(bool(cands))
+        cavities = (scan or {}).get("cavities") or []
+        if cavities:
+            head = ", ".join(f"cav{c.get('cavity_id')} {c.get('volume', 0):.0f} Å³ ({c.get('n_lining', 0)} lining"
+                             + ("/interface" if c.get("is_interface") else "") + ")" for c in cavities[:8])
+            self._cavities_lbl.setText(f"Internal cavities detected: {len(cavities)} — {head}"
+                                       + ("…" if len(cavities) > 8 else "."))
+        else:
+            self._cavities_lbl.setText("No internal cavities ≥ the volume floor (well-packed at this probe).")
+        self._cavities_lbl.setVisible(True)
+        self._tbl.setRowCount(len(cands))
+        for i, c in enumerate(cands):
+            cells = [f"{c.get('from_aa','')}{c.get('position')}{c.get('to_aa','')}",
+                     str(c.get("cavity_id", "")), f"{c.get('void_volume', 0):.0f}",
+                     f"{c.get('fill_fraction', 0):.2f}", ("⚠" if c.get("clash") else "ok"),
+                     f"{c.get('score', 0):.2f}", self._ddg_cell(c)]
+            for j, v in enumerate(cells):
+                self._tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        self._tbl.resizeColumnsToContents()
+        has = len(cands) > 0
+        self._placeholder.setVisible(not has)
+        self._tbl.setVisible(has)
+        self._declare_btn.setEnabled(has)
+        self._escalate_btn.setEnabled(has)
+        self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
+        if has:
+            self._tbl.selectRow(0); self._on_row(0)
+
+    @staticmethod
+    def _ddg_cell(c: dict) -> str:
+        ddg = c.get("ddg")
+        return "—" if ddg is None else f"{ddg:+.2f}"
+
+    def reset(self) -> None:
+        """Clear back to the dormant placeholder (keep-and-clear on session reset — the disulfide-tab
+        lesson: the tab PERSISTS as a sibling, but its content belongs to the prior session)."""
+        self._cd, self._cands = None, []
+        self._tbl.setRowCount(0); self._tbl.setVisible(False)
+        self._caveat.setVisible(False); self._cavities_lbl.setVisible(False)
+        self._detail.setVisible(False); self._placeholder.setVisible(True)
+        self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -1566,6 +1745,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                       "only — a starting point, NOT a recommendation to mutate. Cheap "
                                       "(no fold). Needs a folded construct or a loaded structure.")
         self._pro_scan_btn.triggered.connect(self._on_proline_scan)
+        # Cavity-filling scan — a peer strategy in the SAME Stabilize ▾ menu. Detect internal voids +
+        # rank small→larger hydrophobic fills that pack them clash-free. Cheap (reads coordinates, no
+        # fold); works on a de-novo fold OR a loaded crystal/model, like the proline scan.
+        self._cav_scan_btn = pro_menu.addAction("Find cavity-filling sites…")
+        self._cav_scan_btn.setToolTip("FIND cavity-filling stabilization sites: detect internal voids "
+                                      "and rank small→larger hydrophobic substitutions that pack them "
+                                      "clash-free (rotamer-aware). Cavity-filling is modest for generic "
+                                      "thermostability but powerful for CONFORMATIONAL locking (the RSV "
+                                      "prefusion-F lesson) — geometric suggestion only, you judge which "
+                                      "cavity matters. Cheap (no fold). Needs a folded construct or a "
+                                      "loaded structure.")
+        self._cav_scan_btn.triggered.connect(self._on_cavity_scan)
         self._pro_menu_btn.setMenu(pro_menu)
         bar.addWidget(self._pro_menu_btn)
         bar.addSeparator()
@@ -1603,6 +1794,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("Deviation vs WT", _RESULT_DEVIATION_MODE)  # S4c floor-gated dev
         self._mode_combo.addItem("Disulfide sites", _RESULT_DISULFIDE_MODE)  # Mode D engineerability
         self._mode_combo.addItem("Proline sites", _RESULT_PROLINE_MODE)      # proline stabilization
+        self._mode_combo.addItem("Cavity sites", _RESULT_CAVITY_MODE)        # cavity-filling best-fill
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
         # No trailing stretch: a QToolBar left-aligns its items and surfaces the overflow chevron on
@@ -1637,6 +1829,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
             on_show_existing=self._show_existing_prolines,
             on_add_to_basket=self._add_proline_to_basket)
+        self.cavity_tab = CavityResultsTab(
+            on_highlight=self._highlight_cavity_residue,
+            on_declare=self._declare_cavity,
+            on_estimate_ddg=self._estimate_cavity_ddg,
+            on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
+            on_add_to_basket=self._add_cavity_to_basket)
         # The CROSS-STRATEGY design basket — the framework centerpiece (gui_app docks it on the right).
         self.design_basket = DesignBasketPanel(on_enact=self._enact_basket)
 
@@ -2822,6 +3020,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._ss_interface_btn.setEnabled(has_struct and n_chains >= 2)
         if getattr(self, "_pro_scan_btn", None) is not None:
             self._pro_scan_btn.setEnabled(has_struct)          # reads the backbone (no fold), like D
+        if getattr(self, "_cav_scan_btn", None) is not None:
+            self._cav_scan_btn.setEnabled(has_struct)          # reads coordinates (no fold), like proline
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -2862,6 +3062,16 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         self._status.setText("Scanning for proline-stabilization sites (backbone φ/ψ + H-bond, "
                              "geometric suggestion only — a starting point)…")
+        self.launchRequested.emit(spec)
+
+    def _on_cavity_scan(self) -> None:
+        spec = self.cavity_scan_launch_spec()
+        if spec is None:
+            self._status.setText("Cavity scan needs a readable structure — fold the construct, or "
+                                 "check the loaded model is still open.")
+            return
+        self._status.setText("Scanning for cavity-filling sites (internal voids + rotamer-aware fills, "
+                             "geometric suggestion only — you judge which cavity matters)…")
         self.launchRequested.emit(spec)
 
     def _on_disulfide_interface_scan(self) -> None:
@@ -3713,6 +3923,203 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.proline_tab.populate(cd, cd.proline_scan)
         self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
 
+    # ── Cavity-filling scan: launch / apply / highlight / declare / ΔΔG (the proline-mode shape) ──
+    def _active_cavity_scan(self, tab: _ChainDesignTab) -> Dict[int, float]:
+        """{author_resnum: best cavity-fill score} for the active cd's cavity scan, rep chain only.
+        Empty when no scan has run. The heatmap colours each lining residue by its best fill score —
+        the NAVIGATIONAL INDEX into the ranked candidate list (the source of truth)."""
+        cd = tab.design
+        best = ((cd.cavity_scan or {}).get("best_partner") or {})
+        chain_best = best.get(cd.rep_chain)
+        if chain_best is None and len(best) == 1:
+            chain_best = next(iter(best.values()))
+        return {int(rn): float(sc) for rn, sc in (chain_best or {}).items()}
+
+    def _cavity_scan_panel_hex(self, tab: _ChainDesignTab) -> Dict[int, str]:
+        """{author_resnum: hex} for the cavity heatmap (best-fill → teal→gold)."""
+        out: Dict[int, str] = {}
+        for rn, sc in self._active_cavity_scan(tab).items():
+            hexc = cavity_compat_color(sc)
+            if hexc:
+                out[rn] = hexc
+        return out
+
+    def cavity_scan_launch_spec(self) -> Optional[dict]:
+        """Cavity-scan spec — detect internal voids + rank fills on the active design's EXISTING
+        structure (de-novo fold OR a LOADED crystal/model, via `_active_structure`). CHEAP (reads
+        coordinates; NEVER folds). None until there is a structure to read."""
+        src = self._active_structure()
+        if src is None:
+            return None
+        return {
+            "tool": "cavity_scan", "tool_inputs": {"cif_path": src["cif_path"]},
+            "user_input": "[Workbench] find cavity-filling sites (internal-void detection + rotamer fills)",
+            "confidence": "high", "refresh": "cavity_scan",           # cheap + deterministic → no gate
+            "_align_ukey": self._cur_cd_ukey(),
+        }
+
+    def apply_cavity_scan_result(self, spec: dict, result: dict) -> None:
+        """Store the cavity scan on the active cd (ranked fills = source of truth + best-score heatmap
+        map + the per-void summary) and AUTO-SURFACE the 'Cavity sites' colour mode. The geometric-only
+        context-dependent CAVEAT rides on the tab + status."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "cavity_scan"), None)
+        if step is None or not step.get("success"):
+            self._status.setText(f"Cavity scan failed: {step.get('error') if step else 'no result'}")
+            return
+        data = step.get("data") or {}
+        cd = self._scan_target_cd(spec)
+        if cd is None:
+            return
+        cd.cavity_scan = {"candidates": data.get("candidates") or [],
+                          "best_partner": data.get("best_partner") or {},
+                          "cavities": data.get("cavities") or [],
+                          "caveat": data.get("caveat")}
+        self._persist()
+        if cd.cavity_scan["candidates"]:
+            self._select_result_mode(_RESULT_CAVITY_MODE)             # AUTO-SURFACE the heatmap
+            tab = self._cur_tab()
+            if tab is not None:
+                self._apply_color_to(tab)
+                self._push_3d_color(tab)
+        self.cavity_tab.populate(cd, cd.cavity_scan)
+        self._status.setText(step.get("summary") or "Cavity scan complete.")
+
+    def _highlight_cavity_residue(self, cd, cand: dict) -> None:
+        """Glow ONE cavity-fill candidate residue — through the SAME `_glow_state` seam as the proline
+        single-residue glow (restore the prior glow first so it never stacks)."""
+        mid, spec = self._proline_residue_spec(cd, cand)         # same (mid, spec) resolver — residue glow
+        if mid is None:
+            self._glow_state = None
+            self._sync_glow_clear_button()
+            return
+        hue = self._GLOW_HUE
+        apply = [
+            f"show {spec} atoms", f"style {spec} sphere", f"color {spec} {hue} target a",
+            f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
+            f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
+        ]
+        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
+        self._glow_state = {"mid": mid, "both": spec}
+        self._sync_glow_clear_button()
+
+    def _declare_cavity(self, cd, cand: dict) -> None:
+        """Substitute the selected residue to its FILL residue on a NEW variant — the validation path is
+        the EXISTING fold/deviation flow (the fill folds NATIVELY, no constraints): one click does the
+        substitution; the user Folds the variant to validate (re-fold + compare). Same seam as the
+        proline declare, but the target is the candidate's `to_aa` (variable), not a fixed 'P'."""
+        tab = self._focus_tab_for_design(cd)
+        if tab is None or self._design is None:
+            self._status.setText("Can't substitute — the candidate's chain tab isn't available.")
+            return
+        col = self._col_for_resnum(cd, cand.get("position"))
+        if col is None:
+            self._status.setText(f"Can't substitute — residue {cand.get('position')} not on the axis.")
+            return
+        to_aa = cand.get("to_aa")
+        if not to_aa:
+            self._status.setText("Can't substitute — the fill has no target residue.")
+            return
+        vid = self._design.new_variant_id()
+        cd.add_variant(vid)
+        try:
+            cd.edit_variant(vid, col, to_aa)
+        except Exception as exc:
+            self._status.setText(f"Substitution failed: {type(exc).__name__}: {exc}")
+            return
+        self._after_variant_edit(
+            tab, vid, f"{vid}: {cand.get('from_aa','')}{cand.get('position')}→{to_aa} substituted "
+                      f"(cavity fill). Fold this variant to VALIDATE (re-fold + deviation — the fill "
+                      f"folds natively, no constraint).")
+
+    def _estimate_cavity_ddg(self, cd, cand: dict) -> None:
+        """Cavity-fill ΔΔG escalation for ONE candidate (the disulfide/proline-escalation pattern, with
+        the candidate's `to_aa`). FOCUS the cd's tab so from_aa resolves against the RIGHT design,
+        build the spec, launch on the worker seam (long-running; never auto-run across a scan)."""
+        self._focus_tab_for_design(cd)
+        spec = self.build_cavity_ddg_spec(cand)
+        if spec is None:
+            self._status.setText("Can't estimate ΔΔG — needs a readable structure and a recoverable WT "
+                                 "residue (re-scan if the structure changed).")
+            return
+        self._status.setText(f"Estimating ΔΔG (legacy, uncalibrated) for "
+                             f"{cand.get('from_aa','')}{cand.get('position')}{cand.get('to_aa','')} — minutes…")
+        self.launchRequested.emit(spec)
+
+    def build_cavity_ddg_spec(self, cand: dict) -> Optional[dict]:
+        """ΔΔG-escalation spec for ONE cavity-fill candidate → the legacy ΔΔG bridge
+        (refresh='cavity_ddg'). Saves the LIVE structure to PDB (PyRosetta needs PDB), recovers the WT
+        residue own-chain, carries the candidate's `to_aa` (variable target), tags the source so the
+        router gate blocks a de-novo web upload. None when there's no readable structure / from_aa can't
+        be recovered / no target / PDB save fails — never a silent wrong-mutation score."""
+        if self._design is None:
+            return None
+        src = self._active_structure()
+        if src is None:
+            return None
+        ch, pos = (cand.get("chain") or self._cur_tab().design.rep_chain), cand.get("position")
+        to_aa = cand.get("to_aa")
+        if ch is None or pos is None or not to_aa:
+            return None
+        aa = self._from_aa_for(ch, pos)
+        if aa is None:
+            return None
+        pdb = self._save_structure_pdb(src["model_id"])
+        if not pdb:
+            return None
+        source = "denovo" if self._design.source == "sequence" else "loaded"
+        return {
+            "tool": "cavity_ddg_estimate",
+            "tool_inputs": {"pdb_path": pdb, "chain": str(ch), "resnum": int(pos),
+                            "from_aa": aa, "to_aa": str(to_aa), "source": source},
+            "user_input": f"[Workbench] estimate ΔΔG (legacy) for {aa}{pos}{to_aa}",
+            "confidence": "low", "refresh": "cavity_ddg",
+            "_align_ukey": self._cur_cd_ukey(),
+            "_cav_cand": {"chain": str(ch), "position": int(pos)},
+        }
+
+    def apply_cavity_ddg_result(self, spec: dict, result: dict) -> None:
+        """Attach the escalated fill ΔΔG onto the MATCHING candidate (by chain+position) and re-render
+        the cavity table. Fail-LOUD: a failed/aborted estimate shows its reason, never a fabricated
+        number."""
+        step = next((s for s in (result or {}).get("tool_step_results", []) or []
+                     if s.get("tool") == "cavity_ddg_estimate"), None)
+        if step is None:
+            self._status.setText("ΔΔG estimate produced no result.")
+            return
+        if not step.get("success"):
+            self._status.setText(f"ΔΔG estimate: {step.get('error') or 'failed'}")
+            return
+        cd = self._scan_target_cd(spec)
+        want = (spec or {}).get("_cav_cand") or {}
+        data = step.get("data") or {}
+        cands = ((cd.cavity_scan or {}).get("candidates") if cd else None) or []
+        target = next((c for c in cands if str(c.get("chain")) == str(want.get("chain"))
+                       and c.get("position") == want.get("position")), None)
+        if target is None:
+            self._status.setText("ΔΔG came back but its candidate is no longer listed (re-scan).")
+            return
+        target.update({"ddg": data.get("ddg"), "ddg_backend": data.get("backend"),
+                       "ddg_source": data.get("source")})
+        self._persist()
+        self.cavity_tab.populate(cd, cd.cavity_scan)
+        self._status.setText(step.get("summary") or "ΔΔG estimate complete.")
+
+    def _add_cavity_to_basket(self, cd, cand: dict) -> None:
+        """Normalize a cavity-fill candidate → a basket entry (one position → the larger fill residue).
+        Cavity rows already carry `from_aa` + `to_aa` (basket-aware-shaped)."""
+        entry = {
+            "cls": "Cavity", "score": float(cand.get("score", 0.0)),
+            "subs": [{"chain": str(cand.get("chain") or cd.rep_chain), "position": int(cand["position"]),
+                      "from_aa": cand.get("from_aa", "X"), "to_aa": str(cand.get("to_aa", ""))}],
+            "metrics_text": (f"void {cand.get('void_volume', 0):.0f} Å³ cav {cand.get('cavity_id')}; "
+                             f"fills {cand.get('fill_fraction', 0):.0%}; "
+                             + ("⚠ clash" if cand.get("clash") else "clash-free")),
+        }
+        self.design_basket.add_entry(entry)
+        self._status.setText(f"Added {cand.get('from_aa','')}{cand.get('position')}→{cand.get('to_aa','')} "
+                             f"(cavity fill) to the design basket.")
+
     # ── Design basket: stage strategy picks → compose ONE variant via the existing path ───────
     def _add_proline_to_basket(self, cd, cand: dict) -> None:
         """Normalize a proline candidate → a basket entry (one position → Pro). Proline rows already
@@ -3810,6 +4217,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             _RESULT_DEVIATION_MODE: bool(self._active_deviation(tab)),
             _RESULT_DISULFIDE_MODE: bool(self._active_disulfide_scan(tab)),
             _RESULT_PROLINE_MODE:   bool(self._active_proline_scan(tab)),
+            _RESULT_CAVITY_MODE:    bool(self._active_cavity_scan(tab)),
         }
         model = self._mode_combo.model()
         for i in range(self._mode_combo.count()):
@@ -3834,6 +4242,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             tab.set_result_coloring(tab.active_row_id, self._disulfide_scan_panel_hex(tab))
         elif self._mode_key == _RESULT_PROLINE_MODE:
             tab.set_result_coloring(tab.active_row_id, self._proline_scan_panel_hex(tab))
+        elif self._mode_key == _RESULT_CAVITY_MODE:
+            tab.set_result_coloring(tab.active_row_id, self._cavity_scan_panel_hex(tab))
         else:
             tab.set_color_mode(get_mode(self._mode_key))
 
@@ -4661,7 +5071,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         glow seam (`_glow_state`) is SHARED across the Disulfides + Proline tabs (one spotlight at a
         time), so both Clear controls track the one state."""
         active = bool(getattr(self, "_glow_state", None))
-        for tab_name in ("disulfides_tab", "proline_tab"):
+        for tab_name in ("disulfides_tab", "proline_tab", "cavity_tab"):
             tab = getattr(self, tab_name, None)
             if tab is not None:
                 tab.set_glow_active(active)

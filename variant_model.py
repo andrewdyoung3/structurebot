@@ -144,6 +144,11 @@ class ChainDesign:
     # {candidates:[ranked per-residue dicts], best_partner:{chain:{resnum:score}}, existing:[(chain,
     # resnum)], caveat}. The ranked list is the source of truth; best_partner feeds the heatmap mode.
     proline_scan: Dict[str, Any] = field(default_factory=dict)
+    # Cavity-filling scan: small→larger hydrophobic fills of detected internal voids, ranked by
+    # void-fill fraction × rotamer reach-into-void (clash-demoted) (cavity_geometry.scan_cavity_sites).
+    # Shape: {candidates:[ranked fill dicts], best_partner:{chain:{resnum:score}}, cavities:[per-void
+    # summary], caveat}. The ranked list is the source of truth; best_partner feeds the heatmap mode.
+    cavity_scan: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_columns(self) -> int:
@@ -382,6 +387,7 @@ class DesignSession:
                 disulfide_scan   = dict(cd.get("disulfide_scan") or {}),
                 disulfide_interface_scan = dict(cd.get("disulfide_interface_scan") or {}),
                 proline_scan   = dict(cd.get("proline_scan") or {}),
+                cavity_scan    = dict(cd.get("cavity_scan") or {}),
                 guided_fold    = dict(cd.get("guided_fold") or {}),
                 template_assist = dict(cd.get("template_assist") or {}),
             )

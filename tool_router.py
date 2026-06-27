@@ -164,6 +164,8 @@ class ToolRouter:
         "proline":           "🧪",
         "proline_scan":      "🧪🔍",
         "proline_ddg_estimate": "🧪⚡",
+        "cavity_scan":       "🕳️🔍",
+        "cavity_ddg_estimate": "🕳️⚡",
         "glycan":            "🍬",
         "glycan_positions":  "🍬🔮",
         "netnglyc":          "🔬🍬",
@@ -1856,6 +1858,12 @@ class ToolRouter:
         if tool == "proline_ddg_estimate":
             return ("Proline ΔΔG estimate (legacy) — energetic read for ONE flagged X→Pro site "
                     "(uncalibrated; ranking/sign only)")
+        if tool == "cavity_scan":
+            return ("Cavity-filling scan — detect internal voids + rank small→larger hydrophobic "
+                    "fills that pack them clash-free (this structure)")
+        if tool == "cavity_ddg_estimate":
+            return ("Cavity-fill ΔΔG estimate (legacy) — energetic read for ONE flagged fill "
+                    "(uncalibrated; ranking/sign only)")
         if tool == "proline":
             inp   = tool_inputs.get("proline", {})
             mid   = inp.get("model_id") or self._first_model_id()
@@ -2159,6 +2167,10 @@ class ToolRouter:
                 return self._run_proline_scan(inputs)
             if tool == "proline_ddg_estimate":
                 return self._run_proline_ddg_estimate(inputs)
+            if tool == "cavity_scan":
+                return self._run_cavity_scan(inputs)
+            if tool == "cavity_ddg_estimate":
+                return self._run_cavity_ddg_estimate(inputs)
             if tool == "proline":
                 return self._run_proline(inputs)
             if tool == "glycan":
@@ -3589,6 +3601,140 @@ class ToolRouter:
             tool="proline_ddg_estimate", success=True,
             data={"chain": ch, "resnum": rn, "from_aa": aa, "ddg": ddg,
                   "backend": backend, "source": source, "caveat": self._PROLINE_DDG_CAVEAT},
+            summary=summary)
+
+    # ── Cavity-filling scan (panel-primary; the legacy NL `cavity`/CavityBridge stays parallel) ──
+    # The load-bearing caveat — rides with EVERY cavity-scan readout. CONTEXT-DEPENDENT and honest to
+    # BOTH the cautionary literature (generic thermostability) and the success literature (the RSV
+    # prefusion-F vaccines): cavity-filling's value depends on the cavity's STRUCTURAL ROLE, which a
+    # geometric scan cannot judge — the tool surfaces viable fills, the designer supplies the insight.
+    _CAVITY_SCAN_CAVEAT = (
+        "A buried cavity exists in THIS predicted/loaded structure; filling it PERMITS better packing. "
+        "Cavity-filling gives modest, variable gains for generic thermostability (Matthews, T4 lysozyme; "
+        "Machicado, apoflavodoxin — measured 0.0–0.6 kcal/mol, sub-~20 Å³ voids destabilize regardless), "
+        "but is a PROVEN, POWERFUL technique for CONFORMATIONAL stabilization — locking a target state — "
+        "central to the RSV prefusion-F vaccines (McLellan/Graham, DS-Cav1). Its value depends heavily on "
+        "the cavity's structural role, which this geometric scan CANNOT judge: the tool surfaces "
+        "geometrically-viable fills; you supply the structural insight about whether a cavity is "
+        "conformationally important. Does NOT confirm the substitution is tolerated, that the protein "
+        "still folds, that it stabilizes, or that the cavity isn't functional (a ligand/water/catalytic "
+        "site). Validate by substituting → re-folding (no constraint) → comparing; the ΔΔG is a second "
+        "soft signal."
+    )
+
+    def _run_cavity_scan(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """CAVITY-FILLING SCAN — detect internal voids (grid + probe-sphere + exterior solvent flood)
+        then rank small→larger hydrophobic FILLS that reach into a void clash-free, ROTAMER-AWARE
+        (`cavity_geometry`). CHEAP — reads the CIF, NEVER folds; works on a de-novo fold OR a LOADED
+        crystal/model (multimers native — interface cavities fall out). The correct FRESH version (true
+        geometric void detection + rotamer-placement + clash), DISTINCT from the legacy `cavity_bridge`
+        (SASA-burial proxy + static volume-table lookup — kept parallel, §9). Returns the ranked
+        candidate list (source of truth) + a per-residue best-score heatmap map + the per-void summary +
+        the load-bearing CAVEAT. Reads `cif_path`."""
+        import os as _os
+        from cavity_geometry import parse_residue_atoms, parse_heavy_atoms, scan_cavity_sites
+        cif = inputs.get("cif_path")
+        if not cif or not _os.path.isfile(cif):
+            return ToolStepResult(tool="cavity_scan", success=False,
+                                  error="Cavity scan needs an existing structure CIF on disk.")
+        heavy = parse_heavy_atoms(cif)
+        residues = parse_residue_atoms(cif)
+        candidates, best, cavities = scan_cavity_sites(heavy, residues)
+        # best is already {chain: {resnum: score}} — the heatmap map shape the panel expects
+        best_by_chain: Dict[str, Dict[int, float]] = {
+            ch: {int(rn): round(float(sc), 4) for rn, sc in rmap.items()} for ch, rmap in best.items()}
+        if not cavities:
+            summary = ("Cavity scan: no internal cavities ≥ the volume floor in this structure "
+                       "(well-packed at this probe). " + self._CAVITY_SCAN_CAVEAT)
+        elif not candidates:
+            summary = (f"Cavity scan — {len(cavities)} internal cavity(ies), but no clash-free "
+                       f"small→larger fill reaches a void. " + self._CAVITY_SCAN_CAVEAT)
+        else:
+            head = "; ".join(
+                f"{c['from_aa']}{c['position']}{c['to_aa']} (cav {c['cavity_id']}, {c['void_volume']:.0f} Å³"
+                + (", ⚠ clash" if c["clash"] else "") + ")" for c in candidates[:3])
+            summary = (f"Cavity scan — {len(cavities)} internal cavity(ies), {len(candidates)} viable "
+                       f"fill(s); top: {head}. " + self._CAVITY_SCAN_CAVEAT)
+        return ToolStepResult(
+            tool="cavity_scan", success=True,
+            data={"candidates": candidates, "best_partner": best_by_chain, "cavities": cavities,
+                  "caveat": self._CAVITY_SCAN_CAVEAT, "mode": "cavity_scan"},
+            summary=summary)
+
+    _CAVITY_DDG_CAVEAT = (
+        "Cavity-fill ΔΔG (legacy, uncalibrated — ranking/sign only, ~±2.7 kcal/mol). A SOFT signal on "
+        "the geometric fill — not confirmation it stabilizes, that the protein still folds, or that the "
+        "cavity isn't conformationally/functionally important. Validate by substituting → re-folding → "
+        "comparing."
+    )
+
+    def _run_cavity_ddg_estimate(self, inputs: Dict[str, Any]) -> "ToolStepResult":
+        """ΔΔG-ESCALATION for ONE cavity-fill — the `proline_ddg_estimate` pattern, but the target
+        is VARIABLE (``to_aa`` = the filling residue, not a fixed 'P'/'C'). A DIRECT single-mutation
+        `RosettaBridge.analyze`. from_aa is VERIFIED against the residue AT (chain, resnum) in the EXACT
+        PDB scored (silent-wrong-mutation guard); de-novo + web backend BLOCKED (no off-machine upload).
+        Inputs: ``pdb_path``, ``chain``/``resnum``/``from_aa``/``to_aa``, ``source`` ('denovo'|'loaded')."""
+        from disulfide_bridge import _three_to_one, parse_pdb_atoms
+        pdb = inputs.get("pdb_path")
+        ch, rn = inputs.get("chain"), inputs.get("resnum")
+        aa, to_aa = inputs.get("from_aa"), inputs.get("to_aa")
+        source = (inputs.get("source") or "loaded").strip().lower()
+        if not pdb or not Path(pdb).is_file():
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs a structure (PDB) on disk.")
+        if None in (ch, rn, aa, to_aa):
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False,
+                                  error="ΔΔG estimate needs the position with its WT + target residue "
+                                        "(chain, resnum, from_aa, to_aa).")
+        ch, rn, aa, to_aa = str(ch), int(rn), str(aa).upper(), str(to_aa).upper()
+        if aa == to_aa:
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False,
+                                  error="The fill target equals the WT residue — no mutation to score.")
+        # 1) VERIFY from_aa against the EXACT scored structure (silent-wrong-residue guard)
+        atoms = parse_pdb_atoms(pdb)
+        res = (atoms.get(ch) or {}).get(rn)
+        if res is None:
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False,
+                                  error=f"ΔΔG estimate: residue {ch}:{rn} not found in the scored structure.")
+        struct_aa = _three_to_one(res.get("resname", "UNK"))
+        if struct_aa != aa:
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False,
+                                  error=(f"ΔΔG estimate ABORTED — residue mismatch at {ch}:{rn}: the scan says {aa} "
+                                         f"but the structure has {struct_aa}. Scoring would target the wrong mutation "
+                                         f"(off-by-one / wrong chain / stale edit). Re-scan first."))
+        # 2) backend gate (fail-closed BEFORE any compute/upload) — reuses the shared escalation gate
+        from rosetta_bridge import _select_backend, RosettaBridge
+        backend = _select_backend()
+        wsl_ok = False
+        if backend == "local":
+            try:
+                from wsl_bridge import WSLBridge
+                _w = WSLBridge()
+                wsl_ok = bool(_w.is_available() and _w.check_pyrosetta())
+            except Exception:
+                wsl_ok = False
+        ok, reason = self._ddg_escalation_gate(backend, source, wsl_ok)
+        if not ok:
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False, error=reason)
+        # 3) score EXACTLY this fill mutation (single mutation)
+        bridge = RosettaBridge()
+        r = bridge.analyze(pdb_path=pdb,
+                           mutations=[{"chain": ch, "position": rn, "from_aa": aa, "to_aa": to_aa}])
+        ddg = None
+        if getattr(r, "success", False):
+            for key, v in (r.data.get("ddg_scores", {}) or {}).items():
+                m = re.match(r"[A-Z](\d+)[A-Z]", str(key))
+                if m and int(m.group(1)) == rn:
+                    ddg = float(v); break
+        if ddg is None:
+            return ToolStepResult(tool="cavity_ddg_estimate", success=False,
+                                  error=f"ΔΔG estimate produced no score for {aa}{rn}{to_aa} ({backend}).")
+        summary = (f"Cavity-fill ΔΔG (legacy, {backend}) for {ch}:{aa}{rn}{to_aa} — {ddg:+.2f} kcal/mol. "
+                   + self._CAVITY_DDG_CAVEAT)
+        return ToolStepResult(
+            tool="cavity_ddg_estimate", success=True,
+            data={"chain": ch, "resnum": rn, "from_aa": aa, "to_aa": to_aa, "ddg": ddg,
+                  "backend": backend, "source": source, "caveat": self._CAVITY_DDG_CAVEAT},
             summary=summary)
 
     def _resolve_boltz_templates(
