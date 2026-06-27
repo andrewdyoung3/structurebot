@@ -313,11 +313,18 @@ REACH_NEUTRAL = 0.5            # fallback when Sγ can't be placed (N absent) �
 
 # Clash check (tier b) — vdW overlap of the placed Sγ (+ a built Gly Cβ) against surrounding heavy
 # atoms. A clash flags + softly DEMOTES a site ("sulfurs could meet, but the Cys collides"), never
-# hard-eliminates it (suite discipline). Radii: standard vdW (Å).
+# hard-eliminates it (suite discipline). The check is ROTAMER-AWARE (2026-06-27): the χ1 sweep
+# prefers a reachable CLASH-FREE rotamer and flags a clash only when NO reachable rotamer dodges the
+# collision (genuinely unviable on the rigid backbone) — not when the reach-optimal rotamer happens
+# to collide (a clash-unaware artifact that over-flagged ~10/17). Radii: standard vdW (Å).
 HEAVY_VDW = {"C": 1.70, "N": 1.55, "O": 1.52, "S": 1.80, "P": 1.80, "SE": 1.90,
              "FE": 1.80, "ZN": 1.39, "MG": 1.73, "MN": 1.80, "CL": 1.75, "NA": 2.27}
-CLASH_TOLERANCE = 0.5          # allowed vdW overlap (Å) before a contact counts as a clash
-CLASH_PENALTY = 0.4            # score multiplier applied to a clashing candidate (soft demotion)
+CLASH_TOLERANCE = 0.5          # allowed vdW overlap (Å) before a contact counts as a clash (kept at
+                               # 0.5 — rotamer-awareness fixes the RATE; don't also loosen the
+                               # threshold, or the genuinely-unavoidable cases get under-flagged)
+CLASH_PENALTY = 0.6            # score multiplier for a residual-clash site (soft demotion; softened
+                               # 0.4→0.6 — even "no rotamer dodges" is an uncertain rigid-backbone
+                               # signal, neighbours still can't repack, so demote gently)
 CLASH_GRID_CELL = 4.0          # spatial-hash cell size (≥ max vdW-sum − tol, so ±1 cell suffices)
 
 
@@ -375,45 +382,77 @@ def sg_rotamers(n: Vec3, ca: Vec3, cb: Vec3) -> List[Vec3]:
     return [_place_sg(n, ca, cb, chi) for chi in _chi1_grid()]
 
 
-def sg_reachability(cb_a: Vec3, sgs_a: List[Vec3], cb_b: Vec3, sgs_b: List[Vec3]) -> Dict[str, object]:
-    """The DIRECT disulfide determinant the backbone-orientation term only proxied: over both
-    residues' Sγ rotamer sets (ONE sweep), find the pair whose Sγ–Sγ is closest to the bonding
-    distance AT an acceptable χSS. Returns ``{reach_score, best_sg_sg, best_chi_ss, sg_a, sg_b}`` —
-    reach_score = the max over rotamer pairs of ``Gaussian(Sγ–Sγ, 2.05, σ) × (1 if |χSS|∈[60,120]°
-    else CHI_OUT_FACTOR)``; the reported geometry + the ``sg_a``/``sg_b`` placement (for the clash
-    probe) are that maximizing pair's. Soft (never hard-zero). PURE."""
-    best_q, best_d, best_chi, best_sg = -1.0, None, None, (sgs_a[0], sgs_b[0])
+def sg_reachability(cb_a: Vec3, sgs_a: List[Vec3], cb_b: Vec3, sgs_b: List[Vec3],
+                    clash_checker=None) -> Dict[str, object]:
+    """The DIRECT disulfide determinant the backbone-orientation term only proxied — ROTAMER-AWARE.
+    Over both residues' Sγ rotamer sets (ONE sweep), score reach quality ``Gaussian(Sγ–Sγ, 2.05, σ)
+    × (1 if |χSS|∈[60,120]° else CHI_OUT_FACTOR)`` for every χ1×χ1 pair, tracking TWO bests: the
+    reach-optimal pair (any clash), and — when a *clash_checker(sg_a, sg_b)→bool* is given — the
+    reach-optimal pair that is also CLASH-FREE. Reports the CLASH-FREE best if one exists (``clash``
+    False, the geometry a real disulfide more likely adopts — the sidechain settles clash-free), else
+    the reach-optimal best with ``clash`` True (genuinely unviable — NO reachable rotamer dodges the
+    collision). Without a checker, ``clash`` is None (not evaluated). The clash probe runs only on a
+    reach-IMPROVING candidate (q above the running clean best), so it stays cheap. Returns
+    ``{reach_score, best_sg_sg, best_chi_ss, sg_a, sg_b, clash}``. Soft (never hard-zero). PURE-ish
+    (clash_checker may read a grid)."""
+    # Three bests, by quality q: best OVERALL (any rotamer — the fallback geometry/score), best
+    # REACHING (a genuine disulfide: |χSS|∈[60,120]° AND Sγ–Sγ in the bonding window), and best
+    # reaching AND CLASH-FREE. "Clash-free" is asked ONLY among REACHING rotamers — dodging a clash
+    # by adopting a non-disulfide dihedral is NOT a viable disulfide, so it doesn't clear the flag.
+    best_all = (-1.0, None, None, (sgs_a[0], sgs_b[0]))        # (q, d, chi, (sga, sgb))
+    best_reach = (-1.0, None, None, None)
+    best_clean = (-1.0, None, None, None)
+    done = False
     for sga in sgs_a:
         for sgb in sgs_b:
             d = calc_distance(sga, sgb)
             chi = calc_dihedral(cb_a, sga, sgb, cb_b)
             in_win = CHI_SS_MIN <= abs(chi) <= CHI_SS_MAX
             q = _gauss_score(d, SG_SG_IDEAL, SG_SG_REACH_SIGMA) * (1.0 if in_win else CHI_OUT_FACTOR)
-            if q > best_q:
-                best_q, best_d, best_chi, best_sg = q, d, chi, (sga, sgb)
-                if best_q >= 0.999:                  # essentially ideal — no rotamer can do better
-                    break
-        else:
-            continue
-        break
-    return {"reach_score": round(best_q, 4),
-            "best_sg_sg": (None if best_d is None else round(best_d, 3)),
-            "best_chi_ss": (None if best_chi is None else round(best_chi, 1)),
-            "sg_a": best_sg[0], "sg_b": best_sg[1]}
+            if q > best_all[0]:
+                best_all = (q, d, chi, (sga, sgb))
+                if clash_checker is None and q >= 0.999:      # tier-a fast path: ideal, no clash to weigh
+                    done = True; break
+            if in_win and SG_SG_MIN <= d <= SG_SG_MAX:        # a REACHING rotamer (real disulfide geometry)
+                if q > best_reach[0]:
+                    best_reach = (q, d, chi, (sga, sgb))
+                # clash-test only a reaching rotamer that could become the clash-free best (bounded)
+                if clash_checker is not None and q > best_clean[0] and not clash_checker(sga, sgb):
+                    best_clean = (q, d, chi, (sga, sgb))
+                    if q >= 0.999:                            # ideal AND clash-free — can't do better
+                        done = True; break
+        if done:
+            break
+    if clash_checker is None:
+        q, d, chi, sg, clash = (*best_all, None)
+    elif best_clean[1] is not None:                           # a REACHING clash-free rotamer exists
+        q, d, chi, sg, clash = (*best_clean, False)
+    elif best_reach[1] is not None:                           # reaching rotamers exist but ALL collide
+        q, d, chi, sg, clash = (*best_reach, True)            # → genuinely unviable on the rigid backbone
+    else:                                                     # no reaching rotamer at all (a REACH miss,
+        q, d, chi, sg, clash = (*best_all, False)             #   not a clash — the low reach score says so)
+    return {"reach_score": round(q, 4),
+            "best_sg_sg": (None if d is None else round(d, 3)),
+            "best_chi_ss": (None if chi is None else round(chi, 1)),
+            "sg_a": sg[0], "sg_b": sg[1], "clash": clash}
 
 
 def backbone_pair_score(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3], *,
-                        min_surface_score: Optional[float] = None) -> Optional[Dict[str, object]]:
+                        min_surface_score: Optional[float] = None,
+                        clash_grid: Optional["ClashGrid"] = None,
+                        exclude: Optional[set] = None) -> Optional[Dict[str, object]]:
     """Soft-graded engineerability of INSTALLING a disulfide between two residues (residue-agnostic).
     ``score = Cα–Cα Gaussian × Cβ–Cβ Gaussian × ROTAMER Sγ-REACHABILITY`` — reachability takes the
     slot the weak backbone-orientation proxy held. Returns the measured backbone geometry (Cα–Cα,
     Cβ–Cβ, the Cα-Cβ-Cβ-Cα orientation dihedral — MEASURED + displayed, no longer scored) PLUS the
-    reachability readout (best achievable Sγ–Sγ + χSS over the χ1 sweep) and, under ``_placed``, the
-    best-rotamer Sγ coords for an optional downstream clash check (the scan pops it; not persisted).
-    Builds a Gly Cβ (`build_cb`) so Gly→Cys is scored. If N is absent (Sγ unplaceable) reachability
-    falls back to REACH_NEUTRAL. *min_surface_score* (the scan passes its `min_score`) SKIPS the
-    expensive reachability sweep when Cα×Cβ alone can't clear it (reach ≤ 1, so the pair can't
-    surface) — a LOSSLESS speed gate. None if either residue lacks a Cα. PURE (no IO)."""
+    reachability readout (best achievable Sγ–Sγ + χSS) + a ``clash`` flag. With *clash_grid* (+ the
+    pair's *exclude* ``{(chain,resnum)}``) the χ1 sweep is ROTAMER-AWARE: it reports the best
+    reachable CLASH-FREE rotamer's geometry (clash False) and flags a clash ONLY when no reachable
+    rotamer dodges the collision (clash True) — the displayed Sγ–Sγ/χSS are then the clash-free
+    conformation a real disulfide more likely adopts. Builds a Gly Cβ (`build_cb`) so Gly→Cys is
+    scored. If N is absent (Sγ unplaceable) reachability falls back to REACH_NEUTRAL.
+    *min_surface_score* (the scan passes its `min_score`) SKIPS the sweep when Cα×Cβ alone can't
+    clear it (reach ≤ 1) — a LOSSLESS speed gate. None if either residue lacks a Cα."""
     ca1, ca2 = res_a.get("CA"), res_b.get("CA")
     if not (ca1 and ca2):
         return None
@@ -435,14 +474,13 @@ def backbone_pair_score(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3], *,
     skip_sweep = (min_surface_score is not None and ca_sc * cb_sc < min_surface_score)
     if not skip_sweep and n1 and n2 and cb1 is not ca1 and cb2 is not ca2:
         sgs_a, sgs_b = sg_rotamers(n1, ca1, cb1), sg_rotamers(n2, ca2, cb2)
-        reach = sg_reachability(cb1, sgs_a, cb2, sgs_b)
-        reach_sc = float(reach["reach_score"])
-        placed = {"sg_a": reach["sg_a"], "sg_b": reach["sg_b"],
-                  "cb_a": (cb1 if built1 is not None else None),
-                  "cb_b": (cb2 if built2 is not None else None)}
+        checker = _make_clash_checker(clash_grid, exclude, cb1 if built1 is not None else None,
+                                      cb2 if built2 is not None else None) if clash_grid else None
+        reach = sg_reachability(cb1, sgs_a, cb2, sgs_b, clash_checker=checker)
+        reach_sc, clash = float(reach["reach_score"]), reach["clash"]
     else:
         reach = {"reach_score": REACH_NEUTRAL, "best_sg_sg": None, "best_chi_ss": None}
-        reach_sc, placed = REACH_NEUTRAL, None
+        reach_sc, clash = REACH_NEUTRAL, None
 
     return {
         "ca_ca": round(ca, 3), "cb_cb": round(cb, 3),
@@ -450,10 +488,27 @@ def backbone_pair_score(res_a: Dict[str, Vec3], res_b: Dict[str, Vec3], *,
         "ca_score": round(ca_sc, 4), "cb_score": round(cb_sc, 4),
         "reach_score": round(reach_sc, 4),
         "best_sg_sg": reach["best_sg_sg"], "best_chi_ss": reach["best_chi_ss"],
-        "clash": None,                                   # set by the scan when a clash grid is given
-        "score": round(ca_sc * cb_sc * reach_sc, 4),
-        "_placed": placed,                               # internal: clash probe; popped before persist
+        "clash": clash,
+        "score": round(ca_sc * cb_sc * reach_sc, 4),     # clash-FREE score; scan demotes a clash
     }
+
+
+def _make_clash_checker(grid: "ClashGrid", exclude: Optional[set],
+                        cb_a_built: Optional[Vec3], cb_b_built: Optional[Vec3]):
+    """Build the per-pair clash predicate the rotamer sweep calls: ``checker(sg_a, sg_b) → bool``.
+    The two placed Sγ vary per rotamer; any BUILT Gly Cβ is fixed, so it rides as a constant probe.
+    Excludes the two mutated residues' own atoms (their sidechains become the Cys; the partner Sγ is
+    the intended bond, not a clash)."""
+    fixed = []
+    if cb_a_built is not None:
+        fixed.append((cb_a_built, "C"))
+    if cb_b_built is not None:
+        fixed.append((cb_b_built, "C"))
+    exc = exclude or set()
+
+    def checker(sg_a: Vec3, sg_b: Vec3) -> bool:
+        return grid.any_clash([(sg_a, "S"), (sg_b, "S")] + fixed, exc)
+    return checker
 
 
 def _resolve_cb(res: Dict[str, Vec3], ca: Vec3) -> Tuple[Vec3, Optional[Vec3]]:
@@ -504,25 +559,12 @@ class ClashGrid:
         return False
 
 
-def _finalize_pair(pg: Dict[str, object], cha: str, ra: int, chb: str, rb: int,
-                   clash_grid: Optional["ClashGrid"]) -> Dict[str, object]:
-    """Pop the internal best-rotamer Sγ coords (never persisted) and, if a clash grid is supplied
-    (tier b), probe the placed Sγ (+ any built Gly Cβ) for vdW overlap against surrounding heavy
-    atoms — set the ``clash`` flag and SOFTLY demote a clashing site (× CLASH_PENALTY), never
-    hard-eliminate it. Without a grid (tier a), ``clash`` stays None (not evaluated). The min_score
-    gate upstream runs on the CLASH-FREE score, so a clash demotes rank but never hides a site."""
-    placed = pg.pop("_placed", None)
-    if clash_grid is None or placed is None:
-        pg["clash"] = None
-        return pg
-    probes: List[Tuple[Vec3, str]] = [(placed["sg_a"], "S"), (placed["sg_b"], "S")]
-    if placed.get("cb_a"):
-        probes.append((placed["cb_a"], "C"))
-    if placed.get("cb_b"):
-        probes.append((placed["cb_b"], "C"))
-    clash = clash_grid.any_clash(probes, exclude={(cha, ra), (chb, rb)})
-    pg["clash"] = bool(clash)
-    if clash:
+def _demote_if_clash(pg: Dict[str, object]) -> Dict[str, object]:
+    """SOFTLY demote a residual-clash candidate (× CLASH_PENALTY), never hard-eliminate it. The
+    ``clash`` flag is already set by `backbone_pair_score`'s ROTAMER-AWARE sweep (True only when NO
+    reachable rotamer dodges the collision). The min_score gate upstream runs on the CLASH-FREE
+    score, so a clash demotes rank but never hides a site."""
+    if pg.get("clash") is True:
         pg["score"] = round(float(pg["score"]) * CLASH_PENALTY, 4)
     return pg
 
@@ -559,10 +601,11 @@ def scan_engineerable_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]
                     continue
                 if ca_gate is not None and calc_distance(ca_a, ca_b) > ca_gate:
                     continue                          # PREFILTER — too far; skip the full score
-                pg = backbone_pair_score(residues[ra], residues[rb], min_surface_score=min_score)
+                pg = backbone_pair_score(residues[ra], residues[rb], min_surface_score=min_score,
+                                         clash_grid=clash_grid, exclude={(ch, ra), (ch, rb)})
                 if pg is None or pg["score"] < min_score:   # gate on the CLASH-FREE score
                     continue
-                pg = _finalize_pair(pg, ch, ra, ch, rb, clash_grid)
+                pg = _demote_if_clash(pg)
                 # INTRACHAIN: both members are on `ch`, so the two-chain pair shape collapses to
                 # chain_a == chain_b here (no cross-chain enumeration until step 4). best_partner is
                 # keyed per MEMBER by ITS OWN chain — already the cross-chain-correct form.
@@ -605,10 +648,11 @@ def scan_interface_sites(atoms_by_chain: Dict[str, Dict[int, Dict[str, Vec3]]], 
                         continue
                     if ca_gate is not None and calc_distance(ca_a, ca_b) > ca_gate:
                         continue                          # INTERFACE bound — too far across chains
-                    pg = backbone_pair_score(res_a[ra], res_b[rb], min_surface_score=min_score)
+                    pg = backbone_pair_score(res_a[ra], res_b[rb], min_surface_score=min_score,
+                                             clash_grid=clash_grid, exclude={(cha, ra), (chb, rb)})
                     if pg is None or pg["score"] < min_score:   # gate on the CLASH-FREE score
                         continue
-                    pg = _finalize_pair(pg, cha, ra, chb, rb, clash_grid)
+                    pg = _demote_if_clash(pg)
                     ranked.append({"chain_a": cha, "resnum_a": ra, "chain_b": chb, "resnum_b": rb, **pg})
                     best[(cha, ra)] = max(best.get((cha, ra), 0.0), float(pg["score"]))
                     best[(chb, rb)] = max(best.get((chb, rb), 0.0), float(pg["score"]))

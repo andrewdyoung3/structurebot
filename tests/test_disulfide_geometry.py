@@ -323,33 +323,74 @@ def test_reachable_pair_outscores_unreachable_at_similar_distance():
     assert reachable["reach_score"] > away["reach_score"]
 
 
-def test_clash_flag_set_when_sg_overlaps_neighbor():
-    # the placed Sγ of a candidate sitting ON a neighbour heavy atom → clash flag True + demotion;
-    # a clear candidate → clash False, undemoted
+# THE rotamer-aware core fix: the clash question is asked among REACHING rotamers, and a clash is
+# flagged ONLY when no reaching rotamer dodges it (not when the reach-optimal happens to collide).
+def test_rotamer_aware_dodges_a_reach_optimal_clash():
+    a = _reach_atoms()["A"][1]
+    b = _reach_atoms()["A"][5]
+    sgs_a = g.sg_rotamers(a["N"], a["CA"], a["CB"])
+    sgs_b = g.sg_rotamers(b["N"], b["CA"], b["CB"])
+    base = g.sg_reachability(a["CB"], sgs_a, b["CB"], sgs_b)          # no checker → reach-optimal
+    opt = base["sg_a"]
+    # a checker that clashes ONLY the reach-optimal Sγ_a → must dodge to a DIFFERENT reaching rotamer
+    res = g.sg_reachability(a["CB"], sgs_a, b["CB"], sgs_b,
+                            clash_checker=lambda sa, sb: g.calc_distance(sa, opt) < 0.1)
+    assert res["clash"] is False                                     # dodged — NOT flagged (the fix)
+    assert g.calc_distance(res["sg_a"], opt) > 0.1                   # a genuinely different rotamer
+    assert g.SG_SG_MIN <= res["best_sg_sg"] <= g.SG_SG_MAX           # the dodge is still a REACHING rotamer
+    assert g.CHI_SS_MIN <= abs(res["best_chi_ss"]) <= g.CHI_SS_MAX
+
+
+def test_clash_flagged_only_when_every_reaching_rotamer_collides():
+    a = _reach_atoms()["A"][1]
+    b = _reach_atoms()["A"][5]
+    sgs_a = g.sg_rotamers(a["N"], a["CA"], a["CB"])
+    sgs_b = g.sg_rotamers(b["N"], b["CA"], b["CB"])
+    # a checker that clashes EVERYTHING → no reaching rotamer dodges → genuinely flagged (true positive)
+    res = g.sg_reachability(a["CB"], sgs_a, b["CB"], sgs_b, clash_checker=lambda sa, sb: True)
+    assert res["clash"] is True
+    # the flagged geometry is still the REACHING one (a real disulfide that collides), not a junk pose
+    assert g.SG_SG_MIN <= res["best_sg_sg"] <= g.SG_SG_MAX
+
+
+def test_clash_free_dodge_does_not_use_a_nonreaching_rotamer():
+    # dodging by adopting a non-disulfide dihedral must NOT clear the flag: if the only clash-free
+    # rotamers are OUT of the χSS/distance window, the pair stays flagged (reaches only by colliding)
+    a = _reach_atoms()["A"][1]
+    b = _reach_atoms()["A"][5]
+    sgs_a = g.sg_rotamers(a["N"], a["CA"], a["CB"])
+    sgs_b = g.sg_rotamers(b["N"], b["CA"], b["CB"])
+    # clash ONLY the reaching rotamers (Sγ–Sγ in the bonding window): a non-reaching rotamer would be
+    # clash-free but must not count → flagged
+    def clash_reaching_only(sa, sb):
+        d = g.calc_distance(sa, sb)
+        chi = g.calc_dihedral(a["CB"], sa, sb, b["CB"])
+        return g.CHI_SS_MIN <= abs(chi) <= g.CHI_SS_MAX and g.SG_SG_MIN <= d <= g.SG_SG_MAX
+    res = g.sg_reachability(a["CB"], sgs_a, b["CB"], sgs_b, clash_checker=clash_reaching_only)
+    assert res["clash"] is True                                     # only non-reaching dodges exist → flagged
+
+
+def test_scan_clash_demotes_and_excludes_self():
+    # integration: a clashing site is softly DEMOTED (× CLASH_PENALTY) but never hidden; the two
+    # mutated residues' own atoms are excluded from the clash
     atoms = _reach_atoms()
-    # neighbour atoms FAR from everything → no clash
-    clear_grid = g.ClashGrid([("A", 100, "C", (50.0, 50.0, 50.0))])
-    rc, _ = g.scan_engineerable_sites(atoms, clash_grid=clear_grid)
-    top_clear = rc[0]
-    assert top_clear["clash"] is False
-    # now drop a carbon RIGHT where the best-reach Sγ lands (recover it from a no-grid run)
-    pg = g.backbone_pair_score(atoms["A"][1], atoms["A"][5])  # _placed carries the Sγ coords
-    sg = pg["_placed"]["sg_a"]
-    clash_grid = g.ClashGrid([("A", 100, "C", sg)])           # a C atom ON the Sγ (residue 100 ≠ 1/5)
-    rk, _ = g.scan_engineerable_sites(atoms, clash_grid=clash_grid)
+    clear = g.ClashGrid([("A", 100, "C", (50.0, 50.0, 50.0))])      # far → nothing clashes
+    rc, _ = g.scan_engineerable_sites(atoms, clash_grid=clear)
+    clean = next(p for p in rc if {p["resnum_a"], p["resnum_b"]} == {1, 5})
+    assert clean["clash"] is False
+    # blanket the region around res 1's Cβ with a wall of atoms (res 100, not excluded) → every
+    # reaching rotamer of the 1–5 pair collides → flagged + demoted below its clash-free score
+    cb1 = atoms["A"][1]["CB"]
+    wall = [("A", 100, "C", (cb1[0]+dx, cb1[1]+dy, cb1[2]+dz))
+            for dx in (-1.5, 0, 1.5) for dy in (-1.5, 0, 1.5) for dz in (-1.5, 0, 1.5)]
+    rk, _ = g.scan_engineerable_sites(atoms, clash_grid=g.ClashGrid(wall))
     hit = next(p for p in rk if {p["resnum_a"], p["resnum_b"]} == {1, 5})
     assert hit["clash"] is True
-    assert hit["score"] < top_clear["score"]                  # clashing site is softly DEMOTED
-
-
-def test_clash_excludes_the_two_mutated_residues():
-    # the candidate's OWN residue atoms must not count as a clash (their sidechains become the Cys)
-    atoms = _reach_atoms()
-    # a grid containing ONLY the two candidate residues' backbone atoms → must NOT clash
-    grid = g.ClashGrid([("A", 1, "C", atoms["A"][1]["CA"]), ("A", 5, "C", atoms["A"][5]["CA"])])
-    rk, _ = g.scan_engineerable_sites(atoms, clash_grid=grid)
-    hit = next(p for p in rk if {p["resnum_a"], p["resnum_b"]} == {1, 5})
-    assert hit["clash"] is False                              # excluded → no self-clash
+    assert hit["score"] < clean["score"]                            # softly demoted, still present
+    # self-exclusion: a grid of ONLY the two candidate residues' own atoms must NOT clash
+    selfgrid = g.ClashGrid([("A", 1, "C", atoms["A"][1]["CA"]), ("A", 5, "C", atoms["A"][5]["CA"])])
+    rs, _ = g.scan_engineerable_sites(atoms, clash_grid=selfgrid)
+    assert next(p for p in rs if {p["resnum_a"], p["resnum_b"]} == {1, 5})["clash"] is False
 
 
 # ── pair-shape reshape: two-chain container, intra-chain only (no cross-chain leakage) ───
