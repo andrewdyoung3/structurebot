@@ -16,7 +16,7 @@ Canonical disulfide geometry — the windows the readouts MEASURE against (measu
 promised). Sources: standard disulfide stereochemistry (Cβ–Sγ–Sγ–Cβ ≈ ±90°; S–S ≈ 2.05 Å):
   SG–SG : 2.05 Å ideal   (bonding window 1.8–2.5 Å)
   Cβ–Cβ : 3.8 Å ideal    (window 3.0–4.5 Å)
-  Cα–Cα : ~5.5 Å typical (window 4.5–7.5 Å)
+  Cα–Cα : ~5.5 Å typical (window 4.5–7.0 Å — Disulfide-by-Design surveyed range)
   χSS   : |χ| ≈ 90° ideal (window 60–120°); the SIGN is the disulfide handedness.
 """
 from __future__ import annotations
@@ -59,11 +59,33 @@ def calc_dihedral(a1: Vec3, b1: Vec3, b2: Vec3, a2: Vec3) -> float:
     return math.degrees(math.atan2(_dot(m1, n2), _dot(n1, n2)))
 
 
+# ── CONSTANTS LITERATURE-AUDIT (2026-06-28) — pinned vs tunable (the durable split; PROJECT_CONTEXT §9) ─
+# LITERATURE-PINNED = a sourced fact; do NOT change without contradicting the primary source. TUNABLE =
+# calibration; the literature gives a range/direction, the value is a preference (tune-from-use, the
+# range is the guard).
+#   LITERATURE-PINNED:
+#     SG_SG_IDEAL 2.05 Å    — cystine S–S covalent bond length (standard disulfide stereochemistry)
+#     CHI_SS_IDEAL 90°      — χ3 (Cβ–Sγ–Sγ–Cβ) gauche ±90° preference (Dombkowski 2003, Bioinformatics 19:1852)
+#     CB_CB_IDEAL 3.8 Å     — modeled-disulfide Cβ–Cβ (Disulfide by Design)
+#     CA_CA_MAX 7.0 Å       — DbD surveyed Cα–Cα range 4.0–7.0 (Dombkowski 2003; Craig & Dombkowski 2013, BMC Bioinf 14:346)
+#     CYS_CB_SG_BOND 1.808, CB_CA_BOND 1.53 — Engh & Huber 1991 (Acta Cryst A47:392) †
+#     HEAVY_VDW{}           — Bondi 1964 van der Waals radii (J Phys Chem 68:441)
+#   TUNABLE (literature range in parens):
+#     CYS_CA_CB_SG_ANGLE 114.0 (Engh & Huber 114.4°; LEFT at 114.0 — verification showed the literal
+#       114.4 re-ranks mid-pack Mode-D candidates by up to ~0.05 because it feeds a DISCRETE clash-free
+#       rotamer selection, so the placement angle is calibration-SENSITIVE not cosmetic; not auto-changed) ;
+#     CA_CA_MIN 4.5 (DbD 4.0) ; CA_CA_SCORE_IDEAL/_SIGMA 5.5/1.0 ; CB_CB window 3.0–4.5 (DbD ≤5)/_SIGMA 0.6 ;
+#     CHI_SS window 60–120 ; CHI1_SWEEP_STEP 15° (sampling) ; SG_SG_REACH_SIGMA 0.45 ; CHI_OUT_FACTOR 0.5 ;
+#     REACH_NEUTRAL 0.5 ; CLASH_TOLERANCE 0.5 (0.4–0.5 common) ; CLASH_PENALTY 0.6 ; CB build dihedral
+#     −122.3° (empirically validated vs 112 real residues)
+#   † high-confidence STANDARD values; the audit's web search did not surface the Engh & Huber Cys row on a
+#     primary-source page — flagged (not falsely cited), confidence high.
+#
 # ── canonical disulfide windows ───────────────────────────────────────────────────────────
 
 SG_SG_IDEAL, SG_SG_MIN, SG_SG_MAX = 2.05, 1.8, 2.5
 CB_CB_IDEAL, CB_CB_MIN, CB_CB_MAX = 3.8, 3.0, 4.5
-CA_CA_IDEAL, CA_CA_MIN, CA_CA_MAX = 5.5, 4.5, 7.5
+CA_CA_IDEAL, CA_CA_MIN, CA_CA_MAX = 5.5, 4.5, 7.0
 CHI_SS_IDEAL, CHI_SS_MIN, CHI_SS_MAX = 90.0, 60.0, 120.0
 
 

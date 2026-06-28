@@ -30,6 +30,19 @@ from typing import Dict, List, Optional, Tuple
 
 from disulfide_geometry import Vec3, calc_distance, calc_dihedral
 
+# ── CONSTANTS LITERATURE-AUDIT (2026-06-28) — pinned vs tunable (the durable split; PROJECT_CONTEXT §9) ─
+#   LITERATURE-PINNED (a sourced fact — do NOT change without contradicting the source):
+#     PHI_IDEAL −63°        — proline φ = −63±15° (MacArthur & Thornton 1991, JMB 218:397)
+#     HB_ENERGY_CUTOFF −0.5 — DSSP H-bond threshold, VERBATIM (Kabsch & Sander 1983, Biopolymers 22:2577)
+#     HB_Q1Q2_F 0.084·332   — DSSP electrostatic prefactor (q = −0.42/+0.20), VERBATIM (Kabsch & Sander 1983)
+#     HB_N_H_BOND 1.01 Å    — amide N–H length (DSSP) ; HB_MIN_SEQ_SEP 2 — DSSP i±1 convention
+#     ψ bimodal minima ≈ −55° / +145° — the depleted band BETWEEN is the soft veto (MacArthur & Thornton 1991)
+#   TUNABLE (literature range/bound in parens — tune from use):
+#     PHI_SIGMA 18 (lit spread ±15° — 15 is the literal lower bound; 18 a defensible σ, LEFT per audit gate) ;
+#     PSI_FORBIDDEN_CENTER 65 / _HALFWIDTH 45 / PSI_PENALTY 0.5 (band matches the depleted region; depth calibration) ;
+#     HBOND_PENALTY 0.3 (mechanism pinned — Pro can't donate N–H···O; magnitude tunable) ;
+#     HB_NEIGHBOR_CUTOFF 5.5 (lossless prefilter) ; SCAN_MIN_SCORE 0.05
+#
 # ── tunable scoring constants (STARTING POINTS — tune from use, like the disulfide constants) ─────
 PHI_IDEAL = -63.0          # proline's ring-locked backbone φ (deg)
 PHI_SIGMA = 18.0           # Gaussian width on φ (deg) — φ is the DOMINANT discriminator

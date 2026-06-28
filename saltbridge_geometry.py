@@ -52,6 +52,22 @@ from typing import Dict, List, Optional, Tuple
 from disulfide_geometry import (Vec3, ClashGrid, build_cb, calc_distance,
                                 place_from_internal)
 
+# ── CONSTANTS LITERATURE-AUDIT (2026-06-28) — pinned vs tunable (the durable split; PROJECT_CONTEXT §9) ─
+#   LITERATURE-PINNED (a sourced fact — do NOT change without contradicting the source):
+#     SB_DIST_CUTOFF 4.0 Å  — closest carboxyl-O↔basic-N salt-bridge cutoff (Barlow & Thornton 1983,
+#                             JMB 168:867; Kumar & Nussinov 1999/2002)
+#     SB_DIST_IDEAL 2.8 Å   — ion-pair / H-bond O···N separation
+#     SB_HBOND_DIST 3.5 Å   — donor–acceptor heavy-atom H-bond cutoff (standard)
+#     NEG_ATOMS/POS_ATOMS   — charged groups: Asp Oδ, Glu Oε, Arg Nε/Nη, Lys Nζ (Barlow & Thornton / Kumar & Nussinov)
+#   TUNABLE (literature range/note in parens — tune from use):
+#     SB_DIST_SHOULDER 5.0 (long-range ion pair quoted to ~6 Å) ; SB_DIST_MIN 2.2 (O···N steric ~2.2–2.4) ;
+#     SB_BURIED_SASA 20 / SB_SURFACE_SASA 40 (burial cutoffs, calibration) ; SB_BURIAL_SURFACE_WEIGHT 0.5
+#     (DIRECTION pinned — surface bridges marginal/destabilizing via desolvation, Hendsch & Tidor 1994,
+#     Protein Sci 3:211; magnitude tunable) ; SB_CB_REACH D2.5/E3.9/K4.5/R5.5 (representative Cβ→group reach
+#     approximations, χ2.. folded in — NOT measured; K=4.5 short vs extended Lys Cβ–Nζ ≈6.4, longer=more
+#     permissive) ; SB_CBCB_SIGMA 2.2 ; SB_GEOM_AT_CUTOFF 0.6 ; SB_NOVEL_MIN_SCORE 0.6 ;
+#     SALTBRIDGE_CLASH_PENALTY 0.6 ; SB_MIN_SCORE 0.05
+#
 # ── charged-group atoms (salvaged from the legacy salt_bridge_bridge; His kept as data only) ──────
 # Acidic carboxylate oxygens / basic side-chain nitrogens — the Barlow&Thornton / Kumar&Nussinov
 # heavy atoms the closest-pair distance is measured between. Arg includes Nε (part of the

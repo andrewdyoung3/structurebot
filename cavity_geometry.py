@@ -49,6 +49,18 @@ from disulfide_geometry import (
     Vec3, calc_distance, place_from_internal, build_cb, ClashGrid, HEAVY_VDW, parse_heavy_atoms,
 )
 
+# ── CONSTANTS LITERATURE-AUDIT (2026-06-28) — pinned vs tunable (the durable split; PROJECT_CONTEXT §9) ─
+#   LITERATURE-PINNED (a sourced fact — do NOT change without contradicting the source):
+#     PROBE_RADIUS 1.4 Å    — water-probe convention (VOIDOO: Kleywegt & Jones 1994, Acta Cryst D50:178; CASTp)
+#     MIN_VOLUME 20 Å³      — sub-~20 Å³ voids destabilize regardless (Machicado et al. 2006, JMB) ≈ one methyl
+#     _CC_BOND 1.52 Å / _CC_ANGLE 110.5° — standard sp³ C–C (Engh & Huber 1991)
+#   TUNABLE (literature range/note in parens — tune from use):
+#     GRID_SPACING 0.5 (VOIDOO ~0.33; coarser for plain-Python speed) ; LINING_RADIUS 4.5 ; OVERFILL_PENALTY
+#     0.6 ; VOLUME_GAIN_CAP 50 ; CHI1_STEP 20° / CHI2_SET (sampling) ; _SC_VOLUME{} / _VOLUME_MUTATIONS{}
+#     (Zamyatnin 1972 / Richards 1974 side-chain volumes — used RELATIVELY, absolute calibration NOT load-
+#     bearing ‡ ; the enlargement map is a conservative curation policy)
+#   ‡ the specific _SC_VOLUME values are standard but were not linked to a primary-source page (flagged).
+#
 # ── tunable scoring constants (STARTING POINTS — tune from use, like the disulfide/proline ones) ──
 PROBE_RADIUS = 1.4          # rolling-probe radius (Å) — the classic water probe (VOIDOO/CASTp). A
                             # void must admit a probe CENTRE this size to seed (smaller interstitial
