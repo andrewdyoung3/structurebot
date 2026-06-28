@@ -53,7 +53,7 @@ def test_chi_ss_sign_is_handedness():
 
 # ── canonical-window acceptance / rejection ──────────────────────────────────────────
 def _ideal_pair():
-    # SG–SG ≈ 2.05 (in 1.8–2.5), Cβ–Cβ ≈ 3.8 (in 3.0–4.5), Cα–Cα ≈ 5.5 (in 4.5–7.5),
+    # SG–SG ≈ 2.05 (in 1.8–2.5), Cβ–Cβ ≈ 3.8 (in 3.0–4.5), Cα–Cα ≈ 5.5 (in 4.5–7.0),
     # χSS ≈ +90° (in 60–120). Built along axes so each distance is exact.
     a = {"CA": (0.0, 0.0, 0.0),  "CB": (0.0, 1.5, 0.0),  "SG": (0.0, 2.5, 0.0)}
     b = {"CA": (5.5, 0.0, 0.0),  "CB": (3.8, 1.5, 0.0),  "SG": (2.05, 2.5, 0.0)}
@@ -65,6 +65,19 @@ def test_ideal_disulfide_accepted_all_windows():
     assert pg["sg_sg"] == 2.05 and pg["bonding_compatible"] is True
     assert pg["windows"]["sg_sg"] is True and pg["windows"]["cb_cb"] is True
     assert pg["windows"]["ca_ca"] is True
+
+
+def test_ca_ca_7p2_is_out_of_window_after_audit():
+    # INTENDED CHANGE (constants-literature-audit 2026-06-28): CA_CA_MAX 7.5 → 7.0 (Disulfide-by-Design
+    # surveyed Cα–Cα range 4.0–7.0; Dombkowski 2003 / Craig & Dombkowski 2013). A pair at Cα–Cα = 7.2 Å
+    # (was IN the old 4.5–7.5 window) now reads OUT-of-window in the Mode-A/B membership READOUT. This is
+    # display-only — the Mode-D ranking Gaussian (σ=1.0) is unchanged. NOT a regression.
+    a = {"CA": (0.0, 0.0, 0.0), "CB": (0.0, 1.5, 0.0), "SG": (0.0, 2.5, 0.0)}
+    b = {"CA": (7.2, 0.0, 0.0), "CB": (5.5, 1.5, 0.0), "SG": (3.75, 2.5, 0.0)}
+    pg = g.pair_geometry(a, b)
+    assert pg["ca_ca"] == 7.2
+    assert pg["windows"]["ca_ca"] is False        # 7.2 > CA_CA_MAX (7.0) — the intended audit change
+    assert g.CA_CA_MAX == 7.0
 
 
 def test_far_apart_pair_rejected():
