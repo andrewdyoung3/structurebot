@@ -1511,9 +1511,15 @@ class DesignBasketPanel(QtWidgets.QWidget):
     (keep-and-clear). Each entry = ``{cls, label, score, subs:[{chain,position,from_aa,to_aa}],
     metrics_text}`` — a substitution targets 1+ positions (proline → one→Pro; disulfide → two→Cys)."""
 
-    def __init__(self, *, on_enact=None):
+    def __init__(self, *, on_enact=None, on_chain_equiv=None):
         super().__init__()
         self._on_enact = on_enact                  # (entries) -> compose a variant via the existing path
+        # (chain id) -> [all fold-chain ids sharing that chain's ChainDesign]. Homo-oligomer copies
+        # collapse onto ONE cd (an edit applies to ALL copies — identical sequence), so conflict /
+        # dedupe MUST key by cd-equivalence, not raw chain: two picks at the same resnum on equivalent
+        # copies are the SAME residue. None → no resolver wired (independent testability) → raw-chain
+        # behaviour. Drives both the conflict key and the "applies to A, B" display.
+        self._chain_equiv = on_chain_equiv
         self.entries: List[dict] = []
         outer = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
@@ -1549,10 +1555,21 @@ class DesignBasketPanel(QtWidgets.QWidget):
         row.addWidget(self._enact_btn)
         outer.addLayout(row)
 
+    def _group_key(self, chain):
+        """Cd-EQUIVALENCE key for a chain — homo-oligomer copies share one ChainDesign, so a pick on
+        any copy applies to all → they key TOGETHER for conflict + dedupe (a pick on A and a pick on
+        its equivalent copy B at the same resnum are the SAME residue, not two). Falls back to the raw
+        chain id when no resolver is wired or the chain is unresolved (each its own group)."""
+        if self._chain_equiv is None:
+            return chain
+        return frozenset(self._chain_equiv(chain))
+
     def add_entry(self, entry: dict) -> None:
-        """Stage one strategy pick. Idempotent-ish: an IDENTICAL entry (same subs) is not duplicated."""
-        sig = tuple((s["chain"], s["position"], s["to_aa"]) for s in entry.get("subs", []))
-        if any(tuple((s["chain"], s["position"], s["to_aa"]) for s in e.get("subs", [])) == sig
+        """Stage one strategy pick. Idempotent-ish: an entry whose subs match an existing entry's by
+        (cd-equivalence, position, to_aa) is not duplicated — so the SAME substitution staged on two
+        equivalent homo-oligomer copies (A:35→W and B:35→W) collapses to ONE entry."""
+        sig = tuple((self._group_key(s["chain"]), s["position"], s["to_aa"]) for s in entry.get("subs", []))
+        if any(tuple((self._group_key(s["chain"]), s["position"], s["to_aa"]) for s in e.get("subs", [])) == sig
                for e in self.entries):
             return
         self.entries.append(entry)
@@ -1569,17 +1586,25 @@ class DesignBasketPanel(QtWidgets.QWidget):
             self._on_enact(list(self.entries))
 
     def _conflicts(self) -> List[str]:
-        """(chain, position) targeted by 2+ entries with DIFFERENT substitutions — you can't make one
-        residue two things. CERTAIN conflicts only (no spatial-proximity / interference prediction —
-        that's the designer's call + the re-fold; the fold reveals combination effects honestly)."""
-        seen: Dict[tuple, str] = {}
+        """A (cd-equivalence, position) targeted by 2+ entries with DIFFERENT substitutions — you can't
+        make one residue two things. Keys by cd-EQUIVALENCE not raw chain (via `_group_key`), so a pick
+        at the same resnum on equivalent homo-oligomer copies (A:35→W vs B:35→Y) is caught — they map
+        to ONE shared template column at enact, where the second would silently overwrite the first.
+        CERTAIN conflicts only (no spatial-proximity / interference prediction — that's the designer's
+        call + the re-fold; the fold reveals combination effects honestly)."""
+        seen: Dict[tuple, Tuple[str, object]] = {}     # (group_key, pos) -> (to_aa, originating chain)
         clashes: List[str] = []
         for e in self.entries:
             for s in e.get("subs", []):
-                key = (s["chain"], s["position"])
-                if key in seen and seen[key] != s["to_aa"]:
-                    clashes.append(f"{s['chain']}:{s['position']} (→{seen[key]} and →{s['to_aa']})")
-                seen.setdefault(key, s["to_aa"])
+                key = (self._group_key(s["chain"]), s["position"])
+                cur = seen.get(key)
+                if cur is not None and cur[0] != s["to_aa"]:
+                    if str(cur[1]) == str(s["chain"]):
+                        clashes.append(f"{s['chain']}:{s['position']} (→{cur[0]} and →{s['to_aa']})")
+                    else:                              # equivalent copies (same cd) — name BOTH chains
+                        clashes.append(f"{cur[1]}/{s['chain']} are equivalent copies — "
+                                       f":{s['position']} (→{cur[0]} and →{s['to_aa']})")
+                seen.setdefault(key, (s["to_aa"], s["chain"]))
         return sorted(set(clashes))
 
     def _refresh(self) -> None:
@@ -1587,7 +1612,19 @@ class DesignBasketPanel(QtWidgets.QWidget):
         self._list.setRowCount(n)
         for i, e in enumerate(self.entries):
             sub_s = ", ".join(f"{s['from_aa']}{s['position']}{s['to_aa']}" for s in e["subs"])
-            for j, v in enumerate([e["cls"], sub_s, f"{e.get('score', 0):.2f}", e.get("metrics_text", "")]):
+            # Fix 2: when a pick targets a chain whose cd is SHARED by other copies, surface every
+            # chain the substitution will apply to ("applies to A, B") — a direct consequence of the
+            # cd-equivalence rule (homo-oligomer copies are one design), so the designer isn't misled
+            # into thinking a homo pick is chain-specific. Display-only (entry data unchanged).
+            applies = set()
+            for s in e["subs"]:
+                eq = self._chain_equiv(s["chain"]) if self._chain_equiv else [s["chain"]]
+                if len(eq) > 1:
+                    applies.update(str(c) for c in eq)
+            detail = e.get("metrics_text", "")
+            if applies:
+                detail = f"applies to {', '.join(sorted(applies))} · " + detail
+            for j, v in enumerate([e["cls"], sub_s, f"{e.get('score', 0):.2f}", detail]):
                 self._list.setItem(i, j, QtWidgets.QTableWidgetItem(v))
         self._list.resizeColumnsToContents()
         has = n > 0
@@ -1597,7 +1634,8 @@ class DesignBasketPanel(QtWidgets.QWidget):
         self._clear_btn.setEnabled(has)
         conflicts = self._conflicts()
         if conflicts:
-            self._conflict.setText("⚠ Same-residue conflict — two picks target the same position: "
+            self._conflict.setText("⚠ Same-residue conflict — two picks target the same residue "
+                                   "(equivalent homo-oligomer copies count as one): "
                                    + "; ".join(conflicts) + ". Remove one before enacting "
                                    "(one residue can't be two substitutions).")
         self._conflict.setVisible(bool(conflicts))
@@ -2065,7 +2103,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
             on_add_to_basket=self._add_saltbridge_to_basket)
         # The CROSS-STRATEGY design basket — the framework centerpiece (gui_app docks it on the right).
-        self.design_basket = DesignBasketPanel(on_enact=self._enact_basket)
+        self.design_basket = DesignBasketPanel(on_enact=self._enact_basket,
+                                               on_chain_equiv=self._chain_equiv)
 
     def attach_session(self, session) -> None:
         """Re-point the panel at a different SessionState — used on session RESTORE, where the
@@ -4647,17 +4686,36 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if not by_cd:
             self._status.setText("Enact failed — the basket's chains aren't on the active design.")
             return
+        # BACKSTOP (Fix 1b): two subs grouped onto the SAME cd at the SAME resnum but with DIFFERENT
+        # target residues would silently overwrite (edit_variant dedups v.mutations by resnum) — the
+        # homo-collapse loss. The basket conflict-check blocks this upstream; this is the defensive net
+        # for any caller that reaches enact without it (programmatic basket construction, future seams).
+        # Refuse the WHOLE enact rather than compose a half-built, last-write-wins variant.
+        for tcd, subs in by_cd.values():
+            want: Dict[int, str] = {}
+            for s in subs:
+                pos, aa = int(s["position"]), s["to_aa"]
+                if want.get(pos, aa) != aa:
+                    self._status.setText(
+                        f"Enact blocked — conflicting substitutions at {tcd.rep_chain}:{pos} "
+                        f"(→{want[pos]} and →{aa}) on one chain-design (equivalent copies are one "
+                        f"residue). Resolve the basket conflict first.")
+                    return
+                want[pos] = aa
         made: List[tuple] = []                        # (cd, vid, n_applied)
         for tcd, subs in by_cd.values():
             vid = self._design.new_variant_id()
             tcd.add_variant(vid)
+            seen_pos: set = set()
             n = 0
             for s in subs:
                 col = self._col_for_resnum(tcd, s["position"])
                 if col is None:
                     continue
                 tcd.edit_variant(vid, col, s["to_aa"])
-                n += 1
+                if int(s["position"]) not in seen_pos:    # count distinct residues (a homo dup → one)
+                    seen_pos.add(int(s["position"]))
+                    n += 1
             made.append((tcd, vid, n))
         made.sort(key=lambda m: -m[2])                # refresh on the most-substituted cd's new variant
         primary_cd, primary_vid, _ = made[0]
@@ -5234,6 +5292,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             for (_mdl, ch) in cd.members:
                 m[str(ch)] = cd
         return m
+
+    def _chain_equiv(self, chain) -> List[str]:
+        """All fold-chain ids that resolve to the SAME ChainDesign as *chain* — the homo-oligomer
+        copies that share one cd (an edit applies to ALL: identical sequence). `[chain]` when the
+        chain is unresolved / there's no design (each its own equivalence class). The design basket
+        consumes this to (a) key conflict + dedupe by cd-equivalence rather than raw chain, and (b)
+        surface 'applies to: A, B' on a homo pick."""
+        cd = self._chain_to_cd().get(str(chain))
+        if cd is None:
+            return [str(chain)]
+        return [str(ch) for (_m, ch) in cd.members] or [str(chain)]
 
     def build_disulfide_introduce_spec(self, pairs, engine: str = "boltz") -> Optional[dict]:
         """MODE C (introduce) — declare ONE OR MORE disulfide bonds between positions that are NOT
