@@ -593,9 +593,10 @@ def test_normalize_assembly_emits_changechains_and_combine():
         _chimerax_result("model id #1 ...\nmodel id #2 ...\nmodel id #3 ..."),  # info models (after)
         _chimerax_result(""),                               # hide #2 models
     ]
-    flat_id, final = router._normalize_assembly_to_flat_model("2", "2omf assembly 1")
+    flat_id, final, note = router._normalize_assembly_to_flat_model("2", "2omf assembly 1")
     assert flat_id == "3"
     assert final == ["A", "B", "C"]
+    assert note is None                                 # success → no error note
     cmds = [c[0][0] for c in router.bridge.run_command.call_args_list]
     assert "changechains #2.2/A B" in cmds and "changechains #2.3/A C" in cmds
     assert any(c.startswith("combine #2 ") and "retainIds true" in c for c in cmds)
@@ -607,10 +608,51 @@ def test_normalize_assembly_flat_input_is_noop():
     router.bridge.run_command.side_effect = [
         _chimerax_result("chain id #2/A chain_id A"),       # info chains #2 (already flat)
     ]
-    flat_id, final = router._normalize_assembly_to_flat_model("2", "x")
-    assert flat_id is None and final is None
+    flat_id, final, note = router._normalize_assembly_to_flat_model("2", "x")
+    assert flat_id is None and final is None and note is None    # no-op (already flat) → not an error
     cmds = [c[0][0] for c in router.bridge.run_command.call_args_list]
     assert not any("changechains" in c or c.startswith("combine") for c in cmds)
+
+
+def test_normalize_assembly_failure_returns_reason():
+    """A normalization that runs but yields no new combined model returns a non-None reason
+    (so the fallback is never silent)."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.bridge.run_command.side_effect = [
+        _chimerax_result("chain id #2.1/A chain_id A\n"
+                         "chain id #2.2/A chain_id A"),     # info chains #2 (submodels present)
+        _chimerax_result("changed"),                        # changechains #2.2/A B
+        _chimerax_result("model id #1\nmodel id #2"),       # info models (before)
+        _chimerax_result("combine failed"),                 # combine
+        _chimerax_result("model id #1\nmodel id #2"),       # info models (after) — NO new id
+    ]
+    flat_id, final, note = router._normalize_assembly_to_flat_model("2", "x")
+    assert flat_id is None and note and "combine produced no new model" in note
+
+
+def test_run_bio_assembly_surfaces_normalization_failure_in_summary():
+    """When normalization is attempted but fails, _run_bio_assembly records the reason and surfaces
+    a clear warning in the summary — never a silent fallback that looks like a pre-Fix-A build."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.session.get_structure.return_value = {"name": "2OMF"}
+    router.session.get_assembly_info.return_value = None
+    router.bridge.run_command.side_effect = [
+        _chimerax_result("Made 3 copies for 2omf assembly 1"),                 # sym
+        _chimerax_result('model id #1 type AtomicStructure name 2omf\n'
+                         'model id #2 type Model name "2omf assembly 1"'),     # info models (parse)
+        _chimerax_result("chain id #2.1/A chain_id A\n"
+                         "chain id #2.2/A chain_id A"),                        # info chains #2
+        _chimerax_result("changed"),                                          # changechains
+        _chimerax_result("model id #1\nmodel id #2"),                         # info models before
+        _chimerax_result("combine failed"),                                   # combine
+        _chimerax_result("model id #1\nmodel id #2"),                         # info models after (no new id)
+    ]
+    result = router._run_bio_assembly({"model_id": "1", "assembly_id": 1})
+    assert result.success                                  # assembly still generated (fail-soft)
+    _, rec = router.session.set_generated_assembly.call_args[0]
+    assert rec["normalized"] is False
+    assert rec["normalize_error"] and "combine produced no new model" in rec["normalize_error"]
+    assert "chain-id normalization failed" in result.summary    # surfaced, not silent
 
 
 def test_run_bio_assembly_normalizes_and_records_flat_model():

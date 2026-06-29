@@ -4565,16 +4565,19 @@ class ToolRouter:
         unique chain ids via `changechains`, then `combine … retainIds true` into ONE integer-id
         AtomicStructure that ingestion + native commands handle correctly.
 
-        Returns ``(flat_model_id, final_chains)`` or ``(None, None)`` when there's nothing to
-        normalize (already flat) or the step fails — the caller then falls back to the submodel
-        group. Best-effort: never raises (a failed normalization must not break assembly generation).
-        The submodel group is hidden so only the flat assembly shows; the AU is handled by the caller.
+        Returns ``(flat_model_id, final_chains, note)``: on success ``(id, [chains], None)``; when
+        there's nothing to normalize (already flat) ``(None, None, None)``; on FAILURE
+        ``(None, None, "<reason>")`` — the caller falls back to the submodel group AND surfaces the
+        reason (never a SILENT fallback: a swallowed failure would look identical to the pre-Fix-A
+        symptom, so the reason must reach the summary to be diagnosable). Best-effort: never raises
+        (a failed normalization must not break assembly generation). The submodel group is hidden so
+        only the flat assembly shows; the AU is handled by the caller.
         """
         try:
             submodel_chains = _parse_submodel_chains(
                 self._cx_value(f"info chains #{group_model_id}"), group_model_id)
             if not submodel_chains:
-                return None, None                       # not submodel-addressed → already flat
+                return None, None, None                 # not submodel-addressed → already flat (no-op)
             renames, final_chains = plan_assembly_chain_renames(submodel_chains)
             for sub, old, new in renames:               # only collisions are renamed (uniques kept)
                 self.bridge.run_command(f"changechains #{sub}/{old} {new}")
@@ -4583,12 +4586,12 @@ class ToolRouter:
             after = {int(i) for i in _INT_MODEL_RE.findall(self._cx_value("info models"))}
             new_ids = sorted(after - before)
             if not new_ids:
-                return None, None
+                return None, None, "combine produced no new model id"
             flat_id = str(new_ids[-1])
             self.bridge.run_command(f"hide #{group_model_id} models")   # show only the flat assembly
-            return flat_id, final_chains
-        except Exception:
-            return None, None
+            return flat_id, final_chains, None
+        except Exception as exc:
+            return None, None, f"{type(exc).__name__}: {exc}"
 
     def _run_bio_assembly(
         self,
@@ -4691,11 +4694,11 @@ class ToolRouter:
         # AND StructureBot's ingestion (which only parses integer `#N/chain` addressing) enumerates
         # every copy as its own chain. Best-effort: falls back to the submodel group on any failure.
         group_model_id = assembly_model_id
-        flat_model_id, final_chains = (None, None)
+        flat_model_id, final_chains, normalize_note = (None, None, None)
         if assembly_model_id:
             struct_info0 = self.session.get_structure(model_id)
             base_name = ((struct_info0.get("name") if struct_info0 else None) or "assembly")
-            flat_model_id, final_chains = self._normalize_assembly_to_flat_model(
+            flat_model_id, final_chains, normalize_note = self._normalize_assembly_to_flat_model(
                 assembly_model_id, f"{base_name} assembly {assembly_id}")
         # downstream (ingestion, interface scan) addresses the FLAT model when normalization ran
         if flat_model_id:
@@ -4733,6 +4736,7 @@ class ToolRouter:
             "group_model_id":    group_model_id,
             "normalized":        bool(flat_model_id),
             "assembly_chains":   list(final_chains) if final_chains else None,
+            "normalize_error":   normalize_note,        # non-None only when normalization was ATTEMPTED and FAILED
             "assembly_id":       assembly_id,
             "assembly_type":     asm_type,
             "n_subunits":        n_subunits,
@@ -4753,6 +4757,13 @@ class ToolRouter:
             + (" (flat, unique chain ids)" if flat_model_id else "")
             + f" ({copies_note}); AU #{model_id} kept and hidden"
         )
+        # NEVER a silent fallback: if normalization was attempted but FAILED, the copies keep
+        # duplicate chain ids (the pre-Fix-A symptom). Surface the reason so it's diagnosable rather
+        # than looking identical to an un-fixed build.
+        if normalize_note:
+            summary += (f"  ⚠ chain-id normalization failed ({normalize_note}) — copies keep "
+                        f"DUPLICATE ids on submodel group #{group_model_id}; color-by-chain and "
+                        f"per-copy ops will NOT distinguish them.")
 
         elapsed_ms = (_time.perf_counter() - t0) * 1000
         return ToolStepResult(
