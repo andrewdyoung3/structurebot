@@ -448,3 +448,162 @@ def test_boltz_available_swallows_errors(monkeypatch):
     monkeypatch.setattr(boltz_bridge.BoltzBridge, "is_available",
                         lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
     assert boltz_available() is False
+
+
+# ── Pre-flight GPU guards: VRAM/size + concurrency (the fail-loud-before-thrash gate) ────
+#
+# Measured on the RTX 5070 Ti Laptop (12 GB): peak VRAM ≈ 3447 + 0.010336·N² MiB. Anchors
+# (N→peak MiB): 80→3411, 300→4554, 500→5942, 700→8526; 900→11693 (at the ceiling — thrashed);
+# 1084→~15 GB predicted (thrashed). The guard reads ACTUAL free VRAM and refuses BEFORE launch.
+
+class TestVramCurve:
+    def test_curve_matches_swept_anchors(self):
+        b = _bridge()
+        # the fitted curve reproduces the measured fitting points within the fit residual (~200 MiB)
+        for n, measured in [(80, 3411), (300, 4554), (500, 5942), (700, 8526)]:
+            assert abs(b.estimated_vram_mib(n) - measured) <= 250, (n, b.estimated_vram_mib(n))
+
+    def test_curve_is_quadratic_and_monotonic(self):
+        b = _bridge()
+        assert b.estimated_vram_mib(1084) > b.estimated_vram_mib(900) > b.estimated_vram_mib(700)
+        # 1084 res predicts well past a 12 GB GPU (≈15 GB) — the doomed fold
+        assert b.estimated_vram_mib(1084) > 14000
+
+    def test_total_residues_sums_all_chains(self):
+        b = _bridge()
+        assert b._total_residues([{"sequence": "M" * 503}, {"sequence": "M" * 581}]) == 1084
+
+
+class TestSizeGuard:
+    def _b(self, *, free, running=()):
+        b = _bridge()
+        b._gpu_guard = True
+        b._free_vram_mib = lambda: free            # inject GPU state (no real nvidia-smi)
+        b._running_fold_pids = lambda: list(running)
+        return b
+
+    def test_refuses_1084_on_12gb_before_any_subprocess(self):
+        # the doomed fold: 503+581 needs ~15 GB; 11.4 GB free → refuse, NO fold subprocess
+        b = self._b(free=11400)
+        res = b.predict([{"id": "A", "sequence": "M" * 503}, {"id": "B", "sequence": "M" * 581}])
+        assert res["success"] is False
+        err = res["error"]
+        assert "1084-residue" in err and "GB VRAM" in err and "too large to fold safely" in err
+        b._wsl.run_command.assert_not_called()      # THE gate: fail loud BEFORE launch (no thrash)
+
+    def test_approves_monomer_on_free_gpu(self):
+        # 80-res monomer needs ~3.4 GB; 11.4 GB free → cleared, the fold subprocess IS launched
+        b = self._b(free=11400)
+        b._wsl.run_command = MagicMock(return_value={"ok": False, "error": "stop after launch"})
+        res = b.predict([{"id": "A", "sequence": "M" * 80}])
+        assert res["success"] is False             # our mock stops it, but the point is it LAUNCHED
+        assert b._wsl.run_command.called
+        assert "too large" not in (res["error"] or "")
+
+    def test_margin_refuses_a_fold_that_would_fit_bare_but_not_with_buffer(self):
+        # 700 res needs ~8.5 GB. With only 9 GB free, 8.5 + 2 GB margin > 9 → refuse (the noisy-
+        # free-VRAM lesson: a fold that fits at 11 GB free thrashes at 9 GB).
+        b = self._b(free=9000)
+        res = b.predict([{"id": "A", "sequence": "M" * 700}])
+        assert res["success"] is False and "too large to fold safely" in res["error"]
+        b._wsl.run_command.assert_not_called()
+
+    def test_unknown_free_vram_does_not_block(self):
+        # can't probe VRAM → size guard SKIPPED (don't block on a probe failure)
+        b = self._b(free=None)
+        b._wsl.run_command = MagicMock(return_value={"ok": False, "error": "stop after launch"})
+        res = b.predict([{"id": "A", "sequence": "M" * 1084}])
+        assert b._wsl.run_command.called           # launched despite size (couldn't assess)
+
+    def test_guard_disabled_via_config_allows_oversize(self):
+        b = self._b(free=11400)
+        b._gpu_guard = False                       # BOLTZ_GPU_GUARD=off escape hatch
+        b._wsl.run_command = MagicMock(return_value={"ok": False, "error": "stop after launch"})
+        res = b.predict([{"id": "A", "sequence": "M" * 1084}])
+        assert b._wsl.run_command.called           # guard off → oversize fold launches
+
+
+class TestConcurrencyGuard:
+    def _b(self, *, free, running):
+        b = _bridge()
+        b._gpu_guard = True
+        b._free_vram_mib = lambda: free
+        b._running_fold_pids = lambda: list(running)
+        return b
+
+    def test_refuses_second_fold_while_one_runs_with_specific_message(self):
+        # another fold holds the GPU → refuse with the BUSY message (distinct from the size one),
+        # NO second subprocess — even for a small fold that would otherwise fit
+        b = self._b(free=400, running=["12345"])
+        res = b.predict([{"id": "A", "sequence": "M" * 80}])
+        assert res["success"] is False
+        err = res["error"]
+        assert "Another Boltz fold is already using the GPU" in err
+        assert "too large" not in err              # specific 'busy', not misattributed to size
+        b._wsl.run_command.assert_not_called()
+
+    def test_concurrency_checked_before_size(self):
+        # a busy GPU leaves low free VRAM; the message must say BUSY, not "too big"
+        b = self._b(free=300, running=["999"])
+        res = b.predict([{"id": "A", "sequence": "M" * 1084}])
+        assert "Another Boltz fold" in res["error"] and "too large" not in res["error"]
+
+
+class TestGpuFaultMessage:
+    def test_detects_illegal_access_and_oom(self):
+        b = _bridge()
+        assert b._is_gpu_memory_fault("torch.AcceleratorError: CUDA error: an illegal memory access")
+        assert b._is_gpu_memory_fault("RuntimeError: CUDA out of memory. Tried to allocate ...")
+        assert not b._is_gpu_memory_fault("ValueError: Template chain A is not one of the chains")
+
+    def test_run_failure_translates_cuda_fault(self):
+        # a CUDA illegal-access crash → the informative cause+size message, NOT the raw torch line
+        b = _bridge()
+        b._free_vram_mib = lambda: 510
+        r = {"ok": False, "returncode": 1, "stdout": "",
+             "stderr": "torch.AcceleratorError: CUDA error: an illegal memory access was encountered\n",
+             "error": "Command exited 1"}
+        msg = b._run_failure_message(r, [{"id": "A", "sequence": "M" * 1084}], budget=9000)
+        assert "GPU memory fault on the 1084-residue fold" in msg
+        assert "0.5 GB free" in msg and "another fold" in msg.lower()
+        assert "AcceleratorError" not in msg        # the raw torch line is NOT leaked
+
+    def test_predict_surfaces_gpu_fault_message_on_crash(self):
+        # end-to-end through predict: a CUDA fault from the (guard-cleared) fold is translated
+        b = _bridge()
+        b._gpu_guard = False                        # let it reach the fold to simulate the crash
+        b._free_vram_mib = lambda: 480
+        b._wsl.run_command = MagicMock(return_value={
+            "ok": False, "returncode": 1, "stdout": "",
+            "stderr": "torch.AcceleratorError: CUDA error: an illegal memory access was encountered",
+            "error": "Command exited 1"})
+        res = b.predict([{"id": "A", "sequence": "M" * 1084}])
+        assert res["success"] is False
+        assert "GPU memory fault" in res["error"] and "1084-residue" in res["error"]
+
+
+class TestVramProbeParsing:
+    def test_free_vram_parses_nvidia_smi(self):
+        b = _bridge()
+        b._wsl.run_command = MagicMock(return_value={"ok": True, "stdout": "11385\n", "stderr": ""})
+        assert b._free_vram_mib() == 11385
+
+    def test_free_vram_none_on_probe_failure(self):
+        b = _bridge()
+        b._wsl.run_command = MagicMock(return_value={"ok": False, "stdout": "", "stderr": "no smi"})
+        assert b._free_vram_mib() is None
+
+    def test_free_vram_none_on_exception(self):
+        b = _bridge()
+        b._wsl.run_command = MagicMock(side_effect=RuntimeError("wsl down"))
+        assert b._free_vram_mib() is None           # degrades gracefully (never raises)
+
+    def test_running_fold_pids_parses_pgrep(self):
+        b = _bridge()
+        b._wsl.run_command = MagicMock(return_value={"ok": True, "stdout": "321\n494\n", "stderr": ""})
+        assert b._running_fold_pids() == ["321", "494"]
+
+    def test_running_fold_pids_empty_when_none(self):
+        b = _bridge()
+        b._wsl.run_command = MagicMock(return_value={"ok": True, "stdout": "", "stderr": ""})
+        assert b._running_fold_pids() == []

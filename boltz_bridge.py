@@ -73,6 +73,11 @@ class BoltzBridge:
         self._timeout_scale    = float(getattr(_cfg, "BOLTZ_TIMEOUT_SCALE", 0.012))
         self._timeout_floor    = int(getattr(_cfg, "BOLTZ_TIMEOUT_FLOOR", 1800))
         self._timeout_cap      = int(getattr(_cfg, "BOLTZ_TIMEOUT_CAP", 21600))
+        # Pre-fold GPU guards (VRAM/size + concurrency). The VRAM curve is measured (see config).
+        self._gpu_guard      = bool(getattr(_cfg, "BOLTZ_GPU_GUARD", True))
+        self._vram_base_mib  = float(getattr(_cfg, "BOLTZ_VRAM_BASE_MIB", 3447.0))
+        self._vram_per_n2    = float(getattr(_cfg, "BOLTZ_VRAM_PER_N2_MIB", 0.010336))
+        self._vram_margin_mib = int(getattr(_cfg, "BOLTZ_VRAM_MARGIN_MIB", 2048))
         from wsl_bridge import WSLBridge
         self._wsl = WSLBridge(distribution=self._distro)
 
@@ -150,10 +155,21 @@ class BoltzBridge:
                f"--sampling_steps {self._sampling} --diffusion_samples {self._samples}")
 
         # FAIL-CLOSED LOCAL-ONLY guard — refuse to run if the breach surface is present.
+        # (Runs FIRST — before even the read-only GPU probes — so a breaching request touches
+        # no WSL subprocess at all.)
         try:
             self._assert_local_only(cmd, yaml_text, allow_remote)
         except _RemoteBreach as exc:
             return self._err(label, f"LOCAL-ONLY breach refused: {exc}")
+
+        # PRE-FLIGHT GPU GUARDS — refuse a fold that can't fit this GPU's free VRAM, or one
+        # launched onto a GPU another fold already holds, BEFORE the (expensive) fold subprocess:
+        # fail LOUD in seconds with an honest message instead of thrashing for hours (the silent
+        # VRAM-overcommit death). Cleans up the staged workspace on refusal (no orphan temp dir).
+        guard = self._preflight_gpu_guard(chains, label)
+        if guard is not None:
+            shutil.rmtree(work, ignore_errors=True)
+            return guard
 
         budget = self._resolve_timeout(chains, timeout)
         r = wsl.run_command(cmd, timeout=budget)
@@ -165,6 +181,9 @@ class BoltzBridge:
             # Boltz can raise a per-input exception (e.g. a template parse KeyError/ValueError) yet
             # still EXIT 0 — so r.ok is True but no model is written. Surface the SWALLOWED error
             # from the logs instead of the opaque "no predicted CIF", so the real cause is visible.
+            blob = f"{r.get('stderr', '')}\n{r.get('stdout', '')}"
+            if self._is_gpu_memory_fault(blob):    # a CUDA fault Boltz swallowed but still exited 0
+                return self._err(label, self._gpu_fault_message(chains))
             swallowed = self._extract_boltz_error(r.get("stdout", ""), r.get("stderr", ""))
             base = parsed.get("error", "Boltz produced no parsable output")
             return self._err(label, f"{base}{(' — Boltz error: ' + swallowed) if swallowed else ''}")
@@ -206,6 +225,82 @@ class BoltzBridge:
         scaled = math.ceil(self._timeout_scale * total * total)
         return max(self._timeout_floor, min(scaled, self._timeout_cap))
 
+    # ── Pre-flight GPU guards (VRAM/size + concurrency) ─────────────────────────
+    @staticmethod
+    def _total_residues(chains: List[Dict[str, str]]) -> int:
+        """Total residues across ALL chains — Boltz's pair representation (and thus VRAM) scales
+        with the total token count, so a 2×250 dimer costs like a 500-mer."""
+        return sum(len((c.get("sequence") or "")) for c in chains)
+
+    def estimated_vram_mib(self, total_residues: int) -> int:
+        """Estimated PEAK GPU VRAM (MiB) for a fold of *total_residues*, from the measured curve
+        ``BASE + PER_N2·N²`` (the ~quadratic pair representation). GPU-INDEPENDENT — a property of
+        Boltz + size, not the card; the guard compares it against the card's actual free VRAM."""
+        n = max(0, int(total_residues))
+        return int(self._vram_base_mib + self._vram_per_n2 * n * n)
+
+    def _free_vram_mib(self) -> Optional[int]:
+        """Free GPU VRAM (MiB) via nvidia-smi inside WSL. None if it can't be read — in which case
+        the size guard is SKIPPED (we don't block folds on a probe failure; the CUDA-fault message
+        is the backstop)."""
+        try:
+            r = self._wsl.run_command(
+                "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits", timeout=30)
+        except Exception:
+            return None
+        if not isinstance(r, dict) or not r.get("ok"):
+            return None
+        for ln in (r.get("stdout") or "").splitlines():
+            s = ln.strip()
+            if s.isdigit():
+                return int(s)
+        return None
+
+    def _running_fold_pids(self) -> List[str]:
+        """PIDs of any in-flight Boltz fold in WSL (a ``boltz predict`` process). The ``[b]oltz``
+        bracket idiom keeps pgrep from matching its OWN command line (the self-match trap). Empty
+        if none or if pgrep can't run (then the size guard's free-VRAM check still catches a busy
+        GPU — low free VRAM — just with the size message, not the busy one)."""
+        try:
+            r = self._wsl.run_command("pgrep -f '[b]oltz predict' || true", timeout=30)
+        except Exception:
+            return []
+        if not isinstance(r, dict) or not r.get("ok"):
+            return []
+        return [p for p in (r.get("stdout") or "").split() if p.strip().isdigit()]
+
+    def _preflight_gpu_guard(
+        self, chains: List[Dict[str, str]], label: str
+    ) -> Optional[Dict[str, Any]]:
+        """Refuse (return an `_err`) when a fold can't run SAFELY, BEFORE launching the subprocess.
+        Order matters: the CONCURRENCY check is first so a busy GPU reports the SPECIFIC 'another
+        fold is running' message — not the misleading 'too big' one (a running fold leaves little
+        free VRAM, which the size check would otherwise blame on size). None → cleared to launch.
+        Disabled wholesale by BOLTZ_GPU_GUARD=off (escape hatch if the curve is wrong for a setup)."""
+        if not self._gpu_guard:
+            return None
+        # 1) CONCURRENCY / single-flight — don't launch a second fold onto a held GPU (it faults on
+        #    GPU init: CUDA illegal access). Same single-flight discipline as the WSL/ChimeraX teardown.
+        if self._running_fold_pids():
+            free = self._free_vram_mib()
+            avail = f"{free / 1024:.1f} GB free" if free is not None else "GPU busy"
+            return self._err(label,
+                f"Another Boltz fold is already using the GPU ({avail}). Wait for it to finish "
+                f"or cancel it, then retry — two folds can't share the GPU.")
+        # 2) SIZE / VRAM — does this fold fit, with a conservative margin? (free VRAM is noisy.)
+        free = self._free_vram_mib()
+        if free is None:
+            return None                          # can't probe VRAM → don't block (backstops catch a fault)
+        total = self._total_residues(chains)
+        need = self.estimated_vram_mib(total)
+        if need + self._vram_margin_mib > free:
+            return self._err(label,
+                f"This {total}-residue fold needs ~{need / 1024:.1f} GB VRAM "
+                f"(+{self._vram_margin_mib / 1024:.0f} GB safety margin) but only {free / 1024:.1f} GB "
+                f"is free on this GPU — too large to fold safely here. Fold the chains separately, "
+                f"use a smaller construct, or free the GPU.")
+        return None
+
     def _run_failure_message(
         self, r: Dict[str, Any], chains: List[Dict[str, str]], budget: int
     ) -> str:
@@ -217,6 +312,12 @@ class BoltzBridge:
         timed_out = "timed out" in str(r.get("error", "")).lower()
         if not timed_out:
             # A real failure (non-zero exit / crash), not a wall — surface the ACTUAL cause.
+            blob = f"{r.get('stderr', '')}\n{r.get('stdout', '')}\n{r.get('error', '')}"
+            if self._is_gpu_memory_fault(blob):
+                # The CUDA-illegal-access/OOM class — TRANSLATE it (cause+size+next-step), don't
+                # leak the raw torch.AcceleratorError. Backstop for a fault that slips the pre-flight
+                # guard (e.g. a fold that fit the estimate but a transient spike or race overran it).
+                return self._gpu_fault_message(chains)
             swallowed = self._extract_boltz_error(r.get("stdout", ""), r.get("stderr", ""))
             base = r.get("error") or (r.get("stderr", "") or "")[-200:] or "unknown error"
             return f"Boltz run failed: {swallowed or base}"
@@ -232,6 +333,27 @@ class BoltzBridge:
                     f"raise BOLTZ_TIMEOUT to override, or reduce size.")
         return (f"Boltz fold timed out after {budget}s — the size-scaled budget for "
                 f"{total} residues. Raise BOLTZ_TIMEOUT to override, or reduce size.")
+
+    @staticmethod
+    def _is_gpu_memory_fault(text: str) -> bool:
+        """True if *text* carries a CUDA memory/accelerator fault signature (illegal access / OOM /
+        cublas alloc). These corrupt the CUDA context and read as opaque tracebacks — worth a
+        tailored cause+next-step message rather than the raw torch line."""
+        t = (text or "").lower()
+        return any(s in t for s in (
+            "illegal memory access", "out of memory", "cuda out of memory",
+            "acceleratorerror", "cuda error", "cublas_status_alloc_failed",
+            "cudnn_status_alloc_failed", "cuda_error_out_of_memory"))
+
+    def _gpu_fault_message(self, chains: List[Dict[str, str]]) -> str:
+        """Cause+size+next-step for a GPU memory fault — the informative translation of a raw
+        CUDA-illegal-access/OOM (reports the fold size + the GPU's current free VRAM)."""
+        total = self._total_residues(chains)
+        free = self._free_vram_mib()
+        avail = f"{free / 1024:.1f} GB free" if free is not None else "GPU memory"
+        return (f"GPU memory fault on the {total}-residue fold — likely VRAM exhaustion "
+                f"({avail}) or another fold holding the GPU. Ensure no other fold is running, "
+                f"then retry or reduce size.")
 
     # ── YAML + output parsing ───────────────────────────────────────────────────
     def _translate_template_paths(
