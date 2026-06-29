@@ -346,6 +346,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._worker: Optional[_RequestWorker] = None
         self._pending_focus: List[str] = []   # next_model_id() guesses — focus FALLBACK
         self._opened_mids: List[str] = []     # REAL opened ids from the bridge — focus TRUTH
+        self._assembly_snapshot: dict = {}    # {au_id: assembly_model_id} before a request → detect a NEW bio-assembly
         self._services: List[ManagedService] = []   # things WE started → teardown on close
         self._started_chimerax = False
         self._current_session_name = None       # the named session the live state belongs to (Save/Load/Save As)
@@ -551,6 +552,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._in_flight = True
         self._pending_focus = []
         self._opened_mids = []
+        # Snapshot the generated-assembly state so the post-request ingest can detect an assembly
+        # BUILT (or rebuilt) by THIS request — a `bio_assembly` build never fires the bridge's
+        # post-open hook (it composes the model with `combine`, not `open`), so this is the only seam.
+        self._assembly_snapshot = self._assembly_model_ids()
         self.presenter.cancelled = False
         self.input.setEnabled(False)
         self.cancel_action.setEnabled(True)
@@ -761,6 +766,32 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             self.show_model(mid)
         if opened:                              # claimed a working model → hide other windows' models
             self._isolate_foreign_models()
+        self._ingest_new_assembly()             # a bio_assembly build → make the assembly the active design
+
+    def _assembly_model_ids(self) -> dict:
+        """{au_model_id: assembly_model_id} for every generated bio-assembly — the snapshot key the
+        ingest diffs across a request to spot a newly built (or rebuilt) assembly."""
+        gen = getattr(self.session, "generated_assemblies", {}) or {}
+        return {au: rec.get("assembly_model_id") for au, rec in gen.items()}
+
+    def _ingest_new_assembly(self) -> None:
+        """PART A: a `bio_assembly` build composes a FLAT, unique-chain assembly model via
+        sym→changechains→combine, but `combine` never opens a FILE, so the bridge's post-open hook
+        never fires and the Variant Workbench never ingests the assembly — it keeps the 1-chain AU
+        as the active design (greying the interchain-disulfide menu, running the cavity scan on the
+        monomer). Detect an assembly BUILT or CHANGED during the just-finished request (vs the
+        start-of-request snapshot) and make it the active design via the SAME show_model seam an
+        open uses, so the interface tools + scans target the assembly. Bio_assembly-specific for now
+        (a general post-`combine` ingest path is the follow-up)."""
+        before = getattr(self, "_assembly_snapshot", None) or {}
+        now = self._assembly_model_ids()
+        new_mid = None
+        for au, amid in now.items():
+            if amid and str(before.get(au)) != str(amid):
+                new_mid = str(amid)
+        self._assembly_snapshot = now            # new baseline so a later request doesn't re-ingest
+        if new_mid:
+            self.show_model(new_mid)             # → workbench.load_model: the assembly becomes active
 
     def _isolate_foreign_models(self) -> None:
         """In a SHARED ChimeraX, HIDE (not close) any still-visible model that was already open

@@ -1687,6 +1687,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
+        # A visible ACTIVE-MODEL indicator (panel header) — the single source of truth for which
+        # model the tools/scans address (e.g. "Active: Assembly #3 (Homotrimer) · 3 chains"). It
+        # surfaces the bio-assembly ingest: when a `bio_assembly` build swaps the active design from
+        # the 1-chain AU to the flat multi-chain assembly, the user can SEE that the interface tools
+        # and scans now target the assembly, not the monomer.
+        self._active_lbl = QtWidgets.QLabel("Active: (no model loaded)")
+        self._active_lbl.setStyleSheet("color:#7fd1ff;padding:2px 6px;font-weight:bold;")
+        lay.addWidget(self._active_lbl)
+
         # The toolbar groups the low-frequency tool/fold controls behind two QToolButton
         # menus (Tools ▾ / Fold ▾) so the row sheds width and the window narrows to ~content
         # width; the high-frequency authoring/test/colour controls stay as direct widgets.
@@ -2185,6 +2194,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
 
     def _render(self) -> None:
         self._tabs.clear()
+        self._update_active_indicator()       # repaint the panel-header active-model label
         if not self._design:
             return
         for _ukey, cd in self._design.chains.items():
@@ -3082,6 +3092,36 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     # {cif_path, model_id} from EITHER source so the cheap read-modes work on a loaded PDB, not just
     # a de-novo fold (the reported symptom: these were greyed on a loaded PDB). The DEEP cross-chain
     # ESM+ΔΔG engineering tool (`disulfide_bridge`) stays the parallel escalation path, not merged.
+
+    def _generated_assembly_for_model(self, mid) -> Optional[Dict[str, Any]]:
+        """The generated bio-assembly record whose flat/normalized model is *mid*, or None — so the
+        active-model indicator can label an INGESTED biological assembly distinctly from a plain AU."""
+        if self._session is None:
+            return None
+        gen = getattr(self._session, "generated_assemblies", {}) or {}
+        for rec in gen.values():
+            if rec and str(rec.get("assembly_model_id")) == str(mid):
+                return rec
+        return None
+
+    def _update_active_indicator(self) -> None:
+        """Repaint the active-model header from the LIVE design (model id, member-chain count, and
+        whether it is an ingested biological assembly). Best-effort; pre-`_active_lbl` calls no-op."""
+        if getattr(self, "_active_lbl", None) is None:
+            return
+        if self._design is None:
+            self._active_lbl.setText("Active: (no model loaded)")
+            return
+        mid = str(self._design.model_id)
+        n_chains = sum(len(c.members) for c in self._design.chains.values())
+        chains_word = "chain" if n_chains == 1 else "chains"
+        asm = self._generated_assembly_for_model(mid)
+        if asm:
+            kind = asm.get("assembly_type") or f"assembly {asm.get('assembly_id')}"
+            label = f"Assembly #{mid} ({kind})"
+        else:
+            label = f"#{mid}"
+        self._active_lbl.setText(f"Active: {label} · {n_chains} {chains_word}")
 
     def _has_structure(self) -> bool:
         """True if the ACTIVE design has a structure to read disulfide geometry from — EITHER a

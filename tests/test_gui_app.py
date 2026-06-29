@@ -324,6 +324,7 @@ def test_opened_mid_focus_uses_ground_truth(_app):
     w._finish_request = lambda: None
     w.show_model = lambda mid: shown.append(mid)
     w._isolate_foreign_models = lambda: None      # opened a model → isolate fires (stubbed here)
+    w._ingest_new_assembly = lambda: None
     W._on_request_done(w)
     assert shown == ["3"]                                     # real id wins over next_model_id guess
 
@@ -333,8 +334,57 @@ def test_opened_mid_focus_falls_back_to_guess(_app):
     w = types.SimpleNamespace(_opened_mids=[], _pending_focus=["1"])
     w._finish_request = lambda: None
     w.show_model = lambda mid: shown.append(mid)
+    w._ingest_new_assembly = lambda: None
     W._on_request_done(w)
     assert shown == ["1"]                                     # fallback when bridge saw no open
+
+
+# ── PART A: a bio_assembly build → ingest the flat assembly as the active design ──
+
+def _ingest_fake(session):
+    """A stand-in carrying the assembly-ingest methods bound to a real SessionState."""
+    w = types.SimpleNamespace(session=session, _assembly_snapshot={})
+    w.show_model = None     # set by the caller
+    for name in ("_assembly_model_ids", "_ingest_new_assembly"):
+        setattr(w, name, types.MethodType(getattr(W, name), w))
+    return w
+
+
+def test_ingest_new_assembly_makes_it_active(_app):
+    from session_state import SessionState
+    s = SessionState()
+    shown = []
+    w = _ingest_fake(s)
+    w.show_model = lambda mid: shown.append(mid)
+    w._assembly_snapshot = w._assembly_model_ids()           # snapshot BEFORE the build (empty)
+    # a bio_assembly build lands a flat assembly model #3 for AU #1
+    s.set_generated_assembly("1", {"assembly_model_id": "3", "assembly_id": 1,
+                                   "assembly_type": "Homotrimer"})
+    w._ingest_new_assembly()
+    assert shown == ["3"]                                    # the assembly becomes the active design
+
+
+def test_ingest_noop_when_nothing_built(_app):
+    from session_state import SessionState
+    s = SessionState()
+    shown = []
+    w = _ingest_fake(s)
+    w.show_model = lambda mid: shown.append(mid)
+    w._assembly_snapshot = w._assembly_model_ids()
+    w._ingest_new_assembly()                                 # a plain (non-assembly) request
+    assert shown == []
+
+
+def test_ingest_does_not_refire_for_preexisting_assembly(_app):
+    from session_state import SessionState
+    s = SessionState()
+    s.set_generated_assembly("1", {"assembly_model_id": "3", "assembly_id": 1})
+    shown = []
+    w = _ingest_fake(s)
+    w.show_model = lambda mid: shown.append(mid)
+    w._assembly_snapshot = w._assembly_model_ids()           # assembly already present (a PRIOR request)
+    w._ingest_new_assembly()
+    assert shown == []                                       # unchanged → not re-ingested
 
 
 # ── Stage 4: engine.dispatch (semicolon + fast-paths) shared with the GUI ─────────
