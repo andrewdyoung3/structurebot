@@ -467,6 +467,18 @@ BOLTZ_TIMEOUT_EXPLICIT: bool = "BOLTZ_TIMEOUT" in os.environ   # explicit env ov
 BOLTZ_TIMEOUT_SCALE: float = float(os.environ.get("BOLTZ_TIMEOUT_SCALE", "0.012"))
 BOLTZ_TIMEOUT_FLOOR: int = int(os.environ.get("BOLTZ_TIMEOUT_FLOOR", "1800"))
 BOLTZ_TIMEOUT_CAP:   int = int(os.environ.get("BOLTZ_TIMEOUT_CAP", "21600"))
+# Pre-fold GPU guards. Boltz VRAM ~quadratic in TOTAL residues (the N×N pair representation).
+# Measured on the RTX 5070 Ti Laptop (12 GB), boltz_env torch cu130/sm_120, --no_kernels: peak
+# GPU VRAM (MiB) ≈ BASE + PER_N2·N² — anchors (N→peak MiB): 80→3411, 300→4554, 500→5942,
+# 700→8526, 900→11693 (at the 12 GB ceiling — thrashed), 1084→~15 GB predicted (thrashed). The
+# guard reads ACTUAL free VRAM (nvidia-smi) at launch and refuses BEFORE the subprocess when the
+# estimate + a conservative MARGIN exceeds free (free VRAM is noisy; a fold that fits at 11 GB
+# free thrashes at 9 GB). The estimate is GPU-independent (a property of Boltz + size); only the
+# free side adapts — so this generalizes to a larger GPU (bigger free → bigger folds pass).
+BOLTZ_GPU_GUARD: bool = os.environ.get("BOLTZ_GPU_GUARD", "on").strip().lower() not in ("0", "off", "false", "no")
+BOLTZ_VRAM_BASE_MIB:   float = float(os.environ.get("BOLTZ_VRAM_BASE_MIB", "3447"))
+BOLTZ_VRAM_PER_N2_MIB: float = float(os.environ.get("BOLTZ_VRAM_PER_N2_MIB", "0.010336"))
+BOLTZ_VRAM_MARGIN_MIB: int   = int(os.environ.get("BOLTZ_VRAM_MARGIN_MIB", "2048"))
 # S4c noise floor: total seeds (1 reference + N-1) folded to MEASURE the cross-seed WT
 # variance for a STOCHASTIC engine (Boltz). N=4 balances a usable per-residue stdev/range
 # against compute (paid once per design+combo, cached). Deterministic engines (ESMFold)
