@@ -3501,3 +3501,71 @@ class TestDesignBasket:
         assert p.design_basket.entries
         p.design_basket.reset()
         assert p.design_basket.entries == [] and not p.design_basket._list.isVisible()
+
+    # ── cd-EQUIVALENCE keying: homo-oligomer copies share one cd, so a same-resnum pick on two
+    #    copies is the SAME residue. Two divergent picks must BLOCK (not silently last-write-wins at
+    #    edit_variant); two identical picks dedupe to one; distinct-cd (hetero) chains are unaffected.
+    def _homodimer(self, p, seq="MKVLWAAGTDER"):
+        p._add_sequence_construct("dimer", [(seq, 2)])      # ONE cd, members (mid,A)+(mid,B)
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "model_id": "7", "cif_path": "/tmp/x.cif"}
+        p._run_commands_bg = lambda c: None
+        return cd
+
+    def _cavity(self, chain, pos, to_aa, seq="MKVLWAAGTDER"):
+        return {"chain": chain, "position": pos, "from_aa": seq[pos - 1], "to_aa": to_aa,
+                "void_volume": 40.0, "cavity_id": 1, "fill_fraction": 0.6, "clash": False, "score": 0.5}
+
+    def test_homodimer_same_resnum_divergent_picks_block_enact(self, _app):
+        # today's exact failure: A:3→W and B:3→Y on equivalent copies — caught at conflict-check,
+        # enact never reached (no silent overwrite of chain A by chain B).
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._homodimer(p)
+        p._add_cavity_to_basket(cd, self._cavity("A", 3, "W"))
+        p._add_cavity_to_basket(cd, self._cavity("B", 3, "Y"))
+        assert len(p.design_basket.entries) == 2                     # divergent → both staged
+        assert p.design_basket._conflicts()                          # FLAGGED (equivalence-keyed)
+        assert "equivalent copies" in p.design_basket._conflict.text()
+        assert not p.design_basket._enact_btn.isEnabled()            # enact blocked
+        n0 = len(cd.variants)
+        p.design_basket._enact()
+        assert len(cd.variants) == n0                                # never composed
+
+    def test_homodimer_same_resnum_identical_picks_dedupe(self, _app):
+        # A:3→W and B:3→W are the SAME residue on equivalent copies → ONE entry, ONE mutation;
+        # the row surfaces that it applies to both copies.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._homodimer(p)
+        p._add_cavity_to_basket(cd, self._cavity("A", 3, "W"))
+        p._add_cavity_to_basket(cd, self._cavity("B", 3, "W"))       # identical → deduped
+        assert len(p.design_basket.entries) == 1
+        assert not p.design_basket._conflicts()
+        assert "applies to A, B" in p.design_basket._list.item(0, 3).text()   # Fix 2 surfacing
+        p.design_basket._enact()
+        v = cd.variants[-1]
+        assert [(m.resnum, m.to_aa) for m in v.mutations] == [(3, "W")]       # one residue, both copies
+
+    def test_hetero_same_resnum_distinct_cds_both_land(self, _app):
+        # control: distinct sequences → distinct cds → A:3 and B:3 are different residues, both land.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("het", [("MKVLWAAGTDER", 1), ("ACDEFGHIKLMN", 1)])
+        p._run_commands_bg = lambda c: None
+        cd_map = p._chain_to_cd()
+        cdA, cdB = cd_map["A"], cd_map["B"]
+        p._add_cavity_to_basket(cdA, self._cavity("A", 3, "W", "MKVLWAAGTDER"))
+        p._add_cavity_to_basket(cdB, self._cavity("B", 3, "W", "ACDEFGHIKLMN"))
+        assert not p.design_basket._conflicts()                      # distinct cds → no collision
+        p.design_basket._enact()
+        assert [(m.resnum, m.to_aa) for m in cdA.variants[-1].mutations] == [(3, "W")]
+        assert [(m.resnum, m.to_aa) for m in cdB.variants[-1].mutations] == [(3, "W")]
+
+    def test_enact_backstop_blocks_divergent_same_cd_without_conflict_check(self, _app):
+        # the defensive net: a programmatic enact that bypassed the basket conflict-check must NOT
+        # silently overwrite — it refuses the whole compose.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._homodimer(p)
+        n0 = len(cd.variants)
+        p._enact_basket([{"cls": "X", "subs": [{"chain": "A", "position": 3, "from_aa": "V", "to_aa": "W"},
+                                               {"chain": "B", "position": 3, "from_aa": "V", "to_aa": "Y"}]}])
+        assert len(cd.variants) == n0                                # refused, not last-write-wins
+        assert "conflicting substitutions" in p._status.text()
