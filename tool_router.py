@@ -124,6 +124,64 @@ _color_classify_fn = None
 _design_classify_fn = None
 
 
+# ── biological-assembly chain-id normalization (pure helpers; unit-testable) ───────────
+_SUBMODEL_CHAIN_RE = re.compile(r"chain id #(\d+\.\d+)/(\S+)")
+_INT_MODEL_RE = re.compile(r"model id #(\d+)\b")
+
+
+def _chain_id_candidates():
+    """Unique chain-id supply for assembly copies: A–Z, a–z, 0–9, then AA, AB, … (mmCIF auth
+    chain ids may be multi-char), so even a large assembly never runs out."""
+    import string
+    singles = string.ascii_uppercase + string.ascii_lowercase + string.digits
+    for c in singles:
+        yield c
+    for a in singles:
+        for b in singles:
+            yield a + b
+
+
+def _parse_submodel_chains(text: str, group_model_id: str):
+    """`info chains #N` text → ordered [(submodel_id, [chain_ids]), …] for SUBMODELS of the group
+    (`#N.M/chain` lines only). [] when the text has no submodel addressing (already a flat model →
+    nothing to normalize). Preserves first-seen order of submodels and of chains within each."""
+    prefix = f"{group_model_id}."
+    order: List[str] = []
+    by_sub: Dict[str, List[str]] = {}
+    for sub, ch in _SUBMODEL_CHAIN_RE.findall(text or ""):
+        if not sub.startswith(prefix):
+            continue
+        if sub not in by_sub:
+            by_sub[sub] = []
+            order.append(sub)
+        if ch not in by_sub[sub]:
+            by_sub[sub].append(ch)
+    return [(s, by_sub[s]) for s in order]
+
+
+def plan_assembly_chain_renames(submodel_chains):
+    """Plan unique chain ids across assembly copies. *submodel_chains* = ordered
+    [(submodel_id, [chain_ids])]. Returns ``(renames, final_chains)`` where *renames* =
+    [(submodel_id, old_chain, new_chain)] ONLY for chains that COLLIDE with an already-claimed id
+    (a chain whose id is still free is LEFT ALONE — a hetero ASU's first copy keeps A,B; only the
+    duplicating copies are relabelled), and *final_chains* is the resulting full chain-id list.
+    Pure / unit-testable."""
+    used: set = set()
+    renames: List[Tuple[str, str, str]] = []
+    final: List[str] = []
+    for sub, chains in submodel_chains:
+        for ch in chains:
+            if ch not in used:
+                used.add(ch)
+                final.append(ch)
+                continue
+            new = next(c for c in _chain_id_candidates() if c not in used)
+            used.add(new)
+            final.append(new)
+            renames.append((sub, ch, new))
+    return renames, final
+
+
 class ToolRouter:
     """
     Routes translator output through the correct computational tools.
@@ -4488,6 +4546,50 @@ class ToolRouter:
             summary          = summary,
         )
 
+    def _cx_value(self, command: str) -> str:
+        """run_command → its text 'value' (str), '' on anything unexpected. Never raises."""
+        try:
+            r = self.bridge.run_command(command)
+        except Exception:
+            return ""
+        if isinstance(r, dict):
+            v = r.get("value")
+            return v if isinstance(v, str) else ""
+        return r if isinstance(r, str) else ""
+
+    def _normalize_assembly_to_flat_model(self, group_model_id: str, asm_name: str):
+        """FIX A: `sym … copies true` makes submodel-per-copy with DUPLICATE chain ids
+        (#N.1/A, #N.2/A, …), which (1) makes native `color bychain` paint every copy the same and
+        (2) is INVISIBLE to StructureBot's ingestion (its parser only matches integer `#N/chain`
+        addressing and keys by chain letter alone — so it'd see zero/one chain). Give every copy
+        unique chain ids via `changechains`, then `combine … retainIds true` into ONE integer-id
+        AtomicStructure that ingestion + native commands handle correctly.
+
+        Returns ``(flat_model_id, final_chains)`` or ``(None, None)`` when there's nothing to
+        normalize (already flat) or the step fails — the caller then falls back to the submodel
+        group. Best-effort: never raises (a failed normalization must not break assembly generation).
+        The submodel group is hidden so only the flat assembly shows; the AU is handled by the caller.
+        """
+        try:
+            submodel_chains = _parse_submodel_chains(
+                self._cx_value(f"info chains #{group_model_id}"), group_model_id)
+            if not submodel_chains:
+                return None, None                       # not submodel-addressed → already flat
+            renames, final_chains = plan_assembly_chain_renames(submodel_chains)
+            for sub, old, new in renames:               # only collisions are renamed (uniques kept)
+                self.bridge.run_command(f"changechains #{sub}/{old} {new}")
+            before = {int(i) for i in _INT_MODEL_RE.findall(self._cx_value("info models"))}
+            self.bridge.run_command(f'combine #{group_model_id} name "{asm_name}" retainIds true')
+            after = {int(i) for i in _INT_MODEL_RE.findall(self._cx_value("info models"))}
+            new_ids = sorted(after - before)
+            if not new_ids:
+                return None, None
+            flat_id = str(new_ids[-1])
+            self.bridge.run_command(f"hide #{group_model_id} models")   # show only the flat assembly
+            return flat_id, final_chains
+        except Exception:
+            return None, None
+
     def _run_bio_assembly(
         self,
         inputs:     Dict[str, Any],
@@ -4584,6 +4686,21 @@ class ToolRouter:
         except Exception:
             pass
 
+        # FIX A: normalize the submodel-per-copy assembly (duplicate chain ids) into ONE flat
+        # integer-id model with UNIQUE chain ids — so native `color bychain` distinguishes copies
+        # AND StructureBot's ingestion (which only parses integer `#N/chain` addressing) enumerates
+        # every copy as its own chain. Best-effort: falls back to the submodel group on any failure.
+        group_model_id = assembly_model_id
+        flat_model_id, final_chains = (None, None)
+        if assembly_model_id:
+            struct_info0 = self.session.get_structure(model_id)
+            base_name = ((struct_info0.get("name") if struct_info0 else None) or "assembly")
+            flat_model_id, final_chains = self._normalize_assembly_to_flat_model(
+                assembly_model_id, f"{base_name} assembly {assembly_id}")
+        # downstream (ingestion, interface scan) addresses the FLAT model when normalization ran
+        if flat_model_id:
+            assembly_model_id = flat_model_id
+
         # Fetch assembly info for the pdb_id (may already be cached)
         pdb_id = None
         n_subunits = None
@@ -4606,10 +4723,16 @@ class ToolRouter:
         except Exception:
             pass
 
-        # Track in session_state
+        # Track in session_state. `assembly_model_id` is the model downstream tools address — the
+        # FLAT normalized model when Fix A ran, else the raw submodel group. `group_model_id` keeps
+        # the sym submodel group for reference; `normalized` records whether unique chain ids were
+        # assigned (so a homo-oligomer's copies ingest as distinct member chains).
         gen_record: Dict[str, Any] = {
             "au_model_id":       model_id,
             "assembly_model_id": assembly_model_id,
+            "group_model_id":    group_model_id,
+            "normalized":        bool(flat_model_id),
+            "assembly_chains":   list(final_chains) if final_chains else None,
             "assembly_id":       assembly_id,
             "assembly_type":     asm_type,
             "n_subunits":        n_subunits,
@@ -4619,10 +4742,15 @@ class ToolRouter:
 
         # Build summary
         asm_label = asm_type or f"assembly {assembly_id}"
-        copies_note = f"{n_subunits} chains" if n_subunits else "multiple chains"
+        if final_chains:
+            copies_note = f"{len(final_chains)} unique chains ({', '.join(final_chains[:8])}" \
+                          + ("…" if len(final_chains) > 8 else "") + ")"
+        else:
+            copies_note = f"{n_subunits} chains" if n_subunits else "multiple chains"
         summary = (
             f"Generated {asm_label} from AU #{model_id} "
             + (f"→ assembly model #{assembly_model_id}" if assembly_model_id else "")
+            + (" (flat, unique chain ids)" if flat_model_id else "")
             + f" ({copies_note}); AU #{model_id} kept and hidden"
         )
 

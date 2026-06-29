@@ -534,6 +534,114 @@ def test_bio_assembly_no_bridge_returns_clean_error():
     assert "unavailable" in result.error.lower() or "bridge" in result.error.lower()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. Fix A — submodel-per-copy → flat model with UNIQUE chain ids
+# ══════════════════════════════════════════════════════════════════════════════
+
+from tool_router import plan_assembly_chain_renames, _parse_submodel_chains
+
+
+def test_parse_submodel_chains_homotrimer():
+    """`info chains #2` for a 3-copy homo assembly → 3 submodels each with chain A."""
+    txt = ("chain id #2.1/A chain_id A\n"
+           "chain id #2.2/A chain_id A\n"
+           "chain id #2.3/A chain_id A")
+    assert _parse_submodel_chains(txt, "2") == [("2.1", ["A"]), ("2.2", ["A"]), ("2.3", ["A"])]
+
+
+def test_parse_submodel_chains_flat_returns_empty():
+    """A flat model (no submodel addressing) → [] (nothing to normalize)."""
+    assert _parse_submodel_chains("chain id #2/A chain_id A", "2") == []
+
+
+def test_plan_renames_homotrimer_relabels_only_duplicates():
+    """First copy keeps A; the two duplicating copies get B, C. final = [A, B, C]."""
+    renames, final = plan_assembly_chain_renames([("2.1", ["A"]), ("2.2", ["A"]), ("2.3", ["A"])])
+    assert final == ["A", "B", "C"]
+    assert renames == [("2.2", "A", "B"), ("2.3", "A", "C")]
+
+
+def test_plan_renames_hetero_asu_skips_already_unique():
+    """Edge case (relay): heterodimer ASU (A,B) × 3 copies. Copy 1 keeps A,B (NOT relabelled);
+    only the colliding copies are renamed → C,D then E,F. No collision with kept ids."""
+    sub = [("2.1", ["A", "B"]), ("2.2", ["A", "B"]), ("2.3", ["A", "B"])]
+    renames, final = plan_assembly_chain_renames(sub)
+    assert final == ["A", "B", "C", "D", "E", "F"]
+    assert renames == [("2.2", "A", "C"), ("2.2", "B", "D"),
+                       ("2.3", "A", "E"), ("2.3", "B", "F")]
+    assert len(final) == len(set(final))                    # all unique
+
+
+def test_plan_renames_no_duplicates_no_renames():
+    """A single copy (or already-distinct chains) → no renames."""
+    renames, final = plan_assembly_chain_renames([("2.1", ["A", "B"])])
+    assert renames == [] and final == ["A", "B"]
+
+
+def test_normalize_assembly_emits_changechains_and_combine():
+    """_normalize_assembly_to_flat_model issues changechains for each duplicate + combine, and
+    returns the new flat model id + unique chain list."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.bridge.run_command.side_effect = [
+        _chimerax_result("chain id #2.1/A chain_id A\n"
+                         "chain id #2.2/A chain_id A\n"
+                         "chain id #2.3/A chain_id A"),     # info chains #2
+        _chimerax_result("changed"),                        # changechains #2.2/A B
+        _chimerax_result("changed"),                        # changechains #2.3/A C
+        _chimerax_result("model id #1 ...\nmodel id #2 ..."),  # info models (before)
+        _chimerax_result("Created model #3"),               # combine
+        _chimerax_result("model id #1 ...\nmodel id #2 ...\nmodel id #3 ..."),  # info models (after)
+        _chimerax_result(""),                               # hide #2 models
+    ]
+    flat_id, final = router._normalize_assembly_to_flat_model("2", "2omf assembly 1")
+    assert flat_id == "3"
+    assert final == ["A", "B", "C"]
+    cmds = [c[0][0] for c in router.bridge.run_command.call_args_list]
+    assert "changechains #2.2/A B" in cmds and "changechains #2.3/A C" in cmds
+    assert any(c.startswith("combine #2 ") and "retainIds true" in c for c in cmds)
+
+
+def test_normalize_assembly_flat_input_is_noop():
+    """A flat (non-submodel) model → no changechains/combine, returns (None, None)."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.bridge.run_command.side_effect = [
+        _chimerax_result("chain id #2/A chain_id A"),       # info chains #2 (already flat)
+    ]
+    flat_id, final = router._normalize_assembly_to_flat_model("2", "x")
+    assert flat_id is None and final is None
+    cmds = [c[0][0] for c in router.bridge.run_command.call_args_list]
+    assert not any("changechains" in c or c.startswith("combine") for c in cmds)
+
+
+def test_run_bio_assembly_normalizes_and_records_flat_model():
+    """End-to-end (mocked): _run_bio_assembly runs sym, normalizes to a flat model, and records
+    assembly_model_id = the FLAT id with the unique chain list."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.session.get_structure.return_value = {"name": "2OMF"}
+    router.session.get_assembly_info.return_value = None
+    router.bridge.run_command.side_effect = [
+        _chimerax_result("Made 3 copies for 2omf assembly 1"),                 # sym
+        _chimerax_result('model id #1 type AtomicStructure name 2omf\n'
+                         'model id #2 type Model name "2omf assembly 1"'),     # info models (parse)
+        _chimerax_result("chain id #2.1/A chain_id A\n"
+                         "chain id #2.2/A chain_id A\n"
+                         "chain id #2.3/A chain_id A"),                        # info chains #2
+        _chimerax_result("changed"),                                          # changechains B
+        _chimerax_result("changed"),                                          # changechains C
+        _chimerax_result("model id #1\nmodel id #2"),                         # info models before combine
+        _chimerax_result("Created model #3"),                                 # combine
+        _chimerax_result("model id #1\nmodel id #2\nmodel id #3"),            # info models after combine
+        _chimerax_result(""),                                                 # hide #2
+    ]
+    result = router._run_bio_assembly({"model_id": "1", "assembly_id": 1})
+    assert result.success
+    _, rec = router.session.set_generated_assembly.call_args[0]
+    assert rec["assembly_model_id"] == "3"          # downstream addresses the FLAT model
+    assert rec["group_model_id"] == "2"             # the sym submodel group kept for reference
+    assert rec["normalized"] is True
+    assert rec["assembly_chains"] == ["A", "B", "C"]
+
+
 def test_session_generated_assemblies_roundtrip(tmp_path):
     """set_generated_assembly / get_generated_assembly survive a save/load cycle."""
     from session_state import SessionState
