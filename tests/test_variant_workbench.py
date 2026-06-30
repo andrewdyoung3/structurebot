@@ -3090,6 +3090,72 @@ class TestDisulfideLoadedPdbSource:
         assert "#2/A:3,7" in cmds and "distance #2/A:3@CB #2/A:7@CB" in cmds
 
 
+class TestBioAssemblyActiveDesign:
+    """PART A: an ingested bio-assembly becomes the ACTIVE design — the panel-header indicator
+    labels it, the interchain-disulfide menu enables on its ≥2 chains, and `_active_structure`
+    (so the cavity/salt-bridge/disulfide scans) targets the ASSEMBLY model, not the 1-chain AU."""
+
+    def _session_with_assembly(self, au="1", asm_mid="3", asm_type="Homotrimer", asm_id=1):
+        from session_state import SessionState
+        s = SessionState()
+        s.set_generated_assembly(au, {
+            "au_model_id": au, "assembly_model_id": asm_mid, "group_model_id": asm_mid,
+            "normalized": True, "assembly_id": asm_id, "assembly_type": asm_type,
+            "n_subunits": 3, "pdb_id": "2OMF",
+        })
+        return s
+
+    @staticmethod
+    def _install_save(c):
+        def _run(cmd):
+            m = re.search(r'save "([^"]+)"', cmd or "")
+            if m:
+                Path(m.group(1)).write_text("data_assembly\n")
+        c._run.side_effect = _run
+
+    def _trimer(self, seq="MKVCAAC"):
+        return [_chainseq("3", "A", seq), _chainseq("3", "B", seq), _chainseq("3", "C", seq)]
+
+    def test_assembly_is_active_design_after_load(self, _app):
+        s = self._session_with_assembly()
+        p, _ = _panel(self._trimer(), session=s)
+        p.load_model("3")                                       # ingest the flat assembly model #3
+        assert str(p._design.model_id) == "3"
+        txt = p._active_lbl.text()
+        assert "Assembly #3" in txt and "Homotrimer" in txt    # labelled as a generated assembly
+        assert "3 chains" in txt                               # all three copies are member chains
+
+    def test_plain_au_not_labelled_assembly(self, _app):
+        s = self._session_with_assembly()                       # the assembly is #3; load the AU #1
+        p, _ = _panel([_chainseq("1", "A", "MKV")], session=s)
+        p.load_model("1")
+        txt = p._active_lbl.text()
+        assert "Assembly" not in txt                           # the AU is NOT a generated assembly
+        assert "#1" in txt and "1 chain" in txt
+
+    def test_no_model_indicator_default(self, _app):
+        p, _ = _panel([], session=self._session_with_assembly())
+        assert "no model" in p._active_lbl.text().lower()
+
+    def test_interface_disulfide_menu_enabled_on_assembly(self, _app):
+        s = self._session_with_assembly()
+        p, _ = _panel(self._trimer(), session=s)
+        p.load_model("3")
+        assert p._ss_interface_btn.isEnabled()                 # ≥2 chains → interchain scan enabled
+        assert p._ss_geometry_btn.isEnabled() and p._ss_scan_btn.isEnabled()
+
+    def test_cavity_scan_targets_assembly_not_au(self, _app):
+        s = self._session_with_assembly()
+        p, c = _panel(self._trimer(), session=s)
+        self._install_save(c)
+        p.load_model("3")
+        spec = p.cavity_scan_launch_spec()
+        assert spec is not None
+        cif = spec["tool_inputs"]["cif_path"]
+        assert cif.endswith("ss_struct_3.cif")                 # the ASSEMBLY (#3)…
+        assert not cif.endswith("ss_struct_1.cif")             # …NOT the AU (#1)
+
+
 class TestDisulfideDdgEscalation:
     """Analysis-side §9 convergence: escalate a geometric interface hit → the legacy ΔΔG bridge.
     from_aa recovered own-chain (cross-chain discipline); the energetic read attaches to the clicked

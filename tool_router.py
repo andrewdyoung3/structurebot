@@ -1252,7 +1252,11 @@ class ToolRouter:
         # detect_category_phrase() uses the broad viewer vocabulary; alias
         # resolution populates intent_key up front; LLM tier runs in execute().
         # Translator-emitted commands are cleared (rendered deterministically).
-        if user_input:
+        # EXCEPTION — bio-assembly phrasing wins over representation: "show/present/display as
+        # <oligomer>" / "… biological assembly" means BUILD the assembly, not set a cartoon/surface
+        # rep. Without this guard the broad "show" vocabulary claims it first → the rep render fails
+        # (the 5HRZ "show as trimeric assembly" → blocked cartoon #1 bug).
+        if user_input and not self._detect_bio_assembly_intent(user_input):
             from intent_registry import VIEWER_REGISTRY as _vreg
             if _vreg.detect_category_phrase(user_input):
                 # Strip the target so an intervening target ("show the ligand as
@@ -4631,39 +4635,40 @@ class ToolRouter:
                 error="ChimeraX bridge unavailable.",
             )
 
-        # Check what assemblies are available (sym #N with no further args)
-        def _list_assemblies() -> str:
+        # Check what assemblies are available (sym #N with no further args) — RAW value (no
+        # sentinel string, so the no-assembly detector below isn't fooled by the word "assemblies").
+        def _list_assemblies_raw() -> str:
             try:
                 r = self.bridge.run_command(f"sym #{model_id}")
-                val = (r.get("value") or "").strip()
-                return val if val else "(could not list assemblies)"
+                return (r.get("value") or "").strip()
             except Exception:
-                return "(could not list assemblies)"
+                return ""
+
+        def _fail(reason: str) -> ToolStepResult:
+            """Graceful failure: when the structure has NO deposited assembly, say so plainly (the
+            AU is likely already the biological unit) rather than dumping a raw sym error."""
+            listing = _list_assemblies_raw()
+            has_any = bool(re.search(r"assembl|cop(y|ies)\s+of", listing, re.I))
+            if not has_any:
+                msg = (f"{reason}\n#{model_id} has no deposited biological assembly — the "
+                       f"asymmetric unit is likely already the biological unit, so there is "
+                       f"nothing to build.")
+            else:
+                msg = f"{reason}\nAvailable assemblies for #{model_id}: {listing or '(none listed)'}"
+            return ToolStepResult(tool="bio_assembly", success=False, error=msg)
 
         # Generate the assembly
         sym_cmd = f"sym #{model_id} assembly {assembly_id} copies true"
         try:
             result = self.bridge.run_command(sym_cmd)
         except Exception as exc:
-            return ToolStepResult(
-                tool="bio_assembly", success=False,
-                error=(
-                    f"ChimeraX error running `{sym_cmd}`: {exc}\n"
-                    f"Available assemblies: {_list_assemblies()}"
-                ),
-            )
+            return _fail(f"ChimeraX error running `{sym_cmd}`: {exc}")
 
         err = result.get("error") if isinstance(result, dict) else None
         val = (result.get("value") or "") if isinstance(result, dict) else str(result)
 
         if err:
-            return ToolStepResult(
-                tool="bio_assembly", success=False,
-                error=(
-                    f"sym assembly generation failed: {err}\n"
-                    f"Available assemblies for model #{model_id}: {_list_assemblies()}"
-                ),
-            )
+            return _fail(f"sym assembly generation failed: {err}")
 
         # Parse the assembly model ID from the ChimeraX response.
         # Response format: "Made N copies for <name> assembly M"
@@ -4764,6 +4769,18 @@ class ToolRouter:
             summary += (f"  ⚠ chain-id normalization failed ({normalize_note}) — copies keep "
                         f"DUPLICATE ids on submodel group #{group_model_id}; color-by-chain and "
                         f"per-copy ops will NOT distinguish them.")
+
+        # VALIDATE a user-ASSERTED oligomer against the deposited assembly (the oligomer word is
+        # optional; when present it's an assertion to check, not a build directive). We built the
+        # DEPOSITED assembly — if the user named a different stoichiometry, warn (never silently the
+        # wrong thing, never force the user's word over the file).
+        requested = self._parse_requested_oligomer_count(user_input)
+        actual = len(final_chains) if final_chains else n_subunits
+        if requested is not None and actual is not None and requested != actual:
+            gen_record["oligomer_mismatch"] = {"requested": requested, "actual": actual}
+            summary += (f"  ⚠ you asked for a {requested}-mer but {pdb_id or 'this structure'}'s "
+                        f"deposited assembly {assembly_id} is a {actual}-mer — built the DEPOSITED "
+                        f"assembly. To build a different one, name its assembly id (e.g. 'assembly 2').")
 
         elapsed_ms = (_time.perf_counter() - t0) * 1000
         return ToolStepResult(
@@ -7396,13 +7413,66 @@ class ToolRouter:
 
     # ── Conformer-comparison intent helpers ───────────────────────────────────
 
+    # "… as [a/an/the] <oligomer>" — "show as trimer", "present model as a homotetramer".
+    _AS_OLIGOMER_RE = re.compile(
+        r"\bas\s+(?:a\s+|an\s+|the\s+)?(?:homo|hetero)?"
+        r"(?:mono|di|tri|tetra|penta|hexa|hepta|octa|nona|deca)mer")
+    # "<oligomer> assembly/unit/complex" — "trimeric assembly", "build the trimeric assembly".
+    _OLIGOMER_ASSEMBLY_RE = re.compile(
+        r"(?:mono|di|tri|tetra|penta|hexa|hepta|octa|nona|deca)mer(?:ic)?\s+"
+        r"(?:assembly|unit|complex)")
+    # BUILD/PRESENT verbs — gate the "biological assembly" / "<oligomer> assembly" cues so an
+    # ANALYSIS verb ("detect/analyse/find the biological assembly") routes to the analyser, not the
+    # builder. The `as <oligomer>` construction is inherently a build directive → not gated.
+    _ASSEMBLY_PRESENT_VERB_RE = re.compile(
+        r"\b(assemble|reassemble|present|display|show|view|render|build|generate|"
+        r"make|create|form|expand|load|open|work)\b")
+    # word → copy count, for validating a user-asserted oligomer against the deposited metadata.
+    _OLIGOMER_COUNTS = {
+        "monomer": 1, "dimer": 2, "trimer": 3, "tetramer": 4, "pentamer": 5,
+        "hexamer": 6, "heptamer": 7, "octamer": 8, "nonamer": 9, "decamer": 10,
+    }
+
     @classmethod
     def _detect_bio_assembly_intent(cls, text: str) -> bool:
-        """True if *text* requests biological-assembly generation via `sym`."""
+        """True if *text* requests building the biological assembly. Beyond the explicit keyword
+        list, fires on the PHRASING FAMILY (per the product spec): an explicit "biological
+        assembly/unit", OR "… as <oligomer>" (show/present/display/assemble/work … as a trimer),
+        OR "<oligomer> assembly/unit/complex" (trimeric assembly). PRECISE — requires an `as
+        <oligomer>` connector or an `<oligomer> assembly` compound, so an incidental oligomer
+        mention ("show the trimer interface") is NOT swept in. The oligomer word is OPTIONAL: a bare
+        "display the biological assembly" suffices (the deposited assembly drives the oligomer)."""
         if not text:
             return False
         low = text.lower()
-        return any(kw in low for kw in cls._BIO_ASSEMBLY_KEYWORDS)
+        if any(kw in low for kw in cls._BIO_ASSEMBLY_KEYWORDS):
+            return True
+        if cls._AS_OLIGOMER_RE.search(low):             # "… as <oligomer>" — inherently a build directive
+            return True
+        # "biological assembly/unit" or "<oligomer> assembly" — only with a BUILD/PRESENT verb, so
+        # "detect/analyse the biological assembly" routes to the analyser, not the builder.
+        cue = ("biological assembly" in low or "biological unit" in low
+               or bool(cls._OLIGOMER_ASSEMBLY_RE.search(low)))
+        if cue and cls._ASSEMBLY_PRESENT_VERB_RE.search(low):
+            return True
+        return False
+
+    @classmethod
+    def _parse_requested_oligomer_count(cls, text: str) -> Optional[int]:
+        """The copy count a user ASSERTED (dimer→2, trimer→3, …, or 'N-mer'/'Nmer'), for validating
+        against the deposited assembly metadata. None when no oligomer word is supplied (the common
+        case — the oligomer then comes purely from the file). An ASSERTION to validate, NOT a build
+        directive: a conflict warns, it never forces the wrong oligomer."""
+        if not text:
+            return None
+        low = text.lower()
+        for word, n in cls._OLIGOMER_COUNTS.items():
+            if word in low:
+                return n
+        m = re.search(r"\b(\d+)\s*-?\s*mer\b", low)        # "3-mer" / "12mer"
+        if m:
+            return int(m.group(1))
+        return None
 
     @staticmethod
     def _parse_bio_assembly_id(text: str) -> int:

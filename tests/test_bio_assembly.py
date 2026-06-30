@@ -684,6 +684,121 @@ def test_run_bio_assembly_normalizes_and_records_flat_model():
     assert rec["assembly_chains"] == ["A", "B", "C"]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. PART B — broadened NL routing + metadata-driven oligomer validation
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("phrase", [
+    "assemble as trimer",
+    "show as trimer",
+    "show as trimeric assembly",
+    "show as a trimeric assembly",
+    "present model as trimer",
+    "display model as a tetramer",
+    "display the biological assembly",
+    "show biological assembly of trimer",
+    "work as homotrimer",
+    "work as a homotetramer",
+    "build the biological unit",
+])
+def test_bio_assembly_intent_family_detected(phrase):
+    """The whole phrasing family (the 5HRZ failures) must register as bio_assembly intent."""
+    assert ToolRouter._detect_bio_assembly_intent(phrase), f"missed bio_assembly intent: {phrase!r}"
+
+
+@pytest.mark.parametrize("phrase", [
+    "show cartoon",
+    "show the ligand as sticks",
+    "color chain A red",
+    "show the trimer interface contacts",     # incidental oligomer mention — NOT a build request
+    "stabilize the trimer interface",
+])
+def test_non_bio_assembly_phrases_not_swept_in(phrase):
+    """Representation / incidental-oligomer phrases must NOT be misread as bio_assembly."""
+    assert not ToolRouter._detect_bio_assembly_intent(phrase), f"false bio_assembly intent: {phrase!r}"
+
+
+@pytest.mark.parametrize("phrase,expected", [
+    ("show as trimer", "bio_assembly"),
+    ("show as trimeric assembly", "bio_assembly"),
+    ("display the biological assembly", "bio_assembly"),
+    ("show cartoon", "representation"),       # plain representation still wins
+])
+def test_route_precedence_assembly_over_representation(phrase, expected):
+    """bio-assembly phrasing routes to bio_assembly (not representation); plain rep still routes
+    to representation."""
+    router = _make_router()
+    routed = router.route(_translator_result_chimerax(cmds=["open 5HRZ"]), user_input=phrase)
+    assert expected in routed["tools_needed"], f"{phrase!r} → {routed['tools_needed']}"
+
+
+@pytest.mark.parametrize("phrase,n", [
+    ("show as trimer", 3), ("work as a tetramer", 4), ("display as dimer", 2),
+    ("make the hexamer", 6), ("build a 12-mer", 12), ("display the biological assembly", None),
+])
+def test_parse_requested_oligomer_count(phrase, n):
+    assert ToolRouter._parse_requested_oligomer_count(phrase) == n
+
+
+def _normalize_side_effects(n_subunits_summary="Made 3 copies for 2omf assembly 1"):
+    return [
+        _chimerax_result(n_subunits_summary),                                  # sym
+        _chimerax_result('model id #1 type AtomicStructure name 2omf\n'
+                         'model id #2 type Model name "2omf assembly 1"'),     # info models (parse)
+        _chimerax_result("chain id #2.1/A chain_id A\n"
+                         "chain id #2.2/A chain_id A\n"
+                         "chain id #2.3/A chain_id A"),                        # info chains #2
+        _chimerax_result("changed"), _chimerax_result("changed"),             # changechains B, C
+        _chimerax_result("model id #1\nmodel id #2"),                         # info models before
+        _chimerax_result("Created model #3"),                                 # combine
+        _chimerax_result("model id #1\nmodel id #2\nmodel id #3"),            # info models after
+        _chimerax_result(""),                                                 # hide #2
+    ]
+
+
+def test_bio_assembly_oligomer_mismatch_warns():
+    """User asserts 'tetramer' but the deposited assembly is a trimer → built the deposited one,
+    summary WARNS, never silently builds the wrong thing."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.session.get_structure.return_value = {"name": "2OMF"}
+    router.session.get_assembly_info.return_value = None
+    router.bridge.run_command.side_effect = _normalize_side_effects()
+    result = router._run_bio_assembly({"model_id": "1", "assembly_id": 1,
+                                       "_user_input": "show 2omf as a tetramer"})
+    assert result.success
+    _, rec = router.session.set_generated_assembly.call_args[0]
+    assert rec["assembly_chains"] == ["A", "B", "C"]                          # built the DEPOSITED trimer
+    assert rec.get("oligomer_mismatch") == {"requested": 4, "actual": 3}
+    assert "you asked for a 4-mer" in result.summary and "is a 3-mer" in result.summary
+
+
+def test_bio_assembly_matching_oligomer_no_warning():
+    """User asserts 'trimer' and the deposited assembly IS a trimer → no warning."""
+    router = _make_router(structures={"1": {"name": "2OMF"}})
+    router.session.get_structure.return_value = {"name": "2OMF"}
+    router.session.get_assembly_info.return_value = None
+    router.bridge.run_command.side_effect = _normalize_side_effects()
+    result = router._run_bio_assembly({"model_id": "1", "assembly_id": 1,
+                                       "_user_input": "show 2omf as a trimer"})
+    assert result.success
+    _, rec = router.session.set_generated_assembly.call_args[0]
+    assert "oligomer_mismatch" not in rec
+    assert "you asked for" not in result.summary
+
+
+def test_bio_assembly_no_deposited_assembly_graceful():
+    """A structure with NO deposited assembly → a graceful message, not a raw sym error / wrong build."""
+    router = _make_router(structures={"1": {"name": "1CRN"}})
+    router.session.get_structure.return_value = {"name": "1CRN"}
+    router.bridge.run_command.side_effect = [
+        _chimerax_result(error="no assembly 1"),     # sym assembly 1 fails
+        _chimerax_result(""),                        # sym #1 listing → empty (no assemblies)
+    ]
+    result = router._run_bio_assembly({"model_id": "1", "assembly_id": 1})
+    assert not result.success
+    assert "no deposited biological assembly" in result.error
+
+
 def test_session_generated_assemblies_roundtrip(tmp_path):
     """set_generated_assembly / get_generated_assembly survive a save/load cycle."""
     from session_state import SessionState
