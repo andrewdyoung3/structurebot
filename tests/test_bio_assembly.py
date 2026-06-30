@@ -821,3 +821,59 @@ def test_session_generated_assemblies_roundtrip(tmp_path):
     assert rec["assembly_model_id"] == "2"
     assert rec["assembly_type"] == "homotetramer"
     assert rec["n_subunits"] == 4
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. _visible_focus_model_id — bio_assembly targets the VISIBLE model
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_visible_focus_single_visible_returns_it():
+    """Only B (#3) visible → focus is B, not the always-#1 heuristic (the reported repro)."""
+    router = _make_router(structures={"1": {"name": "A"}, "3": {"name": "B"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=["3"])
+    assert router._visible_focus_model_id() == "3"
+
+
+def test_visible_focus_multiple_visible_returns_most_recent():
+    """A's assembly (#2) + B's monomer (#3) both visible → most-recently-added (#3)."""
+    router = _make_router(structures={"1": {"name": "A"}, "2": {"name": "A"}, "3": {"name": "B"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=["2", "3"])
+    assert router._visible_focus_model_id() == "3"
+
+
+def test_visible_focus_none_visible_returns_none():
+    """Nothing visible → None (caller falls back to _primary_model_id)."""
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=[])
+    assert router._visible_focus_model_id() is None
+
+
+def test_visible_focus_no_bridge_returns_none():
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge = None
+    assert router._visible_focus_model_id() is None
+
+
+def test_visible_focus_probe_failure_returns_none():
+    """A probe error must not crash — returns None so the caller falls back."""
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge.visible_model_ids = MagicMock(side_effect=RuntimeError("REST down"))
+    assert router._visible_focus_model_id() is None
+
+
+def test_bio_assembly_routing_targets_visible_model():
+    """route('show as trimeric assembly') with A+B open targets the VISIBLE B (#3), not #1."""
+    router = _make_router(structures={"1": {"name": "A"}, "2": {"name": "A"}, "3": {"name": "B"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=["2", "3"])
+    routed = router.route(_translator_result_chimerax(), user_input="show as trimeric assembly")
+    inp = routed["tool_inputs"].get("bio_assembly", {})
+    assert inp.get("model_id") == "3", f"expected visible B (#3), got {inp.get('model_id')}"
+
+
+def test_bio_assembly_routing_falls_back_when_no_visible_info():
+    """No visible info (probe fails) → unchanged _primary_model_id() default (#1)."""
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge.visible_model_ids = MagicMock(side_effect=RuntimeError("REST down"))
+    routed = router.route(_translator_result_chimerax(), user_input="show as trimeric assembly")
+    inp = routed["tool_inputs"].get("bio_assembly", {})
+    assert inp.get("model_id") == "1", f"expected fallback #1, got {inp.get('model_id')}"

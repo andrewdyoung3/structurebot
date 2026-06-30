@@ -310,8 +310,28 @@ class SessionState:
     def remove_structure(self, model_id: str) -> None:
         self.structures.pop(str(model_id), None)
 
+    def close_models(self, model_ids) -> None:
+        """Drop one or more closed models from tracking: remove them from `structures`
+        AND prune any `generated_assemblies` record that references a closed id (as the
+        source AU or the assembly model). Without the assembly prune a stale record would
+        keep resolving a name to an id ChimeraX may later REUSE for an unrelated model —
+        a mis-close. Ids are matched at top level ('2.1' → '2')."""
+        closed = {str(m).split(".")[0] for m in model_ids if str(m).strip()}
+        if not closed:
+            return
+        for mid in list(self.structures):
+            if str(mid).split(".")[0] in closed:
+                self.structures.pop(mid, None)
+        for au_mid, rec in list(self.generated_assemblies.items()):
+            rec = rec or {}
+            au = str(au_mid).split(".")[0]
+            amid = str(rec.get("assembly_model_id") or "").split(".")[0]
+            if au in closed or (amid and amid in closed):
+                self.generated_assemblies.pop(au_mid, None)
+
     def clear_all_structures(self) -> None:
         self.structures.clear()
+        self.generated_assemblies.clear()
 
     def get_structure(self, model_id: str) -> Optional[Dict[str, Any]]:
         return self.structures.get(str(model_id))
