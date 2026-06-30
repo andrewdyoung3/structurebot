@@ -202,3 +202,38 @@ def test_restore_when_structure_present_no_reopen(monkeypatch):
     assert not any(c.lower().startswith("open") for c in calls), (
         f"present structure must not trigger a re-open; got calls={calls}"
     )
+
+
+# ── close_models: multi-id removal + generated-assembly prune ─────────────────
+
+def test_close_models_removes_ids_and_prunes_assembly():
+    """`close #1,3` must drop BOTH ids from structures AND prune the generated-assembly
+    record (else a stale id keeps resolving a name to a possibly-reused model)."""
+    sess = SessionState()
+    sess.add_structure("1", "5HRZ", metadata={"pdb_id": "5HRZ"})
+    sess.add_structure("2", "1ABC", metadata={"pdb_id": "1ABC"})
+    sess.set_generated_assembly("1", {"au_model_id": "1", "assembly_model_id": "3",
+                                      "pdb_id": "5HRZ"})
+
+    sess.close_models(["1", "3"])
+
+    assert "1" not in sess.structures            # AU removed
+    assert "2" in sess.structures                # untouched
+    assert sess.generated_assemblies == {}       # assembly record pruned
+
+
+def test_close_models_prunes_by_assembly_id_only():
+    """Closing just the assembly model (#3) prunes its record even if the AU id isn't named."""
+    sess = SessionState()
+    sess.set_generated_assembly("1", {"au_model_id": "1", "assembly_model_id": "3",
+                                      "pdb_id": "5HRZ"})
+    sess.close_models(["3"])
+    assert sess.generated_assemblies == {}
+
+
+def test_clear_all_structures_also_clears_assemblies():
+    sess = SessionState()
+    sess.add_structure("1", "5HRZ", metadata={"pdb_id": "5HRZ"})
+    sess.set_generated_assembly("1", {"au_model_id": "1", "assembly_model_id": "3"})
+    sess.clear_all_structures()
+    assert sess.structures == {} and sess.generated_assemblies == {}

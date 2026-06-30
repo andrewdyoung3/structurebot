@@ -352,6 +352,177 @@ def _validate_command_verbs(
     return new_cmds, new_exps, blocked
 
 
+# ── Close-target resolution guard (remove/delete-a-model fix) ─────────────────
+# Closing a loaded model is "close #N" in ChimeraX — `close` accepts ONLY a model
+# spec (`#1`, `#1,2`), `all`, or `session`, NEVER a PDB id or structure name. Two
+# LLM failure modes produce a DEAD command that silently no-ops (the user's "remove
+# PDB XXXX had no effect" bug):
+#   (1) right verb, literal id:   "remove 5HRZ" → `close 5HRZ`
+#   (2) literal verb (esp. with several models open, where the model is less
+#       consistent): "remove 1ABC" → `remove 1ABC` / `delete 1ABC`
+# The verb-guard doesn't catch (1) (the verb `close` IS valid; nothing checked the
+# argument) and only *blocks* (2) (no close happens). This guard NORMALISES both to
+# `close #N` by resolving a non-spec target against the session's loaded structures.
+#
+# Asymmetry by verb:
+#   • `close <x>` unambiguously means close-a-model → an unresolvable target is an
+#     error, so BLOCK it (don't emit a dead command).
+#   • `remove`/`delete <x>` are ambiguous (`remove cartoon`, `delete waters`,
+#     `delete #1/A:5`) → rewrite ONLY when <x> resolves to a loaded structure;
+#     otherwise leave the command UNTOUCHED for the representation / atom paths.
+# Runs BEFORE the verb-guard so a normalised `remove …`→`close #N` is never blocked.
+_CLOSE_TARGET_RE = re.compile(r'^\s*(close|remove|delete)\s+(\S.*)$', re.IGNORECASE)
+
+
+def _is_valid_close_spec(target: str) -> bool:
+    """True if *target* is already a spec ChimeraX `close` accepts as-is: a model
+    spec (`#…`), `all`, or `session`."""
+    t = (target or "").strip().lower()
+    return t.startswith("#") or t in ("all", "session")
+
+
+def _resolve_close_target(target: str, session) -> list:
+    """Top-level model ids in *session* that make up the structure the user named
+    *target* (a name or pdb_id, case-insensitive). Includes BOTH the loaded structure
+    AND any biological assembly generated from it — closing "5hrz" should remove the
+    visible assembly, not just the (hidden) asymmetric unit. Submodel ids ('2.1')
+    collapse to top-level; result is numerically sorted; [] if nothing matches."""
+    if session is None:
+        return []
+    t = (target or "").strip().strip('"\'').lower()
+    if not t:
+        return []
+    hits: list = []
+
+    def _add(mid):
+        top = str(mid).split(".")[0]
+        if top and top not in hits:
+            hits.append(top)
+
+    # 1. Loaded structures by name or pdb_id.
+    for mid, info in (getattr(session, "structures", {}) or {}).items():
+        name = str((info or {}).get("name", "")).strip().lower()
+        pdb_id = str(((info or {}).get("metadata") or {}).get("pdb_id", "")).strip().lower()
+        if t == name or (pdb_id and t == pdb_id):
+            _add(mid)
+
+    # 2. Generated biological assemblies: a `display as trimer` builds a SEPARATE assembly
+    #    model that is NOT in `structures` (it lives in `generated_assemblies`, keyed by AU
+    #    model id). Add its assembly model when the named structure's AU is already matched,
+    #    OR the assembly record's own pdb_id matches — the latter still reaches the assembly
+    #    after the AU has been closed (it lingers, otherwise un-addressable by name).
+    for au_mid, rec in (getattr(session, "generated_assemblies", {}) or {}).items():
+        rec = rec or {}
+        amid = str(rec.get("assembly_model_id") or "").split(".")[0]
+        if not amid:
+            continue
+        apdb = str(rec.get("pdb_id", "")).strip().lower()
+        if str(au_mid).split(".")[0] in hits or (apdb and t == apdb):
+            _add(amid)
+
+    return sorted(hits, key=lambda s: int(s) if s.isdigit() else 1 << 30)
+
+
+# A plain top-level model spec: `#1` or `#1,2,3` (NOT `#1/A`, `#1.2`, `#1:50` — those carry
+# a sub-part we must not expand/rewrite).
+_PLAIN_MODEL_SPEC_RE = re.compile(r'^#\d+(?:,\d+)*$')
+
+
+def _assembly_counterparts(mid: str, session) -> list:
+    """The AU↔assembly counterparts of top-level *mid* via `generated_assemblies`:
+    if *mid* is an AU that has a generated assembly, its assembly id; if *mid* IS an
+    assembly, its source AU id. [] if none / no session. Closing one without the other
+    would orphan a (hidden) AU or leave the visible assembly behind."""
+    out: list = []
+    for au_mid, rec in (getattr(session, "generated_assemblies", {}) or {}).items():
+        rec = rec or {}
+        au = str(au_mid).split(".")[0]
+        amid = str(rec.get("assembly_model_id") or "").split(".")[0]
+        if not amid:
+            continue
+        if mid == au:
+            out.append(amid)
+        elif mid == amid:
+            out.append(au)
+    return out
+
+
+def _expand_with_assemblies(ids: list, session) -> list:
+    """Add AU↔assembly counterparts to a set of top-level model ids, numerically sorted.
+    So closing the AU also closes its generated assembly (and vice-versa) however the
+    target was expressed — a literal `#1` spec OR a resolved name."""
+    out = list(ids)
+    for mid in list(ids):
+        for extra in _assembly_counterparts(mid, session):
+            if extra not in out:
+                out.append(extra)
+    return sorted(out, key=lambda s: int(s) if s.isdigit() else 1 << 30)
+
+
+def _validate_close_targets(commands: list, explanations: list, session) -> tuple:
+    """
+    Guard: normalise model-removal commands to `close #N` using the session's loaded
+    structures + generated assemblies.
+
+      close <name/PDB-id>           → close #N  (or BLOCK if unresolvable — `close`
+                                       unambiguously means close-a-model)
+      remove/delete <name/PDB-id>   → close #N  ONLY when it resolves to a loaded
+                                       structure; otherwise UNTOUCHED (ambiguous —
+                                       `remove cartoon`, `delete waters`, `delete #1/A`)
+      close <#N | #N,M>             → EXPAND with AU↔assembly counterparts (the LLM
+                                       often resolves the name to a spec itself, e.g.
+                                       "close 5hrz" → `close #1`; without expansion the
+                                       generated assembly is never closed)
+      close <all | session | #1/A…> → untouched
+
+    Returns (new_commands, new_explanations, blocked_messages).
+    """
+    new_cmds: list = []
+    new_exps: list = []
+    blocked:  list = []
+    for i, cmd in enumerate(commands):
+        exp = explanations[i] if i < len(explanations) else ""
+        m = _CLOSE_TARGET_RE.match(cmd)
+        if m:
+            verb = m.group(1).lower()
+            target = m.group(2).strip()
+            if _PLAIN_MODEL_SPEC_RE.match(target):
+                # Already a model spec — but a `close #1` may need the AU's assembly added
+                # (or vice-versa). Only `close` expands; a literal `remove/delete #N` is left
+                # to the verb-guard / atom path (it's not a normalise-the-name case).
+                if verb == "close":
+                    base = re.findall(r"\d+", target)
+                    expanded = _expand_with_assemblies(base, session)
+                    if expanded != base:
+                        fixed = "close #" + ",".join(expanded)
+                        print(f"  [close-guard] expanded {cmd!r} -> {fixed!r}", flush=True)
+                        new_cmds.append(fixed)
+                        new_exps.append(exp)
+                        continue
+            elif not _is_valid_close_spec(target):
+                hits = _resolve_close_target(target, session)
+                if hits:
+                    fixed = "close #" + ",".join(hits)
+                    print(f"  [close-guard] rewrote {cmd!r} -> {fixed!r}", flush=True)
+                    new_cmds.append(fixed)
+                    new_exps.append(exp)
+                    continue
+                if verb == "close":
+                    # close-a-model with an unresolvable target → a dead command; block it.
+                    blocked.append(
+                        f"Couldn't close {target!r}: ChimeraX `close` needs a model number "
+                        f"(e.g. close #1), not a name, and no loaded structure matches "
+                        f"{target!r}. It may already be closed, or try 'close all'."
+                    )
+                    print(f"  [close-guard] blocked {cmd!r}: {target!r} not a loaded model", flush=True)
+                    continue
+                # remove/delete <x> that isn't a loaded structure: NOT necessarily a model
+                # op (rep/atom command) → leave untouched for the other guards / op-classes.
+        new_cmds.append(cmd)
+        new_exps.append(exp)
+    return new_cmds, new_exps, blocked
+
+
 # ── Static system block (cached) ───────────────────────────────────────────────
 
 _STATIC_SYSTEM = """\
@@ -1151,11 +1322,14 @@ class CommandTranslator:
                 "confidence":          "high" | "medium" | "low",
             }
 
-        Four deterministic backend-agnostic guards run on every result:
+        Five deterministic backend-agnostic guards run on every result:
           1. _sanitize_zone_syntax   — rewrite Chimera-1 zone → :< operator
           2. _scope_chain_refs_to_macromolecule — exclude ligand/solvent/ions
           3. _validate_open_targets  — block unresolvable open targets (Bug 4a)
-          4. _validate_command_verbs — reject unregistered leading verbs (Bug 4b)
+          4. _validate_close_targets — normalise `close/remove/delete <name/PDB-id>`
+                                       → `close #N` (BEFORE the verb-guard, so a
+                                       normalised `remove …`→`close` isn't blocked)
+          5. _validate_command_verbs — reject unregistered leading verbs (Bug 4b)
         """
         result   = self._backend.translate(self, user_input, session)
         cmds     = result.get("commands")     or []
@@ -1175,7 +1349,17 @@ class CommandTranslator:
         if open_blocked:
             warnings.extend(open_blocked)
 
-        # Guard 4 (Bug 4b): reject commands with an unregistered leading verb
+        # Guard 4: normalise model-removal commands to `close #N`. ChimeraX `close`
+        # only accepts a model spec; the LLM emits a literal name/id ("remove 5HRZ"
+        # → "close 5HRZ", or — with several models open — even "remove 1ABC"), which
+        # silently no-ops. MUST run before the verb-guard: a normalised `remove …`
+        # becomes `close #N` so the verb-guard (which would otherwise reject `remove`)
+        # never sees it.
+        cmds, exps, close_blocked = _validate_close_targets(cmds, exps, session)
+        if close_blocked:
+            warnings.extend(close_blocked)
+
+        # Guard 5 (Bug 4b): reject commands with an unregistered leading verb
         cmds, exps, verb_blocked = _validate_command_verbs(cmds, exps)
         if verb_blocked:
             warnings.extend(verb_blocked)
