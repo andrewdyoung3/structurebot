@@ -2962,6 +2962,12 @@ class TestCrossChainModeC:
         pushed = []
         p._run_commands_bg = lambda cmds: pushed.extend(cmds)
         p.apply_disulfide_interface_scan_result({"_align_ukey": p._cur_cd_ukey()}, self._interface_result())
+        assert p._glow_state is not None                          # apply auto-highlights the best pair
+        # click-to-toggle: re-clicking the already-glowing pair clears it (the escape hatch)
+        pushed.clear()
+        p.disulfides_tab._sec["I"]["table"].cellClicked.emit(0, 0)
+        assert p._glow_state is None
+        # clicking once more re-applies the cross-chain glow through the same seam
         pushed.clear()
         p.disulfides_tab._sec["I"]["table"].cellClicked.emit(0, 0)
         joined = " ".join(pushed)
@@ -3345,8 +3351,17 @@ class TestProlineMode:
         p._run_commands_bg = lambda c: pushed.extend(c)
         cd = self._construct(p)
         p.proline_tab.populate(cd, self._scan())
+        assert p._glow_state == {"mid": "7", "both": "#7/A:5"}     # populate auto-highlights the best row
+        # click-to-toggle: re-clicking the already-glowing row clears it (the escape hatch)
         pushed.clear()
-        p.proline_tab._tbl.cellClicked.emit(0, 0)                  # click the top row (W5)
+        p.proline_tab._tbl.cellClicked.emit(0, 0)                  # click the top row (W5) again
+        off = " ".join(pushed)
+        assert "~select" in off and "transparency #7 0 target c" in off   # restore (un-glow) recipe
+        assert p._glow_state is None
+        assert not p.proline_tab._clear_glow_btn.isEnabled()      # nothing glowing → Clear dim
+        # clicking once more re-applies the glow through the same seam
+        pushed.clear()
+        p.proline_tab._tbl.cellClicked.emit(0, 0)
         joined = " ".join(pushed)
         assert "#7/A:5" in joined and "transparency #7 70 target c" in joined   # glow recipe
         assert p._glow_state == {"mid": "7", "both": "#7/A:5"}
@@ -3437,8 +3452,17 @@ class TestCavityMode:
         p._run_commands_bg = lambda c: pushed.extend(c)
         cd = self._construct(p)
         p.cavity_tab.populate(cd, self._scan())
+        assert p._glow_state == {"mid": "7", "both": "#7/A:3"}      # populate auto-highlights the best row
+        # click-to-toggle: re-clicking the already-glowing row clears it (the escape hatch)
         pushed.clear()
-        p.cavity_tab._tbl.cellClicked.emit(0, 0)                    # click the top row (V3)
+        p.cavity_tab._tbl.cellClicked.emit(0, 0)                    # click the top row (V3) again
+        off = " ".join(pushed)
+        assert "~select" in off and "transparency #7 0 target c" in off   # restore (un-glow) recipe
+        assert p._glow_state is None
+        assert not p.cavity_tab._clear_glow_btn.isEnabled()        # nothing glowing → Clear dim
+        # clicking once more re-applies the glow through the same seam
+        pushed.clear()
+        p.cavity_tab._tbl.cellClicked.emit(0, 0)
         joined = " ".join(pushed)
         assert "#7/A:3" in joined and "transparency #7 70 target c" in joined   # glow recipe
         assert p._glow_state == {"mid": "7", "both": "#7/A:3"}
@@ -3635,3 +3659,29 @@ class TestDesignBasket:
                                                {"chain": "B", "position": 3, "from_aa": "V", "to_aa": "Y"}]}])
         assert len(cd.variants) == n0                                # refused, not last-write-wins
         assert "conflicting substitutions" in p._status.text()
+
+
+class TestToolbarWraps:
+    """The Workbench toolbar uses a WRAPPING flow layout — at a narrow width its pills wrap onto a
+    second row instead of clipping behind an overflow chevron, so every action stays reachable."""
+
+    def test_toolbar_uses_flow_layout_with_every_action(self, _app):
+        from variant_workbench import _FlowLayout
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        flow = p._toolbar_layout
+        assert isinstance(flow, _FlowLayout)
+        widgets = [flow.itemAt(i).widget() for i in range(flow.count())]
+        # every high-frequency pill + menu button + the colour combo is in the layout (nothing
+        # hidden behind a ">>" chevron the way a QToolBar would clip them).
+        for btn in (p._add_btn, p._add_seq_btn, p._apply_btn, p._tools_btn, p._stab_btn,
+                    p._sol_btn, p._fold_menu_btn, p._ss_menu_btn, p._pro_menu_btn,
+                    p._dev_btn, p._align_btn, p._mode_combo):
+            assert btn in widgets
+
+    def test_toolbar_wraps_taller_at_narrow_width(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        flow = p._toolbar_layout
+        narrow = flow.heightForWidth(600)      # forces the pills onto multiple rows
+        wide = flow.heightForWidth(4000)       # comfortably one row
+        assert wide > 0
+        assert narrow > wide                   # narrow WRAPPED (grew taller) rather than clipping

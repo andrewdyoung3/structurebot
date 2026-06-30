@@ -214,6 +214,33 @@ def test_show_model_adds_and_focuses_tab(_app):
     assert w.tabs.currentWidget().chain.key == ("2", "A")
 
 
+# ── chain-strip mirrors the active design: stale model tabs are pruned ─────────────
+
+def test_prune_chain_tabs_keeps_only_active_model(_app):
+    w = _fake(_grids={}, tabs=QtWidgets.QTabWidget(), presenter=MagicMock())
+    w._prune_chain_tabs_except = types.MethodType(W._prune_chain_tabs_except, w)
+    # the AU (#1/A) plus a generated assembly's chains (#3/A,B,C) all have tabs
+    for mid, ch in [("1", "A"), ("3", "A"), ("3", "B"), ("3", "C")]:
+        w._add_chain_tab(ChainSeq(mid, ch, [ResidueCell(mid, ch, 1, "M", 1)]))
+    assert w.tabs.count() == 4
+    w._prune_chain_tabs_except("3")                       # #3 is the active design now
+    assert set(w._grids.keys()) == {("3", "A"), ("3", "B"), ("3", "C")}
+    assert w.tabs.count() == 3                            # the stale #1/A tab is gone
+    assert all(k[0] == "3" for k in w._grids)
+
+
+def test_show_model_prunes_previous_models_chain_tabs(_app):
+    w = _fake(_grids={}, tabs=QtWidgets.QTabWidget(), presenter=MagicMock(),
+              workbench=MagicMock(), controller=MagicMock(), _pool=MagicMock())
+    w._prune_chain_tabs_except = types.MethodType(W._prune_chain_tabs_except, w)
+    w._add_chain_tab(ChainSeq("1", "A", [ResidueCell("1", "A", 1, "M", 1)]))   # prior active model
+    assert ("1", "A") in w._grids
+    w.show_model("3")                                     # a different model becomes active
+    assert ("1", "A") not in w._grids                     # stale AU tab pruned
+    assert all(k[0] != "1" for k in w._grids)
+    w._pool.start.assert_called_once()                    # #3 not yet loaded → its worker dispatched
+
+
 # ── Stage 3: managed service, Ollama preflight, ground-truth tab focus ────────────
 
 def test_managed_service_windowless_logged(_app, monkeypatch, tmp_path):
