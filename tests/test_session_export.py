@@ -42,7 +42,9 @@ def _mixed_sessions():
                                                 "floor_ddm": {"1": 0.3, "2": 0.3},
                                                 "floor_lddt": {"1": 0.9, "2": 0.9}, "multichain": False}},
                          "stability": {"rows": [{"resnum": 2, "from_aa": "C", "to_aa": "W", "ddg": 1.2,
-                                                 "ddg_source": "rosetta", "combined_score": 0.5,
+                                                 "ddg_source": "rosetta", "rosetta_ddg": 1.2,
+                                                 "thermompnn_ddg": -0.3, "rasp_ddg": 0.1,
+                                                 "dynamut2_ddg": 0.4, "combined_score": 0.5,
                                                  "recommendation": "ok"}], "sum_ddg": 1.2, "tier": "deep"},
                          "solubility": None}},
             {"id": "V2", "mutations": [{"resnum": 1, "from_aa": "A", "to_aa": "S", "source": "manual"}],
@@ -106,6 +108,19 @@ def test_deviation_keeps_both_metrics_and_floors(tmp_path):
     d = {r[hdr.index("resnum")]: dict(zip(hdr, r)) for r in data}
     assert d["2"]["dRMSD"] == "2.0" and d["2"]["dRMSD_floor"] == "0.3"
     assert d["2"]["lDDT"] == "0.7" and d["2"]["lDDT_floor"] == "0.9"
+
+
+def test_stability_export_keeps_every_method_column(tmp_path):
+    # the report keeps ALL ddG sets side-by-side (Rosetta did NOT erase ThermoMPNN/RaSP/DynaMut2),
+    # so a higher-quality run augments the export rather than replacing it.
+    export_session(_mixed_sessions(), tmp_path)
+    rows = _read_csv(tmp_path / "csv" / "stability_ddg.csv")
+    hdr, data = rows[0], rows[1:]
+    for col in ("rosetta_ddg", "thermompnn_ddg", "rasp_ddg", "dynamut2_ddg"):
+        assert col in hdr
+    r = dict(zip(hdr, data[0]))
+    assert r["rosetta_ddg"] == "1.2" and r["thermompnn_ddg"] == "-0.3"      # both methods present
+    assert r["rasp_ddg"] == "0.1" and r["dynamut2_ddg"] == "0.4"
 
 
 def test_remote_msa_provenance_reaches_fold_plddt_export(tmp_path):
