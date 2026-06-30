@@ -27,6 +27,9 @@ from translator import (
     _validate_open_targets,
     _is_valid_open_target,
     _validate_command_verbs,
+    _validate_close_targets,
+    _is_valid_close_spec,
+    _resolve_close_target,
     probe_chimerax_verbs,
 )
 
@@ -505,6 +508,80 @@ def test_verb_guard_end_to_end_in_translate() -> None:
     _assert("view" in cmds, "non-blocked commands survive", f"got {cmds}")
     _assert(any("find" in str(w) for w in result.get("warnings", [])),
             "block message surfaced in warnings", f"got {result.get('warnings')}")
+
+
+def _session_with(structures: dict):
+    """A minimal session stub exposing `.structures` for the close-target guard."""
+    import types
+    return types.SimpleNamespace(structures=structures)
+
+
+def test_is_valid_close_spec() -> None:
+    """Specs ChimeraX `close` accepts as-is pass; a name/PDB-id does not."""
+    for ok in ("#1", "#1,2", "#2.1", "all", "ALL", "session"):
+        assert _is_valid_close_spec(ok), f"{ok!r} should be a valid close spec"
+    for bad in ("5HRZ", "5hrz", "1abc", "mymodel"):
+        assert not _is_valid_close_spec(bad), f"{bad!r} should NOT be a valid close spec"
+
+
+def test_resolve_close_target_by_name_and_pdbid() -> None:
+    """A name or pdb_id resolves to its top-level model id; no match → []."""
+    sess = _session_with({
+        "1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}},
+        "2.1": {"name": "1abc", "metadata": {"pdb_id": "1ABC"}},
+    })
+    assert _resolve_close_target("5hrz", sess) == ["1"]          # case-insensitive name
+    assert _resolve_close_target("1ABC", sess) == ["2"]          # submodel id collapses to top-level
+    assert _resolve_close_target("9XYZ", sess) == []             # unknown
+    assert _resolve_close_target("5HRZ", None) == []             # no session → no crash
+
+
+def test_resolve_close_target_multiple_copies() -> None:
+    """The same PDB opened twice resolves to both model ids."""
+    sess = _session_with({
+        "1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}},
+        "3": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}},
+    })
+    assert _resolve_close_target("5hrz", sess) == ["1", "3"]
+
+
+def test_close_guard_rewrites_pdb_id_to_model_spec() -> None:
+    """`close 5HRZ` → `close #1` when 5HRZ is loaded as #1 (the core bug fix)."""
+    sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})
+    cmds, exps, blocked = _validate_close_targets(["close 5HRZ"], ["remove it"], sess)
+    assert cmds == ["close #1"], f"expected rewrite, got {cmds}"
+    assert exps == ["remove it"], "explanation preserved across rewrite"
+    assert not blocked, f"a resolvable target must not be blocked: {blocked}"
+
+
+def test_close_guard_passes_valid_specs_untouched() -> None:
+    """Already-valid specs (`#N`/`all`/`session`) are never rewritten or blocked."""
+    sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})
+    for spec in ("close #1", "close #1,2", "close all", "close session"):
+        cmds, _, blocked = _validate_close_targets([spec], ["x"], sess)
+        assert cmds == [spec] and not blocked, f"{spec!r} should pass untouched, got {cmds}"
+
+
+def test_close_guard_blocks_unresolvable_target() -> None:
+    """An unresolvable name is blocked with an actionable message — never emitted as a dead command."""
+    sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})
+    cmds, _, blocked = _validate_close_targets(["close 9XYZ"], ["nope"], sess)
+    assert cmds == [], f"unresolvable close must be dropped, got {cmds}"
+    assert blocked and "9XYZ" in blocked[0], f"actionable block message expected, got {blocked}"
+
+
+def test_close_guard_end_to_end_in_translate() -> None:
+    """translate() rewrites `close 5HRZ` → `close #1` via the session structures."""
+    t = _make_translator()
+    sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})
+    good_json = (
+        '{"commands": ["close 5HRZ"], "explanations": ["remove the model"], '
+        '"warnings": [], "clarification_needed": null, "confidence": "high", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    _stub_backend(t, good_json)
+    result = t.translate("remove PDB 5HRZ", sess)
+    assert result.get("commands") == ["close #1"], f"got {result.get('commands')}"
 
 
 def test_probe_chimerax_verbs_caches_on_success() -> None:
