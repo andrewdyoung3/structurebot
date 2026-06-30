@@ -533,7 +533,8 @@ def _fakew(**attrs):
     """Bind the session-menu methods to a non-QWidget stand-in (avoids the full QMainWindow)."""
     obj = types.SimpleNamespace(**attrs)
     for name in ("_on_load_session", "_on_clear_session", "_on_save_session",
-                 "_redisplay_designs", "_reset_view_for_session", "show_model"):
+                 "_redisplay_designs", "_reset_view_for_session", "show_model",
+                 "_close_own_models"):
         setattr(obj, name, types.MethodType(getattr(W, name), obj))
     return obj
 
@@ -574,19 +575,65 @@ def test_load_session_replaces_and_redisplays_denovo(_app, monkeypatch):
     wb.rehydrate_denovo.assert_called_once()        # de-novo design re-displayed via the contract
 
 
+class _CloseBridge:
+    """Bridge stub for the Clear path: `info models` returns a controllable id listing;
+    every command is recorded so the test can assert which models were closed."""
+    def __init__(self, models_value="", raise_conn=False):
+        self._models_value = models_value
+        self._raise_conn = raise_conn
+        self.commands = []
+    def run_command(self, cmd, timeout=None):
+        self.commands.append(cmd)
+        if self._raise_conn:
+            raise ConnectionError("ChimeraX connection lost")
+        if cmd == "info models":
+            return {"value": self._models_value, "error": None}
+        return {"value": "", "error": None}
+
+
 def test_clear_session_resets_state_and_view(_app, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(QtWidgets.QMessageBox, "question",
                         lambda *a, **k: QtWidgets.QMessageBox.StandardButton.Yes)
     monkeypatch.setattr(gui_app, "ToolRouter", lambda *a, **k: _MM())
     orig = _SS(); wb = _MM()
-    w = _fakew(bridge=_MM(), session=orig, router=_MM(), workbench=wb, presenter=_MM(),
-               tabs=QtWidgets.QTabWidget(), _grids={"x": 1})
+    br = _CloseBridge(models_value="#1 atomic 5HRZ\n#2 atomic 1ABC")
+    w = _fakew(bridge=br, session=orig, router=_MM(), workbench=wb, presenter=_MM(),
+               tabs=QtWidgets.QTabWidget(), _grids={"x": 1}, _foreign_mids=set())
     w._on_clear_session()
     assert w.session is not orig and isinstance(w.session, _SS)   # fresh state
     wb.attach_session.assert_called_once()
     wb.reset.assert_called_once()
     assert w._grids == {}                            # view reset
+    assert "close #1,2" in br.commands               # this session's models were CLOSED
+
+
+def test_close_own_models_excludes_foreign(_app):
+    br = _CloseBridge(models_value="#1 atomic foreign\n#2 atomic mine\n#3 atomic mine")
+    w = _fakew(bridge=br, _foreign_mids={"1"})       # #1 belongs to another window
+    w._close_own_models()
+    assert br.commands == ["info models", "close #2,3"]   # foreign #1 spared
+
+
+def test_close_own_models_numeric_sort(_app):
+    br = _CloseBridge(models_value="#1 a\n#2 a\n#10 a")
+    w = _fakew(bridge=br, _foreign_mids=set())
+    w._close_own_models()
+    assert br.commands == ["info models", "close #1,2,10"]  # numeric, not lexical
+
+
+def test_close_own_models_noop_when_nothing_mine(_app):
+    br = _CloseBridge(models_value="#1 a")
+    w = _fakew(bridge=br, _foreign_mids={"1"})       # the only model is foreign
+    w._close_own_models()
+    assert br.commands == ["info models"]            # nothing closed
+
+
+def test_close_own_models_survives_connection_loss(_app):
+    br = _CloseBridge(raise_conn=True)               # ChimeraX closed → run_command raises
+    w = _fakew(bridge=br, _foreign_mids=set())
+    w._close_own_models()                            # must not raise (best-effort)
+    assert br.commands == ["info models"]            # tried once; no close attempted
 
 
 def test_save_session_reports_success(_app, monkeypatch):
@@ -742,14 +789,17 @@ def test_remap_rewrites_structural_align_reference(_app):
     assert set(s.structures) == {"11"}                            # the reference structure rekeyed
 
 
-def test_reconnect_clicked_noop_without_structures(_app):
+def test_reconnect_clicked_relaunches_even_without_structures(_app):
+    # On an EMPTY session the button must STILL relaunch ChimeraX (the documented recovery
+    # for a closed window) — it must NOT bail. _do_reconnect handles zero structures fine.
     w = _fakew(session=_SS(), presenter=_MM(),
                reconnect_action=_MM(), statusBar=lambda: _MM(), _pool=_MM())
     # bind the reconnect handler too
     w._on_reconnect_clicked = types.MethodType(W._on_reconnect_clicked, w)
+    w._on_reconnect_done = lambda *a, **k: None       # slot the worker signal connects to
     w._on_reconnect_clicked()
-    w.presenter.dim.assert_called_once()                         # "nothing to re-open"
-    w._pool.start.assert_not_called()
+    w._pool.start.assert_called_once()                           # the relaunch worker DID start
+    w.reconnect_action.setEnabled.assert_called_with(False)      # disabled while reconnecting
 
 
 def test_reconnect_done_applies_remap_and_relinks(_app, monkeypatch):
