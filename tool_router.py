@@ -125,7 +125,14 @@ _design_classify_fn = None
 
 
 # ── biological-assembly chain-id normalization (pure helpers; unit-testable) ───────────
-_SUBMODEL_CHAIN_RE = re.compile(r"chain id #(\d+\.\d+)/(\S+)")
+# Matches submodel addressing `#N.M/<chain>` in BOTH `info chains` (`chain id #2.1/A …`) and
+# `info residues` (`residue id #2.1/A:12 …`) output — the char class stops at ':' so a residue
+# spec's chain id is captured cleanly. `info residues` is the canonical source because it ALSO
+# reports NON-POLYMER chains (glycans/ligands); `info chains` lists polymer chains only, and that
+# omission was the glyco-assembly "1 chain" bug: a NAG-bearing copy's glycan chains (B, C, …) were
+# invisible to the planner, so the copy-rename targets collided with them (`changechains` rejected)
+# and `combine retainIds` then refused the duplicate chain-A copies.
+_SUBMODEL_CHAIN_RE = re.compile(r"#(\d+\.\d+)/([^:/\s]+)")
 _INT_MODEL_RE = re.compile(r"model id #(\d+)\b")
 
 
@@ -142,9 +149,14 @@ def _chain_id_candidates():
 
 
 def _parse_submodel_chains(text: str, group_model_id: str):
-    """`info chains #N` text → ordered [(submodel_id, [chain_ids]), …] for SUBMODELS of the group
+    """`info residues #N` text → ordered [(submodel_id, [chain_ids]), …] for SUBMODELS of the group
     (`#N.M/chain` lines only). [] when the text has no submodel addressing (already a flat model →
-    nothing to normalize). Preserves first-seen order of submodels and of chains within each."""
+    nothing to normalize). Preserves first-seen order of submodels and of chains within each.
+
+    Sourced from `info residues` (not `info chains`) so NON-POLYMER chains — glycans/ligands like
+    NAG, which sit in their own chain ids B, C, … — are enumerated too; otherwise the copy-rename
+    plan collides with those hidden chains and normalization fails (the glyco-assembly bug). The
+    regex also accepts `info chains` lines, so this stays usable either way."""
     prefix = f"{group_model_id}."
     order: List[str] = []
     by_sub: Dict[str, List[str]] = {}
@@ -4579,7 +4591,7 @@ class ToolRouter:
         """
         try:
             submodel_chains = _parse_submodel_chains(
-                self._cx_value(f"info chains #{group_model_id}"), group_model_id)
+                self._cx_value(f"info residues #{group_model_id}"), group_model_id)
             if not submodel_chains:
                 return None, None, None                 # not submodel-addressed → already flat (no-op)
             renames, final_chains = plan_assembly_chain_renames(submodel_chains)
