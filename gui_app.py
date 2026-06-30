@@ -938,9 +938,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 if "all" in s:
                     self.session.clear_all_structures()
                 else:
-                    m = re.search(r"#(\d+)", cmd)
-                    if m:
-                        self.session.remove_structure(m.group(1))
+                    ids = re.findall(r"#(\d+)", cmd)   # `close #1,3` → ['1','3']
+                    if ids:
+                        self.session.close_models(ids)
             for kw in ("cartoon", "surface", "style", "color", "show", "hide",
                        "transparency", "rainbow", "mlp", "coulombic", "preset"):
                 if s.startswith(kw):

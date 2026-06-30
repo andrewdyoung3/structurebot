@@ -510,10 +510,12 @@ def test_verb_guard_end_to_end_in_translate() -> None:
             "block message surfaced in warnings", f"got {result.get('warnings')}")
 
 
-def _session_with(structures: dict):
-    """A minimal session stub exposing `.structures` for the close-target guard."""
+def _session_with(structures: dict, generated_assemblies: dict = None):
+    """A minimal session stub exposing `.structures` (+ optional `.generated_assemblies`)
+    for the close-target guard."""
     import types
-    return types.SimpleNamespace(structures=structures)
+    return types.SimpleNamespace(structures=structures,
+                                 generated_assemblies=generated_assemblies or {})
 
 
 def test_is_valid_close_spec() -> None:
@@ -543,6 +545,43 @@ def test_resolve_close_target_multiple_copies() -> None:
         "3": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}},
     })
     assert _resolve_close_target("5hrz", sess) == ["1", "3"]
+
+
+def test_resolve_close_target_includes_generated_assembly() -> None:
+    """REGRESSION (live-verify Test 3): `display as trimer` builds assembly #3 from AU #1
+    (5HRZ). Closing "5hrz" must hit BOTH the hidden AU and the visible assembly."""
+    sess = _session_with(
+        {"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}},
+        {"1": {"au_model_id": "1", "assembly_model_id": "3", "pdb_id": "5HRZ"}},
+    )
+    assert _resolve_close_target("5hrz", sess) == ["1", "3"]      # AU + assembly, numerically sorted
+    assert _resolve_close_target("5HRZ", sess) == ["1", "3"]
+
+
+def test_resolve_close_target_assembly_after_au_closed() -> None:
+    """After the AU is closed it leaves `structures`, but the lingering assembly stays
+    addressable by pdb_id via `generated_assemblies` (else it's un-closable by name)."""
+    sess = _session_with(
+        {},                                                       # AU already removed
+        {"1": {"au_model_id": "1", "assembly_model_id": "3", "pdb_id": "5HRZ"}},
+    )
+    assert _resolve_close_target("5hrz", sess) == ["3"]
+
+
+def test_resolve_close_target_no_assembly_unchanged() -> None:
+    """A plain PDB with no generated assembly resolves to just its own id."""
+    sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})
+    assert _resolve_close_target("5hrz", sess) == ["1"]
+
+
+def test_close_guard_closes_assembly_and_au() -> None:
+    """`close 5hrz` → `close #1,3` (both the AU and its generated assembly)."""
+    sess = _session_with(
+        {"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}},
+        {"1": {"au_model_id": "1", "assembly_model_id": "3", "pdb_id": "5HRZ"}},
+    )
+    cmds, _, blocked = _validate_close_targets(["close 5hrz"], ["x"], sess)
+    assert cmds == ["close #1,3"] and not blocked, f"got {cmds}"
 
 
 def test_close_guard_rewrites_pdb_id_to_model_spec() -> None:

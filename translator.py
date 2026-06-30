@@ -382,22 +382,45 @@ def _is_valid_close_spec(target: str) -> bool:
 
 
 def _resolve_close_target(target: str, session) -> list:
-    """Top-level model ids in *session* whose name OR pdb_id matches *target*
-    (case-insensitive). [] if none. Submodel ids ('2.1') collapse to top-level."""
+    """Top-level model ids in *session* that make up the structure the user named
+    *target* (a name or pdb_id, case-insensitive). Includes BOTH the loaded structure
+    AND any biological assembly generated from it — closing "5hrz" should remove the
+    visible assembly, not just the (hidden) asymmetric unit. Submodel ids ('2.1')
+    collapse to top-level; result is numerically sorted; [] if nothing matches."""
     if session is None:
         return []
     t = (target or "").strip().strip('"\'').lower()
     if not t:
         return []
     hits: list = []
+
+    def _add(mid):
+        top = str(mid).split(".")[0]
+        if top and top not in hits:
+            hits.append(top)
+
+    # 1. Loaded structures by name or pdb_id.
     for mid, info in (getattr(session, "structures", {}) or {}).items():
         name = str((info or {}).get("name", "")).strip().lower()
         pdb_id = str(((info or {}).get("metadata") or {}).get("pdb_id", "")).strip().lower()
         if t == name or (pdb_id and t == pdb_id):
-            top = str(mid).split(".")[0]
-            if top not in hits:
-                hits.append(top)
-    return hits
+            _add(mid)
+
+    # 2. Generated biological assemblies: a `display as trimer` builds a SEPARATE assembly
+    #    model that is NOT in `structures` (it lives in `generated_assemblies`, keyed by AU
+    #    model id). Add its assembly model when the named structure's AU is already matched,
+    #    OR the assembly record's own pdb_id matches — the latter still reaches the assembly
+    #    after the AU has been closed (it lingers, otherwise un-addressable by name).
+    for au_mid, rec in (getattr(session, "generated_assemblies", {}) or {}).items():
+        rec = rec or {}
+        amid = str(rec.get("assembly_model_id") or "").split(".")[0]
+        if not amid:
+            continue
+        apdb = str(rec.get("pdb_id", "")).strip().lower()
+        if str(au_mid).split(".")[0] in hits or (apdb and t == apdb):
+            _add(amid)
+
+    return sorted(hits, key=lambda s: int(s) if s.isdigit() else 1 << 30)
 
 
 def _validate_close_targets(commands: list, explanations: list, session) -> tuple:
