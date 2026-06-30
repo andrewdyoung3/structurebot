@@ -27,6 +27,44 @@ def _app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+# ── _DotTabBar: a "new / unviewed results" dot per tab ───────────────────────────
+
+def test_dot_tab_bar_tracks_and_paints(_app):
+    bar = gui_app._DotTabBar()
+    tabs = QtWidgets.QTabWidget()
+    tabs.setTabBar(bar)
+    for name in ("A", "B", "C"):
+        tabs.addTab(QtWidgets.QWidget(), name)
+    bar.set_new(1, True)
+    assert 1 in bar._new
+    bar.set_new(1, False)
+    assert 1 not in bar._new
+    bar.set_new(2, True)
+    bar.size()                                          # realize geometry
+    bar.repaint()                                       # paintEvent over a dotted tab must not raise
+
+
+def test_dot_marks_on_new_results_and_clears_on_view(_app):
+    # the gui wire (without a full window): a result-tab signal sets the dot when it's not current;
+    # activating that tab clears it. Driven through the same _mark_tab_new / _on_tab_activated methods.
+    bar = gui_app._DotTabBar()
+    tabs = QtWidgets.QTabWidget()
+    tabs.setTabBar(bar)
+    home, results = QtWidgets.QWidget(), QtWidgets.QWidget()
+    tabs.addTab(home, "Home"); tabs.addTab(results, "Results")
+    tabs.setCurrentIndex(0)
+
+    class _Stub:
+        def __init__(self): self.tabs = tabs
+        _mark_tab_new = gui_app.StructureBotWindow._mark_tab_new
+        _on_tab_activated = gui_app.StructureBotWindow._on_tab_activated
+    s = _Stub()
+    s._mark_tab_new(results)                             # results not current → dot
+    assert tabs.indexOf(results) in bar._new
+    s._on_tab_activated(tabs.indexOf(results))           # user opens it → cleared
+    assert tabs.indexOf(results) not in bar._new
+
+
 # ── QtPresenter: output renders to an HTML signal, never a widget ─────────────────
 
 def test_output_emits_html_signal(_app):

@@ -2412,13 +2412,15 @@ class TestDisulfideSuite:
         assert p.build_disulfide_introduce_spec((5, 5)) is None         # same column
         assert p.build_disulfide_introduce_spec((2, 999)) is None       # out of range
 
-    # ── GUI-SURFACE guard: the Disulfides menu actually RENDERS at top level, the actions are
+    # ── GUI-SURFACE guard: the Disulfides menu RENDERS (now a SUBMENU of Tools ▾), the actions are
     #    wired (trigger reaches the handler), and enabled-state tracks the precondition. This is
     #    the test the no-ChimeraX v1 verify lacked — it closes the discoverability blind spot.
-    def test_disulfide_menu_top_level_with_renamed_four_actions(self, _app):
+    def test_disulfide_menu_nested_under_tools_with_four_actions(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
-        assert p._ss_menu_btn.text() == "Disulfides"             # a TOP-LEVEL toolbar button…
-        acts = p._ss_menu_btn.menu().actions()
+        # Disulfides is now a SUBMENU under Tools ▾ (Analysis group), not a top-level button.
+        tools_subs = [a.menu() for a in p._tools_btn.menu().actions() if a.menu() is not None]
+        assert p._ss_menu in tools_subs and p._ss_menu.title() == "Disulfides"
+        acts = p._ss_menu.actions()
         # FOUR actions now: A assess / B measure / D find / C declare — and the labels carry the
         # load-bearing scope language (find/discover ONLY on D; A says "existing", never "discover")
         assert {p._ss_discover_btn, p._ss_geometry_btn, p._ss_scan_btn, p._ss_constrain_btn} <= set(acts)
@@ -3516,6 +3518,19 @@ class TestCavityMode:
         t.reset()
         assert t._tbl.rowCount() == 0 and not t._tbl.isVisible()
 
+    def test_populate_announces_new_results_for_tab_dot(self, _app):
+        # the tab-bar "new results" dot wire: a populate that produces rows emits resultsArrived;
+        # an empty scan does NOT (nothing new to view).
+        from variant_workbench import CavityResultsTab
+        t = CavityResultsTab(on_highlight=lambda *a, **k: None)
+        fired = []
+        t.resultsArrived.connect(lambda: fired.append(1))
+        t.populate(MagicMock(), self._scan())            # 2 candidates → announces once
+        assert fired == [1]
+        fired.clear()
+        t.populate(MagicMock(), {"candidates": []})      # no candidates → no announce
+        assert fired == []
+
 
 class TestDesignBasket:
     """The cross-strategy substitution-staging panel: curate picks → compose ONE variant."""
@@ -3738,18 +3753,26 @@ class TestToolbarWraps:
     """The Workbench toolbar uses a WRAPPING flow layout — at a narrow width its pills wrap onto a
     second row instead of clipping behind an overflow chevron, so every action stays reachable."""
 
-    def test_toolbar_uses_flow_layout_with_every_action(self, _app):
+    def test_toolbar_flow_layout_groups_every_control(self, _app):
         from variant_workbench import _FlowLayout
         p, _ = _panel([], session=__import__("session_state").SessionState())
         flow = p._toolbar_layout
         assert isinstance(flow, _FlowLayout)
         widgets = [flow.itemAt(i).widget() for i in range(flow.count())]
-        # every high-frequency pill + menu button + the colour combo is in the layout (nothing
-        # hidden behind a ">>" chevron the way a QToolBar would clip them).
-        for btn in (p._add_btn, p._add_seq_btn, p._apply_btn, p._tools_btn, p._stab_btn,
-                    p._sol_btn, p._fold_menu_btn, p._ss_menu_btn, p._pro_menu_btn,
-                    p._dev_btn, p._align_btn, p._mode_combo):
-            assert btn in widgets
+        # Edit group + Tools ▾ + the View pill are direct flow items (nothing hidden behind a ">>"
+        # chevron the way a QToolBar would clip them).
+        for w in (p._add_btn, p._add_seq_btn, p._aa_combo, p._apply_btn, p._tools_btn, p._view_group):
+            assert w in widgets
+        # View group (pill) carries fold / align / colour / deviation.
+        view_kids = p._view_group.findChildren(QtWidgets.QWidget)
+        for w in (p._fold_menu_btn, p._align_btn, p._mode_combo, p._dev_btn):
+            assert w in view_kids
+        # Analysis controls live under Tools ▾ — the two per-variant tests as actions, and the two
+        # stabilization-strategy SUBMENUS (Disulfides / Stabilize).
+        tmenu = p._tools_btn.menu()
+        assert p._stab_btn in tmenu.actions() and p._sol_btn in tmenu.actions()
+        subs = [a.menu() for a in tmenu.actions() if a.menu() is not None]
+        assert p._ss_menu in subs and p._pro_menu in subs
 
     def test_toolbar_wraps_taller_at_narrow_width(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())

@@ -625,6 +625,15 @@ class _StabilizationResultsTab(QtWidgets.QWidget):
     each tab's behaviour is unchanged. Persists across tab-switch + session reset (keep-and-clear: the
     subclass `reset()` empties content, the tab lives on as a sibling in `gui_app.tabs`)."""
 
+    # Emitted when this tab gains NEW results (a populate produced rows). The gui tab-bar consumes
+    # it to paint a "new / unviewed results" dot on the tab; cleared when the tab is activated.
+    # Behaviour-neutral (a notification only — no analysis/data change).
+    resultsArrived = QtCore.Signal()
+
+    def _announce(self) -> None:
+        """Signal that fresh results landed in this tab (drives the tab-bar new-results dot)."""
+        self.resultsArrived.emit()
+
     def __init__(self, *, on_highlight, on_clear_glow=None, on_add_to_basket=None):
         super().__init__()
         self._on_highlight = on_highlight          # (cd, item) -> glow it in 3D (the shared seam)
@@ -866,6 +875,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             sec["basket_btn"].setEnabled(has and self._on_add_to_basket is not None)
         if has:
             tbl.selectRow(0); self._on_row(key, 0)         # preselect + highlight the best/first
+            self._announce()                               # new results → tab-bar dot
 
     def populate_assess(self, cd, pairs: List[dict]) -> None:
         self._fill_table("A", cd, pairs, lambda p: [
@@ -954,6 +964,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             f"Measure its geometry with “Measure pair geometry” to read the as-produced bond.")
         sec["readout"].setVisible(True)
         sec["placeholder"].setVisible(False)
+        self._announce()                                   # new results → tab-bar dot
 
     def reset(self) -> None:
         """Clear EVERY section back to its dormant 'Run … to populate' placeholder. The tab itself
@@ -1117,6 +1128,7 @@ class ProlineResultsTab(_StabilizationResultsTab):
         self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
         if has:
             self._tbl.selectRow(0); self._on_row(0)
+            self._announce()                               # new results → tab-bar dot
 
     @staticmethod
     def _ddg_cell(c: dict) -> str:
@@ -1273,6 +1285,7 @@ class CavityResultsTab(_StabilizationResultsTab):
         self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
         if has:
             self._tbl.selectRow(0); self._on_row(0)
+            self._announce()                               # new results → tab-bar dot
 
     @staticmethod
     def _ddg_cell(c: dict) -> str:
@@ -1486,6 +1499,8 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
             self._nv_tbl.selectRow(0); self._on_novel_row(0)
         elif existing:
             self._ex_tbl.selectRow(0); self._on_existing_row(0)
+        if has_nv or existing:
+            self._announce()                               # new results → tab-bar dot
 
     def reset(self) -> None:
         """Clear back to the dormant placeholders (keep-and-clear on session reset — the tab PERSISTS as
@@ -1794,7 +1809,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "(no loaded structure). Fold it as a mono/di/tri/tetramer.")
         self._add_seq_btn.clicked.connect(self._on_add_sequence)
         bar.addWidget(self._add_seq_btn)
-        bar.addWidget(self._toolbar_vsep())
         bar.addWidget(QtWidgets.QLabel("Substitute →"))
         self._aa_combo = QtWidgets.QComboBox()
         self._aa_combo.addItems(list(_AA_ORDER))
@@ -1832,24 +1846,22 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._clear_scan_btn = tools_menu.addAction("Clear scan set")
         self._clear_scan_btn.setToolTip("Clear the scan set.")
         self._clear_scan_btn.triggered.connect(self._clear_scan_set)
-        self._tools_btn.setMenu(tools_menu)
-        bar.addWidget(self._tools_btn)
-        bar.addWidget(self._toolbar_vsep())
-
-        # Stage 4a: per-variant action buttons (act on the ACTIVE variant row).
-        # Stability runs the 4-axis voter on the variant's EXACT mutations through the
-        # engine spine (deep → confirm-gate); solubility is the pure CamSol scalar (instant).
-        self._stab_btn = QtWidgets.QPushButton("Test stability")
+        # ── Analysis group: per-variant tests (formerly top-level "Test stability/solubility"
+        #    buttons) collapsed under Tools ▾ as menu items — SAME handlers, just regrouped.
+        tools_menu.addSeparator()
+        self._stab_btn = tools_menu.addAction("Test stability")
         self._stab_btn.setToolTip("Score the ACTIVE variant's exact mutations (4-axis ddG "
                                   "voter) through the tool spine. Deep adds Rosetta (gated).")
-        self._stab_btn.clicked.connect(self._on_test_stability)
-        bar.addWidget(self._stab_btn)
-        self._sol_btn = QtWidgets.QPushButton("Test solubility")
+        self._stab_btn.triggered.connect(self._on_test_stability)
+        self._sol_btn = tools_menu.addAction("Test solubility")
         self._sol_btn.setToolTip("CamSol intrinsic-solubility of the ACTIVE variant vs the "
                                  "template (instant, local).")
-        self._sol_btn.clicked.connect(self._on_test_solubility)
-        bar.addWidget(self._sol_btn)
-        bar.addWidget(self._toolbar_vsep())
+        self._sol_btn.triggered.connect(self._on_test_solubility)
+        # (the Disulfides + Stabilize SUBMENUS are appended to this same Tools menu below, at
+        #  their build sites — menus are live, so order-of-construction doesn't matter.)
+        self._tools_btn.setMenu(tools_menu)
+        bar.addWidget(self._tools_btn)
+        bar.addWidget(self._toolbar_vsep())          # divider: Analysis | View
 
         # Fold ▾ — Stage-4b fold the ACTIVE variant (engine picker; ESMFold local) +
         # fold/reference visibility + the tile escape-hatch.
@@ -1999,12 +2011,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._show_align_ref_cb.setToolTip("Show the ACTIVE construct's US-align reference (the PDB "
                                            "its fold was aligned onto) in the overlay.")
         self._show_align_ref_cb.toggled.connect(self._on_align_ref_overlay_toggle)
-        self._fold_menu_btn.setMenu(fold_menu)
-        bar.addWidget(self._fold_menu_btn)
-        bar.addWidget(self._toolbar_vsep())
+        self._fold_menu_btn.setMenu(fold_menu)        # added to the View group (pill) below
 
-        # Disulfides ▾ — TOP-LEVEL (sibling of Fold ▾, not buried) so the cysteine/disulfide suite
-        # is discoverable. Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
+        # Disulfides — now a SUBMENU under Tools ▾ (Analysis group), no longer a top-level button.
+        # Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
         # Labels surface the load-bearing distinction — OBSERVE existing cysteines (A/B) vs FIND
         # NOVEL installable sites (D) vs INTERVENE (C). "Find/discover/suggest" belongs ONLY to D
         # (the mode that finds sites not already present); A "assesses existing", never "discovers".
@@ -2014,12 +2024,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         #   C Declare cysteine bonds and fold — introduce Cys (substitution) + fold WITH the bond(s)
         # Each action is ENABLED by its real precondition (greyed = visibly unavailable, not a silent
         # no-op): A needs a de-novo construct; B/C/D need it FOLDED. Synced on tab-change/render/fold.
-        self._ss_menu_btn = QtWidgets.QToolButton()
-        self._ss_menu_btn.setText("Disulfides")
-        self._ss_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self._ss_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        ss_menu = QtWidgets.QMenu(self._ss_menu_btn)
-        ss_menu.setToolTipsVisible(True)
+        tools_menu.addSeparator()
+        # Explicit parent (the long-lived Tools button) + addMenu(object): the addMenu(str) overload
+        # returns a QMenu shiboken can let be GC'd; constructing with a parent keeps it alive.
+        self._ss_menu = QtWidgets.QMenu("Disulfides", self._tools_btn)
+        self._ss_menu.setToolTipsVisible(True)
+        tools_menu.addMenu(self._ss_menu)
+        ss_menu = self._ss_menu                        # actions below populate this nested submenu
         self._ss_discover_btn = ss_menu.addAction("Assess existing Cys pairs (multi-fold)…")
         self._ss_discover_btn.setToolTip("ASSESS the construct's EXISTING cysteine pairs: fold "
                                          "UNCONSTRAINED across N seeds and report how often each pair "
@@ -2054,20 +2065,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                           "it does NOT enforce geometry — the result is measured, "
                                           "never assumed. Needs a folded construct.")
         self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
-        self._ss_menu_btn.setMenu(ss_menu)
-        bar.addWidget(self._ss_menu_btn)
-        bar.addWidget(self._toolbar_vsep())
 
-        # Stabilize ▾ — TOP-LEVEL peer of Disulfides (stabilization is the program's core; the
-        # strategies are first-class peers). Proline-stabilization scan: per-residue X→Pro sites by
+        # Stabilize — now a SUBMENU under Tools ▾ (Analysis group), peer of Disulfides. Proline-
+        # stabilization scan: per-residue X→Pro sites by
         # backbone φ/ψ proline-compatibility + a backbone-H-bond-donor penalty. Cheap (reads the
         # structure, no fold); works on a de-novo fold OR a loaded crystal/model.
-        self._pro_menu_btn = QtWidgets.QToolButton()
-        self._pro_menu_btn.setText("Stabilize")
-        self._pro_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self._pro_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        pro_menu = QtWidgets.QMenu(self._pro_menu_btn)
-        pro_menu.setToolTipsVisible(True)
+        self._pro_menu = QtWidgets.QMenu("Stabilize", self._tools_btn)
+        self._pro_menu.setToolTipsVisible(True)
+        tools_menu.addMenu(self._pro_menu)
+        pro_menu = self._pro_menu                       # actions below populate this nested submenu
         self._pro_scan_btn = pro_menu.addAction("Find proline-stabilization sites…")
         self._pro_scan_btn.setToolTip("FIND X→Pro stabilizing sites: rank residues by backbone φ/ψ "
                                       "proline-compatibility with a backbone-H-bond-donor penalty "
@@ -2100,9 +2106,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "geometric suggestion only, you judge the context. Cheap (no fold). "
                                      "Needs a folded construct or a loaded structure.")
         self._sb_scan_btn.triggered.connect(self._on_saltbridge_scan)
-        self._pro_menu_btn.setMenu(pro_menu)
-        bar.addWidget(self._pro_menu_btn)
-        bar.addWidget(self._toolbar_vsep())
         self._sync_disulfide_menu_enabled()           # initial precondition state (greyed until ready)
 
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
@@ -2113,9 +2116,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "seed-pinned WT reference fold (same engine). Floor-gated: "
                                  "residues within the noise floor stay neutral. First use for "
                                  "an engine folds the WT reference + its noise floor (cached).")
-        self._dev_btn.clicked.connect(self._on_deviation_clicked)
-        bar.addWidget(self._dev_btn)
-        bar.addWidget(self._toolbar_vsep())
+        self._dev_btn.clicked.connect(self._on_deviation_clicked)   # added to the View group below
 
         # Stage 3: structurally align the DE-NOVO construct's fold onto a chosen PDB,
         # SEQUENCE-INDEPENDENTLY (US-align, LOCAL-ONLY) — the case ChimeraX matchmaker can't
@@ -2125,10 +2126,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                    "(sequence-independent, US-align LOCAL-ONLY). Captures TM-score "
                                    "+ RMSD and overlays the fold on the reference. De-novo only; "
                                    "fold the construct first.")
-        self._align_btn.clicked.connect(self._on_align_clicked)
-        bar.addWidget(self._align_btn)
-        bar.addWidget(self._toolbar_vsep())
-        bar.addWidget(QtWidgets.QLabel("Color:"))
+        self._align_btn.clicked.connect(self._on_align_clicked)   # added to the View group below
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
             self._mode_combo.addItem(m.label, m.key)
@@ -2140,7 +2138,26 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("Cavity sites", _RESULT_CAVITY_MODE)        # cavity-filling best-fill
         self._mode_combo.addItem("Salt-bridge sites", _RESULT_SALTBRIDGE_MODE)  # salt-bridge charge-pair
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        bar.addWidget(self._mode_combo)
+        # ── View group: a segmented "pill" cluster (Fold ▾ · Align to PDB · Color · Deviation vs WT)
+        #    — lighter-weight controls on a grouped translucent background, visually distinct from the
+        #    Edit/Analysis buttons. PURE grouping + styling: every widget + handler is unchanged; only
+        #    the parent (this pill instead of the flow row) and a flat/auto-raise look differ.
+        self._view_group = QtWidgets.QFrame()
+        self._view_group.setObjectName("workbenchViewGroup")
+        self._view_group.setStyleSheet(
+            "#workbenchViewGroup{background:rgba(127,127,127,0.14);border-radius:7px;}")
+        _vg = QtWidgets.QHBoxLayout(self._view_group)
+        _vg.setContentsMargins(7, 2, 7, 2)
+        _vg.setSpacing(6)
+        self._fold_menu_btn.setAutoRaise(True)        # lighter-weight, segmented look
+        self._align_btn.setFlat(True)
+        self._dev_btn.setFlat(True)
+        _vg.addWidget(self._fold_menu_btn)
+        _vg.addWidget(self._align_btn)
+        _vg.addWidget(QtWidgets.QLabel("Color:"))
+        _vg.addWidget(self._mode_combo)
+        _vg.addWidget(self._dev_btn)
+        bar.addWidget(self._view_group)
         # The flow layout left-aligns + wraps; no trailing stretch (a stretch item would consume the
         # row and stop wrapping). The container carries every pill — nothing is ever hidden.
         lay.addWidget(self._toolbar_container)

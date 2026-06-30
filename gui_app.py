@@ -60,6 +60,44 @@ def _async_raise(tid: int, exctype=KeyboardInterrupt) -> None:
         pass
 
 
+# ── tab bar with a "new results" dot ─────────────────────────────────────────────
+
+class _DotTabBar(QtWidgets.QTabBar):
+    """Tab bar that paints a small accent dot in a tab's top-right corner when that tab has new,
+    UNVIEWED results. Membership is index-keyed in ``_new``; a tab clears its dot when activated.
+    Pure presentation — it never changes which tab is current or what a tab contains."""
+
+    _DOT_COLOR = "#e06c2a"
+    _R = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._new: set = set()
+
+    def set_new(self, index: int, on: bool = True) -> None:
+        if index < 0:
+            return
+        if on:
+            self._new.add(index)
+        else:
+            self._new.discard(index)
+        self.update()
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)                              # normal tabs first
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(self._DOT_COLOR))
+        for i in list(self._new):
+            if i >= self.count():
+                continue
+            r = self.tabRect(i)
+            painter.drawEllipse(
+                QtCore.QPoint(r.right() - self._R - 4, r.top() + self._R + 4), self._R, self._R)
+        painter.end()
+
+
 # ── workers ─────────────────────────────────────────────────────────────────────
 
 class _RequestSignals(QtCore.QObject):
@@ -371,6 +409,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.resize(1000, 720)
 
         self.tabs = QtWidgets.QTabWidget()
+        # Custom tab bar that can paint a "new / unviewed results" dot per tab (set BEFORE adding
+        # tabs so every tab uses it). Result tabs raise their dot via the resultsArrived signal below.
+        self.tabs.setTabBar(_DotTabBar(self.tabs))
+        self.tabs.currentChanged.connect(self._on_tab_activated)
         self.tabs.addTab(self.workbench, "Variant Workbench")   # Stage-1 panel (first tab)
         # PERSISTENT Disulfides results tab (whole-suite home) — a sibling top-level tab. It survives
         # switching back to "Variant Workbench" + panel rebuilds (the old modeless dialog vanished).
@@ -382,6 +424,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.workbench.cavity_tab, "Cavity")
         # PERSISTENT Salt-bridge results tab — the fourth peer strategy. Same contract.
         self.tabs.addTab(self.workbench.saltbridge_tab, "Salt bridges")
+        # "New results" dots — REAL wire: each strategy tab raises its dot when a scan populates it
+        # (resultsArrived), cleared when the user opens that tab. (Chain tabs #N/C are stubbed below —
+        # mark_chain_tab_new is ready; hook it to a per-chain result event when one exists.)
+        for _rt in (self.workbench.disulfides_tab, self.workbench.proline_tab,
+                    self.workbench.cavity_tab, self.workbench.saltbridge_tab):
+            _rt.resultsArrived.connect(lambda _w=_rt: self._mark_tab_new(_w))
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(
@@ -893,6 +941,32 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._grids[ch.key] = grid
         self.tabs.addTab(grid, f"#{ch.model}/{ch.chain}  ({len(ch.cells)} aa)")
         return grid
+
+    # ── tab "new results" dots ───────────────────────────────────────────────────
+    def _mark_tab_new(self, widget) -> None:
+        """Dot the tab hosting *widget* as having new, unviewed results — unless it's already the
+        current tab (then there's nothing unviewed). Index-keyed; the result tabs hold fixed early
+        indices, so the index stays valid."""
+        bar = self.tabs.tabBar()
+        i = self.tabs.indexOf(widget)
+        if isinstance(bar, _DotTabBar) and i >= 0 and i != self.tabs.currentIndex():
+            bar.set_new(i, True)
+
+    def _on_tab_activated(self, index: int) -> None:
+        """Opening a tab clears its new-results dot (the results are now viewed)."""
+        bar = self.tabs.tabBar()
+        if isinstance(bar, _DotTabBar):
+            bar.set_new(index, False)
+
+    def mark_chain_tab_new(self, model, chain) -> None:
+        """STUB hook for per-chain (#N/C) tab dots. The infrastructure is ready — call this when a
+        result tied to a specific chain lands (e.g. a fold / per-chain scan completing). HOOK POINT:
+        wire it from the workbench's per-chain result handlers (the `apply_*` seams in
+        variant_workbench that target one chain) once a per-chain 'new result' event is identified.
+        No auto-marking today, so chain tabs never show a spurious dot."""
+        grid = self._grids.get((str(model), str(chain))) or self._grids.get((model, chain))
+        if grid is not None:
+            self._mark_tab_new(grid)
 
     def _focus_model(self, model_id: str) -> None:
         for key, grid in self._grids.items():
