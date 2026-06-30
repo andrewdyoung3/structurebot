@@ -570,6 +570,43 @@ def test_close_guard_blocks_unresolvable_target() -> None:
     assert blocked and "9XYZ" in blocked[0], f"actionable block message expected, got {blocked}"
 
 
+def _multi_pdb_session():
+    """Three structures open — the multi-PDB scenario where the local model leaks the
+    literal verb ("remove 1ABC") instead of normalising to close."""
+    return _session_with({
+        "1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}},
+        "2": {"name": "1ABC", "metadata": {"pdb_id": "1ABC"}},
+        "3": {"name": "2HHB", "metadata": {"pdb_id": "2HHB"}},
+    })
+
+
+def test_close_guard_normalizes_remove_verb_multi_pdb() -> None:
+    """REGRESSION (the live-verify failure): with several models open, `remove 1ABC` /
+    `remove 2hhb` (literal verb) must normalise to the CORRECT `close #N`."""
+    sess = _multi_pdb_session()
+    cmds, _, blocked = _validate_close_targets(["remove 1ABC"], ["x"], sess)
+    assert cmds == ["close #2"] and not blocked, f"got {cmds}"
+    cmds, _, blocked = _validate_close_targets(["remove 2hhb"], ["x"], sess)
+    assert cmds == ["close #3"] and not blocked, f"got {cmds}"
+
+
+def test_close_guard_normalizes_delete_verb() -> None:
+    """`delete <loaded structure>` is a remove-a-model intent → close #N."""
+    sess = _multi_pdb_session()
+    cmds, _, blocked = _validate_close_targets(["delete 5HRZ"], ["x"], sess)
+    assert cmds == ["close #1"] and not blocked, f"got {cmds}"
+
+
+def test_close_guard_leaves_rep_and_atom_commands_untouched() -> None:
+    """remove/delete of something that is NOT a loaded structure (a representation, a
+    chain, an atom spec) must pass through UNCHANGED and UNBLOCKED — only `close` blocks."""
+    sess = _multi_pdb_session()
+    for cmd in ("remove cartoon", "remove chain B", "delete #1/A:5",
+                "delete waters", "remove ribbon"):
+        cmds, _, blocked = _validate_close_targets([cmd], ["x"], sess)
+        assert cmds == [cmd] and not blocked, f"{cmd!r} must be untouched, got {cmds} blocked={blocked}"
+
+
 def test_close_guard_end_to_end_in_translate() -> None:
     """translate() rewrites `close 5HRZ` → `close #1` via the session structures."""
     t = _make_translator()
@@ -582,6 +619,29 @@ def test_close_guard_end_to_end_in_translate() -> None:
     _stub_backend(t, good_json)
     result = t.translate("remove PDB 5HRZ", sess)
     assert result.get("commands") == ["close #1"], f"got {result.get('commands')}"
+
+
+def test_close_guard_remove_verb_survives_verb_guard_end_to_end() -> None:
+    """The literal-verb leak end-to-end: a backend emitting `remove 1ABC` must come out
+    of translate() as `close #2` — proving Guard 4 runs BEFORE the verb-guard (which would
+    otherwise reject `remove`). Uses a populated registry so the verb-guard is live."""
+    t = _make_translator()
+    sess = _multi_pdb_session()
+    bad_json = (
+        '{"commands": ["remove 1ABC"], "explanations": ["remove that model"], '
+        '"warnings": [], "clarification_needed": null, "confidence": "high", '
+        '"tools_needed": ["chimerax"], "tool_inputs": {}}'
+    )
+    _stub_backend(t, bad_json)
+    old = _translator_mod._chimerax_verb_registry
+    _translator_mod._chimerax_verb_registry = frozenset({"close", "open", "color"})  # 'remove' absent
+    try:
+        result = t.translate("remove 1ABC", sess)
+        assert result.get("commands") == ["close #2"], f"got {result.get('commands')}"
+        assert not any("remove" in str(w).lower() for w in result.get("warnings", [])), \
+            "normalised command must NOT be verb-blocked"
+    finally:
+        _translator_mod._chimerax_verb_registry = old
 
 
 def test_probe_chimerax_verbs_caches_on_success() -> None:

@@ -353,16 +353,25 @@ def _validate_command_verbs(
 
 
 # ── Close-target resolution guard (remove/delete-a-model fix) ─────────────────
-# ChimeraX `close` accepts ONLY a model spec (`#1`, `#1,2`), `all`, or `session` —
-# NEVER a PDB id or structure name. But the LLM, asked to "remove 5HRZ" / "remove
-# PDB 5HRZ", emits `close 5HRZ` (the verb maps right but the id is passed through
-# literally). `close 5HRZ` is a no-op/error in ChimeraX, so the model never closes —
-# the user's "remove PDB XXXX had no effect" bug. The verb-guard passes it (the verb
-# `close` IS valid); nothing checked the ARGUMENT. This guard resolves a non-spec
-# close target to `#N` via the session's loaded structures (by PDB id or name,
-# case-insensitive); if it can't be resolved it BLOCKS with an actionable message
-# rather than emitting a dead command.
-_CLOSE_TARGET_RE = re.compile(r'^\s*close\s+(\S.*)$', re.IGNORECASE)
+# Closing a loaded model is "close #N" in ChimeraX — `close` accepts ONLY a model
+# spec (`#1`, `#1,2`), `all`, or `session`, NEVER a PDB id or structure name. Two
+# LLM failure modes produce a DEAD command that silently no-ops (the user's "remove
+# PDB XXXX had no effect" bug):
+#   (1) right verb, literal id:   "remove 5HRZ" → `close 5HRZ`
+#   (2) literal verb (esp. with several models open, where the model is less
+#       consistent): "remove 1ABC" → `remove 1ABC` / `delete 1ABC`
+# The verb-guard doesn't catch (1) (the verb `close` IS valid; nothing checked the
+# argument) and only *blocks* (2) (no close happens). This guard NORMALISES both to
+# `close #N` by resolving a non-spec target against the session's loaded structures.
+#
+# Asymmetry by verb:
+#   • `close <x>` unambiguously means close-a-model → an unresolvable target is an
+#     error, so BLOCK it (don't emit a dead command).
+#   • `remove`/`delete <x>` are ambiguous (`remove cartoon`, `delete waters`,
+#     `delete #1/A:5`) → rewrite ONLY when <x> resolves to a loaded structure;
+#     otherwise leave the command UNTOUCHED for the representation / atom paths.
+# Runs BEFORE the verb-guard so a normalised `remove …`→`close #N` is never blocked.
+_CLOSE_TARGET_RE = re.compile(r'^\s*(close|remove|delete)\s+(\S.*)$', re.IGNORECASE)
 
 
 def _is_valid_close_spec(target: str) -> bool:
@@ -393,9 +402,16 @@ def _resolve_close_target(target: str, session) -> list:
 
 def _validate_close_targets(commands: list, explanations: list, session) -> tuple:
     """
-    Guard: rewrite `close <name/PDB-id>` → `close #N` using the session's loaded
-    structures; block it if the target can't be resolved to a loaded model.
-    A target that is ALREADY a valid spec (`#…`/`all`/`session`) passes untouched.
+    Guard: normalise model-removal commands to `close #N` using the session's loaded
+    structures.
+
+      close  <name/PDB-id>          → close #N  (or BLOCK if unresolvable — `close`
+                                       unambiguously means close-a-model)
+      remove/delete <name/PDB-id>   → close #N  ONLY when it resolves to a loaded
+                                       structure; otherwise UNTOUCHED (ambiguous —
+                                       `remove cartoon`, `delete waters`, `delete #1/A`)
+      close <#N | all | session>    → untouched (already a valid spec)
+
     Returns (new_commands, new_explanations, blocked_messages).
     """
     new_cmds: list = []
@@ -405,7 +421,8 @@ def _validate_close_targets(commands: list, explanations: list, session) -> tupl
         exp = explanations[i] if i < len(explanations) else ""
         m = _CLOSE_TARGET_RE.match(cmd)
         if m:
-            target = m.group(1).strip()
+            verb = m.group(1).lower()
+            target = m.group(2).strip()
             if not _is_valid_close_spec(target):
                 hits = _resolve_close_target(target, session)
                 if hits:
@@ -414,13 +431,17 @@ def _validate_close_targets(commands: list, explanations: list, session) -> tupl
                     new_cmds.append(fixed)
                     new_exps.append(exp)
                     continue
-                blocked.append(
-                    f"Couldn't close {target!r}: ChimeraX `close` needs a model number "
-                    f"(e.g. close #1), not a name, and no loaded structure matches "
-                    f"{target!r}. It may already be closed, or try 'close all'."
-                )
-                print(f"  [close-guard] blocked {cmd!r}: {target!r} not a loaded model", flush=True)
-                continue
+                if verb == "close":
+                    # close-a-model with an unresolvable target → a dead command; block it.
+                    blocked.append(
+                        f"Couldn't close {target!r}: ChimeraX `close` needs a model number "
+                        f"(e.g. close #1), not a name, and no loaded structure matches "
+                        f"{target!r}. It may already be closed, or try 'close all'."
+                    )
+                    print(f"  [close-guard] blocked {cmd!r}: {target!r} not a loaded model", flush=True)
+                    continue
+                # remove/delete <x> that isn't a loaded structure: NOT necessarily a model
+                # op (rep/atom command) → leave untouched for the other guards / op-classes.
         new_cmds.append(cmd)
         new_exps.append(exp)
     return new_cmds, new_exps, blocked
@@ -1229,8 +1250,10 @@ class CommandTranslator:
           1. _sanitize_zone_syntax   — rewrite Chimera-1 zone → :< operator
           2. _scope_chain_refs_to_macromolecule — exclude ligand/solvent/ions
           3. _validate_open_targets  — block unresolvable open targets (Bug 4a)
-          4. _validate_command_verbs — reject unregistered leading verbs (Bug 4b)
-          5. _validate_close_targets — resolve `close <name/PDB-id>` → `close #N`
+          4. _validate_close_targets — normalise `close/remove/delete <name/PDB-id>`
+                                       → `close #N` (BEFORE the verb-guard, so a
+                                       normalised `remove …`→`close` isn't blocked)
+          5. _validate_command_verbs — reject unregistered leading verbs (Bug 4b)
         """
         result   = self._backend.translate(self, user_input, session)
         cmds     = result.get("commands")     or []
@@ -1250,17 +1273,20 @@ class CommandTranslator:
         if open_blocked:
             warnings.extend(open_blocked)
 
-        # Guard 4 (Bug 4b): reject commands with an unregistered leading verb
-        cmds, exps, verb_blocked = _validate_command_verbs(cmds, exps)
-        if verb_blocked:
-            warnings.extend(verb_blocked)
-
-        # Guard 5: resolve `close <name/PDB-id>` → `close #N` (or block if unresolvable).
-        # ChimeraX `close` only accepts a model spec; the LLM emits the PDB id literally
-        # ("remove 5HRZ" → "close 5HRZ"), which silently no-ops.
+        # Guard 4: normalise model-removal commands to `close #N`. ChimeraX `close`
+        # only accepts a model spec; the LLM emits a literal name/id ("remove 5HRZ"
+        # → "close 5HRZ", or — with several models open — even "remove 1ABC"), which
+        # silently no-ops. MUST run before the verb-guard: a normalised `remove …`
+        # becomes `close #N` so the verb-guard (which would otherwise reject `remove`)
+        # never sees it.
         cmds, exps, close_blocked = _validate_close_targets(cmds, exps, session)
         if close_blocked:
             warnings.extend(close_blocked)
+
+        # Guard 5 (Bug 4b): reject commands with an unregistered leading verb
+        cmds, exps, verb_blocked = _validate_command_verbs(cmds, exps)
+        if verb_blocked:
+            warnings.extend(verb_blocked)
 
         result["commands"]     = cmds
         result["explanations"] = exps
