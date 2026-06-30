@@ -212,3 +212,33 @@ def test_start_reuses_reachable_rest_no_spawn():
         assert bridge.start() is True
     popen.assert_not_called()
     kill.assert_not_called()
+
+
+def test_start_resets_lean_layout_on_fresh_spawn():
+    """A freshly spawned ChimeraX must re-apply the lean layout: the once-per-session
+    guard is reset on spawn (else the relaunched window keeps Log/Models/toolbars until
+    the next open — the live-verify Test 2 issue)."""
+    bridge = _bridge()
+    bridge._lean_layout_applied = True                        # carried over from a prior instance
+    proc = MagicMock(); proc.poll.return_value = None
+    running = MagicMock(side_effect=[False, True])            # port dead at entry, up after spawn
+    with patch.object(bridge, "is_running", running), \
+         patch.object(bridge, "_chimerax_process_exists", MagicMock(return_value=False)), \
+         patch("chimerax_bridge.subprocess.Popen", MagicMock(return_value=proc)), \
+         patch("chimerax_bridge.Path") as _path, \
+         patch("chimerax_bridge.time.sleep", MagicMock()):
+        _path.return_value.is_file.return_value = True
+        assert bridge.start(timeout=5) is True
+    assert bridge._lean_layout_applied is False               # reset so the new window gets it
+
+
+def test_start_reuse_does_not_reset_lean_layout():
+    """Reusing a reachable REST server must NOT reset the guard (no fresh window → no re-apply)."""
+    bridge = _bridge()
+    bridge._lean_layout_applied = True
+    with patch.object(bridge, "is_running", MagicMock(return_value=True)), \
+         patch("chimerax_bridge.subprocess.Popen", MagicMock()), \
+         patch("chimerax_bridge.Path") as _path:
+        _path.return_value.is_file.return_value = True
+        assert bridge.start() is True
+    assert bridge._lean_layout_applied is True                # untouched on reuse

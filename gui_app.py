@@ -1176,12 +1176,19 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     # ── Reconnect / refresh the ChimeraX view (relaunch + re-open + re-link) ──────────
     def _on_reconnect_clicked(self) -> None:
-        if not self.session.structures:
-            self.presenter.dim("Nothing to re-open — no structures in this session yet.")
-            return
+        # Always (re)launch ChimeraX — even on an EMPTY session. The button is the user's
+        # documented recovery for a closed window ("Re-open the ChimeraX window (if closed)…"),
+        # and the normal command path deliberately never auto-relaunches (the anti-window-pile
+        # guard). An early-return on an empty session left the user with NO way to bring
+        # ChimeraX back after closing it in a fresh session. `_do_reconnect` handles zero
+        # structures fine (ensure_visible_gui then a no-op re-open loop).
         self.reconnect_action.setEnabled(False)
         self.statusBar().showMessage("Reconnecting ChimeraX…")
-        self.presenter.info("Reconnecting ChimeraX (relaunching if closed; re-opening structures)…")
+        if not self.session.structures:
+            self.presenter.info("Reconnecting ChimeraX (relaunching the window if closed; "
+                                "no structures in this session to re-open)…")
+        else:
+            self.presenter.info("Reconnecting ChimeraX (relaunching if closed; re-opening structures)…")
         w = _ReconnectWorker(self)
         w.signals.done.connect(self._on_reconnect_done)
         self._pool.start(w)

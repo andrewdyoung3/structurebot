@@ -742,14 +742,17 @@ def test_remap_rewrites_structural_align_reference(_app):
     assert set(s.structures) == {"11"}                            # the reference structure rekeyed
 
 
-def test_reconnect_clicked_noop_without_structures(_app):
+def test_reconnect_clicked_relaunches_even_without_structures(_app):
+    # On an EMPTY session the button must STILL relaunch ChimeraX (the documented recovery
+    # for a closed window) — it must NOT bail. _do_reconnect handles zero structures fine.
     w = _fakew(session=_SS(), presenter=_MM(),
                reconnect_action=_MM(), statusBar=lambda: _MM(), _pool=_MM())
     # bind the reconnect handler too
     w._on_reconnect_clicked = types.MethodType(W._on_reconnect_clicked, w)
+    w._on_reconnect_done = lambda *a, **k: None       # slot the worker signal connects to
     w._on_reconnect_clicked()
-    w.presenter.dim.assert_called_once()                         # "nothing to re-open"
-    w._pool.start.assert_not_called()
+    w._pool.start.assert_called_once()                           # the relaunch worker DID start
+    w.reconnect_action.setEnabled.assert_called_with(False)      # disabled while reconnecting
 
 
 def test_reconnect_done_applies_remap_and_relinks(_app, monkeypatch):
