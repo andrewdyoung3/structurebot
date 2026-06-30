@@ -1434,7 +1434,10 @@ class ToolRouter:
             and not _claimed
         )
         if _ba_intent:
-            _ba_model_id   = self._primary_model_id()
+            # Target the VISIBLE model (what the user is focused on), not the always-#1
+            # heuristic — else "show as assembly" with A+B open re-assembles the first-opened
+            # A instead of the visible B. Falls back to _primary_model_id when no visible info.
+            _ba_model_id   = self._visible_focus_model_id() or self._primary_model_id()
             _ba_assembly_id = self._parse_bio_assembly_id(user_input)
             tools_needed = ["bio_assembly"]
             tool_inputs  = {
@@ -4616,7 +4619,9 @@ class ToolRouter:
         t0 = _time.perf_counter()
         user_input = user_input or inputs.get("_user_input", "")
 
-        model_id    = str(inputs.get("model_id") or self._primary_model_id())
+        model_id    = str(inputs.get("model_id")
+                          or self._visible_focus_model_id()
+                          or self._primary_model_id())
         assembly_id = int(inputs.get("assembly_id") or 1)
 
         # Guard: must have a loaded model
@@ -9261,6 +9266,33 @@ class ToolRouter:
         if "1" in structures:
             return "1"
         return next(iter(structures))
+
+    def _visible_focus_model_id(self) -> Optional[str]:
+        """The model the user is focused on — i.e. what's VISIBLE on screen — so an
+        unspecified prompt acts on it rather than on a stale heuristic (the always-#1
+        bias of `_primary_model_id`). Read from the bridge's live display state:
+          • exactly one visible tracked structure → that one (the clear case);
+          • several visible → the most-recently-added (highest numeric id), a proxy for
+            "what the user just brought up";
+          • no bridge / nothing visible / probe fails → None, so the caller falls back to
+            `_primary_model_id()` unchanged (tests + headless stay deterministic).
+        Submodel ids collapse to top level (visible_model_ids already returns top-level)."""
+        if self.bridge is None:
+            return None
+        try:
+            visible = list(self.bridge.visible_model_ids() or [])
+        except Exception:
+            return None
+        if not visible:
+            return None
+        # Prefer visible ids that are tracked structures (skip e.g. a bare surface/volume).
+        tracked = [v for v in visible if v in self.session.structures]
+        pool = tracked or visible
+        if not pool:
+            return None
+        if len(pool) == 1:
+            return pool[0]
+        return max(pool, key=lambda s: int(s) if str(s).isdigit() else -1)
 
     def available_tools(self) -> Dict[str, str]:
         """Return {tool_name: status_string} for all tools."""
