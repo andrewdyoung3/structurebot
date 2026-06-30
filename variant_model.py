@@ -750,8 +750,16 @@ def stability_summary(candidates: List[Dict[str, Any]],
             continue
         ddg, src = candidate_ddg(c)
         per_resnum[rn] = ddg
+        # Carry EVERY method's ddG side-by-side (not just the collapsed best) so the export keeps
+        # all sets — a later deep Rosetta run augments rather than erases the ThermoMPNN/RaSP axes.
+        # `rosetta_ddg` is the candidate's physics axis (`ddg`, None on the fast tier); the ML/proxy/
+        # dynamics axes are always present when their voter scored.
         rows.append({"resnum": rn, "from_aa": c.get("from_aa"), "to_aa": to_aa,
                      "ddg": ddg, "ddg_source": src,
+                     "rosetta_ddg": c.get("ddg"),
+                     "thermompnn_ddg": c.get("thermompnn_ddg"),
+                     "rasp_ddg": c.get("rasp_ddg"),
+                     "dynamut2_ddg": c.get("dynamut2_ddg"),
                      "combined_score": c.get("combined_score"),
                      "recommendation": c.get("recommendation")})
     rows.sort(key=lambda r: r["resnum"])
@@ -760,6 +768,57 @@ def stability_summary(candidates: List[Dict[str, Any]],
             "sum_ddg": round(sum(vals), 2) if vals else None,
             "n_scored": len(rows),
             "tier": "deep" if any(r["ddg_source"] == "rosetta" for r in rows) else "fast"}
+
+
+# Per-method ddG axes carried on each stability row (accumulated across runs by merge_stability).
+_DDG_AXES = ("rosetta_ddg", "thermompnn_ddg", "rasp_ddg", "dynamut2_ddg")
+
+
+def _best_axis_ddg(row: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Best-available ddG + source from a stability ROW's per-method axes, SAME priority as
+    `candidate_ddg` (rosetta > thermompnn > rasp; dynamut2 is an export-only dynamics axis, not
+    folded into the displayed/summed best). Drives `ddg`/`per_resnum` after a cross-run merge."""
+    for axis, src in (("rosetta_ddg", "rosetta"), ("thermompnn_ddg", "thermompnn"),
+                      ("rasp_ddg", "rasp")):
+        v = row.get(axis)
+        if isinstance(v, (int, float)):
+            return float(v), src
+    return None, "not_computed"
+
+
+def merge_stability(prev: Optional[Dict[str, Any]],
+                    new: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge a NEW stability summary onto a PRIOR one so the per-method ddG axes ACCUMULATE across
+    runs — a deep Rosetta run AUGMENTS an earlier fast ThermoMPNN/RaSP run (adds the physics column)
+    instead of REPLACING it (the export-overwrite bug). Aligned to the NEW run's rows (the variant's
+    CURRENT mutations, so a re-targeted residue never carries stale data): for each new row, each
+    per-method axis takes the new value when present, else the prior run's value for the SAME
+    (resnum, to_aa). `ddg`/`ddg_source`/`per_resnum`/`sum_ddg`/`tier` are recomputed from the merged
+    axes (best = rosetta > thermompnn > rasp). Pure / testable."""
+    if not prev or not prev.get("rows"):
+        return new
+    prev_by = {(r.get("resnum"), r.get("to_aa")): r for r in prev.get("rows", [])}
+    rows: List[Dict[str, Any]] = []
+    per_resnum: Dict[int, Optional[float]] = {}
+    for r in new.get("rows", []):
+        merged = dict(r)
+        p = prev_by.get((r.get("resnum"), r.get("to_aa")))
+        if p is not None:
+            for axis in _DDG_AXES:                       # keep a prior axis the new run didn't score
+                if merged.get(axis) is None and p.get(axis) is not None:
+                    merged[axis] = p.get(axis)
+            for f in ("combined_score", "recommendation"):
+                if merged.get(f) is None and p.get(f) is not None:
+                    merged[f] = p.get(f)
+        merged["ddg"], merged["ddg_source"] = _best_axis_ddg(merged)
+        per_resnum[merged["resnum"]] = merged["ddg"]
+        rows.append(merged)
+    rows.sort(key=lambda x: (x["resnum"] if x["resnum"] is not None else 0))
+    vals = [r["ddg"] for r in rows if r["ddg"] is not None]
+    return {"per_resnum": per_resnum, "rows": rows,
+            "sum_ddg": round(sum(vals), 2) if vals else None,
+            "n_scored": len(rows),
+            "tier": "deep" if any(r.get("rosetta_ddg") is not None for r in rows) else "fast"}
 
 
 # ── Stage 4b: reduce a fold result (engine-agnostic) for ResultSlots.fold ───────────

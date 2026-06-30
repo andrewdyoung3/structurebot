@@ -48,7 +48,7 @@ from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            column_tracks, DesignSession,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
-                           suggestion_color)
+                           merge_stability, suggestion_color)
 
 _COLS = 30                                  # residues per wrapped block
 _SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
@@ -5170,7 +5170,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         cd, v = cd_v
         candidates = self._candidates_from_result(result)
-        v.results.stability = stability_summary(candidates, v.mutations)
+        # MERGE, don't replace: a deep Rosetta run augments an earlier fast ThermoMPNN/RaSP run so
+        # ALL method axes survive (the export keeps every set, even after a higher-quality analysis).
+        v.results.stability = merge_stability(v.results.stability,
+                                              stability_summary(candidates, v.mutations))
         # restore the suggestion-scan cache the stability run overwrote
         snap = getattr(self, "_scan_cache_snapshot", None)
         if snap is not None and self._session is not None:
