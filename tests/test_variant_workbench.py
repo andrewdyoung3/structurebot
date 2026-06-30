@@ -107,9 +107,7 @@ class TestStage2:
         tab = p._cur_tab()
         p._add_variant()
         vid = tab.design.variants[0].id
-        p._on_cell(tab, vid, 1)                  # click V1 col1 → edit target (K)
-        p._aa_combo.setCurrentText("A")
-        p._apply_substitution()
+        p._do_substitute(tab, vid, 1, "A")       # K2A via the residue path (toolbar combo removed)
         assert tab.design.get_variant(vid).cells[1].aa == "A"
         assert sess.add_design_session.call_count == 3          # load + add + edit
 
@@ -135,9 +133,8 @@ class TestStage2:
         p._add_variant()
         vid = tab.design.variants[0].id
         _set_mode(p, "charge")
-        p._on_cell(tab, vid, 2)                  # V col2 (V) active + edit target
-        p._aa_combo.setCurrentText("D")
-        p._apply_substitution()                  # V→D : col2 now negative
+        p._on_cell(tab, vid, 2)                  # V col2 (V) active (drives the 3D recolor target)
+        p._do_substitute(tab, vid, 2, "D")       # V→D : col2 now negative (toolbar combo removed)
         cmds = p.color_commands_for(tab)
         red = get_mode("charge").color_for("D")
         # active row is the edited variant → resnum 3 colored red on BOTH copies
@@ -3761,7 +3758,7 @@ class TestToolbarWraps:
         widgets = [flow.itemAt(i).widget() for i in range(flow.count())]
         # Edit group + Tools ▾ + the View pill are direct flow items (nothing hidden behind a ">>"
         # chevron the way a QToolBar would clip them).
-        for w in (p._add_btn, p._add_seq_btn, p._aa_combo, p._apply_btn, p._tools_btn, p._view_group):
+        for w in (p._add_btn, p._add_seq_btn, p._tools_btn, p._view_group):
             assert w in widgets
         # View group (pill) carries fold / align / colour / deviation.
         view_kids = p._view_group.findChildren(QtWidgets.QWidget)
@@ -3781,3 +3778,14 @@ class TestToolbarWraps:
         wide = flow.heightForWidth(4000)       # comfortably one row
         assert wide > 0
         assert narrow > wide                   # narrow WRAPPED (grew taller) rather than clipping
+
+    def test_flow_layout_centers_items_vertically_in_a_row(self, _app):
+        from variant_workbench import _FlowLayout
+        host = QtWidgets.QWidget()
+        flow = _FlowLayout(host, margin=0, hspacing=6, vspacing=4)
+        short, tall = QtWidgets.QLabel("x"), QtWidgets.QPushButton("Y")
+        tall.setMinimumHeight(40)              # force a height difference within the row
+        flow.addWidget(short); flow.addWidget(tall)
+        flow.setGeometry(QtCore.QRect(0, 0, 1000, 80))      # wide → a single row
+        # both items share a common vertical CENTRE line (not top-aligned, which left labels high).
+        assert abs(short.geometry().center().y() - tall.geometry().center().y()) <= 1

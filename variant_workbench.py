@@ -1720,18 +1720,29 @@ class _FlowLayout(QtWidgets.QLayout):
         y = rect.y() + m.top()
         right = rect.right() - m.right()
         line_height = 0
+        row = 0
+        placed: List[Tuple[object, int, int, "QtCore.QSize", int]] = []   # (item, x, row_top, hint, row)
+        row_h: Dict[int, int] = {}                                        # row -> tallest item
         for item in self._items:
             hint = item.sizeHint()
             next_x = x + hint.width() + self._hspace
             if next_x - self._hspace > right and line_height > 0:    # wrap to the next row
                 x = rect.x() + m.left()
                 y = y + line_height + self._vspace
+                row += 1
                 next_x = x + hint.width() + self._hspace
                 line_height = 0
-            if not test_only:
-                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            placed.append((item, x, y, hint, row))
             x = next_x
             line_height = max(line_height, hint.height())
+            row_h[row] = max(row_h.get(row, 0), hint.height())
+        if not test_only:
+            # Vertically CENTER each item within its row's height so labels / menu buttons / combos
+            # of differing heights line up on a common centre line (not top-aligned, which left the
+            # shorter 'Substitute →' / 'Tools' items sitting high).
+            for item, ix, row_top, hint, r in placed:
+                iy = row_top + (row_h[r] - hint.height()) // 2
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(ix, iy), hint))
         return y + line_height - rect.y() + m.bottom()
 
 
@@ -1740,9 +1751,10 @@ class _FlowLayout(QtWidgets.QLayout):
 class VariantWorkbenchPanel(QtWidgets.QWidget):
     """Stage-3b Workbench panel. `controller` = a seq_editor.SequenceEditorController
     (shares the ChimeraX bridge). `load_model(model_id)` reads the structure, builds the
-    DesignSession, renders the tabs, persists it. Toolbar: add variant, substitute
-    (combo+Apply), color mode, AND the Stage-3b tool LAUNCH buttons ("Run ProteinMPNN…",
-    "Scan…"). Column-click toggles the position into the SCAN SET (the deterministic scan
+    DesignSession, renders the tabs, persists it. Toolbar groups: Edit (add variant /
+    add sequence), Analysis (Tools ▾ — scan / MPNN / per-variant tests / Disulfides +
+    Stabilize submenus), View (Fold ▾ / Align / Color / Deviation pill). Substitution is
+    residue-targeted via the cell right-click menu ("Substitute →"), not a toolbar control. Column-click toggles the position into the SCAN SET (the deterministic scan
     scope) and selects the whole set in 3D (all copies); a color mode paints the panel AND
     recolors the 3D by the active row.
 
@@ -1809,13 +1821,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "(no loaded structure). Fold it as a mono/di/tri/tetramer.")
         self._add_seq_btn.clicked.connect(self._on_add_sequence)
         bar.addWidget(self._add_seq_btn)
-        bar.addWidget(QtWidgets.QLabel("Substitute →"))
-        self._aa_combo = QtWidgets.QComboBox()
-        self._aa_combo.addItems(list(_AA_ORDER))
-        bar.addWidget(self._aa_combo)
-        self._apply_btn = QtWidgets.QPushButton("Apply")
-        self._apply_btn.clicked.connect(self._apply_substitution)
-        bar.addWidget(self._apply_btn)
+        # (Substitute combo + Apply were REMOVED from the toolbar — the same edit is reachable by
+        #  right-clicking a residue in a variant row: the cell menu's "Substitute →" runs the exact
+        #  same `edit_variant`, residue-targeted, so no capability is lost.)
         bar.addWidget(self._toolbar_vsep())
 
         # Tools ▾ — Stage-3b LAUNCH (Scan / Run ProteinMPNN, through the engine spine) +
@@ -3584,15 +3592,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return {str(observed[i]): v for i, v in enumerate(chains_ptm) if i < len(observed)}
         return {}
 
-    def _apply_substitution(self) -> None:
-        tab = self._cur_tab()
-        if tab is None:
-            return
-        if self._edit_target is None:
-            self._status.setText("Select a residue in a VARIANT row first (T is the immutable template).")
-            return
-        vid, col = self._edit_target
-        self._do_substitute(tab, vid, col, self._aa_combo.currentText())
 
     def _after_variant_edit(self, tab: _ChainDesignTab, vid: str, msg: str) -> None:
         """Shared post-edit refresh for substitute/delete/restore: re-lay the grid, keep the
