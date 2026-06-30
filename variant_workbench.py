@@ -48,7 +48,7 @@ from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            column_tracks, DesignSession,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
-                           suggestion_color)
+                           suggestion_color, _STD_AA)
 
 _COLS = 30                                  # residues per wrapped block
 _SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
@@ -4599,6 +4599,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "metrics_text": (f"O–N {cand.get('best_on')}Å Cβ–Cβ {cand.get('cb_cb')}Å; {bur}; "
                              + ("⚠ clash" if cand.get("clash") else "clash-free")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {pair_label(cand)} ({aa_a}{ra}{ta}+{aa_b}{rb}{tb}) to the design basket.")
 
@@ -4613,36 +4617,46 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         cd_map = self._chain_to_cd()
         ca, cb = pair_chains(cand)
         ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
-        subs = [(str(ca), cand.get("resnum_a"), cand.get("to_aa_a")),
-                (str(cb), cand.get("resnum_b"), cand.get("to_aa_b"))]
+        subs = [{"chain": str(ca), "position": cand.get("resnum_a"), "to_aa": cand.get("to_aa_a")},
+                {"chain": str(cb), "position": cand.get("resnum_b"), "to_aa": cand.get("to_aa_b")}]
         by_cd: Dict[int, tuple] = {}
-        for ch, pos, to_aa in subs:
-            tcd = cd_map.get(ch)
-            if tcd is None or pos is None or not to_aa:
-                self._status.setText("Can't substitute — a position isn't on the active design (re-scan).")
-                return
-            by_cd.setdefault(id(tcd), (tcd, []))[1].append((int(pos), str(to_aa)))
+        skipped: List[str] = []                       # same loud-not-silent discipline as _enact_basket
+        for s in subs:
+            tcd, col, reason = self._map_basket_sub(cd_map, s)
+            if reason:
+                skipped.append(reason)
+                continue
+            by_cd.setdefault(id(tcd), (tcd, []))[1].append(
+                (col, str(s["to_aa"]).strip().upper(), int(s["position"])))
         made: List[tuple] = []
-        for tcd, plist in by_cd.values():
+        for tcd, items in by_cd.values():
             vid = self._design.new_variant_id()
             tcd.add_variant(vid)
-            n = 0
-            for pos, to_aa in plist:
-                col = self._col_for_resnum(tcd, pos)
-                if col is None:
-                    continue
-                tcd.edit_variant(vid, col, to_aa)
-                n += 1
-            made.append((tcd, vid, n))
-        if not made or all(m[2] == 0 for m in made):
-            self._status.setText("Substitution failed — no positions mapped to the design.")
+            for col, to_aa, pos in items:
+                try:
+                    tcd.edit_variant(vid, col, to_aa)
+                except Exception as exc:
+                    skipped.append(f"{tcd.rep_chain}:{pos}→{to_aa} ({type(exc).__name__})")
+            v = tcd.get_variant(vid)
+            n = len(v.mutations) if v is not None else 0
+            if n == 0:
+                tcd.variants = [x for x in tcd.variants if x.id != vid]   # never leave an empty variant
+            else:
+                made.append((tcd, vid, n))
+        if not made:
+            msg = "Substitution failed — no positions mapped to the design"
+            if skipped:
+                msg += " (" + "; ".join(sorted(set(skipped))) + ")"
+            self._status.setText(msg + ".")
             return
         made.sort(key=lambda m: -m[2])
         primary_cd, primary_vid, _ = made[0]
         tab = self._focus_tab_for_design(primary_cd)
         msg = (f"{primary_vid}: {pair_label(cand)} charge pair substituted "
-               f"({'across 2 chains' if len(made) > 1 else 'both positions'}). Fold this variant to "
-               f"VALIDATE (re-fold + deviation — charged residues fold natively, no constraint).")
+               f"({'across 2 chains' if len(made) > 1 else 'both positions'}).")
+        if skipped:
+            msg += " Skipped " + "; ".join(sorted(set(skipped))) + "."
+        msg += " Fold this variant to VALIDATE (re-fold + deviation — charged residues fold natively, no constraint)."
         if tab is not None:
             self._after_variant_edit(tab, primary_vid, msg)
         else:
@@ -4741,6 +4755,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                              f"fills {cand.get('fill_fraction', 0):.0%}; "
                              + ("⚠ clash" if cand.get("clash") else "clash-free")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {cand.get('from_aa','')}{cand.get('position')}→{cand.get('to_aa','')} "
                              f"(cavity fill) to the design basket.")
@@ -4758,6 +4776,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                              + ("H-bond donor (penalized)" if cand.get("hbond_donates")
                                 else "no backbone H-bond donor")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {cand.get('from_aa','')}{cand.get('position')}→P to the design basket.")
 
@@ -4782,6 +4804,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "metrics_text": (f"Sγ–Sγ {sg if sg is not None else '—'}Å χSS {chi if chi is not None else '—'}°; "
                              + ("⚠ clash" if clash else "clash-free" if clash is False else "geometric")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {pair_label(pair)} (both→Cys) to the design basket.")
 
@@ -4794,25 +4820,23 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if self._design is None or not entries:
             return
         cd_map = self._chain_to_cd()
-        by_cd: Dict[int, tuple] = {}                  # id(cd) -> (cd, [subs]) — group atoms by owner cd
+        by_cd: Dict[int, tuple] = {}                  # id(cd) -> (cd, [(col, to_aa, pos)]) by owner cd
+        skipped: List[str] = []                       # human reasons a sub couldn't land — NEVER silent
         for e in entries:
             for s in e.get("subs", []):
-                tcd = cd_map.get(s["chain"])
-                if tcd is None:
+                tcd, col, reason = self._map_basket_sub(cd_map, s)
+                if reason:                            # off-template resnum / unmapped chain / bad target
+                    skipped.append(reason)
                     continue
-                by_cd.setdefault(id(tcd), (tcd, []))[1].append(s)
-        if not by_cd:
-            self._status.setText("Enact failed — the basket's chains aren't on the active design.")
-            return
+                by_cd.setdefault(id(tcd), (tcd, []))[1].append((col, s["to_aa"], int(s["position"])))
         # BACKSTOP (Fix 1b): two subs grouped onto the SAME cd at the SAME resnum but with DIFFERENT
         # target residues would silently overwrite (edit_variant dedups v.mutations by resnum) — the
         # homo-collapse loss. The basket conflict-check blocks this upstream; this is the defensive net
         # for any caller that reaches enact without it (programmatic basket construction, future seams).
         # Refuse the WHOLE enact rather than compose a half-built, last-write-wins variant.
-        for tcd, subs in by_cd.values():
+        for tcd, items in by_cd.values():
             want: Dict[int, str] = {}
-            for s in subs:
-                pos, aa = int(s["position"]), s["to_aa"]
+            for _col, aa, pos in items:
                 if want.get(pos, aa) != aa:
                     self._status.setText(
                         f"Enact blocked — conflicting substitutions at {tcd.rep_chain}:{pos} "
@@ -4821,26 +4845,37 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                     return
                 want[pos] = aa
         made: List[tuple] = []                        # (cd, vid, n_applied)
-        for tcd, subs in by_cd.values():
+        for tcd, items in by_cd.values():
             vid = self._design.new_variant_id()
             tcd.add_variant(vid)
-            seen_pos: set = set()
-            n = 0
-            for s in subs:
-                col = self._col_for_resnum(tcd, s["position"])
-                if col is None:
-                    continue
-                tcd.edit_variant(vid, col, s["to_aa"])
-                if int(s["position"]) not in seen_pos:    # count distinct residues (a homo dup → one)
-                    seen_pos.add(int(s["position"]))
-                    n += 1
-            made.append((tcd, vid, n))
+            for col, to_aa, pos in items:
+                try:
+                    tcd.edit_variant(vid, col, to_aa)
+                except Exception as exc:              # defensive — _map_basket_sub already validated
+                    skipped.append(f"{tcd.rep_chain}:{pos}→{to_aa} ({type(exc).__name__})")
+            v = tcd.get_variant(vid)
+            n = len(v.mutations) if v is not None else 0   # REAL changes (a to-WT sub reverts → 0)
+            if n == 0:
+                tcd.variants = [x for x in tcd.variants if x.id != vid]   # never leave an empty variant
+            else:
+                made.append((tcd, vid, n))
+        # Nothing landed → surface WHY (not a silent empty variant), and KEEP the basket so the picks
+        # are recoverable / re-targetable rather than consumed into nothing.
+        if not made:
+            msg = "Enact failed — no substitutions could be applied"
+            if skipped:
+                msg += " (" + "; ".join(sorted(set(skipped))) + ")"
+            self._status.setText(msg + ". The basket is unchanged — re-scan if the structure changed.")
+            return
         made.sort(key=lambda m: -m[2])                # refresh on the most-substituted cd's new variant
         primary_cd, primary_vid, _ = made[0]
         total = sum(m[2] for m in made)
-        msg = (f"Enacted {len(entries)} pick(s) → variant {primary_vid} ({total} substitution(s)"
-               + (f" across {len(made)} chains" if len(made) > 1 else "")
-               + "). Fold it to VALIDATE (the fold reveals the combination's effect).")
+        msg = (f"Enacted variant {primary_vid} — {total} substitution(s)"
+               + (f" across {len(made)} chains" if len(made) > 1 else "") + ".")
+        if skipped:                                   # partial success is reported, never hidden
+            uniq = sorted(set(skipped))
+            msg += f" Skipped {len(uniq)}: " + "; ".join(uniq) + "."
+        msg += " Fold it to VALIDATE (the fold reveals the combination's effect)."
         tab = self._focus_tab_for_design(primary_cd)
         if tab is not None:
             self._after_variant_edit(tab, primary_vid, msg)
@@ -5373,6 +5408,44 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         for i, c in enumerate(cd.template_cells):
             if (not c.is_gap) and c.resnum == int(resnum):
                 return i
+        return None
+
+    def _map_basket_sub(self, cd_map: Dict[str, "ChainDesign"], sub: dict):
+        """Resolve ONE basket sub → ``(cd, col, None)`` when it can land, or ``(None, None, reason)``
+        with a human reason when it can't: the target isn't a standard residue, its chain isn't on
+        the active design, or its resnum isn't a column on that design's template. The SINGLE source
+        of truth for "can this pick land?" — used to GUARD staging AND to apply-and-REPORT at enact,
+        so a pick that can't land is surfaced loud, NEVER silently dropped into an empty variant.
+        The standard-residue check uses the SAME `_STD_AA` set `edit_variant` enforces, so the guard
+        can't disagree with the editor."""
+        chain = str(sub.get("chain"))
+        pos = sub.get("position")
+        raw = sub.get("to_aa")
+        to_aa = (str(raw) if raw is not None else "").strip().upper()
+        if to_aa not in _STD_AA:
+            return None, None, f"{chain}:{pos}→{raw!r} (not a standard residue)"
+        tcd = cd_map.get(chain)
+        if tcd is None:
+            return None, None, f"{chain}:{pos} (chain not on the active design)"
+        try:
+            col = self._col_for_resnum(tcd, pos)
+        except (TypeError, ValueError):
+            col = None
+        if col is None:
+            return None, None, f"{chain}:{pos} (residue not in the design template)"
+        return tcd, col, None
+
+    def _unstageable_reason(self, subs) -> Optional[str]:
+        """First reason any of *subs* can't land on the active design, or None if all can — the
+        curate-time guard so a pick that would silently vanish at enact is blocked AT STAGING
+        (the deferred "zero substitutions landed" gap: stale/mismatched chain or off-template resnum)."""
+        if self._design is None:
+            return "no active design"
+        cd_map = self._chain_to_cd()
+        for s in (subs or []):
+            _cd, _col, reason = self._map_basket_sub(cd_map, s)
+            if reason:
+                return reason
         return None
 
     def _normalize_ss_pairs(self, pairs):
