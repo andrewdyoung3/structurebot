@@ -853,6 +853,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             self.workbench.load_model(mid)
         except Exception as exc:
             self.presenter.warn(f"Workbench load #{mid} failed: {exc}")
+        # The chain-grid tab strip mirrors the SINGLE active design — drop any tab belonging to a
+        # previously-active model so a stale strip can't leak alongside the new one (e.g. the AU's
+        # #1/A persisting next to a generated assembly's #3/A,#3/B,#3/C). Generation is filtered to
+        # the active design's chains, not every model the session has ever shown.
+        self._prune_chain_tabs_except(mid)
         if any(k[0] == mid for k in self._grids):
             self._focus_model(mid)
             return
@@ -860,6 +865,18 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         w.signals.done.connect(self._on_model_loaded)
         w.signals.failed.connect(lambda e: self.presenter.warn(f"show #{mid} failed: {e}"))
         self._pool.start(w)
+
+    def _prune_chain_tabs_except(self, model_id: str) -> None:
+        """Remove chain-grid tabs that do NOT belong to *model_id*. The strip reflects the one active
+        design (the panel holds a single design), so a prior model's chain tabs must not persist when
+        a different model becomes active. No-op when nothing is stale."""
+        stale = [key for key in self._grids if key[0] != str(model_id)]
+        for key in stale:
+            grid = self._grids.pop(key)
+            idx = self.tabs.indexOf(grid)
+            if idx != -1:
+                self.tabs.removeTab(idx)
+            grid.deleteLater()
 
     @QtCore.Slot(str, list)
     def _on_model_loaded(self, model_id: str, chains: list) -> None:

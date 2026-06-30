@@ -1650,6 +1650,76 @@ class DesignBasketPanel(QtWidgets.QWidget):
         self._refresh()
 
 
+class _FlowLayout(QtWidgets.QLayout):
+    """A left-to-right layout that WRAPS to the next row when the current row fills — so a toolbar
+    never clips/hides items behind an overflow chevron at narrow widths (every action stays visible,
+    just on a second row). Reports `heightForWidth` so its container grows taller as the row wraps.
+    Adapted from the canonical Qt FlowLayout example."""
+
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=4):
+        super().__init__(parent)
+        self._items: List[QtWidgets.QLayoutItem] = []
+        self._hspace = hspacing
+        self._vspace = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    # QLayout plumbing ----------------------------------------------------------------
+    def addItem(self, item):               # noqa: N802 (Qt override)
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):               # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):               # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):         # noqa: N802
+        return QtCore.Qt.Orientations(QtCore.Qt.Orientation(0))
+
+    def hasHeightForWidth(self):           # noqa: N802
+        return True
+
+    def heightForWidth(self, width):       # noqa: N802
+        return self._do_layout(QtCore.QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):           # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):                    # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):                 # noqa: N802
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QtCore.QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        x = rect.x() + m.left()
+        y = rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._hspace
+            if next_x - self._hspace > right and line_height > 0:    # wrap to the next row
+                x = rect.x() + m.left()
+                y = y + line_height + self._vspace
+                next_x = x + hint.width() + self._hspace
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + m.bottom()
+
+
 # ── the panel (toolbar + one QTabWidget; a tab per unique chain) ───────────────────
 
 class VariantWorkbenchPanel(QtWidgets.QWidget):
@@ -1702,14 +1772,18 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         # The menu entries are QActions wired to the SAME handlers the old buttons used —
         # no parallel UI path. (State read elsewhere — _scan_set_lbl.text(), _fold_vis_btn/
         # _show_fold_cb/_show_ref_cb .isChecked()/.setChecked() — works identically on QAction.)
-        # A QToolBar (not a bare QHBoxLayout) so the pill row OVERFLOWS into a native ">>" chevron
-        # popup when the window is narrow, instead of forcing the whole window's minimum width to the
-        # sum of every pill (the resize floor the user hit). The toolbar's minimum width collapses to
-        # ~one button + the chevron (~190 px) while every action stays reachable via the popup.
-        bar = QtWidgets.QToolBar()
-        bar.setMovable(False)
-        bar.setFloatable(False)
-        bar.setContentsMargins(6, 4, 6, 0)
+        # A WRAPPING flow layout (not a QToolBar, not a bare QHBoxLayout): at a narrow width the
+        # pill row WRAPS onto a second row instead of clipping items behind a ">>" overflow chevron
+        # (the chevron hid actions — they must ALL stay visible at any width). The container reports
+        # heightForWidth so the panel grows taller as the row wraps; its minimum width collapses to
+        # the widest single pill, so the window still narrows freely.
+        bar_container = QtWidgets.QWidget()
+        bar = _FlowLayout(bar_container, margin=4, hspacing=6, vspacing=4)
+        self._toolbar_container = bar_container       # exposed for the resize test
+        self._toolbar_layout = bar
+        _sp = bar_container.sizePolicy()
+        _sp.setHeightForWidth(True)
+        bar_container.setSizePolicy(_sp)
         self._add_btn = QtWidgets.QPushButton("+ Add variant")
         self._add_btn.clicked.connect(self._add_variant)
         bar.addWidget(self._add_btn)
@@ -1720,7 +1794,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "(no loaded structure). Fold it as a mono/di/tri/tetramer.")
         self._add_seq_btn.clicked.connect(self._on_add_sequence)
         bar.addWidget(self._add_seq_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
         bar.addWidget(QtWidgets.QLabel("Substitute →"))
         self._aa_combo = QtWidgets.QComboBox()
         self._aa_combo.addItems(list(_AA_ORDER))
@@ -1728,7 +1802,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._apply_btn = QtWidgets.QPushButton("Apply")
         self._apply_btn.clicked.connect(self._apply_substitution)
         bar.addWidget(self._apply_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
 
         # Tools ▾ — Stage-3b LAUNCH (Scan / Run ProteinMPNN, through the engine spine) +
         # Stage-3a cached-result IMPORT + the scan-set status/clear.
@@ -1760,7 +1834,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._clear_scan_btn.triggered.connect(self._clear_scan_set)
         self._tools_btn.setMenu(tools_menu)
         bar.addWidget(self._tools_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
 
         # Stage 4a: per-variant action buttons (act on the ACTIVE variant row).
         # Stability runs the 4-axis voter on the variant's EXACT mutations through the
@@ -1775,7 +1849,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "template (instant, local).")
         self._sol_btn.clicked.connect(self._on_test_solubility)
         bar.addWidget(self._sol_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
 
         # Fold ▾ — Stage-4b fold the ACTIVE variant (engine picker; ESMFold local) +
         # fold/reference visibility + the tile escape-hatch.
@@ -1927,7 +2001,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._show_align_ref_cb.toggled.connect(self._on_align_ref_overlay_toggle)
         self._fold_menu_btn.setMenu(fold_menu)
         bar.addWidget(self._fold_menu_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
 
         # Disulfides ▾ — TOP-LEVEL (sibling of Fold ▾, not buried) so the cysteine/disulfide suite
         # is discoverable. Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
@@ -1982,7 +2056,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
         self._ss_menu_btn.setMenu(ss_menu)
         bar.addWidget(self._ss_menu_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
 
         # Stabilize ▾ — TOP-LEVEL peer of Disulfides (stabilization is the program's core; the
         # strategies are first-class peers). Proline-stabilization scan: per-residue X→Pro sites by
@@ -2028,7 +2102,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._sb_scan_btn.triggered.connect(self._on_saltbridge_scan)
         self._pro_menu_btn.setMenu(pro_menu)
         bar.addWidget(self._pro_menu_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
         self._sync_disulfide_menu_enabled()           # initial precondition state (greyed until ready)
 
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
@@ -2041,7 +2115,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "an engine folds the WT reference + its noise floor (cached).")
         self._dev_btn.clicked.connect(self._on_deviation_clicked)
         bar.addWidget(self._dev_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
 
         # Stage 3: structurally align the DE-NOVO construct's fold onto a chosen PDB,
         # SEQUENCE-INDEPENDENTLY (US-align, LOCAL-ONLY) — the case ChimeraX matchmaker can't
@@ -2053,7 +2127,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                    "fold the construct first.")
         self._align_btn.clicked.connect(self._on_align_clicked)
         bar.addWidget(self._align_btn)
-        bar.addSeparator()
+        bar.addWidget(self._toolbar_vsep())
         bar.addWidget(QtWidgets.QLabel("Color:"))
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
@@ -2067,9 +2141,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("Salt-bridge sites", _RESULT_SALTBRIDGE_MODE)  # salt-bridge charge-pair
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         bar.addWidget(self._mode_combo)
-        # No trailing stretch: a QToolBar left-aligns its items and surfaces the overflow chevron on
-        # the right when they don't fit — a stretch would just push the chevron off-screen.
-        lay.addWidget(bar)
+        # The flow layout left-aligns + wraps; no trailing stretch (a stretch item would consume the
+        # row and stop wrapping). The container carries every pill — nothing is ever hidden.
+        lay.addWidget(self._toolbar_container)
 
         self._tabs = QtWidgets.QTabWidget()
         self._tabs.currentChanged.connect(self._on_tab_changed)
@@ -2157,6 +2231,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             if tab is not None:
                 self._apply_color_to(tab)
                 self._push_3d_color(tab)      # recolour the still-open fold (no re-fold)
+
+    @staticmethod
+    def _toolbar_vsep() -> "QtWidgets.QFrame":
+        """A thin vertical separator for the wrapping toolbar (the flow-layout analog of
+        `QToolBar.addSeparator`). A FRESH widget per call — a layout item can't be shared."""
+        f = QtWidgets.QFrame()
+        f.setFrameShape(QtWidgets.QFrame.VLine)
+        f.setFrameShadow(QtWidgets.QFrame.Sunken)
+        return f
 
     # ── load + render ─────────────────────────────────────────────────────────────
     def load_model(self, model_id: str) -> None:
@@ -4134,9 +4217,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
             f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
         ]
-        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
-        self._glow_state = {"mid": mid, "both": spec}
-        self._sync_glow_clear_button()
+        self._apply_or_toggle_glow({"mid": mid, "both": spec}, apply)   # re-click toggles it off
 
     def _show_existing_prolines(self, cd) -> None:
         """Highlight the EXISTING prolines in 3D (the 'see what's already there' design-context half) —
@@ -4323,9 +4404,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
             f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
         ]
-        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
-        self._glow_state = {"mid": mid, "both": spec}
-        self._sync_glow_clear_button()
+        self._apply_or_toggle_glow({"mid": mid, "both": spec}, apply)   # re-click toggles it off
 
     def _declare_cavity(self, cd, cand: dict) -> None:
         """Substitute the selected residue to its FILL residue on a NEW variant — the validation path is
@@ -4496,10 +4575,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         pair shape), through the shared `_glow_state` (restore-then-apply, never stacking). Works for an
         intra-chain pair AND a cross-chain one (`_disulfide_pair_specs` reads chain_a/chain_b)."""
         apply = self._disulfide_scan_highlight_commands(cd, pair)
-        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
         mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
-        self._glow_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
-        self._sync_glow_clear_button()
+        new_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
+        self._apply_or_toggle_glow(new_state, apply)   # re-clicking the same pair toggles it off
 
     def _add_saltbridge_to_basket(self, cd, cand: dict) -> None:
         """Normalize a NOVEL salt-bridge candidate → a basket entry (TWO positions → the complementary
@@ -5646,6 +5724,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         WITHOUT applying a new colour mode. The manual escape from the pair-click spotlight."""
         self._run_commands_bg(self._consume_glow_restore())
 
+    def _apply_or_toggle_glow(self, new_state: Optional[dict], apply_cmds: List[str]) -> None:
+        """Apply a new 3D glow — OR, when the requested glow is IDENTICAL to the one already active,
+        TOGGLE it OFF (restore the standard view). Re-clicking the highlighted row is thus a visible
+        escape hatch on the item itself, complementing the 'Clear … view' button. Always restores any
+        PRIOR glow first so spotlights never stack. *new_state* is the ``{mid, both}`` the glow records
+        (None when the spec is degenerate); *apply_cmds* are the highlight commands."""
+        prior = getattr(self, "_glow_state", None)
+        if new_state is not None and new_state == prior:    # same item re-clicked → un-glow
+            self._run_commands_bg(self._consume_glow_restore())
+            return
+        self._run_commands_bg(self._glow_restore_commands(prior) + apply_cmds)
+        self._glow_state = new_state
+        self._sync_glow_clear_button()
+
     def _sync_glow_clear_button(self) -> None:
         """Light the Clear-view control on EVERY stabilization tab iff a glow is currently active. The
         glow seam (`_glow_state`) is SHARED across the Disulfides + Proline tabs (one spotlight at a
@@ -5662,10 +5754,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         the convergence surface). RESTORE the prior glow FIRST (so A un-glows + the scene un-ghosts
         before B glows — non-destructive, never stacking), apply the new glow, then record its state."""
         apply = self._disulfide_scan_highlight_commands(cd, pair)
-        self._run_commands_bg(self._glow_restore_commands(getattr(self, "_glow_state", None)) + apply)
         mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
-        self._glow_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
-        self._sync_glow_clear_button()              # lit while glowing, dim when nothing to clear
+        new_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
+        self._apply_or_toggle_glow(new_state, apply)   # re-clicking the same pair toggles it off
 
     def _declare_disulfide_pair(self, cd, pair) -> None:
         """Declare a bond from a Disulfides-tab table → Mode C. FOCUS the pair's construct tab first
