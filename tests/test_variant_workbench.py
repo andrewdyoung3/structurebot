@@ -3592,6 +3592,65 @@ class TestDesignBasket:
         p.design_basket.reset()
         assert p.design_basket.entries == [] and not p.design_basket._list.isVisible()
 
+    # ── enact is LOUD, never silent/partial: an unmappable sub is REPORTED, mappable subs still land,
+    #    one bad target never aborts the compose, and a zero-landed enact leaves NO empty variant. ──
+    def _cav(self, chain, pos, to_aa, from_aa="V"):
+        return {"chain": chain, "position": pos, "from_aa": from_aa, "to_aa": to_aa,
+                "void_volume": 40.0, "cavity_id": 1, "fill_fraction": 0.6, "clash": False, "score": 0.5}
+
+    def test_enact_offtemplate_resnum_makes_no_empty_variant_and_reports(self, _app):
+        # the "no sequence changes" failure: a position not on the template used to compose an EMPTY
+        # variant silently. Now: no variant, the basket is kept, and the reason is surfaced.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)                                   # template resnums 1..12
+        n0 = len(cd.variants)
+        p._enact_basket([{"cls": "Cavity", "subs": [
+            {"chain": "A", "position": 105, "from_aa": "V", "to_aa": "C"}]}])
+        assert len(cd.variants) == n0                             # NO empty variant left behind
+        assert "no substitutions could be applied" in p._status.text()
+        assert "105" in p._status.text()                         # the offending residue is named
+
+    def test_enact_partial_applies_good_subs_and_reports_skips(self, _app):
+        # the "only a few cysteines" failure: a mix of mappable + unmappable subs must land the
+        # mappable ones AND report the rest — not abort, not silently drop.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._enact_basket([{"cls": "Disulfide", "subs": [
+            {"chain": "A", "position": 5, "from_aa": "W", "to_aa": "C"},     # maps
+            {"chain": "A", "position": 999, "from_aa": "G", "to_aa": "C"}]}])  # off-template
+        v = cd.variants[-1]
+        assert [(m.resnum, m.to_aa) for m in v.mutations] == [(5, "C")]       # good sub landed
+        assert "Skipped" in p._status.text() and "999" in p._status.text()    # the rest reported
+
+    def test_enact_one_bad_target_does_not_abort_the_rest(self, _app):
+        # a non-standard to_aa (e.g. a mode emitting a 3-letter code) must NOT raise mid-loop and
+        # leave a half-built variant — the good subs land, the bad one is reported.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._enact_basket([{"cls": "Mix", "subs": [
+            {"chain": "A", "position": 3, "from_aa": "V", "to_aa": "C"},
+            {"chain": "A", "position": 5, "from_aa": "W", "to_aa": "GLU"},    # invalid (3-letter)
+            {"chain": "A", "position": 8, "from_aa": "G", "to_aa": "C"}]}])
+        v = cd.variants[-1]
+        assert [(m.resnum, m.to_aa) for m in v.mutations] == [(3, "C"), (8, "C")]
+        assert "Skipped" in p._status.text() and "GLU" in p._status.text()
+
+    def test_curate_guard_blocks_offtemplate_pick_at_staging(self, _app):
+        # block-at-staging: a pick whose residue isn't on the active design is refused when added,
+        # so it can never silently vanish at enact.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_cavity_to_basket(cd, self._cav("A", 105, "W"))
+        assert p.design_basket.entries == []                     # not staged
+        assert "Can't add" in p._status.text() and "105" in p._status.text()
+
+    def test_curate_guard_blocks_unknown_chain_at_staging(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_cavity_to_basket(cd, self._cav("Z", 3, "W"))      # chain Z not on the design
+        assert p.design_basket.entries == []
+        assert "Can't add" in p._status.text() and "chain not on the active design" in p._status.text()
+
     # ── cd-EQUIVALENCE keying: homo-oligomer copies share one cd, so a same-resnum pick on two
     #    copies is the SAME residue. Two divergent picks must BLOCK (not silently last-write-wins at
     #    edit_variant); two identical picks dedupe to one; distinct-cd (hetero) chains are unaffected.
