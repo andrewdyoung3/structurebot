@@ -1613,6 +1613,55 @@ class TestDeNovoPanel:
         assert ti["wt_ref"]["path"] == "/tmp/dimer.cif"      # reopen path carried from template_fold
         assert spec["confidence"] == "low"                   # first deviation → gate (the floor folds)
 
+    def test_denovo_variant_fold_unpinned_picks_engine_and_oligomer(self, _app):
+        # UN-PINNED: with n_copies the user's engine + oligomer are honoured (the variant is its OWN
+        # fold). Superpose onto the T-fold ONLY when the chosen shape matches the baseline.
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)            # baseline = boltz dimer (A,B), T-fold "7"
+        p._add_variant(); v = cd.variants[-1]
+        p._cur_tab().set_active_row(v.id)
+        m = p.fold_launch_spec("boltz", n_copies=2)               # MATCHES baseline → superpose
+        assert m["tool"] == "boltz" and [c["id"] for c in m["tool_inputs"]["chains"]] == ["A", "B"]
+        assert m["tool_inputs"]["compare_to"] == "7" and "no_reference" not in m["tool_inputs"]
+        t = p.fold_launch_spec("boltz", n_copies=3)               # different oligomer → standalone
+        assert [c["id"] for c in t["tool_inputs"]["chains"]] == ["A", "B", "C"]
+        assert t["tool_inputs"].get("no_reference") is True and "compare_to" not in t["tool_inputs"]
+        assert all(c["sequence"] == v.sequence for c in t["tool_inputs"]["chains"])
+        e = p.fold_launch_spec("esmfold", n_copies=1)             # different engine + monomer
+        assert e["tool"] == "esmfold" and e["tool_inputs"]["sequence"] == v.sequence
+        assert e["tool_inputs"].get("no_reference") is True
+
+    def test_denovo_variant_fold_unpinned_esmfold_assembly_rejected(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)
+        p._add_variant(); p._cur_tab().set_active_row(cd.variants[-1].id)
+        assert p.fold_launch_spec("esmfold", n_copies=2) is None  # ESMFold is monomer-only
+
+    def test_denovo_variant_fold_pinned_path_unchanged_without_n_copies(self, _app):
+        # back-compat: no n_copies → still PINNED to the construct (the disulfide-constrain caller).
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)
+        p._add_variant(); p._cur_tab().set_active_row(cd.variants[-1].id)
+        fs = p.fold_launch_spec("esmfold")            # asks esmfold/monomer → OVERRIDDEN to boltz dimer
+        assert fs["tool"] == "boltz" and fs["tool_inputs"]["compare_to"] == "7"
+
+    def test_denovo_deviation_refuses_and_greys_on_combo_mismatch(self, _app):
+        # un-pinned-fold guard: a variant folded at a different shape than the baseline has no valid
+        # WT reference → no T-fold reuse, the click refuses, and the Deviation button greys.
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)            # baseline boltz:assembly
+        p._add_variant(); v = cd.variants[-1]
+        tab = p._cur_tab(); tab.set_active_row(v.id)
+        v.results.fold = {"engine": "boltz", "target": "monomer", "model_id": "8"}   # MISMATCH
+        assert p.deviation_launch_spec()["tool_inputs"]["wt_ref"] is None            # no dimer-as-monomer
+        p._on_deviation_clicked()
+        assert "same way" in p._status.text() and "boltz:monomer" in p._status.text()
+        p._sync_deviation_enabled(tab)
+        assert not p._dev_btn.isEnabled()                        # greyed on mismatch
+        v.results.fold = {"engine": "boltz", "target": "assembly", "model_id": "9"}  # MATCHES baseline
+        p._sync_deviation_enabled(tab)
+        assert p._dev_btn.isEnabled()                            # re-enabled when comparable
+
     def test_denovo_monomer_deviation_has_identity_column_map(self, _app):
         # column-pairing holds for a de-novo monomer: substitution-only → identity map; reference
         # reused from the monomer T-fold.

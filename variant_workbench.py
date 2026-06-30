@@ -4924,8 +4924,27 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._select_result_mode("none")          # current result has no data → revert
             self._mode_key = "none"
 
+    def _sync_deviation_enabled(self, tab: "_ChainDesignTab") -> None:
+        """Grey the Deviation button when the active variant's fold can't be compared to a WT
+        reference of the SAME engine+oligomer (an un-pinned fold at a different shape than the
+        construct baseline) — clearer than a click that then refuses. Enabled in every other case
+        (incl. no fold yet — the handler then tells you to fold first). Synced on render/active-row."""
+        btn = getattr(self, "_dev_btn", None)
+        if btn is None:
+            return
+        ok = True
+        v = self._active_variant(tab) if tab is not None else None
+        cd = tab.design if tab is not None else None
+        if (v is not None and v.results.fold and cd is not None
+                and self._design is not None and self._design.source == "sequence"):
+            combo = f"{v.results.fold.get('engine')}:{v.results.fold.get('target')}"
+            tf = cd.template_fold or {}
+            ok = combo in cd.wt_refs or f"{tf.get('engine')}:{tf.get('target')}" == combo
+        btn.setEnabled(ok)
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
         self._refresh_color_mode_availability(tab)    # grey result modes lacking data
+        self._sync_deviation_enabled(tab)             # grey Deviation on an un-comparable fold combo
         if self._mode_key == _RESULT_DDG_MODE:
             hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
             tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
@@ -5291,29 +5310,45 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             boltz = False
         return {"esmfold": esm, "boltz": boltz}
 
-    def fold_launch_spec(self, engine: str, assembly: bool = False) -> Optional[dict]:
+    def fold_launch_spec(self, engine: str, assembly: bool = False,
+                         n_copies: Optional[int] = None) -> Optional[dict]:
         """Deterministic fold spec for the ACTIVE variant through *engine*: fold LOCAL-ONLY,
         open the model, pLDDT-colour it, matchmaker onto the WT reference. *assembly* (Boltz
-        only) folds the full homo-oligomer — one chain per `cd.members` copy, each the variant's
-        sequence — overlaid on the WT oligomer. confidence='low' → the spine's confirm-gate.
-        None when there is no active variant. The SAME spec shape every engine reuses."""
+        only) folds the full homo-oligomer. confidence='low' → the spine's confirm-gate.
+        None when there is no active variant. The SAME spec shape every engine reuses.
+
+        DE-NOVO oligomer:
+          • *n_copies* OMITTED (the disulfide-constrain caller + the loaded picker) → PINNED: the
+            variant folds at the CONSTRUCT's engine + oligomer and superposes onto the T-fold, so
+            the variant, the WT reference, and the floor seeds all fold the same (deviation-valid).
+          • *n_copies* GIVEN (the de-novo variant picker) → UN-PINNED: the user's engine + N-mer are
+            honoured — the variant is its OWN fold (the construct baseline is untouched). Superpose
+            onto the T-fold ONLY when engine + oligomer MATCH the baseline (you can't overlay a
+            monomer on a trimer reference); a mismatched fold is standalone (no_reference) and
+            deviation-vs-WT guards/greys on the combo (a per-oligomer reference is the follow-up)."""
         tab = self._cur_tab()
         v = self._active_variant(tab)
         if v is None or self._design is None:
             return None
         cd = tab.design
-        # DE-NOVO (sequence-seeded): the variant folds at the CONSTRUCT's engine + oligomer (GAP C)
-        # and superposes onto the construct's T-FOLD, not the synthetic design id (GAP A). The
-        # T-fold IS the de-novo analog of the crystal reference; engine/target are pinned from it,
-        # not the picker, so the variant, the WT reference, and the floor seeds all fold the same.
         denovo = self._design.source == "sequence"
         tf = cd.template_fold if denovo else {}
+        unpinned = denovo and n_copies is not None
+        n = matches = 0
         if denovo:
             if not tf.get("model_id"):
-                return None                       # construct not folded yet → no reference to fold against
-            engine     = tf.get("engine", engine)             # PIN engine from the construct fold
-            assembly   = (tf.get("target") == "assembly")     # PIN oligomer from the construct fold
-            compare_to = tf.get("model_id")                   # superpose onto the T-fold (GAP A)
+                return None                       # construct not folded yet → no baseline/reference
+            if unpinned:
+                n = max(1, int(n_copies))
+                if n > 1 and engine not in ("boltz", "colabfold"):
+                    return None                   # ESMFold is monomer-only
+                assembly   = n > 1
+                matches    = (engine == tf.get("engine") and n == len(cd.members))   # baseline shape?
+                compare_to = tf.get("model_id") if matches else None                 # superpose iff matched
+            else:
+                engine     = tf.get("engine", engine)             # PIN engine from the construct fold
+                assembly   = (tf.get("target") == "assembly")     # PIN oligomer from the construct fold
+                compare_to = tf.get("model_id")                   # superpose onto the T-fold
         else:
             compare_to = self._design.model_id    # crystal design: matchmaker onto the loaded WT
         ti: Dict[str, object] = {
@@ -5321,11 +5356,19 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "chain":      cd.rep_chain,
             "engine":     engine,
             "open_model": True,
-            "local_only": True,                   # LOCAL-ONLY: no remote Atlas/MSA server
-            "compare_to": compare_to,
+            "local_only": (engine in _LOCAL_FOLD_ENGINES) if unpinned else True,
         }
+        if compare_to is not None:
+            ti["compare_to"] = compare_to         # superpose onto the WT reference
+        else:
+            ti["no_reference"] = True             # mismatched-shape variant fold → standalone (no overlay)
         if engine == "boltz" and assembly:
-            if denovo:
+            if unpinned:
+                ids = ([ch for (_m, ch) in cd.members] if matches
+                       else [chr(ord("A") + i) for i in range(n)])    # reuse baseline ids iff matched
+                ti["chains"] = [{"id": ch, "sequence": v.sequence} for ch in ids]
+                target = f"{len(ids)}-chain assembly"
+            elif denovo:
                 # FULL-COMPLEX composition (Stage 2b): a hetero construct's variant folds the
                 # WHOLE declared assembly, not the active chain alone. The ACTIVE cd contributes
                 # the variant's sequence × its members; EVERY OTHER cd contributes its own
@@ -5886,15 +5929,41 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText("Select a VARIANT row first (T is the template baseline).")
             return
         cd = self._cur_tab().design
-        # DE-NOVO: no engine picker — the variant folds at the CONSTRUCT's engine + oligomer
-        # (pinned in fold_launch_spec from cd.template_fold). Requires the construct be folded first.
+        # DE-NOVO: a variant folds against the construct's baseline (T-fold), which must exist first.
+        # Engine + oligomer are now USER-CHOSEN (un-pinned) — the result lands on the variant's OWN
+        # fold (the baseline is untouched); deviation-vs-WT guards/greys when the chosen combo differs
+        # from the baseline. Same picker idea as a loaded variant, with mono/di/tri/tetramer.
         if self._design is not None and self._design.source == "sequence":
-            tf = cd.template_fold
-            if not tf.get("model_id"):
+            if not (cd.template_fold or {}).get("model_id"):
                 self._status.setText("Fold the construct first (Fold ▾ → Fold construct) — a "
-                                     "variant folds at the construct's engine + oligomer.")
+                                     "variant folds against the construct's baseline.")
                 return
-            spec = self.fold_launch_spec(tf.get("engine", "boltz"))   # engine/target pinned inside
+            avail = self._fold_engine_availability()
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Fold variant")
+            box.setText(f"Fold {v.id} ({len(v.sequence)} aa) — pick engine + oligomer:")
+            box.setInformativeText(
+                "ESMFold = local monomer (fast). Boltz-2 = higher-quality, LOCAL-ONLY, seed-pinned; "
+                "folds mono/di/tri/tetramer. Deviation-vs-WT needs the SAME oligomer as the construct "
+                "baseline (it greys otherwise — re-fold to match).")
+            combos = [("ESMFold (monomer)", "esmfold", 1), ("Boltz-2 (monomer)", "boltz", 1),
+                      ("Boltz-2 (dimer)", "boltz", 2), ("Boltz-2 (trimer)", "boltz", 3),
+                      ("Boltz-2 (tetramer)", "boltz", 4)]
+            dn_btns: Dict[object, Tuple[str, int]] = {}
+            for label, eng, nc in combos:
+                b = box.addButton(label, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                if not avail.get(eng, False):
+                    b.setEnabled(False)
+                    b.setToolTip("Boltz env (~/boltz_env) not available" if eng == "boltz"
+                                 else "Local ESMFold worker (venv312) not installed")
+                dn_btns[b] = (eng, nc)
+            box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            dn_choice = dn_btns.get(box.clickedButton())
+            if dn_choice is None:
+                return
+            dn_eng, dn_nc = dn_choice
+            spec = self.fold_launch_spec(dn_eng, n_copies=dn_nc)       # UN-PINNED: user's engine + N-mer
             if spec is not None:
                 self.launchRequested.emit(spec)
             return
@@ -6044,9 +6113,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         wt_ref = cd.wt_refs.get(combo)
         if not wt_ref and self._design.source == "sequence" and cd.template_fold.get("model_id"):
             tf = cd.template_fold
-            wt_ref = {"engine":   tf.get("engine"),  "target": tf.get("target"),
-                      "seed":     tf.get("seed"),    "model_id": tf.get("model_id"),
-                      "path":     tf.get("cif_path") or tf.get("pdb_path")}
+            # Reuse the construct T-fold as the reference ONLY when it was folded the SAME way as the
+            # variant (engine:oligomer). An un-pinned variant folded at a different shape has no valid
+            # baseline reference → leave None (the _on_deviation_clicked guard refuses; a per-oligomer
+            # reference fold is the deferred "adapt" follow-up).
+            if f"{tf.get('engine')}:{tf.get('target')}" == combo:
+                wt_ref = {"engine":   tf.get("engine"),  "target": tf.get("target"),
+                          "seed":     tf.get("seed"),    "model_id": tf.get("model_id"),
+                          "path":     tf.get("cif_path") or tf.get("pdb_path")}
         ti: Dict[str, object] = {
             "variant_model_id": fold["model_id"],
             "engine":           engine,
@@ -6092,6 +6166,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 f"indel-aware deviation is monomer-only for now. Fold {v.id} as a MONOMER "
                 f"to compare (refusing to mis-pair the multimer deletion).")
             return
+        # GREY-OUT + WARN (un-pinned-fold guard): deviation compares per-residue vs a WT reference
+        # folded the SAME way (engine:oligomer). A variant folded at a different shape than the
+        # construct baseline (now possible) has no valid reference — refuse rather than mis-compare a
+        # monomer to a trimer. (The per-oligomer WT reference fold is the deferred "adapt" follow-up.)
+        if self._design.source == "sequence":
+            combo = f"{v.results.fold.get('engine')}:{v.results.fold.get('target')}"
+            tf = tab.design.template_fold or {}
+            if combo not in tab.design.wt_refs and f"{tf.get('engine')}:{tf.get('target')}" != combo:
+                self._status.setText(
+                    f"Deviation-vs-WT needs a WT reference folded the same way as {v.id} ({combo}); "
+                    f"the construct baseline is {tf.get('engine')}:{tf.get('target')}. Re-fold {v.id} "
+                    f"to match the baseline (a per-oligomer reference is coming) — refusing to "
+                    f"compare different fold shapes.")
+                return
         spec = self.deviation_launch_spec()
         if spec is not None:
             self.launchRequested.emit(spec)
