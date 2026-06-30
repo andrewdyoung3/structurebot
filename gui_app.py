@@ -1021,7 +1021,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         `self.tabs`, so a blanket `clear()` would destroy the panel + its toolbar — leaving no way
         to start a new session). The workbench is cleared to its no-design state via `reset()`.
         Does NOT close ChimeraX models — a named Load reopens scene.cxs (replacing the scene
-        itself); Clear leaves the user's models untouched (parity with the CLI)."""
+        itself), and Clear closes its own models separately in `_on_clear_session` (via
+        `_close_own_models`) BEFORE calling this."""
         # KEEP the persistent suite tabs (the workbench + its toolbar AND the sibling Disulfides tab —
         # a sibling, not the workbench, so it was being swept out with the chain grids and never
         # re-added). Drop only the chain-grid tabs.
@@ -1113,9 +1114,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
     def _on_clear_session(self) -> None:
         if QtWidgets.QMessageBox.question(
                 self, "Clear session",
-                "Start a fresh session? Workbench designs + analysis are cleared. "
-                "Loaded ChimeraX models are left open.") != QtWidgets.QMessageBox.StandardButton.Yes:
+                "Start a fresh session? Workbench designs + analysis are cleared and "
+                "this session's ChimeraX models are closed.") != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        # Close THIS window's ChimeraX models so Clear is a TRULY fresh start (matches the CLI
+        # `clear`). Leaving models open used to DESYNC: session.structures emptied while the model
+        # stayed on screen, so its id was invisible to the translator and "remove that model"
+        # couldn't resolve it. Close BEFORE wiping the session (the close reads the live model set,
+        # not session.structures). Best-effort — a closed/unreachable ChimeraX never blocks the reset.
+        self._close_own_models()
         self.session = SessionState()
         self.router = ToolRouter(self.bridge, self.session)
         self.workbench.attach_session(self.session)
@@ -1125,7 +1132,24 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             Path("session.json").unlink()
         except OSError:
             pass
-        self.presenter.dim("Session cleared — fresh start. Loaded ChimeraX models are untouched.")
+        self.presenter.dim("Session cleared — fresh start. This session's ChimeraX models were closed.")
+
+    def _close_own_models(self) -> None:
+        """Close every ChimeraX model THIS window owns — all open models EXCEPT the foreign
+        baseline (`_foreign_mids`: models another StructureBot window had open when this one
+        connected; those are only ever HIDDEN, never closed, so a shared ChimeraX is respected).
+        Best-effort: a closed or unreachable ChimeraX (run_command raises ConnectionError, which
+        we deliberately do NOT auto-relaunch from here) is a silent no-op so the session reset
+        always completes."""
+        try:
+            res = self.bridge.run_command("info models")
+            val = (res.get("value") or "") if isinstance(res, dict) else ""
+            all_ids = set(re.findall(r"#(\d+)", val))
+            mine = sorted(all_ids - getattr(self, "_foreign_mids", set()), key=int)
+            if mine:
+                self.bridge.run_command("close #" + ",".join(mine))
+        except Exception:
+            pass
 
     def _on_save_as_session(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(self, "Save As", "New session name:")
