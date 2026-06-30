@@ -584,6 +584,48 @@ def test_close_guard_closes_assembly_and_au() -> None:
     assert cmds == ["close #1,3"] and not blocked, f"got {cmds}"
 
 
+def test_close_guard_expands_au_spec_to_assembly() -> None:
+    """REGRESSION (live Test 3): the LLM often resolves the name to a spec ITSELF
+    ("close 5hrz" → `close #1`). The guard must still add the generated assembly so the
+    visible trimer is closed too."""
+    sess = _session_with(
+        {"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}},
+        {"1": {"au_model_id": "1", "assembly_model_id": "3", "pdb_id": "5HRZ"}},
+    )
+    cmds, _, blocked = _validate_close_targets(["close #1"], ["x"], sess)
+    assert cmds == ["close #1,3"] and not blocked, f"got {cmds}"
+
+
+def test_close_guard_expands_assembly_spec_to_au() -> None:
+    """Closing the assembly spec (`close #3`) also closes its source AU (no hidden orphan)."""
+    sess = _session_with(
+        {"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}},
+        {"1": {"au_model_id": "1", "assembly_model_id": "3", "pdb_id": "5HRZ"}},
+    )
+    cmds, _, blocked = _validate_close_targets(["close #3"], ["x"], sess)
+    assert cmds == ["close #1,3"] and not blocked, f"got {cmds}"
+
+
+def test_close_guard_plain_spec_no_assembly_untouched() -> None:
+    """A `close #N` with no related assembly is left exactly as-is (no spurious rewrite)."""
+    sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})
+    for spec in ("close #1", "close #1,2"):
+        cmds, _, blocked = _validate_close_targets([spec], ["x"], sess)
+        assert cmds == [spec] and not blocked, f"{spec!r} should be untouched, got {cmds}"
+
+
+def test_close_guard_complex_spec_not_expanded() -> None:
+    """A sub-part spec (`close #1/A`, `close #1:50`) is NOT a plain model spec → untouched,
+    even when #1 has an assembly (we must not turn an atom/chain close into a model close)."""
+    sess = _session_with(
+        {"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}},
+        {"1": {"au_model_id": "1", "assembly_model_id": "3", "pdb_id": "5HRZ"}},
+    )
+    for spec in ("close #1/A", "close #1:50"):
+        cmds, _, blocked = _validate_close_targets([spec], ["x"], sess)
+        assert cmds == [spec] and not blocked, f"{spec!r} should be untouched, got {cmds}"
+
+
 def test_close_guard_rewrites_pdb_id_to_model_spec() -> None:
     """`close 5HRZ` → `close #1` when 5HRZ is loaded as #1 (the core bug fix)."""
     sess = _session_with({"1": {"name": "5HRZ", "metadata": {"pdb_id": "5HRZ"}}})

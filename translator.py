@@ -423,17 +423,57 @@ def _resolve_close_target(target: str, session) -> list:
     return sorted(hits, key=lambda s: int(s) if s.isdigit() else 1 << 30)
 
 
+# A plain top-level model spec: `#1` or `#1,2,3` (NOT `#1/A`, `#1.2`, `#1:50` — those carry
+# a sub-part we must not expand/rewrite).
+_PLAIN_MODEL_SPEC_RE = re.compile(r'^#\d+(?:,\d+)*$')
+
+
+def _assembly_counterparts(mid: str, session) -> list:
+    """The AU↔assembly counterparts of top-level *mid* via `generated_assemblies`:
+    if *mid* is an AU that has a generated assembly, its assembly id; if *mid* IS an
+    assembly, its source AU id. [] if none / no session. Closing one without the other
+    would orphan a (hidden) AU or leave the visible assembly behind."""
+    out: list = []
+    for au_mid, rec in (getattr(session, "generated_assemblies", {}) or {}).items():
+        rec = rec or {}
+        au = str(au_mid).split(".")[0]
+        amid = str(rec.get("assembly_model_id") or "").split(".")[0]
+        if not amid:
+            continue
+        if mid == au:
+            out.append(amid)
+        elif mid == amid:
+            out.append(au)
+    return out
+
+
+def _expand_with_assemblies(ids: list, session) -> list:
+    """Add AU↔assembly counterparts to a set of top-level model ids, numerically sorted.
+    So closing the AU also closes its generated assembly (and vice-versa) however the
+    target was expressed — a literal `#1` spec OR a resolved name."""
+    out = list(ids)
+    for mid in list(ids):
+        for extra in _assembly_counterparts(mid, session):
+            if extra not in out:
+                out.append(extra)
+    return sorted(out, key=lambda s: int(s) if s.isdigit() else 1 << 30)
+
+
 def _validate_close_targets(commands: list, explanations: list, session) -> tuple:
     """
     Guard: normalise model-removal commands to `close #N` using the session's loaded
-    structures.
+    structures + generated assemblies.
 
-      close  <name/PDB-id>          → close #N  (or BLOCK if unresolvable — `close`
+      close <name/PDB-id>           → close #N  (or BLOCK if unresolvable — `close`
                                        unambiguously means close-a-model)
       remove/delete <name/PDB-id>   → close #N  ONLY when it resolves to a loaded
                                        structure; otherwise UNTOUCHED (ambiguous —
                                        `remove cartoon`, `delete waters`, `delete #1/A`)
-      close <#N | all | session>    → untouched (already a valid spec)
+      close <#N | #N,M>             → EXPAND with AU↔assembly counterparts (the LLM
+                                       often resolves the name to a spec itself, e.g.
+                                       "close 5hrz" → `close #1`; without expansion the
+                                       generated assembly is never closed)
+      close <all | session | #1/A…> → untouched
 
     Returns (new_commands, new_explanations, blocked_messages).
     """
@@ -446,7 +486,20 @@ def _validate_close_targets(commands: list, explanations: list, session) -> tupl
         if m:
             verb = m.group(1).lower()
             target = m.group(2).strip()
-            if not _is_valid_close_spec(target):
+            if _PLAIN_MODEL_SPEC_RE.match(target):
+                # Already a model spec — but a `close #1` may need the AU's assembly added
+                # (or vice-versa). Only `close` expands; a literal `remove/delete #N` is left
+                # to the verb-guard / atom path (it's not a normalise-the-name case).
+                if verb == "close":
+                    base = re.findall(r"\d+", target)
+                    expanded = _expand_with_assemblies(base, session)
+                    if expanded != base:
+                        fixed = "close #" + ",".join(expanded)
+                        print(f"  [close-guard] expanded {cmd!r} -> {fixed!r}", flush=True)
+                        new_cmds.append(fixed)
+                        new_exps.append(exp)
+                        continue
+            elif not _is_valid_close_spec(target):
                 hits = _resolve_close_target(target, session)
                 if hits:
                     fixed = "close #" + ",".join(hits)
