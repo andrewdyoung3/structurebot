@@ -631,6 +631,20 @@ class TestStage4a:
         assert v.results.stability["sum_ddg"] == 2.0
         assert "ddG +2.0" in tab.badges[vid]        # inline badge rendered
 
+    def test_apply_stability_result_merges_fast_then_deep_keeping_both(self, _app):
+        # the user's flow: a fast ThermoMPNN run, THEN a deep Rosetta run that didn't recompute
+        # ThermoMPNN — the stored slot must keep BOTH axes (deep augments, never overwrites).
+        p, tab, vid = self._variant_panel()
+        p._scan_cache_snapshot = ("1", None)
+        p.apply_stability_result(vid, {"tool_step_results": [{"tool": "mutation_scan", "data": {
+            "candidates": [{"resnum": 1, "from_aa": "M", "to_aa": "W", "thermompnn_ddg": -0.4}]}}]})
+        p._scan_cache_snapshot = ("1", None)
+        p.apply_stability_result(vid, {"tool_step_results": [{"tool": "mutation_scan", "data": {
+            "candidates": [{"resnum": 1, "from_aa": "M", "to_aa": "W", "ddg": 1.8}]}}]})  # rosetta only
+        row = tab.design.get_variant(vid).results.stability["rows"][0]
+        assert row["thermompnn_ddg"] == -0.4 and row["rosetta_ddg"] == 1.8      # both kept
+        assert tab.design.get_variant(vid).results.stability["tier"] == "deep"
+
     def test_solubility_pure_compute_fills_slot(self, _app):
         p, tab, vid = self._variant_panel()
         p._on_test_solubility()

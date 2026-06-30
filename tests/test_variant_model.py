@@ -20,7 +20,7 @@ from variant_model import (
     build_design_session, build_design_session_from_sequence,
     import_mpnn_designs, column_tracks, build_color_commands,
     build_color_commands_by_resnum, build_model_color_commands,
-    candidate_ddg, stability_summary,
+    candidate_ddg, stability_summary, merge_stability,
     filter_new_mpnn_variants, group_scan_suggestions, suggestion_color,
     fold_summary,
 )
@@ -410,6 +410,43 @@ class TestStage4aStability:
         s = stability_summary([{"resnum": 5, "to_aa": "D", "thermompnn_ddg": 0.3}],
                               [Mutation(5, "A", "D")])
         assert s["tier"] == "fast" and s["per_resnum"] == {5: 0.3}
+
+    def test_stability_summary_carries_every_method_axis(self):
+        # each row keeps ALL methods side-by-side (not just the collapsed best) so the export can
+        # report ThermoMPNN/RaSP/DynaMut2/Rosetta as separate columns.
+        s = stability_summary([{"resnum": 7, "to_aa": "W", "ddg": 1.5, "thermompnn_ddg": -0.4,
+                                "rasp_ddg": 0.2, "dynamut2_ddg": 0.9}], [Mutation(7, "A", "W")])
+        r = s["rows"][0]
+        assert (r["rosetta_ddg"], r["thermompnn_ddg"], r["rasp_ddg"], r["dynamut2_ddg"]) == \
+               (1.5, -0.4, 0.2, 0.9)
+        assert (r["ddg"], r["ddg_source"]) == (1.5, "rosetta")    # best still rosetta
+
+    def test_merge_stability_deep_run_augments_fast_keeping_thermompnn(self):
+        # THE export-overwrite bug: a fast ThermoMPNN run, then a deep Rosetta run that did NOT
+        # recompute ThermoMPNN. The merge must keep BOTH axes (Rosetta added, ThermoMPNN retained).
+        fast = stability_summary([{"resnum": 10, "from_aa": "I", "to_aa": "R",
+                                   "thermompnn_ddg": -0.4}], [Mutation(10, "I", "R")])
+        deep = stability_summary([{"resnum": 10, "from_aa": "I", "to_aa": "R",
+                                   "ddg": 1.8}], [Mutation(10, "I", "R")])     # rosetta only
+        merged = merge_stability(fast, deep)
+        row = merged["rows"][0]
+        assert row["thermompnn_ddg"] == -0.4        # ThermoMPNN PRESERVED across the deep run
+        assert row["rosetta_ddg"] == 1.8            # Rosetta ADDED
+        assert (row["ddg"], row["ddg_source"]) == (1.8, "rosetta")   # best = physics
+        assert merged["tier"] == "deep"
+
+    def test_merge_stability_aligns_to_new_rows_dropping_stale(self):
+        # merge is keyed to the NEW run's mutations — a residue no longer designed is NOT carried.
+        prev = stability_summary([{"resnum": 10, "to_aa": "R", "thermompnn_ddg": -0.4}],
+                                 [Mutation(10, "I", "R")])
+        new = stability_summary([{"resnum": 20, "to_aa": "K", "ddg": 0.5}], [Mutation(20, "A", "K")])
+        merged = merge_stability(prev, new)
+        assert [r["resnum"] for r in merged["rows"]] == [20]      # stale resnum 10 dropped
+
+    def test_merge_stability_no_prev_returns_new(self):
+        new = stability_summary([{"resnum": 5, "to_aa": "D", "thermompnn_ddg": 0.3}],
+                                [Mutation(5, "A", "D")])
+        assert merge_stability(None, new) is new and merge_stability({}, new) is new
 
 
 class TestStage4aColor:
