@@ -5023,13 +5023,18 @@ class ToolRouter:
                     "  Load a structure first, or pass a sequence explicitly."
                 ),
             )
-        if not pdb_path:
+        # Only the DEEP (Rosetta) tier hard-requires a local PDB. The fast tier is
+        # sequence-driven (CamSol + ESM) with structure-based voters (ThermoMPNN, RaSP)
+        # that degrade to silence when no structure is present — so a de-novo construct
+        # with no downloadable PDB still gets a fast stability result.
+        if run_rosetta and not pdb_path:
             return ToolStepResult(
                 tool="mutation_scan", success=False,
                 error=(
-                    "Mutation scan requires a local PDB file for Rosetta ddG.\n"
+                    "The deep (Rosetta) stability tier requires a local PDB file.\n"
                     "  StructureBot will attempt to download from RCSB if the\n"
-                    "  structure has a 4-letter PDB ID and internet is available."
+                    "  structure has a 4-letter PDB ID and internet is available.\n"
+                    "  For a de-novo construct, re-run the FAST tier (no Rosetta)."
                 ),
             )
 

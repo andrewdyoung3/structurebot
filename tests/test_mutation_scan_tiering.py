@@ -197,6 +197,35 @@ class TestSpecificMutationScoring:
         cands = (step.data or {}).get("candidates", [])
         assert {(c["resnum"], c["to_aa"]) for c in cands} == {(3, "W"), (5, "Y")}
 
+    def test_fast_tier_runs_without_a_local_pdb(self):
+        # A de-novo construct has no downloadable PDB (_ensure_pdb_file → None). The FAST
+        # tier is sequence-driven (CamSol+ESM; structure voters degrade to silence), so it
+        # must still succeed — NOT the deep-tier "requires a local PDB" refusal.
+        router = _make_router()
+        with patch.object(router, "_fetch_sequence", return_value="ACDEFGHIKLMNPQR"), \
+             patch.object(router, "_ensure_pdb_file", return_value=None), \
+             patch("mutation_scanner.MutationScanner._get_or_run_camsol",
+                   return_value={i: 0.0 for i in range(1, 16)}), \
+             patch("mutation_scanner.MutationScanner._get_or_run_esm",
+                   return_value={i: 0.5 for i in range(1, 16)}):
+            step = router._run_mutation_scan(
+                {"model_id": "1", "chain": "A",
+                 "score_mutations": {3: "W", 5: "Y"}}, user_input="")   # fast: no run_rosetta
+        assert step.success, step.error
+        cands = (step.data or {}).get("candidates", [])
+        assert {(c["resnum"], c["to_aa"]) for c in cands} == {(3, "W"), (5, "Y")}
+
+    def test_deep_tier_still_requires_a_local_pdb(self):
+        # The DEEP (Rosetta) tier genuinely needs the structure — the refusal stays.
+        router = _make_router()
+        with patch.object(router, "_fetch_sequence", return_value="ACDEFGHIKLMNPQR"), \
+             patch.object(router, "_ensure_pdb_file", return_value=None):
+            step = router._run_mutation_scan(
+                {"model_id": "1", "chain": "A", "score_mutations": {3: "W"},
+                 "run_rosetta": True}, user_input="")
+        assert not step.success
+        assert "deep (Rosetta)" in step.error and "PDB" in step.error
+
 
 # ── 3. Default (fast) tier ─────────────────────────────────────────────────────
 
