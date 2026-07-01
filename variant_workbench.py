@@ -5306,6 +5306,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "score_mutations": score_mutations,
                                  # scope the deep-tier estimate to the scored positions
                                  "scan_positions": sorted(score_mutations)}
+        # De-novo construct: there is no downloadable PDB, so feed the WT fold's structure
+        # (saved fresh to a temp PDB) as pdb_path — otherwise the fast-tier STRUCTURE voters
+        # (ThermoMPNN, RaSP) and the author-resnum authority degrade to silence, leaving only
+        # CamSol + ESM. Loaded crystals are LEFT to the router's _ensure_pdb_file (canonical
+        # RCSB PDB) — UNCHANGED. Best-effort + fail-open: an unfolded / closed / unsaveable
+        # construct leaves pdb_path unset and the scan still runs sequence-only.
+        if self._design.source == "sequence":
+            src = self._active_structure()
+            pdb = self._save_structure_pdb(src["model_id"]) if src else None
+            if pdb:
+                ti["pdb_path"] = pdb
         if deep:
             ti["run_rosetta"] = True
         tier = "deep" if deep else "fast"

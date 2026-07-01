@@ -614,6 +614,42 @@ class TestStage4a:
         assert spec["tool_inputs"]["run_rosetta"] is True
         assert spec["confidence"] == "low"          # deep → confirm-gate, no auto-proceed
 
+    def test_stability_spec_loaded_model_omits_pdb_path(self, _app):
+        # Loaded crystal → left to the router's _ensure_pdb_file (canonical RCSB PDB); the
+        # spec must NOT feed a pdb_path (that path is unchanged by the de-novo structure feed).
+        p, tab, vid = self._variant_panel()
+        spec = p.stability_launch_spec(deep=False)
+        assert "pdb_path" not in spec["tool_inputs"]
+
+    def test_stability_spec_feeds_denovo_fold_structure(self, _app, monkeypatch):
+        # De-novo construct: the fast-tier STRUCTURE voters (ThermoMPNN/RaSP) need a
+        # structure, so the spec saves the WT fold to a PDB and passes it as pdb_path.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAC")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        p._add_variant()                            # V1 active
+        tab = p._cur_tab()
+        vid = tab.design.variants[0].id
+        tab.design.edit_variant(vid, 0, "W")        # M1W
+        # _save_structure_pdb saves the live model via ChimeraX — stub it (no REST in tests).
+        monkeypatch.setattr(p, "_save_structure_pdb", lambda mid: f"/tmp/wt_{mid}.pdb")
+        spec = p.stability_launch_spec(deep=False)
+        assert spec["tool_inputs"]["pdb_path"] == "/tmp/wt_7.pdb"    # WT fold model → PDB
+        assert spec["tool_inputs"]["score_mutations"] == {1: "W"}
+
+    def test_stability_spec_denovo_unfolded_stays_sequence_only(self, _app):
+        # Not yet folded → no structure to feed → pdb_path omitted (fast tier degrades to
+        # CamSol + ESM), never a crash.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAC")   # no template_fold
+        p._add_variant()
+        tab = p._cur_tab()
+        tab.design.edit_variant(tab.design.variants[0].id, 0, "W")
+        spec = p.stability_launch_spec(deep=False)
+        assert "pdb_path" not in spec["tool_inputs"]
+
     def test_stability_spec_none_for_template_or_no_mutations(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
         p.load_model("1")
