@@ -152,6 +152,18 @@ def _pprint(msg: str) -> None:
         print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
+def _perr(msg: str) -> None:
+    """Print to STDERR — the REAL ESMFold worker error/traceback, so a failure is diagnosable even
+    when the relayed stdout isn't surfaced (e.g. the GUI worker thread). Never raises."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        try:
+            print(msg.encode("ascii", "replace").decode("ascii"), file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+
 # ── PDB pLDDT parser ──────────────────────────────────────────────────────────
 
 def _parse_plddt_from_pdb(pdb_str: str) -> Dict[int, float]:
@@ -628,6 +640,12 @@ class ESMFoldBridge:
                     for line in proc.stderr.splitlines():
                         if line.strip():
                             _pprint(f"  [ESMFold-worker-stderr] {line}")
+                # Surface the REAL crash (CUDA OOM / import / hard fault) on STDERR so it stays
+                # diagnosable even when the relayed stdout isn't shown. Return contract unchanged.
+                _perr(
+                    f"[ESMFold] venv312 worker crashed (exit {proc.returncode}) — full worker "
+                    f"stderr:\n{proc.stderr or '<none>'}"
+                )
                 return None
 
             # Read result JSON (worker always exits 0 and writes this on any error)
@@ -648,6 +666,12 @@ class ESMFoldBridge:
                     for line in trace.splitlines():
                         if line.strip():
                             _pprint(f"  [ESMFold-worker-trace] {line}")
+                # Surface the REAL inference error + traceback on STDERR (diagnosable regardless of
+                # where stdout goes). Return contract unchanged (None → existing fallback / LOCAL-ONLY).
+                _perr(
+                    f"[ESMFold] local inference failed: {result.get('error', '?')}"
+                    + (f"\n{trace}" if trace else "")
+                )
                 return None
 
             # ── pLDDT scale guard ─────────────────────────────────────────────
