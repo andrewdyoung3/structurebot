@@ -341,6 +341,17 @@ class TestRowHeaderSelect:
         tab = self._tab_with_variant(badge="pLDDT 80")
         assert not hasattr(tab, "rowHeaderClicked")
 
+    def test_badge_header_paints_chips_without_error(self, _app):
+        # Force _BadgeHeaderView.paintSection (offscreen tests don't normally expose-paint)
+        # by rendering the header to a pixmap — a runtime paint error would raise here. Also
+        # asserts the header WIDENED to make room for the chips vs. a name-only header.
+        tab = self._tab_with_variant(badge="ddG -2.1▼ · sol +0.30▲ · pLDDT 88 · ⚠ remote-MSA")
+        vh = tab._blocks[0].verticalHeader()
+        plain = self._tab_with_variant(badge=None)._blocks[0].verticalHeader()
+        assert vh.sizeHint().width() > plain.sizeHint().width()
+        pm = QtGui.QPixmap(vh.sizeHint().width(), max(1, vh.length()))
+        vh.render(pm)          # drives paintSection for every section; raises on paint bugs
+
     def test_select_variant_row_sets_active_silently(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
                       session=MagicMock())
@@ -2369,6 +2380,20 @@ class TestColabFoldComparative:
         v = self._v_with_fold({"mean_plddt": 90.0, "iptm": 0.95})   # Boltz, local
         badge = VariantWorkbenchPanel._badge_for(v)
         assert "remote-MSA" not in badge and "ipTM 0.95" in badge
+
+    def test_chip_kind_maps_badge_segments_to_colors(self):
+        # The badge STRING stays the source-of-truth; _BadgeHeaderView paints each ` · `
+        # segment as a colored chip. Direction is the subtle bit: ddG stabilizes when
+        # NEGATIVE, solubility helps when its delta is POSITIVE (opposite sign convention).
+        from variant_workbench import _BadgeHeaderView as H
+        assert H._chip_kind("ddG -2.1▼") == "good"      # stabilizing
+        assert H._chip_kind("ddG +2.1▲") == "bad"       # destabilizing
+        assert H._chip_kind("sol +0.30▲") == "good"     # more soluble
+        assert H._chip_kind("sol -0.30▼") == "bad"      # less soluble
+        assert H._chip_kind("pLDDT 88") == "neutral"
+        assert H._chip_kind("ipTM 0.95") == "neutral"
+        assert H._chip_kind("SS-bond×2") == "neutral"   # provenance
+        assert H._chip_kind("⚠ remote-MSA") == "warn"
 
     def test_build_align_folds_spec_pairs_two_folds(self):
         spec = VariantWorkbenchPanel.build_align_folds_spec(

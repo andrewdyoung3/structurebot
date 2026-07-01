@@ -162,6 +162,126 @@ class _FoldseekWorker(QtCore.QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+# ── colored metric-badge chips in the variant row headers ─────────────────────────
+
+class _BadgeHeaderView(QtWidgets.QHeaderView):
+    """Vertical header that renders a variant's result badge as colored metric CHIPS
+    after the row name (the Qt equivalent of a reusable MetricBadge).
+
+    The badge STRING (`tab.badges[rid]`, a ` · `-joined summary) stays the single data
+    source-of-truth — tests and the session export read it verbatim; this view only
+    PARSES and PAINTS it. The row name, active-row marker (► + bold), selection styling
+    and section geometry all still come from the base painter / header items; the chips
+    are drawn on top, and `sizeHint` widens the header so they fit."""
+
+    _GAP = 8                    # px between the row name and the first chip
+    _CHIP_GAP = 4               # px between adjacent chips
+    _CHIP_HPAD = 5              # horizontal padding inside a chip
+
+    # kind → (background, foreground). Green = beneficial, red = detrimental, gray =
+    # neutral metric (pLDDT / ipTM / provenance), amber = a provenance WARNING.
+    _CHIP_COLORS = {
+        "good":    (QtGui.QColor("#2e7d32"), QtGui.QColor("white")),
+        "bad":     (QtGui.QColor("#c62828"), QtGui.QColor("white")),
+        "neutral": (QtGui.QColor("#9e9e9e"), QtGui.QColor("white")),
+        "warn":    (QtGui.QColor("#f9a825"), QtGui.QColor("black")),
+    }
+
+    def __init__(self, tab: "_ChainDesignTab"):
+        super().__init__(QtCore.Qt.Vertical, tab)
+        self._tab = tab
+
+    @staticmethod
+    def _chip_kind(seg: str) -> str:
+        """Classify one badge segment. ddG stabilizes when NEGATIVE (green); solubility
+        helps when its delta is POSITIVE (green). The signed number is always present
+        ({:+} formatting), so the sign char disambiguates direction reliably."""
+        s = seg.strip()
+        if s.startswith("ddG"):
+            return "good" if "-" in s else "bad"
+        if s.startswith("sol"):
+            return "good" if "+" in s else "bad"
+        if "remote-MSA" in s or s.startswith("⚠"):
+            return "warn"
+        return "neutral"        # pLDDT / ipTM / SS-bond provenance
+
+    def _chip_font(self) -> QtGui.QFont:
+        f = QtGui.QFont(self.font())
+        f.setPointSizeF(max(6.0, self.font().pointSizeF() - 1.0))
+        return f
+
+    def _badge_for_section(self, logicalIndex: int) -> Optional[str]:
+        rids = getattr(self._tab, "_row_ids", [])
+        rid = rids[logicalIndex] if 0 <= logicalIndex < len(rids) else None
+        if rid in (None, "T", _SUGGEST_ROW):
+            return None
+        return self._tab.badges.get(rid)
+
+    def _margin(self) -> int:
+        return self.style().pixelMetric(QtWidgets.QStyle.PM_HeaderMargin, None, self)
+
+    def _name_end_x(self, rect: QtCore.QRect, logicalIndex: int) -> float:
+        """X where the base-painted row name ends (left margin + name text width)."""
+        model = self.model()
+        text = model.headerData(logicalIndex, QtCore.Qt.Vertical, QtCore.Qt.DisplayRole)
+        text = "" if text is None else str(text)
+        f = model.headerData(logicalIndex, QtCore.Qt.Vertical, QtCore.Qt.FontRole)
+        fm = QtGui.QFontMetrics(f if isinstance(f, QtGui.QFont) else self.font())
+        return rect.left() + self._margin() + fm.horizontalAdvance(text)
+
+    def paintSection(self, painter: QtGui.QPainter, rect: QtCore.QRect, logicalIndex: int) -> None:
+        super().paintSection(painter, rect, logicalIndex)   # name + marker + selection
+        badge = self._badge_for_section(logicalIndex)
+        if not badge:
+            return
+        chip_font = self._chip_font()
+        cfm = QtGui.QFontMetrics(chip_font)
+        ch = cfm.height()
+        cy = rect.top() + (rect.height() - ch) / 2.0
+        x = self._name_end_x(rect, logicalIndex) + self._GAP
+        painter.save()
+        painter.setFont(chip_font)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        for seg in (s.strip() for s in badge.split("·")):
+            if not seg:
+                continue
+            bg, fg = self._CHIP_COLORS[self._chip_kind(seg)]
+            w = cfm.horizontalAdvance(seg) + 2 * self._CHIP_HPAD
+            if x + w > rect.right():
+                break                       # out of header width — stop cleanly
+            chip = QtCore.QRectF(x, cy, w, ch)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(chip, ch / 2.0, ch / 2.0)
+            painter.setPen(fg)
+            painter.drawText(chip, QtCore.Qt.AlignCenter, seg)
+            x += w + self._CHIP_GAP
+        painter.restore()
+
+    def sizeHint(self) -> QtCore.QSize:
+        """Widen the header so the longest (name + its chips) fits — otherwise the chips
+        would be clipped by the name-only header width."""
+        base = super().sizeHint()
+        model = self.model()
+        margin = self._margin()
+        cfm = QtGui.QFontMetrics(self._chip_font())
+        want = base.width()
+        for i in range(self.count()):
+            text = model.headerData(i, QtCore.Qt.Vertical, QtCore.Qt.DisplayRole)
+            text = "" if text is None else str(text)
+            f = model.headerData(i, QtCore.Qt.Vertical, QtCore.Qt.FontRole)
+            nfm = QtGui.QFontMetrics(f if isinstance(f, QtGui.QFont) else self.font())
+            total = 2 * margin + nfm.horizontalAdvance(text)
+            badge = self._badge_for_section(i)
+            if badge:
+                total += self._GAP + sum(
+                    cfm.horizontalAdvance(seg) + 2 * self._CHIP_HPAD + self._CHIP_GAP
+                    for seg in (s.strip() for s in badge.split("·")) if seg)
+            want = max(want, total)
+        base.setWidth(int(want))
+        return base
+
+
 # ── one unique-chain tab: T + variants in wrapped column blocks ────────────────────
 
 class _ChainDesignTab(QtWidgets.QScrollArea):
@@ -227,6 +347,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             end = min(start + _COLS, n)
             width = end - start
             block = QtWidgets.QTableWidget(len(labels), width)
+            block.setVerticalHeader(_BadgeHeaderView(self))   # paints result badges as chips
             block.setVerticalHeaderLabels(labels)
             block.horizontalHeader().setVisible(False)
             block.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -279,16 +400,18 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         fr = 2 * block.frameWidth()
         # horizontalHeader is hidden → no column-header height term; the vertical (row-label)
         # header sits to the LEFT, so it adds to width, not height.
+        vh = block.verticalHeader()
+        hw = max(vh.width(), vh.sizeHint().width())   # widen for badge chips (post-fold/stability)
         h = sum(block.rowHeight(r) for r in range(block.rowCount())) + fr
-        w = (sum(block.columnWidth(c) for c in range(block.columnCount()))
-             + block.verticalHeader().width() + fr)
+        w = (sum(block.columnWidth(c) for c in range(block.columnCount())) + hw + fr)
         block.setFixedHeight(h)
         block.setFixedWidth(w)
 
     def _variant_label(self, vid: str) -> str:
-        """Variant row header: the id plus its inline result badge (S4a), if any."""
-        badge = self.badges.get(vid)
-        return f"{vid}  {badge}" if badge else vid
+        """Variant row-header NAME (just the id). The result badge (S4a) is no longer
+        appended as text here — it is painted as colored chips by `_BadgeHeaderView`
+        from `self.badges[vid]`, which stays the string source-of-truth."""
+        return vid
 
     def eventFilter(self, obj, event) -> bool:
         """Row-header click router. LEFT-click ANYWHERE on a row header → SELECT that variant
@@ -481,6 +604,10 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                 if active:
                     f = hdr.font(); f.setBold(True); hdr.setFont(f)
                 block.setVerticalHeaderItem(r, hdr)
+            # a fresh badge (post-fold/stability) can widen the header → re-fit the block
+            # so the chips aren't clipped, then repaint the header.
+            self._size_block_to_content(block)
+            block.verticalHeader().viewport().update()
 
     def rebuild(self) -> None:
         """Re-lay the blocks from the (mutated) design — recomputes consensus/
