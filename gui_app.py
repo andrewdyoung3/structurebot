@@ -445,6 +445,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._pool = QtCore.QThreadPool.globalInstance()
         self._grids: dict = {}            # (model, chain) -> _ChainGrid
         self._in_flight = False
+        self._scan_queue: List[dict] = []  # remaining specs of a stabilization sweep (run in sequence)
         self._pending_q = None            # clarification answer queue (input-box driven)
         self._worker: Optional[_RequestWorker] = None
         self._pending_focus: List[str] = []   # next_model_id() guesses — focus FALLBACK
@@ -569,6 +570,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.input.returnPressed.connect(self._on_submit)
         # Stage 3b: the Workbench requests a tool launch → run it on the engine spine.
         self.workbench.launchRequested.connect(self._on_tool_launch)
+        self.workbench.batchLaunchRequested.connect(self._on_batch_launch)
 
     # ── presenter signal slots (UI thread) ───────────────────────────────────────
     @QtCore.Slot(str)
@@ -687,6 +689,25 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     # ── Stage 3b: tool launch from the Variant Workbench ──────────────────────────
     @QtCore.Slot(dict)
+    def _on_batch_launch(self, specs: list) -> None:
+        """Stabilization sweep: run a LIST of workbench scan specs one at a time (the engine
+        spine is single-in-flight). Each result routes to its tab via the existing per-refresh
+        path; the queue is advanced when each run finishes (in _on_tool_done / _on_request_failed).
+        """
+        if self._in_flight:
+            self.presenter.warn("A request is already running — wait for it to finish.")
+            return
+        if not specs:
+            return
+        self._scan_queue = list(specs)
+        self._advance_scan_queue()
+
+    def _advance_scan_queue(self) -> None:
+        """Launch the next queued scan, if any (called after each run finishes)."""
+        if self._in_flight or not self._scan_queue:
+            return
+        self._on_tool_launch(self._scan_queue.pop(0))
+
     def _on_tool_launch(self, spec: dict) -> None:
         """Run a Workbench-built tool spec through the engine spine on a worker thread.
         On completion, fire the S3a consume path so the result auto-renders in the panel
@@ -874,6 +895,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._finish_request()
         if opened:                              # a fold opened a model → isolate from other windows
             self._isolate_foreign_models()
+        self._advance_scan_queue()              # continue a stabilization sweep, if one is running
 
     @QtCore.Slot()
     def _on_request_done(self) -> None:
@@ -937,9 +959,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
     def _on_request_failed(self, err: str) -> None:
         if err == "cancelled":
             self.output.append(render_html("[warn]Cancelled.[/warn]"))
+            self._scan_queue = []               # cancel aborts the whole stabilization sweep
         else:
             self.output.append(render_html(f"[err]Request failed: {escape(err)}[/err]"))
         self._finish_request()
+        self._advance_scan_queue()              # one scan failing still runs the rest of the sweep
 
     def _finish_request(self) -> None:
         self._in_flight = False

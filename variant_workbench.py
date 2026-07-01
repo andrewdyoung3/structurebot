@@ -1895,6 +1895,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     # Stage 3b: panel → window. Payload = {tool, tool_inputs, user_input, confidence,
     # refresh}. The window turns it into engine.handle_tool_request on the worker thread.
     launchRequested = QtCore.Signal(dict)
+    batchLaunchRequested = QtCore.Signal(list)   # a list of specs to run in sequence (stabilize-all)
 
     def __init__(self, controller, session=None, pool=None):
         super().__init__()
@@ -1996,6 +1997,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         #  their build sites — menus are live, so order-of-construction doesn't matter.)
         self._tools_btn.setMenu(tools_menu)
         bar.addWidget(self._tools_btn)
+        # One-shot stabilization sweep: run every cheap geometric strategy scan (disulfide +
+        # interface + proline + salt-bridge + cavity) in sequence, each populating its existing
+        # results tab — so the user doesn't click through the five Stabilize/Disulfides items.
+        self._stabilize_all_btn = QtWidgets.QPushButton("Identify stabilizing mutations")
+        self._stabilize_all_btn.setToolTip(
+            "Run ALL stabilization-strategy scans at once — disulfide (intra + interface), "
+            "proline, salt-bridge and cavity — and fill their tabs. Each is a geometric "
+            "suggestion (reads coordinates, no fold); a starting point, not a recommendation "
+            "to mutate. Needs a folded construct or a loaded structure.")
+        self._stabilize_all_btn.clicked.connect(self._on_stabilize_all)
+        bar.addWidget(self._stabilize_all_btn)
         bar.addWidget(self._toolbar_vsep())          # divider: Analysis | View
 
         # Fold ▾ — Stage-4b fold the ACTIVE variant (engine picker; ESMFold local) +
@@ -3567,6 +3579,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._cav_scan_btn.setEnabled(has_struct)          # reads coordinates (no fold), like proline
         if getattr(self, "_sb_scan_btn", None) is not None:
             self._sb_scan_btn.setEnabled(has_struct)           # reads coordinates (no fold), like cavity
+        if getattr(self, "_stabilize_all_btn", None) is not None:
+            self._stabilize_all_btn.setEnabled(has_struct)     # the sweep runs all of the above
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -3638,6 +3652,31 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status.setText("Scanning the chain–chain interface for inter-subunit disulfide sites "
                              "(geometric compatibility only — a starting point)…")
         self.launchRequested.emit(spec)
+
+    # ── one-shot stabilization sweep (run every cheap geometric strategy scan) ─────────
+    def stabilization_batch_specs(self) -> List[dict]:
+        """The list of stabilization-strategy scan specs to run in sequence, in a sensible
+        order (disulfide → interface → proline → salt-bridge → cavity). Each builder returns
+        None when its precondition isn't met (no structure; interface needs a multimer), and
+        those are SKIPPED — so a monomer runs four scans, a multimer five, and an unfolded
+        construct runs none. Pure (builds specs; the window runs + routes them to the tabs)."""
+        builders = (self.disulfide_scan_launch_spec,
+                    self.disulfide_interface_scan_launch_spec,
+                    self.proline_scan_launch_spec,
+                    self.saltbridge_scan_launch_spec,
+                    self.cavity_scan_launch_spec)
+        return [spec for spec in (build() for build in builders) if spec is not None]
+
+    def _on_stabilize_all(self) -> None:
+        specs = self.stabilization_batch_specs()
+        if not specs:
+            self._status.setText("Stabilization scans need a readable structure — fold the construct, "
+                                 "or check the loaded model is still open.")
+            return
+        self._status.setText(f"Identifying stabilizing mutations — running {len(specs)} strategy "
+                             f"scan(s); results fill the Disulfides / Proline / Salt bridges / "
+                             f"Cavity tabs…")
+        self.batchLaunchRequested.emit(specs)
 
     def _on_disulfide_constrain(self) -> None:
         if self._design is None or self._design.source != "sequence":

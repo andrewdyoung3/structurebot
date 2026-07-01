@@ -614,6 +614,41 @@ def test_load_session_replaces_and_redisplays_denovo(_app, monkeypatch):
     wb.rehydrate_denovo.assert_called_once()        # de-novo design re-displayed via the contract
 
 
+# ── stabilization sweep: the batch queue runs specs one at a time (single-in-flight) ──
+
+def _batch_stub(**attrs):
+    attrs.setdefault("_in_flight", False)
+    attrs.setdefault("_scan_queue", [])
+    attrs.setdefault("presenter", _MM())
+    obj = types.SimpleNamespace(**attrs)
+    for name in ("_on_batch_launch", "_advance_scan_queue"):
+        setattr(obj, name, types.MethodType(getattr(W, name), obj))
+    return obj
+
+def test_stabilization_sweep_runs_specs_in_sequence(_app):
+    launched = []
+    obj = _batch_stub()
+    def fake_launch(spec):
+        launched.append(spec["refresh"])
+        obj._in_flight = True                        # mirror the real single-in-flight setup
+    obj._on_tool_launch = fake_launch
+    specs = [{"refresh": r} for r in ("disulfide_scan", "proline_scan", "cavity_scan")]
+    obj._on_batch_launch(specs)
+    assert launched == ["disulfide_scan"]            # only the first — the rest wait in the queue
+    for _ in range(4):                               # each completion advances the sweep
+        obj._in_flight = False
+        obj._advance_scan_queue()
+    assert launched == ["disulfide_scan", "proline_scan", "cavity_scan"]
+    assert obj._scan_queue == []
+
+def test_stabilization_sweep_declined_when_busy(_app):
+    obj = _batch_stub(_in_flight=True)
+    obj._on_tool_launch = lambda spec: pytest.fail("must not launch while a run is in flight")
+    obj._on_batch_launch([{"refresh": "proline_scan"}])
+    obj.presenter.warn.assert_called_once()
+    assert obj._scan_queue == []                     # nothing queued while busy
+
+
 class _CloseBridge:
     """Bridge stub for the Clear path: `info models` returns a controllable id listing;
     every command is recorded so the test can assert which models were closed."""

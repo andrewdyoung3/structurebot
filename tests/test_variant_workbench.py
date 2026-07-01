@@ -2458,6 +2458,35 @@ class TestColabFoldComparative:
         assert cf["remote_msa"] is True and "remote MSA" in cf["label"]
 
 
+# ── One-shot stabilization sweep (run every cheap geometric strategy scan at once) ──
+class TestStabilizeAll:
+    def _folded_construct(self, p, copies=1):
+        p._add_sequence_construct("binder", "MKVLWAACGTDECAAC")
+        cd = next(iter(p._design.chains.values()))
+        if copies > 1:                                   # homo-oligomer → ≥2 members (interface)
+            cd.members = [("binder", chr(ord("A") + i)) for i in range(copies)]
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        return cd
+
+    def test_batch_specs_monomer_are_four_scans_no_interface(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._folded_construct(p, copies=1)
+        refreshes = [s["refresh"] for s in p.stabilization_batch_specs()]
+        assert refreshes == ["disulfide_scan", "proline_scan", "saltbridge_scan", "cavity_scan"]
+
+    def test_batch_specs_multimer_include_interface(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._folded_construct(p, copies=2)
+        refreshes = [s["refresh"] for s in p.stabilization_batch_specs()]
+        assert "disulfide_interface_scan" in refreshes and len(refreshes) == 5
+
+    def test_batch_specs_empty_without_a_structure(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAC")   # not folded → no structure
+        assert p.stabilization_batch_specs() == []
+
+
 # ── Fold-based disulfide suite (Modes A discovery / B geometry / C introduce-constrain) ──
 class TestDisulfideSuite:
     def _construct(self, p, seq="MKVLWAACGTDE", start=1):
