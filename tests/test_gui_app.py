@@ -149,8 +149,9 @@ def test_engine_drives_qt_presenter(_app):
 
 def test_handle_tool_request_enters_the_spine(_app):
     sig = PresenterSignals()
-    out = []
+    out, act = [], []
     sig.append_html.connect(lambda h: out.append(h))
+    sig.activity.connect(lambda h: act.append(h))                 # planning warnings → Activity panel
     sig.ask.connect(lambda kind, payload, q: q.put("proceed"))   # the confirm-gate → proceed
     pres = QtPresenter(sig)
 
@@ -181,10 +182,10 @@ def test_handle_tool_request_enters_the_spine(_app):
     assert built["confidence"] == "low"
     host.router.execute.assert_called_once()
     host.translator.translate.assert_not_called()
-    # the deep-tier estimate reached the pane before the gate
+    # the deep-tier estimate reached the user (via the Activity panel) before the gate
     import re as _re
-    text = _re.sub(r"<[^>]+>", "", " ".join(out))
-    assert "approximate runtime" in text.lower()
+    act_text = _re.sub(r"<[^>]+>", "", " ".join(act))
+    assert "approximate runtime" in act_text.lower()
 
 
 def test_handle_tool_request_on_result_seam(_app):

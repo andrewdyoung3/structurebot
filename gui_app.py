@@ -349,6 +349,71 @@ class _HistoryLineEdit(QtWidgets.QLineEdit):
         super().keyPressEvent(e)
 
 
+class _ActivityPanel(QtWidgets.QWidget):
+    """Collapsible 'Activity' strip that sits between the chat log and the input.
+
+    It is the home for the tool-run LIFECYCLE — the tool-pipeline plan and the planning
+    warnings that used to be interleaved into the chat QTextEdit — plus a live status
+    line fed by the busy signal. Lifting these out keeps the chat log conversational.
+
+    Pure view: a header row (collapse toggle + always-visible status label) over a body
+    QTextEdit. The header status stays visible even when collapsed (status at a glance);
+    the body auto-expands when a run posts pipeline/warning content."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._toggle = QtWidgets.QToolButton()
+        self._toggle.setText("Activity")
+        self._toggle.setCheckable(True)
+        self._toggle.setArrowType(QtCore.Qt.RightArrow)
+        self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setStyleSheet("QToolButton{color:#bbbbbb;font-weight:bold;border:none;}")
+        self._toggle.toggled.connect(self._on_toggled)
+
+        self._status = QtWidgets.QLabel("idle")
+        self._status.setStyleSheet("color:#888888;")
+
+        header = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(header)
+        hl.setContentsMargins(4, 0, 4, 0)
+        hl.addWidget(self._toggle)
+        hl.addWidget(self._status, 1)
+
+        self._body = QtWidgets.QTextEdit(readOnly=True)
+        self._body.setStyleSheet("QTextEdit{background:#191919;color:#cccccc;}")
+        self._body.setMaximumHeight(150)
+        self._body.setVisible(False)
+
+        lay.addWidget(header)
+        lay.addWidget(self._body)
+
+    def _on_toggled(self, on: bool) -> None:
+        self._toggle.setArrowType(QtCore.Qt.DownArrow if on else QtCore.Qt.RightArrow)
+        self._body.setVisible(on)
+
+    def _expand(self) -> None:
+        if not self._toggle.isChecked():
+            self._toggle.setChecked(True)          # → _on_toggled shows the body
+
+    # ── presenter slots (UI thread) ──────────────────────────────────────────────
+    @QtCore.Slot(str)
+    def add_activity(self, html: str) -> None:
+        """Append a rendered pipeline table / planning-warning fragment and reveal it."""
+        self._body.append(html if html else "")
+        self._body.moveCursor(QtGui.QTextCursor.End)
+        self._expand()
+
+    @QtCore.Slot(bool, str)
+    def set_status(self, busy: bool, label: str) -> None:
+        self._status.setText(label if busy else "idle")
+        self._status.setStyleSheet("color:%s;" % ("#e0b040" if busy else "#888888"))
+
+
 # ── the window (== the engine host) ───────────────────────────────────────────────
 
 class StructureBotWindow(QtWidgets.QMainWindow):
@@ -438,10 +503,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.input = _HistoryLineEdit()
         self.input.setPlaceholderText("Ask StructureBot…  (e.g. \"open 1hsg and show it as a cartoon\")")
 
+        # Activity strip: the tool-pipeline plan + planning warnings + run status, lifted
+        # OUT of the chat log so the conversation stays clean (item 4).
+        self.activity = _ActivityPanel()
+
         bottom = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.addWidget(self.output)
+        bl.addWidget(self.activity)
         bl.addWidget(self.input)
 
         # Sequence-favored vertical split: the workbench grid gets the majority (3:2 vs the
@@ -492,7 +562,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     def _connect(self) -> None:
         self._sig.append_html.connect(self._on_append)
+        self._sig.activity.connect(self.activity.add_activity)     # tool pipeline + warnings → panel
         self._sig.set_busy.connect(self._on_busy)
+        self._sig.set_busy.connect(self.activity.set_status)       # run status → panel header
         self._sig.ask.connect(self._on_ask)
         self.input.returnPressed.connect(self._on_submit)
         # Stage 3b: the Workbench requests a tool launch → run it on the engine spine.
