@@ -761,24 +761,62 @@ class _StabilizationResultsTab(QtWidgets.QWidget):
         """Signal that fresh results landed in this tab (drives the tab-bar new-results dot)."""
         self.resultsArrived.emit()
 
-    def __init__(self, *, on_highlight, on_clear_glow=None, on_add_to_basket=None):
+    def __init__(self, *, on_highlight, on_clear_glow=None, on_add_to_basket=None,
+                 on_chain_equiv=None):
         super().__init__()
-        self._on_highlight = on_highlight          # (cd, item) -> glow it in 3D (the shared seam)
+        self._on_highlight = on_highlight          # (cd, item, members=None) -> glow it in 3D (shared seam)
         self._on_clear_glow = on_clear_glow        # ()         -> restore the normal 3D representation
         self._on_add_to_basket = on_add_to_basket  # (cd, item) -> stage the pick into the design basket
+        # (chain id) -> [all fold-chain ids sharing that chain's ChainDesign]. Homo-oligomer copies
+        # collapse onto ONE cd, so the SAME site scanned on each copy is the SAME substitution — this
+        # resolver drives the replicate-row GROUPING (a trimer's 3 near-identical rows → one, with the
+        # per-copy geometry spread preserved). None → no grouping (each raw row stands alone).
+        self._chain_equiv = on_chain_equiv
+        self._grouped = True                       # default GROUPED (toggle in the header)
         self._outer = QtWidgets.QVBoxLayout(self)
 
     def _add_header(self, intro_text: str, clear_label: str, clear_tooltip: str) -> None:
-        """Build the intro label + the Clear-view (un-ghost) control into the tab's outer layout.
-        Subclasses call this first, then add their own body widgets to ``self._outer``."""
+        """Build the intro label + the Clear-view (un-ghost) control + the group-replicates toggle into
+        the tab's outer layout. Subclasses call this first, then add their own body widgets to
+        ``self._outer``."""
         intro = QtWidgets.QLabel(intro_text)
         intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
         self._outer.addWidget(intro)
+        row = QtWidgets.QHBoxLayout()
         self._clear_glow_btn = QtWidgets.QPushButton(clear_label)
         self._clear_glow_btn.setToolTip(clear_tooltip)
         self._clear_glow_btn.setEnabled(False)
         self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
-        self._outer.addWidget(self._clear_glow_btn)
+        row.addWidget(self._clear_glow_btn)
+        self._group_chk = QtWidgets.QCheckBox("Group equivalent chains")
+        self._group_chk.setToolTip(
+            "Homo-oligomer copies (e.g. a trimer's three chains) fold to near-identical sites, so the "
+            "same substitution shows up once per copy. Grouped (default): ONE row per unique "
+            "substitution with a ×N badge; a geometry value that varies between copies shows as a "
+            "range (real fold asymmetry), and hovering the row lists each chain's exact value. "
+            "Unchecked: one row per chain copy (every copy's geometry on its own line).")
+        self._group_chk.setChecked(self._grouped)
+        self._group_chk.setVisible(False)          # shown only when a scan actually has equivalent copies
+        self._group_chk.toggled.connect(self._on_group_toggled)
+        row.addWidget(self._group_chk)
+        row.addStretch(1)
+        self._outer.addLayout(row)
+
+    def _on_group_toggled(self, checked: bool) -> None:
+        """Re-render the tab's tables at the new grouping without re-running the scan (the raw
+        candidates are cached per tab; `_rerender` re-fills from them)."""
+        self._grouped = bool(checked)
+        self._rerender()
+
+    def _rerender(self) -> None:
+        """Re-fill this tab's table(s) from its cached raw candidates at the current grouping. Each
+        subclass overrides — the base is a no-op (a tab with no cached results has nothing to redraw)."""
+
+    def _set_group_toggle_visible(self, groupable: bool) -> None:
+        """Show the group-replicates checkbox only when the last scan HAS equivalent copies to collapse
+        (a monomer / hetero-multimer never does — no toggle clutter there)."""
+        if getattr(self, "_group_chk", None) is not None:
+            self._group_chk.setVisible(bool(groupable))
 
     def set_glow_active(self, active: bool) -> None:
         """Enable the Clear-view control only while a glow is active (lit = a spotlight to restore).
@@ -806,6 +844,148 @@ class _StabilizationResultsTab(QtWidgets.QWidget):
         cav.setStyleSheet("color:#b36b00;"); cav.setVisible(False)
         return cav
 
+    # ── replicate-row grouping (collapse a homo-oligomer's per-copy rows into one) ──────────
+    # A homo-oligomer scan produces the SAME site on every equivalent chain (`scan_engineerable_sites`
+    # loops per chain), so a trimer shows each substitution three times. Grouping collapses those into
+    # ONE display row keyed by cd-EQUIVALENCE (`_chain_equiv`, the same resolver the design basket uses)
+    # — WITHOUT discarding the per-copy geometry, which is REAL (a predicted assembly is not perfectly
+    # symmetric, so each copy's Cα–Cα / χSS differs slightly): a varying column shows its min–max range,
+    # and the row's tooltip lists every copy's exact value. The mechanics are shape-agnostic (single-
+    # residue OR pair candidates), so all four strategy tabs share this one implementation.
+
+    @staticmethod
+    def _subs_of(c: dict) -> List[tuple]:
+        """The (chain, resnum, to_aa) substitution members a candidate targets — a PAIR (disulfide /
+        salt-bridge: chain_a/resnum_a + chain_b/resnum_b) or a SINGLE residue (proline / cavity:
+        chain/position). `to_aa` falls back to '' for assessment rows that describe an EXISTING feature
+        (no substitution) — grouping still collapses copies correctly (same site → same key)."""
+        if c.get("resnum_a") is not None:
+            return [(c.get("chain_a"), c.get("resnum_a"), c.get("to_aa_a") or c.get("to_aa") or ""),
+                    (c.get("chain_b"), c.get("resnum_b"), c.get("to_aa_b") or c.get("to_aa") or "")]
+        if c.get("position") is not None:
+            return [(c.get("chain"), c.get("position"), c.get("to_aa") or "")]
+        return []
+
+    def _group_key(self, chain):
+        """Cd-EQUIVALENCE key for a chain — homo-oligomer copies share one ChainDesign, so a site on
+        any copy is the SAME site. Falls back to the raw chain when no resolver is wired."""
+        if self._chain_equiv is None:
+            return chain
+        return frozenset(self._chain_equiv(chain))
+
+    def _sig(self, c: dict):
+        """Grouping signature — the cd-equivalence identity of a candidate's substitution set, order-
+        independent. None when the candidate exposes no groupable members (→ stands alone)."""
+        members = [(self._group_key(ch), pos, aa) for ch, pos, aa in self._subs_of(c)
+                   if ch is not None and pos is not None]
+        if not members:
+            return None
+        return tuple(sorted(members, key=lambda t: (t[1], str(t[2]))))
+
+    def _group_rows(self, cands: List[dict]) -> List[List[dict]]:
+        """Partition candidates into display rows. Grouped (and a resolver wired): equivalent-copy
+        candidates collapse into one row (first = best, since the input is score-sorted). Otherwise one
+        row per candidate. Order is preserved by first appearance (so the best row stays on top)."""
+        if not self._grouped or self._chain_equiv is None:
+            return [[c] for c in cands]
+        order: List[object] = []
+        groups: Dict[object, List[dict]] = {}
+        for i, c in enumerate(cands):
+            k = self._sig(c)
+            if k is None:
+                k = ("__solo__", i)                # ungroupable → its own row
+            if k not in groups:
+                groups[k] = []; order.append(k)
+            groups[k].append(c)
+        return [groups[k] for k in order]
+
+    def _would_group(self, cands: List[dict]) -> bool:
+        """True when grouping WOULD collapse ≥1 set of equivalent copies (drives the toggle's
+        visibility) — computed on the raw list regardless of the current toggle state."""
+        if self._chain_equiv is None:
+            return False
+        seen: set = set()
+        for c in cands:
+            k = self._sig(c)
+            if k is None:
+                continue
+            if k in seen:
+                return True
+            seen.add(k)
+        return False
+
+    @staticmethod
+    def _parse_float(v: str):
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _fmt_range(cls, vals: List[str]) -> str:
+        """Merge one column's values across a group's copies into a display cell: identical → the value;
+        differing numerics → a `lo–hi` range at the copies' own precision (surfacing real fold
+        asymmetry); differing non-numerics → the representative (best/first) value (the tooltip carries
+        the full per-copy detail either way)."""
+        uniq = list(dict.fromkeys(vals))
+        if len(uniq) == 1:
+            return uniq[0]
+        nums, decs = [], 0
+        for v in uniq:
+            f = cls._parse_float(v)
+            if f is None:
+                return uniq[0]
+            nums.append(f)
+            dot = str(v).strip().split(".")
+            decs = max(decs, len(dot[1]) if len(dot) == 2 else 0)
+        lo, hi = min(nums), max(nums)
+        if lo == hi:
+            return uniq[0]
+        return f"{lo:.{decs}f}–{hi:.{decs}f}"
+
+    @staticmethod
+    def _member_chain_label(c: dict) -> str:
+        """The chain(s) a candidate lives on — 'A' for a single residue, 'A' or 'A/B' for a pair."""
+        if c.get("resnum_a") is not None:
+            ca, cb = c.get("chain_a"), c.get("chain_b")
+            return str(ca) if ca == cb else f"{ca}/{cb}"
+        return str(c.get("chain") or "?")
+
+    def _members_tooltip(self, grp: List[dict], rowvals, headers: List[str]) -> str:
+        """Per-copy breakdown for a grouped row's tooltip — each chain copy's full row, so the exact
+        (not just range) geometry of every copy stays one hover away."""
+        lines = []
+        for c in grp:
+            cells = rowvals(c)
+            parts = ", ".join(f"{headers[j]} {cells[j]}" for j in range(1, len(cells)))
+            lines.append(f"chain {self._member_chain_label(c)}: {parts}")
+        return "Per-copy values (equivalent chains):\n" + "\n".join(lines)
+
+    def _fill_ranked(self, tbl: "QtWidgets.QTableWidget", cands: List[dict], rowvals) -> List[List[dict]]:
+        """Fill *tbl* from *cands* at the current grouping. Returns the visible-row model
+        ``rows[i] = [member candidates]`` (length 1 = ungrouped / singleton, representative = ``[0]``)
+        so row handlers map a table row back to its candidate(s). A grouped row shows the ×N badge on
+        column 0, per-column min–max ranges for values that vary across copies, and a per-copy tooltip."""
+        rows = self._group_rows(cands)
+        headers = [tbl.horizontalHeaderItem(j).text() if tbl.horizontalHeaderItem(j) else ""
+                   for j in range(tbl.columnCount())]
+        tbl.setRowCount(len(rows))
+        for i, grp in enumerate(rows):
+            member_cells = [rowvals(c) for c in grp]
+            ncols = len(member_cells[0])
+            merged = [self._fmt_range([mc[j] for mc in member_cells]) for j in range(ncols)]
+            tip = ""
+            if len(grp) > 1:
+                merged[0] = f"{merged[0]}  ×{len(grp)}"
+                tip = self._members_tooltip(grp, rowvals, headers)
+            for j, v in enumerate(merged):
+                it = QtWidgets.QTableWidgetItem(v)
+                if tip:
+                    it.setToolTip(tip)
+                tbl.setItem(i, j, it)
+        tbl.resizeColumnsToContents()
+        return rows
+
 
 # ── persistent Disulfides results tab (whole-suite home; replaces the transient dialogs) ──
 
@@ -821,9 +1001,9 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
     residue pairs with which; the 'Disulfide sites' colour mode is a complementary navigational index."""
 
     def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None, on_clear_glow=None,
-                 on_add_to_basket=None):
+                 on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
         self._on_estimate_ddg = on_estimate_ddg  # (cd, pair_dict) -> ΔΔG escalation (legacy bridge)
         # Explicit escape from the pair-click spotlight: restore the normal representation (un-ghost
@@ -871,7 +1051,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
         ph = QtWidgets.QLabel(placeholder); ph.setWordWrap(True); ph.setStyleSheet("color:#888;")
         gl.addWidget(ph)
         sec = {"box": box, "placeholder": ph, "cols": cols, "cd": None, "pairs": [],
-               "table": None, "caveat": None, "detail": None}
+               "table": None, "caveat": None, "detail": None, "rows": [], "rowvals": None}
         if caveat:
             cav = self._make_caveat(); gl.addWidget(cav); sec["caveat"] = cav
         if cols is not None:
@@ -906,46 +1086,48 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
         self._sec[key] = sec
         self._vl.addWidget(box)
 
-    def _add_to_basket(self, key: str) -> None:
+    def _row_group(self, key: str):
+        """(cd, member candidates) for the section's SELECTED display row — members is the group's
+        equivalent copies (one when ungrouped). (cd, None) when nothing valid is selected."""
         sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
+        rows, cd = sec.get("rows") or [], sec.get("cd")
         tbl = sec.get("table")
         row = tbl.currentRow() if tbl is not None else -1
-        if 0 <= row < len(pairs) and cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(cd, pairs[row])
+        if not (0 <= row < len(rows)) or cd is None:
+            return cd, None
+        return cd, rows[row]
+
+    def _add_to_basket(self, key: str) -> None:
+        cd, grp = self._row_group(key)
+        if grp is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(cd, grp[0])
 
     # ── row-click → highlight the RIGHT pair on the RIGHT construct (the §9 seam) ─────
     def _on_row(self, key: str, row: int) -> None:
         sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
-        if not (0 <= row < len(pairs)) or cd is None:
+        rows, cd = sec.get("rows") or [], sec.get("cd")
+        if not (0 <= row < len(rows)) or cd is None:
             return
-        p = pairs[row]
-        self._on_highlight(cd, p)                   # routes through the panel's existing seam
+        grp = rows[row]
+        self._on_highlight(cd, grp[0], grp)         # routes through the panel's existing seam (all copies)
         d = sec.get("detail")
         if d is not None:
-            d.setText(self._pair_detail(key, p)); d.setVisible(True)
+            d.setText(self._pair_detail(key, grp[0])); d.setVisible(True)
 
     def _declare(self, key: str) -> None:
-        sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
-        tbl = sec.get("table")
-        row = tbl.currentRow() if tbl is not None else -1
-        if not (0 <= row < len(pairs)) or cd is None:
+        cd, grp = self._row_group(key)
+        if grp is None:
             return
         # pass the FULL pair dict (carries chain_a/chain_b) so an INTERFACE (cross-chain) pair reaches
         # the cross-chain Mode-C declare; an intra Mode-D pair (chain_a == chain_b) takes the intra path.
-        self._on_declare(cd, pairs[row])
+        self._on_declare(cd, grp[0])
 
     def _estimate(self, key: str) -> None:
         """ΔΔG-escalate the SELECTED interface row → the panel's legacy-bridge route. Per-row, explicit."""
-        sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
-        tbl = sec.get("table")
-        row = tbl.currentRow() if tbl is not None else -1
-        if not (0 <= row < len(pairs)) or cd is None or self._on_estimate_ddg is None:
+        cd, grp = self._row_group(key)
+        if grp is None or self._on_estimate_ddg is None:
             return
-        self._on_estimate_ddg(cd, pairs[row])
+        self._on_estimate_ddg(cd, grp[0])
 
     @staticmethod
     def _reach_detail(p: dict) -> str:
@@ -984,13 +1166,9 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
     # ── populate (each consumer calls its own) ──────────────────────────────────────
     def _fill_table(self, key: str, cd, pairs: List[dict], rowvals) -> None:
         sec = self._sec[key]
-        sec["cd"], sec["pairs"] = cd, list(pairs)
+        sec["cd"], sec["pairs"], sec["rowvals"] = cd, list(pairs), rowvals
         tbl = sec["table"]
-        tbl.setRowCount(len(pairs))
-        for i, p in enumerate(pairs):
-            for j, v in enumerate(rowvals(p)):
-                tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        tbl.resizeColumnsToContents()
+        sec["rows"] = self._fill_ranked(tbl, sec["pairs"], rowvals)   # grouping-aware fill
         has = len(pairs) > 0
         sec["placeholder"].setVisible(not has)
         tbl.setVisible(has)
@@ -1000,9 +1178,24 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             sec["escalate_btn"].setEnabled(has)
         if sec.get("basket_btn") is not None:
             sec["basket_btn"].setEnabled(has and self._on_add_to_basket is not None)
+        self._refresh_group_toggle()
         if has:
             tbl.selectRow(0); self._on_row(key, 0)         # preselect + highlight the best/first
             self._announce()                               # new results → tab-bar dot
+
+    def _refresh_group_toggle(self) -> None:
+        """Show the group-replicates toggle when ANY populated section has equivalent copies to
+        collapse (one toggle governs the whole suite's tables)."""
+        self._set_group_toggle_visible(
+            any(self._would_group(s.get("pairs") or []) for s in self._sec.values()))
+
+    def _rerender(self) -> None:
+        """Re-fill every populated section at the current grouping (driven by the header toggle)."""
+        for key, sec in self._sec.items():
+            if sec.get("table") is None or not sec.get("pairs") or sec.get("rowvals") is None:
+                continue
+            sec["rows"] = self._fill_ranked(sec["table"], sec["pairs"], sec["rowvals"])
+            sec["table"].selectRow(0); self._on_row(key, 0)
 
     def populate_assess(self, cd, pairs: List[dict]) -> None:
         self._fill_table("A", cd, pairs, lambda p: [
@@ -1100,7 +1293,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
         loaded (stale-data-wrong). So `_reset_view_for_session` KEEPS the tab and calls this to empty
         it; the new session's scans repopulate. Parallel to the panel's own `reset()`."""
         for sec in self._sec.values():
-            sec["cd"], sec["pairs"] = None, []
+            sec["cd"], sec["pairs"], sec["rows"], sec["rowvals"] = None, [], [], None
             tbl = sec.get("table")
             if tbl is not None:
                 tbl.setRowCount(0)
@@ -1116,6 +1309,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             if sec.get("basket_btn") is not None:
                 sec["basket_btn"].setEnabled(False)
             sec["placeholder"].setVisible(True)
+        self._set_group_toggle_visible(False)
         self.set_glow_active(False)              # a reset 3D scene has no active glow to clear
 
 
@@ -1129,14 +1323,15 @@ class ProlineResultsTab(_StabilizationResultsTab):
     Persists across tab-switch + session reset (keep-and-clear, the disulfide-tab lesson)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_show_existing=None, on_add_to_basket=None):
+                 on_show_existing=None, on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare              # (cd, cand) -> substitute→Pro + validate (fold/compare)
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> X→Pro ΔΔG escalation (legacy bridge)
         self._on_show_existing = on_show_existing  # (cd)       -> highlight the existing prolines
         self._cd = None
         self._cands: List[dict] = []
+        self._rows: List[List[dict]] = []          # visible-row model (grouping): row -> member cands
         self._add_header(
             "Proline-stabilization candidates. X→Pro sites ranked by backbone φ/ψ proline-compatibility "
             "with a backbone-H-bond-donor penalty (proline can't donate the N–H···O bond helices/sheets "
@@ -1190,17 +1385,21 @@ class ProlineResultsTab(_StabilizationResultsTab):
         self._outer.addWidget(box)
         self._outer.addStretch(1)
 
+    def _row_rep(self, r: int) -> Optional[dict]:
+        """The representative (best) candidate for visible row *r* — the group's first member."""
+        return self._rows[r][0] if 0 <= r < len(self._rows) else None
+
     def _add_to_basket(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, c)
 
     def _on_row(self, r: int) -> None:
-        if not (0 <= r < len(self._cands)) or self._cd is None:
+        if not (0 <= r < len(self._rows)) or self._cd is None:
             return
-        c = self._cands[r]
-        self._on_highlight(self._cd, c)
-        self._detail.setText(self._cand_detail(c)); self._detail.setVisible(True)
+        grp = self._rows[r]
+        self._on_highlight(self._cd, grp[0], grp)      # glow all equivalent copies (one when ungrouped)
+        self._detail.setText(self._cand_detail(grp[0])); self._detail.setVisible(True)
 
     @staticmethod
     def _cand_detail(c: dict) -> str:
@@ -1216,14 +1415,21 @@ class ProlineResultsTab(_StabilizationResultsTab):
                 f"{don}.{ddg_s} Validate by substituting → re-folding → comparing.")
 
     def _declare(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_declare is not None:
-            self._on_declare(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, c)
 
     def _estimate(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_estimate_ddg is not None:
-            self._on_estimate_ddg(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, c)
+
+    @staticmethod
+    def _rowvals(c: dict) -> List[str]:
+        psi = c.get("psi")
+        return [f"{c.get('from_aa','')}{c.get('position')}P", f"{c.get('phi')}",
+                ("—" if psi is None else f"{psi}"), f"{c.get('score', 0):.2f}",
+                ("donor" if c.get("hbond_donates") else "—"), ProlineResultsTab._ddg_cell(c)]
 
     def populate(self, cd, scan: dict) -> None:
         """Fill the ranked table from a proline scan ({candidates, existing, caveat})."""
@@ -1238,24 +1444,27 @@ class ProlineResultsTab(_StabilizationResultsTab):
                if existing else "."))
         self._existing_lbl.setVisible(True)
         self._existing_btn.setEnabled(bool(existing))
-        self._tbl.setRowCount(len(cands))
-        for i, c in enumerate(cands):
-            psi = c.get("psi")
-            cells = [f"{c.get('from_aa','')}{c.get('position')}P", f"{c.get('phi')}",
-                     ("—" if psi is None else f"{psi}"), f"{c.get('score', 0):.2f}",
-                     ("donor" if c.get("hbond_donates") else "—"), self._ddg_cell(c)]
-            for j, v in enumerate(cells):
-                self._tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._tbl.resizeColumnsToContents()
+        self._render_rows()
         has = len(cands) > 0
         self._placeholder.setVisible(not has)
         self._tbl.setVisible(has)
         self._declare_btn.setEnabled(has)
         self._escalate_btn.setEnabled(has)
         self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
+        self._set_group_toggle_visible(self._would_group(self._cands))
         if has:
             self._tbl.selectRow(0); self._on_row(0)
             self._announce()                               # new results → tab-bar dot
+
+    def _render_rows(self) -> None:
+        self._rows = self._fill_ranked(self._tbl, self._cands, self._rowvals)
+
+    def _rerender(self) -> None:
+        if not self._cands:
+            return
+        self._render_rows()
+        self._tbl.setVisible(True)
+        self._tbl.selectRow(0); self._on_row(0)
 
     @staticmethod
     def _ddg_cell(c: dict) -> str:
@@ -1265,12 +1474,13 @@ class ProlineResultsTab(_StabilizationResultsTab):
     def reset(self) -> None:
         """Clear back to the dormant placeholder (keep-and-clear on session reset — the disulfide-tab
         lesson: the tab PERSISTS as a sibling, but its content belongs to the prior session)."""
-        self._cd, self._cands = None, []
+        self._cd, self._cands, self._rows = None, [], []
         self._tbl.setRowCount(0); self._tbl.setVisible(False)
         self._caveat.setVisible(False); self._existing_lbl.setVisible(False)
         self._detail.setVisible(False); self._placeholder.setVisible(True)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
         self._existing_btn.setEnabled(False)
+        self._set_group_toggle_visible(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -1288,13 +1498,14 @@ class CavityResultsTab(_StabilizationResultsTab):
     across tab-switch + session reset (keep-and-clear)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_add_to_basket=None):
+                 on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare              # (cd, cand) -> substitute→fill + validate (fold/compare)
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> fill ΔΔG escalation (legacy bridge)
         self._cd = None
         self._cands: List[dict] = []
+        self._rows: List[List[dict]] = []          # visible-row model (grouping): row -> member cands
         self._add_header(
             "Cavity-filling candidates. Small→larger hydrophobic fills of detected INTERNAL voids, "
             "ranked by void-fill fraction × how well a rotamer reaches into the void clash-free. The "
@@ -1345,17 +1556,21 @@ class CavityResultsTab(_StabilizationResultsTab):
         self._outer.addWidget(box)
         self._outer.addStretch(1)
 
+    def _row_rep(self, r: int) -> Optional[dict]:
+        """The representative (best) candidate for visible row *r* — the group's first member."""
+        return self._rows[r][0] if 0 <= r < len(self._rows) else None
+
     def _add_to_basket(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, c)
 
     def _on_row(self, r: int) -> None:
-        if not (0 <= r < len(self._cands)) or self._cd is None:
+        if not (0 <= r < len(self._rows)) or self._cd is None:
             return
-        c = self._cands[r]
-        self._on_highlight(self._cd, c)
-        self._detail.setText(self._cand_detail(c)); self._detail.setVisible(True)
+        grp = self._rows[r]
+        self._on_highlight(self._cd, grp[0], grp)      # glow all equivalent copies (one when ungrouped)
+        self._detail.setText(self._cand_detail(grp[0])); self._detail.setVisible(True)
 
     @staticmethod
     def _cand_detail(c: dict) -> str:
@@ -1371,14 +1586,21 @@ class CavityResultsTab(_StabilizationResultsTab):
                 f"{ddg_s} Validate by substituting → re-folding → comparing.")
 
     def _declare(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_declare is not None:
-            self._on_declare(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, c)
 
     def _estimate(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_estimate_ddg is not None:
-            self._on_estimate_ddg(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, c)
+
+    @staticmethod
+    def _rowvals(c: dict) -> List[str]:
+        return [f"{c.get('from_aa','')}{c.get('position')}{c.get('to_aa','')}",
+                str(c.get("cavity_id", "")), f"{c.get('void_volume', 0):.0f}",
+                f"{c.get('fill_fraction', 0):.2f}", ("⚠" if c.get("clash") else "ok"),
+                f"{c.get('score', 0):.2f}", CavityResultsTab._ddg_cell(c)]
 
     def populate(self, cd, scan: dict) -> None:
         """Fill the ranked table from a cavity scan ({candidates, cavities, caveat})."""
@@ -1395,24 +1617,27 @@ class CavityResultsTab(_StabilizationResultsTab):
         else:
             self._cavities_lbl.setText("No internal cavities ≥ the volume floor (well-packed at this probe).")
         self._cavities_lbl.setVisible(True)
-        self._tbl.setRowCount(len(cands))
-        for i, c in enumerate(cands):
-            cells = [f"{c.get('from_aa','')}{c.get('position')}{c.get('to_aa','')}",
-                     str(c.get("cavity_id", "")), f"{c.get('void_volume', 0):.0f}",
-                     f"{c.get('fill_fraction', 0):.2f}", ("⚠" if c.get("clash") else "ok"),
-                     f"{c.get('score', 0):.2f}", self._ddg_cell(c)]
-            for j, v in enumerate(cells):
-                self._tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._tbl.resizeColumnsToContents()
+        self._render_rows()
         has = len(cands) > 0
         self._placeholder.setVisible(not has)
         self._tbl.setVisible(has)
         self._declare_btn.setEnabled(has)
         self._escalate_btn.setEnabled(has)
         self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
+        self._set_group_toggle_visible(self._would_group(self._cands))
         if has:
             self._tbl.selectRow(0); self._on_row(0)
             self._announce()                               # new results → tab-bar dot
+
+    def _render_rows(self) -> None:
+        self._rows = self._fill_ranked(self._tbl, self._cands, self._rowvals)
+
+    def _rerender(self) -> None:
+        if not self._cands:
+            return
+        self._render_rows()
+        self._tbl.setVisible(True)
+        self._tbl.selectRow(0); self._on_row(0)
 
     @staticmethod
     def _ddg_cell(c: dict) -> str:
@@ -1422,11 +1647,12 @@ class CavityResultsTab(_StabilizationResultsTab):
     def reset(self) -> None:
         """Clear back to the dormant placeholder (keep-and-clear on session reset — the disulfide-tab
         lesson: the tab PERSISTS as a sibling, but its content belongs to the prior session)."""
-        self._cd, self._cands = None, []
+        self._cd, self._cands, self._rows = None, [], []
         self._tbl.setRowCount(0); self._tbl.setVisible(False)
         self._caveat.setVisible(False); self._cavities_lbl.setVisible(False)
         self._detail.setVisible(False); self._placeholder.setVisible(True)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
+        self._set_group_toggle_visible(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -1443,14 +1669,16 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
     Persists across tab-switch + session reset (keep-and-clear)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_add_to_basket=None):
+                 on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare              # (cd, cand) -> substitute BOTH positions + validate
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> 2-residue ΔΔG escalation (legacy bridge)
         self._cd = None
         self._existing: List[dict] = []
         self._novel: List[dict] = []
+        self._ex_rows: List[List[dict]] = []       # visible-row models (grouping) for each table
+        self._nv_rows: List[List[dict]] = []
         self._add_header(
             "Salt-bridge candidates. Existing Asp/Glu↔Arg/Lys pairs (assessed by closest carboxyl-O↔"
             "basic-N distance + burial) and NOVEL complementary charge-pair sites (geometry × burial). "
@@ -1517,18 +1745,20 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
 
     # ── row handlers ──
     def _on_existing_row(self, r: int) -> None:
-        if not (0 <= r < len(self._existing)) or self._cd is None:
+        if not (0 <= r < len(self._ex_rows)) or self._cd is None:
             return
         self._nv_tbl.clearSelection()
-        self._on_highlight(self._cd, self._existing[r])
-        self._detail.setText(self._existing_detail(self._existing[r])); self._detail.setVisible(True)
+        grp = self._ex_rows[r]
+        self._on_highlight(self._cd, grp[0], grp)      # glow all equivalent copies
+        self._detail.setText(self._existing_detail(grp[0])); self._detail.setVisible(True)
 
     def _on_novel_row(self, r: int) -> None:
-        if not (0 <= r < len(self._novel)) or self._cd is None:
+        if not (0 <= r < len(self._nv_rows)) or self._cd is None:
             return
         self._ex_tbl.clearSelection()
-        c = self._novel[r]
-        self._on_highlight(self._cd, c)
+        grp = self._nv_rows[r]
+        c = grp[0]
+        self._on_highlight(self._cd, c, grp)           # glow all equivalent copies
         self._detail.setText(self._novel_detail(c)); self._detail.setVisible(True)
         has = self._cd is not None
         self._declare_btn.setEnabled(has)
@@ -1559,20 +1789,24 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
                 f"Cβ–Cβ {c.get('cb_cb')} Å, {bur}{clash}.{ddg_s} Validate by substituting both → "
                 f"re-folding (no constraint) → comparing.")
 
+    def _nv_rep(self, r: int) -> Optional[dict]:
+        """Representative (best) novel candidate for visible row *r* — the group's first member."""
+        return self._nv_rows[r][0] if 0 <= r < len(self._nv_rows) else None
+
     def _add_to_basket(self) -> None:
-        r = self._nv_tbl.currentRow()
-        if 0 <= r < len(self._novel) and self._cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(self._cd, self._novel[r])
+        c = self._nv_rep(self._nv_tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, c)
 
     def _declare(self) -> None:
-        r = self._nv_tbl.currentRow()
-        if 0 <= r < len(self._novel) and self._cd is not None and self._on_declare is not None:
-            self._on_declare(self._cd, self._novel[r])
+        c = self._nv_rep(self._nv_tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, c)
 
     def _estimate(self) -> None:
-        r = self._nv_tbl.currentRow()
-        if 0 <= r < len(self._novel) and self._cd is not None and self._on_estimate_ddg is not None:
-            self._on_estimate_ddg(self._cd, self._novel[r])
+        c = self._nv_rep(self._nv_tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, c)
 
     @staticmethod
     def _burial_cell(p: dict) -> str:
@@ -1586,6 +1820,21 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
             return "—"
         return f"{da:+.1f} / {db:+.1f}"
 
+    @classmethod
+    def _ex_rowvals(cls, p: dict) -> List[str]:
+        on = f"{p.get('on_dist')}" + (" (opt)" if p.get("optimizable") else "")
+        return [pair_label(p), p.get("type", ""), on,
+                ("H-bond" if p.get("hbond_like") else "—"), cls._burial_cell(p),
+                f"{p.get('score', 0):.2f}"]
+
+    @classmethod
+    def _nv_rowvals(cls, c: dict) -> List[str]:
+        sub = (f"{c.get('from_aa_a','')}{c.get('resnum_a')}{c.get('to_aa_a','')}+"
+               f"{c.get('from_aa_b','')}{c.get('resnum_b')}{c.get('to_aa_b','')}")
+        return [sub, pair_label(c), f"{c.get('best_on')}", f"{c.get('cb_cb')}",
+                ("H-bond" if c.get("hbond_like") else "—"), cls._burial_cell(c),
+                ("⚠" if c.get("clash") else "ok"), f"{c.get('score', 0):.2f}", cls._ddg_cell(c)]
+
     def populate(self, cd, scan: dict) -> None:
         """Fill both tables from a salt-bridge scan ({existing, novel, caveat})."""
         existing = (scan or {}).get("existing") or []
@@ -1593,35 +1842,16 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
         self._cd, self._existing, self._novel = cd, list(existing), list(novel)
         self._caveat.setText("⚠ " + ((scan or {}).get("caveat") or "Geometric suggestion only."))
         self._caveat.setVisible(bool(existing or novel))
-        # existing table
-        self._ex_tbl.setRowCount(len(existing))
-        for i, p in enumerate(existing):
-            on = f"{p.get('on_dist')}" + (" (opt)" if p.get("optimizable") else "")
-            cells = [pair_label(p), p.get("type", ""), on,
-                     ("H-bond" if p.get("hbond_like") else "—"), self._burial_cell(p),
-                     f"{p.get('score', 0):.2f}"]
-            for j, v in enumerate(cells):
-                self._ex_tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._ex_tbl.resizeColumnsToContents()
+        self._render_rows()
         self._ex_tbl.setVisible(bool(existing))
         self._ex_placeholder.setVisible(not existing)
-        # novel table
-        self._nv_tbl.setRowCount(len(novel))
-        for i, c in enumerate(novel):
-            sub = (f"{c.get('from_aa_a','')}{c.get('resnum_a')}{c.get('to_aa_a','')}+"
-                   f"{c.get('from_aa_b','')}{c.get('resnum_b')}{c.get('to_aa_b','')}")
-            cells = [sub, pair_label(c), f"{c.get('best_on')}", f"{c.get('cb_cb')}",
-                     ("H-bond" if c.get("hbond_like") else "—"), self._burial_cell(c),
-                     ("⚠" if c.get("clash") else "ok"), f"{c.get('score', 0):.2f}", self._ddg_cell(c)]
-            for j, v in enumerate(cells):
-                self._nv_tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._nv_tbl.resizeColumnsToContents()
         has_nv = bool(novel)
         self._nv_tbl.setVisible(has_nv)
         self._nv_placeholder.setVisible(not has_nv)
         self._declare_btn.setEnabled(has_nv)
         self._escalate_btn.setEnabled(has_nv)
         self._basket_btn.setEnabled(has_nv and self._on_add_to_basket is not None)
+        self._set_group_toggle_visible(self._would_group(self._existing) or self._would_group(self._novel))
         if has_nv:
             self._nv_tbl.selectRow(0); self._on_novel_row(0)
         elif existing:
@@ -1629,14 +1859,31 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
         if has_nv or existing:
             self._announce()                               # new results → tab-bar dot
 
+    def _render_rows(self) -> None:
+        self._ex_rows = self._fill_ranked(self._ex_tbl, self._existing, self._ex_rowvals)
+        self._nv_rows = self._fill_ranked(self._nv_tbl, self._novel, self._nv_rowvals)
+
+    def _rerender(self) -> None:
+        if not (self._existing or self._novel):
+            return
+        self._render_rows()
+        self._ex_tbl.setVisible(bool(self._existing))
+        self._nv_tbl.setVisible(bool(self._novel))
+        if self._novel:
+            self._nv_tbl.selectRow(0); self._on_novel_row(0)
+        elif self._existing:
+            self._ex_tbl.selectRow(0); self._on_existing_row(0)
+
     def reset(self) -> None:
         """Clear back to the dormant placeholders (keep-and-clear on session reset — the tab PERSISTS as
         a sibling, its content belongs to the prior session)."""
         self._cd, self._existing, self._novel = None, [], []
+        self._ex_rows, self._nv_rows = [], []
         for tbl, ph in ((self._ex_tbl, self._ex_placeholder), (self._nv_tbl, self._nv_placeholder)):
             tbl.setRowCount(0); tbl.setVisible(False); ph.setVisible(True)
         self._caveat.setVisible(False); self._detail.setVisible(False)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
+        self._set_group_toggle_visible(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -2329,26 +2576,30 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_declare=self._declare_disulfide_pair,
             on_estimate_ddg=self._estimate_ddg_pair,
             on_clear_glow=self._clear_disulfide_glow,
-            on_add_to_basket=self._add_disulfide_to_basket)
+            on_add_to_basket=self._add_disulfide_to_basket,
+            on_chain_equiv=self._chain_equiv)                # replicate-row grouping (homo-oligomer copies)
         self.proline_tab = ProlineResultsTab(
             on_highlight=self._highlight_proline_residue,
             on_declare=self._declare_proline,
             on_estimate_ddg=self._estimate_proline_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
             on_show_existing=self._show_existing_prolines,
-            on_add_to_basket=self._add_proline_to_basket)
+            on_add_to_basket=self._add_proline_to_basket,
+            on_chain_equiv=self._chain_equiv)
         self.cavity_tab = CavityResultsTab(
             on_highlight=self._highlight_cavity_residue,
             on_declare=self._declare_cavity,
             on_estimate_ddg=self._estimate_cavity_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
-            on_add_to_basket=self._add_cavity_to_basket)
+            on_add_to_basket=self._add_cavity_to_basket,
+            on_chain_equiv=self._chain_equiv)
         self.saltbridge_tab = SaltBridgeResultsTab(
             on_highlight=self._highlight_saltbridge_pair,    # pairwise glow (reuses the disulfide seam)
             on_declare=self._declare_saltbridge,
             on_estimate_ddg=self._estimate_saltbridge_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
-            on_add_to_basket=self._add_saltbridge_to_basket)
+            on_add_to_basket=self._add_saltbridge_to_basket,
+            on_chain_equiv=self._chain_equiv)
         # The CROSS-STRATEGY design basket — the framework centerpiece (gui_app docks it on the right).
         self.design_basket = DesignBasketPanel(on_enact=self._enact_basket,
                                                on_chain_equiv=self._chain_equiv)
@@ -4384,21 +4635,40 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return None, None
         return str(mid), f"#{mid}/{ch}:{pos}"
 
-    def _highlight_proline_residue(self, cd, cand: dict) -> None:
-        """Glow ONE proline candidate residue — the single-residue analog of the disulfide pair glow,
-        through the SAME `_glow_state`/`_consume_glow_restore` seam (restore prior glow first so it
-        never stacks; the Clear-view control + any colour-mode switch clear it)."""
-        mid, spec = self._proline_residue_spec(cd, cand)
-        if mid is None:
-            self._glow_state = None
-            self._sync_glow_clear_button()
-            return
+    def _residue_group_highlight(self, cd, members: List[dict]):
+        """(mid, union_spec, apply_cmds) glowing ONE OR MORE single-residue candidates — the members of
+        a grouped row (a trimer's equivalent copies) light TOGETHER via a union atom-spec. One member →
+        the exact single-residue glow (byte-identical to the ungrouped path). (None, None, []) when no
+        member resolves to a real rendered id."""
+        mid = None
+        specs: List[str] = []
+        for m in members:
+            mm, sp = self._proline_residue_spec(cd, m)
+            if mm is None:
+                continue
+            mid = mm
+            specs.append(sp)
+        if mid is None or not specs:
+            return None, None, []
+        spec = " ".join(specs)
         hue = self._GLOW_HUE
         apply = [
             f"show {spec} atoms", f"style {spec} sphere", f"color {spec} {hue} target a",
             f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
             f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
         ]
+        return mid, spec, apply
+
+    def _highlight_proline_residue(self, cd, cand: dict, members: Optional[List[dict]] = None) -> None:
+        """Glow the selected proline candidate residue — the single-residue analog of the disulfide pair
+        glow, through the SAME `_glow_state`/`_consume_glow_restore` seam (restore prior glow first so it
+        never stacks; the Clear-view control + any colour-mode switch clear it). *members* (a grouped
+        row's equivalent copies) glow together; absent → just *cand*."""
+        mid, spec, apply = self._residue_group_highlight(cd, members or [cand])
+        if mid is None:
+            self._glow_state = None
+            self._sync_glow_clear_button()
+            return
         self._apply_or_toggle_glow({"mid": mid, "both": spec}, apply)   # re-click toggles it off
 
     def _show_existing_prolines(self, cd) -> None:
@@ -4572,20 +4842,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.cavity_tab.populate(cd, cd.cavity_scan)
         self._status.setText(step.get("summary") or "Cavity scan complete.")
 
-    def _highlight_cavity_residue(self, cd, cand: dict) -> None:
-        """Glow ONE cavity-fill candidate residue — through the SAME `_glow_state` seam as the proline
-        single-residue glow (restore the prior glow first so it never stacks)."""
-        mid, spec = self._proline_residue_spec(cd, cand)         # same (mid, spec) resolver — residue glow
+    def _highlight_cavity_residue(self, cd, cand: dict, members: Optional[List[dict]] = None) -> None:
+        """Glow the selected cavity-fill candidate residue — through the SAME `_glow_state` seam as the
+        proline single-residue glow (restore the prior glow first so it never stacks). *members* (a
+        grouped row's equivalent copies) glow together; absent → just *cand*."""
+        mid, spec, apply = self._residue_group_highlight(cd, members or [cand])
         if mid is None:
             self._glow_state = None
             self._sync_glow_clear_button()
             return
-        hue = self._GLOW_HUE
-        apply = [
-            f"show {spec} atoms", f"style {spec} sphere", f"color {spec} {hue} target a",
-            f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
-            f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
-        ]
         self._apply_or_toggle_glow({"mid": mid, "both": spec}, apply)   # re-click toggles it off
 
     def _declare_cavity(self, cd, cand: dict) -> None:
@@ -4752,12 +5017,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 out[rn] = hexc
         return out
 
-    def _highlight_saltbridge_pair(self, cd, pair: dict) -> None:
+    def _highlight_saltbridge_pair(self, cd, pair: dict, members: Optional[List[dict]] = None) -> None:
         """Glow a salt-bridge pair's two members — REUSES the disulfide pair-glow seam (same two-chain
         pair shape), through the shared `_glow_state` (restore-then-apply, never stacking). Works for an
-        intra-chain pair AND a cross-chain one (`_disulfide_pair_specs` reads chain_a/chain_b)."""
-        apply = self._disulfide_scan_highlight_commands(cd, pair)
-        mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
+        intra-chain pair AND a cross-chain one (`_disulfide_pair_specs` reads chain_a/chain_b). *members*
+        (a grouped row's equivalent copies) glow together; absent → just *pair*."""
+        mid, both, apply = self._pair_group_highlight(cd, members or [pair])
         new_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
         self._apply_or_toggle_glow(new_state, apply)   # re-clicking the same pair toggles it off
 
@@ -6060,13 +6325,36 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             if tab is not None:
                 tab.set_glow_active(active)
 
-    def _highlight_disulfide_pair(self, cd, pair: dict) -> None:
+    def _pair_group_highlight(self, cd, members: List[dict]):
+        """(mid, union_both, apply_cmds) glowing ONE OR MORE pair candidates — the members of a grouped
+        row (equivalent copies) light TOGETHER. Reuses `_disulfide_scan_highlight_commands` per member
+        (so a single member is byte-identical to the ungrouped glow, incl. its Cβ–Cβ distance); when >1
+        member a final union `select` lights every copy's halo at once (the per-member selects overwrite
+        one another). (None, None, []) when no member resolves to a real rendered id."""
+        mid = None
+        boths: List[str] = []
+        cmds: List[str] = []
+        for m in members:
+            mm, _a, _b, both = self._disulfide_pair_specs(cd, m)
+            if mm is None:
+                continue
+            mid = mm
+            boths.append(both)
+            cmds += self._disulfide_scan_highlight_commands(cd, m)
+        if mid is None or not cmds:
+            return None, None, []
+        union = " ".join(boths)
+        if len(boths) > 1:
+            cmds.append(f"select {union}")            # union halo across all equivalent copies
+        return mid, union, cmds
+
+    def _highlight_disulfide_pair(self, cd, pair: dict, members: Optional[List[dict]] = None) -> None:
         """Glow a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes through
         the EXISTING `_run_commands_bg` selection seam (no new scattered highlight path; this tab is
         the convergence surface). RESTORE the prior glow FIRST (so A un-glows + the scene un-ghosts
-        before B glows — non-destructive, never stacking), apply the new glow, then record its state."""
-        apply = self._disulfide_scan_highlight_commands(cd, pair)
-        mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
+        before B glows — non-destructive, never stacking), apply the new glow, then record its state.
+        *members* (a grouped row's equivalent copies) glow together; absent → just *pair*."""
+        mid, both, apply = self._pair_group_highlight(cd, members or [pair])
         new_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
         self._apply_or_toggle_glow(new_state, apply)   # re-clicking the same pair toggles it off
 

@@ -3928,3 +3928,126 @@ class TestToolbarWraps:
         flow.setGeometry(QtCore.QRect(0, 0, 1000, 80))      # wide → a single row
         # both items share a common vertical CENTRE line (not top-aligned, which left labels high).
         assert abs(short.geometry().center().y() - tall.geometry().center().y()) <= 1
+
+
+class TestReplicateGrouping:
+    """Homo-oligomer replicate-row grouping — a trimer scans the SAME site on all three chains, so the
+    stabilization tabs showed each substitution three times. Grouping collapses those into ONE row
+    (keyed by cd-equivalence) WITHOUT discarding the real per-copy geometry spread (a predicted
+    assembly is not perfectly symmetric): a varying column shows its min–max range and the row's
+    tooltip lists every copy. Default grouped, toggle in the header, all four stabilization tabs."""
+
+    _EQUIV3 = staticmethod(lambda ch: ["A", "B", "C"])       # a homotrimer: A/B/C share one cd
+
+    def _tri_scan(self, ca=(5.51, 5.52, 5.53)):
+        """Three copies of ONE engineerable site (290–299) on chains A/B/C — geometry differs slightly."""
+        pairs = [{"chain_a": chain, "resnum_a": 290, "chain_b": chain, "resnum_b": 299,
+                  "score": 0.99, "ca_ca": cav, "cb_cb": 3.74,
+                  "best_sg_sg": 2.07, "best_chi_ss": -104, "clash": False, "orientation": 87}
+                 for chain, cav in zip("ABC", ca)]
+        return {"pairs": pairs, "caveat": "geom only"}
+
+    def _tab(self, equiv=None):
+        from variant_workbench import DisulfidesResultsTab
+        return DisulfidesResultsTab(on_highlight=lambda *a, **k: None, on_declare=lambda *a, **k: None,
+                                    on_chain_equiv=equiv or self._EQUIV3)
+
+    def test_trimer_collapses_to_one_row_with_badge(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan())
+        tbl = t._sec["D"]["table"]
+        assert tbl.rowCount() == 1                            # three copies → one grouped row
+        assert "×3" in tbl.item(0, 0).text()                 # copy-count badge
+        assert not t._group_chk.isHidden()                   # toggle offered (there ARE equivalents)
+
+    def test_varying_geometry_shows_range_identical_stays_single(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan(ca=(5.51, 5.52, 5.53)))
+        tbl = t._sec["D"]["table"]
+        assert tbl.item(0, 2).text() == "5.51–5.53"          # Cα–Cα varies → min–max range (real asymmetry)
+        assert tbl.item(0, 1).text() == "0.99"               # score identical → single value
+        assert tbl.item(0, 3).text() == "3.74"               # Cβ–Cβ identical → single value
+        assert tbl.item(0, 7).text() == "87"                 # orientation identical → single value
+
+    def test_tooltip_lists_each_copy(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan())
+        tip = t._sec["D"]["table"].item(0, 0).toolTip()
+        assert "chain A" in tip and "chain B" in tip and "chain C" in tip
+        assert "5.51" in tip and "5.53" in tip               # each copy's EXACT value one hover away
+
+    def test_toggle_off_shows_individual_rows(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan())
+        assert t._sec["D"]["table"].rowCount() == 1
+        t._group_chk.setChecked(False)                       # ungroup
+        tbl = t._sec["D"]["table"]
+        assert tbl.rowCount() == 3                            # one row per chain copy
+        assert "×" not in tbl.item(0, 0).text()              # no badge when ungrouped
+        assert tbl.item(0, 2).text() == "5.51"               # each copy's own geometry, exact
+
+    def test_monomer_or_hetero_no_toggle_no_collapse(self, _app):
+        t = self._tab(equiv=lambda ch: [ch])                 # each chain its own class (monomer / hetero)
+        t.populate_scan(MagicMock(), self._tri_scan())
+        assert t._sec["D"]["table"].rowCount() == 3          # nothing collapses (not equivalent)
+        assert t._group_chk.isHidden()                       # no equivalents → no toggle clutter
+
+    def test_grouped_row_click_highlights_all_copies(self, _app):
+        from variant_workbench import DisulfidesResultsTab
+        captured = {}
+        t = DisulfidesResultsTab(
+            on_highlight=lambda cd, rep, members=None: captured.update(rep=rep, members=members),
+            on_declare=lambda *a, **k: None, on_chain_equiv=self._EQUIV3)
+        t.populate_scan(MagicMock(), self._tri_scan())       # populate auto-selects + highlights row 0
+        assert captured["members"] is not None and len(captured["members"]) == 3   # all 3 copies passed
+        assert captured["rep"] is captured["members"][0]                            # best = representative
+
+    def test_grouped_row_stages_representative_into_basket(self, _app):
+        from variant_workbench import DisulfidesResultsTab
+        staged = []
+        t = DisulfidesResultsTab(on_highlight=lambda *a, **k: None, on_declare=lambda *a, **k: None,
+                                 on_add_to_basket=lambda cd, item: staged.append(item),
+                                 on_chain_equiv=self._EQUIV3)
+        t.populate_scan(MagicMock(), self._tri_scan())
+        t._sec["D"]["table"].selectRow(0)
+        t._add_to_basket("D")
+        assert len(staged) == 1 and staged[0]["chain_a"] == "A"   # one entry, the representative copy
+
+    def test_proline_tab_also_groups(self, _app):
+        from variant_workbench import ProlineResultsTab
+        t = ProlineResultsTab(on_highlight=lambda *a, **k: None, on_chain_equiv=self._EQUIV3)
+        cands = [{"chain": c, "position": 5, "from_aa": "L", "to_aa": "P", "phi": -63, "psi": 150,
+                  "score": round(0.9 + i * 0.0, 2), "hbond_donates": False} for i, c in enumerate("ABC")]
+        t.populate(MagicMock(), {"candidates": cands, "existing": [], "caveat": "x"})
+        assert t._tbl.rowCount() == 1 and "×3" in t._tbl.item(0, 0).text()   # single-residue tab groups too
+
+    def test_residue_union_spec_glows_all_copies(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAGTDER")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "trimer", "model_id": "7", "cif_path": "/tmp/b.cif"}
+        members = [{"chain": c, "position": 5} for c in "ABC"]
+        mid, spec, apply = p._residue_group_highlight(cd, members)
+        assert mid == "7" and spec == "#7/A:5 #7/B:5 #7/C:5"        # union atom-spec across all copies
+        assert f"select {spec}" in apply                           # one halo lights every copy
+
+    def test_pair_union_spec_glows_all_copies(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAGTDER")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "trimer", "model_id": "7", "cif_path": "/tmp/b.cif"}
+        members = [{"chain_a": c, "resnum_a": 290, "chain_b": c, "resnum_b": 299} for c in "ABC"]
+        mid, both, apply = p._pair_group_highlight(cd, members)
+        assert mid == "7" and both == "#7/A:290,299 #7/B:290,299 #7/C:290,299"
+        assert f"select {both}" in apply
+
+    def test_single_member_glow_is_byte_identical(self, _app):
+        # a monomer / ungrouped click must glow EXACTLY as before (no union select, same recipe)
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAGTDER")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7", "cif_path": "/tmp/b.cif"}
+        pair = {"chain_a": "A", "resnum_a": 290, "chain_b": "A", "resnum_b": 299}
+        mid, both, apply = p._pair_group_highlight(cd, [pair])
+        assert both == "#7/A:290,299"
+        assert apply == p._disulfide_scan_highlight_commands(cd, pair)   # unchanged single-pair recipe
