@@ -9736,7 +9736,8 @@ class ToolRouter:
         Commands are executed via bridge.run_command() directly and verified
         via post-command probe.  viz_commands=[] (already run); summary carries result.
         """
-        from intent_registry import VIEWER_REGISTRY, make_llm_classify_fn
+        from intent_registry import (VIEWER_REGISTRY, make_llm_classify_fn,
+                                      structured_view_intent)
         from translator import _scope_chain_refs_to_macromolecule
 
         user_input = user_input or inputs.get("_user_input", "")
@@ -9755,7 +9756,16 @@ class ToolRouter:
                 "representation", inputs.get("_translator_commands") or [])
         spec = tgt["spec"]
 
-        # Tier (b): LLM constrained classifier — fires when alias match missed
+        # Tier (a2): deterministic structured resolver — verb-AGNOSTIC noun + show/hide
+        # polarity → intent, WITHOUT the LLM.  Covers the common "display/render/draw/
+        # make it/switch to ... as sticks/spheres/cartoon/surface" phrasings the fixed
+        # alias lists miss (the reported "display chain A as sticks" gap).
+        if intent_key is None:
+            intent_key = structured_view_intent(user_input)
+            if intent_key is not None:
+                resolution = "structured"
+
+        # Tier (b): LLM constrained classifier — fires when alias + structured missed
         if intent_key is None:
             global _repr_classify_fn
             if _repr_classify_fn is None:
