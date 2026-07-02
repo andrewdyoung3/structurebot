@@ -48,7 +48,7 @@ from variant_model import (AlignedCell, ChainDesign, DesignSession,
                            column_tracks, DesignSession,
                            filter_new_mpnn_variants, group_scan_suggestions,
                            fold_summary, import_mpnn_designs, stability_summary,
-                           suggestion_color)
+                           merge_stability, suggestion_color, _STD_AA)
 
 _COLS = 30                                  # residues per wrapped block
 _SUGGEST_ROW = "__suggest__"                # sentinel row id for the inline Suggest track
@@ -162,6 +162,126 @@ class _FoldseekWorker(QtCore.QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+# ── colored metric-badge chips in the variant row headers ─────────────────────────
+
+class _BadgeHeaderView(QtWidgets.QHeaderView):
+    """Vertical header that renders a variant's result badge as colored metric CHIPS
+    after the row name (the Qt equivalent of a reusable MetricBadge).
+
+    The badge STRING (`tab.badges[rid]`, a ` · `-joined summary) stays the single data
+    source-of-truth — tests and the session export read it verbatim; this view only
+    PARSES and PAINTS it. The row name, active-row marker (► + bold), selection styling
+    and section geometry all still come from the base painter / header items; the chips
+    are drawn on top, and `sizeHint` widens the header so they fit."""
+
+    _GAP = 8                    # px between the row name and the first chip
+    _CHIP_GAP = 4               # px between adjacent chips
+    _CHIP_HPAD = 5              # horizontal padding inside a chip
+
+    # kind → (background, foreground). Green = beneficial, red = detrimental, gray =
+    # neutral metric (pLDDT / ipTM / provenance), amber = a provenance WARNING.
+    _CHIP_COLORS = {
+        "good":    (QtGui.QColor("#2e7d32"), QtGui.QColor("white")),
+        "bad":     (QtGui.QColor("#c62828"), QtGui.QColor("white")),
+        "neutral": (QtGui.QColor("#9e9e9e"), QtGui.QColor("white")),
+        "warn":    (QtGui.QColor("#f9a825"), QtGui.QColor("black")),
+    }
+
+    def __init__(self, tab: "_ChainDesignTab"):
+        super().__init__(QtCore.Qt.Vertical, tab)
+        self._tab = tab
+
+    @staticmethod
+    def _chip_kind(seg: str) -> str:
+        """Classify one badge segment. ddG stabilizes when NEGATIVE (green); solubility
+        helps when its delta is POSITIVE (green). The signed number is always present
+        ({:+} formatting), so the sign char disambiguates direction reliably."""
+        s = seg.strip()
+        if s.startswith("ddG"):
+            return "good" if "-" in s else "bad"
+        if s.startswith("sol"):
+            return "good" if "+" in s else "bad"
+        if "remote-MSA" in s or s.startswith("⚠"):
+            return "warn"
+        return "neutral"        # pLDDT / ipTM / SS-bond provenance
+
+    def _chip_font(self) -> QtGui.QFont:
+        f = QtGui.QFont(self.font())
+        f.setPointSizeF(max(6.0, self.font().pointSizeF() - 1.0))
+        return f
+
+    def _badge_for_section(self, logicalIndex: int) -> Optional[str]:
+        rids = getattr(self._tab, "_row_ids", [])
+        rid = rids[logicalIndex] if 0 <= logicalIndex < len(rids) else None
+        if rid in (None, "T", _SUGGEST_ROW):
+            return None
+        return self._tab.badges.get(rid)
+
+    def _margin(self) -> int:
+        return self.style().pixelMetric(QtWidgets.QStyle.PM_HeaderMargin, None, self)
+
+    def _name_end_x(self, rect: QtCore.QRect, logicalIndex: int) -> float:
+        """X where the base-painted row name ends (left margin + name text width)."""
+        model = self.model()
+        text = model.headerData(logicalIndex, QtCore.Qt.Vertical, QtCore.Qt.DisplayRole)
+        text = "" if text is None else str(text)
+        f = model.headerData(logicalIndex, QtCore.Qt.Vertical, QtCore.Qt.FontRole)
+        fm = QtGui.QFontMetrics(f if isinstance(f, QtGui.QFont) else self.font())
+        return rect.left() + self._margin() + fm.horizontalAdvance(text)
+
+    def paintSection(self, painter: QtGui.QPainter, rect: QtCore.QRect, logicalIndex: int) -> None:
+        super().paintSection(painter, rect, logicalIndex)   # name + marker + selection
+        badge = self._badge_for_section(logicalIndex)
+        if not badge:
+            return
+        chip_font = self._chip_font()
+        cfm = QtGui.QFontMetrics(chip_font)
+        ch = cfm.height()
+        cy = rect.top() + (rect.height() - ch) / 2.0
+        x = self._name_end_x(rect, logicalIndex) + self._GAP
+        painter.save()
+        painter.setFont(chip_font)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        for seg in (s.strip() for s in badge.split("·")):
+            if not seg:
+                continue
+            bg, fg = self._CHIP_COLORS[self._chip_kind(seg)]
+            w = cfm.horizontalAdvance(seg) + 2 * self._CHIP_HPAD
+            if x + w > rect.right():
+                break                       # out of header width — stop cleanly
+            chip = QtCore.QRectF(x, cy, w, ch)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(chip, ch / 2.0, ch / 2.0)
+            painter.setPen(fg)
+            painter.drawText(chip, QtCore.Qt.AlignCenter, seg)
+            x += w + self._CHIP_GAP
+        painter.restore()
+
+    def sizeHint(self) -> QtCore.QSize:
+        """Widen the header so the longest (name + its chips) fits — otherwise the chips
+        would be clipped by the name-only header width."""
+        base = super().sizeHint()
+        model = self.model()
+        margin = self._margin()
+        cfm = QtGui.QFontMetrics(self._chip_font())
+        want = base.width()
+        for i in range(self.count()):
+            text = model.headerData(i, QtCore.Qt.Vertical, QtCore.Qt.DisplayRole)
+            text = "" if text is None else str(text)
+            f = model.headerData(i, QtCore.Qt.Vertical, QtCore.Qt.FontRole)
+            nfm = QtGui.QFontMetrics(f if isinstance(f, QtGui.QFont) else self.font())
+            total = 2 * margin + nfm.horizontalAdvance(text)
+            badge = self._badge_for_section(i)
+            if badge:
+                total += self._GAP + sum(
+                    cfm.horizontalAdvance(seg) + 2 * self._CHIP_HPAD + self._CHIP_GAP
+                    for seg in (s.strip() for s in badge.split("·")) if seg)
+            want = max(want, total)
+        base.setWidth(int(want))
+        return base
+
+
 # ── one unique-chain tab: T + variants in wrapped column blocks ────────────────────
 
 class _ChainDesignTab(QtWidgets.QScrollArea):
@@ -227,6 +347,7 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
             end = min(start + _COLS, n)
             width = end - start
             block = QtWidgets.QTableWidget(len(labels), width)
+            block.setVerticalHeader(_BadgeHeaderView(self))   # paints result badges as chips
             block.setVerticalHeaderLabels(labels)
             block.horizontalHeader().setVisible(False)
             block.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -279,16 +400,18 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
         fr = 2 * block.frameWidth()
         # horizontalHeader is hidden → no column-header height term; the vertical (row-label)
         # header sits to the LEFT, so it adds to width, not height.
+        vh = block.verticalHeader()
+        hw = max(vh.width(), vh.sizeHint().width())   # widen for badge chips (post-fold/stability)
         h = sum(block.rowHeight(r) for r in range(block.rowCount())) + fr
-        w = (sum(block.columnWidth(c) for c in range(block.columnCount()))
-             + block.verticalHeader().width() + fr)
+        w = (sum(block.columnWidth(c) for c in range(block.columnCount())) + hw + fr)
         block.setFixedHeight(h)
         block.setFixedWidth(w)
 
     def _variant_label(self, vid: str) -> str:
-        """Variant row header: the id plus its inline result badge (S4a), if any."""
-        badge = self.badges.get(vid)
-        return f"{vid}  {badge}" if badge else vid
+        """Variant row-header NAME (just the id). The result badge (S4a) is no longer
+        appended as text here — it is painted as colored chips by `_BadgeHeaderView`
+        from `self.badges[vid]`, which stays the string source-of-truth."""
+        return vid
 
     def eventFilter(self, obj, event) -> bool:
         """Row-header click router. LEFT-click ANYWHERE on a row header → SELECT that variant
@@ -481,6 +604,10 @@ class _ChainDesignTab(QtWidgets.QScrollArea):
                 if active:
                     f = hdr.font(); f.setBold(True); hdr.setFont(f)
                 block.setVerticalHeaderItem(r, hdr)
+            # a fresh badge (post-fold/stability) can widen the header → re-fit the block
+            # so the chips aren't clipped, then repaint the header.
+            self._size_block_to_content(block)
+            block.verticalHeader().viewport().update()
 
     def rebuild(self) -> None:
         """Re-lay the blocks from the (mutated) design — recomputes consensus/
@@ -625,24 +752,71 @@ class _StabilizationResultsTab(QtWidgets.QWidget):
     each tab's behaviour is unchanged. Persists across tab-switch + session reset (keep-and-clear: the
     subclass `reset()` empties content, the tab lives on as a sibling in `gui_app.tabs`)."""
 
-    def __init__(self, *, on_highlight, on_clear_glow=None, on_add_to_basket=None):
+    # Emitted when this tab gains NEW results (a populate produced rows). The gui tab-bar consumes
+    # it to paint a "new / unviewed results" dot on the tab; cleared when the tab is activated.
+    # Behaviour-neutral (a notification only — no analysis/data change).
+    resultsArrived = QtCore.Signal()
+
+    def _announce(self) -> None:
+        """Signal that fresh results landed in this tab (drives the tab-bar new-results dot)."""
+        self.resultsArrived.emit()
+
+    def __init__(self, *, on_highlight, on_clear_glow=None, on_add_to_basket=None,
+                 on_chain_equiv=None):
         super().__init__()
-        self._on_highlight = on_highlight          # (cd, item) -> glow it in 3D (the shared seam)
+        self._on_highlight = on_highlight          # (cd, item, members=None) -> glow it in 3D (shared seam)
         self._on_clear_glow = on_clear_glow        # ()         -> restore the normal 3D representation
         self._on_add_to_basket = on_add_to_basket  # (cd, item) -> stage the pick into the design basket
+        # (chain id) -> [all fold-chain ids sharing that chain's ChainDesign]. Homo-oligomer copies
+        # collapse onto ONE cd, so the SAME site scanned on each copy is the SAME substitution — this
+        # resolver drives the replicate-row GROUPING (a trimer's 3 near-identical rows → one, with the
+        # per-copy geometry spread preserved). None → no grouping (each raw row stands alone).
+        self._chain_equiv = on_chain_equiv
+        self._grouped = True                       # default GROUPED (toggle in the header)
         self._outer = QtWidgets.QVBoxLayout(self)
 
     def _add_header(self, intro_text: str, clear_label: str, clear_tooltip: str) -> None:
-        """Build the intro label + the Clear-view (un-ghost) control into the tab's outer layout.
-        Subclasses call this first, then add their own body widgets to ``self._outer``."""
+        """Build the intro label + the Clear-view (un-ghost) control + the group-replicates toggle into
+        the tab's outer layout. Subclasses call this first, then add their own body widgets to
+        ``self._outer``."""
         intro = QtWidgets.QLabel(intro_text)
         intro.setWordWrap(True); intro.setStyleSheet("color:#666;")
         self._outer.addWidget(intro)
+        row = QtWidgets.QHBoxLayout()
         self._clear_glow_btn = QtWidgets.QPushButton(clear_label)
         self._clear_glow_btn.setToolTip(clear_tooltip)
         self._clear_glow_btn.setEnabled(False)
         self._clear_glow_btn.clicked.connect(lambda: self._on_clear_glow() if self._on_clear_glow else None)
-        self._outer.addWidget(self._clear_glow_btn)
+        row.addWidget(self._clear_glow_btn)
+        self._group_chk = QtWidgets.QCheckBox("Group equivalent chains")
+        self._group_chk.setToolTip(
+            "Homo-oligomer copies (e.g. a trimer's three chains) fold to near-identical sites, so the "
+            "same substitution shows up once per copy. Grouped (default): ONE row per unique "
+            "substitution with a ×N badge; a geometry value that varies between copies shows as a "
+            "range (real fold asymmetry), and hovering the row lists each chain's exact value. "
+            "Unchecked: one row per chain copy (every copy's geometry on its own line).")
+        self._group_chk.setChecked(self._grouped)
+        self._group_chk.setVisible(False)          # shown only when a scan actually has equivalent copies
+        self._group_chk.toggled.connect(self._on_group_toggled)
+        row.addWidget(self._group_chk)
+        row.addStretch(1)
+        self._outer.addLayout(row)
+
+    def _on_group_toggled(self, checked: bool) -> None:
+        """Re-render the tab's tables at the new grouping without re-running the scan (the raw
+        candidates are cached per tab; `_rerender` re-fills from them)."""
+        self._grouped = bool(checked)
+        self._rerender()
+
+    def _rerender(self) -> None:
+        """Re-fill this tab's table(s) from its cached raw candidates at the current grouping. Each
+        subclass overrides — the base is a no-op (a tab with no cached results has nothing to redraw)."""
+
+    def _set_group_toggle_visible(self, groupable: bool) -> None:
+        """Show the group-replicates checkbox only when the last scan HAS equivalent copies to collapse
+        (a monomer / hetero-multimer never does — no toggle clutter there)."""
+        if getattr(self, "_group_chk", None) is not None:
+            self._group_chk.setVisible(bool(groupable))
 
     def set_glow_active(self, active: bool) -> None:
         """Enable the Clear-view control only while a glow is active (lit = a spotlight to restore).
@@ -670,6 +844,148 @@ class _StabilizationResultsTab(QtWidgets.QWidget):
         cav.setStyleSheet("color:#b36b00;"); cav.setVisible(False)
         return cav
 
+    # ── replicate-row grouping (collapse a homo-oligomer's per-copy rows into one) ──────────
+    # A homo-oligomer scan produces the SAME site on every equivalent chain (`scan_engineerable_sites`
+    # loops per chain), so a trimer shows each substitution three times. Grouping collapses those into
+    # ONE display row keyed by cd-EQUIVALENCE (`_chain_equiv`, the same resolver the design basket uses)
+    # — WITHOUT discarding the per-copy geometry, which is REAL (a predicted assembly is not perfectly
+    # symmetric, so each copy's Cα–Cα / χSS differs slightly): a varying column shows its min–max range,
+    # and the row's tooltip lists every copy's exact value. The mechanics are shape-agnostic (single-
+    # residue OR pair candidates), so all four strategy tabs share this one implementation.
+
+    @staticmethod
+    def _subs_of(c: dict) -> List[tuple]:
+        """The (chain, resnum, to_aa) substitution members a candidate targets — a PAIR (disulfide /
+        salt-bridge: chain_a/resnum_a + chain_b/resnum_b) or a SINGLE residue (proline / cavity:
+        chain/position). `to_aa` falls back to '' for assessment rows that describe an EXISTING feature
+        (no substitution) — grouping still collapses copies correctly (same site → same key)."""
+        if c.get("resnum_a") is not None:
+            return [(c.get("chain_a"), c.get("resnum_a"), c.get("to_aa_a") or c.get("to_aa") or ""),
+                    (c.get("chain_b"), c.get("resnum_b"), c.get("to_aa_b") or c.get("to_aa") or "")]
+        if c.get("position") is not None:
+            return [(c.get("chain"), c.get("position"), c.get("to_aa") or "")]
+        return []
+
+    def _group_key(self, chain):
+        """Cd-EQUIVALENCE key for a chain — homo-oligomer copies share one ChainDesign, so a site on
+        any copy is the SAME site. Falls back to the raw chain when no resolver is wired."""
+        if self._chain_equiv is None:
+            return chain
+        return frozenset(self._chain_equiv(chain))
+
+    def _sig(self, c: dict):
+        """Grouping signature — the cd-equivalence identity of a candidate's substitution set, order-
+        independent. None when the candidate exposes no groupable members (→ stands alone)."""
+        members = [(self._group_key(ch), pos, aa) for ch, pos, aa in self._subs_of(c)
+                   if ch is not None and pos is not None]
+        if not members:
+            return None
+        return tuple(sorted(members, key=lambda t: (t[1], str(t[2]))))
+
+    def _group_rows(self, cands: List[dict]) -> List[List[dict]]:
+        """Partition candidates into display rows. Grouped (and a resolver wired): equivalent-copy
+        candidates collapse into one row (first = best, since the input is score-sorted). Otherwise one
+        row per candidate. Order is preserved by first appearance (so the best row stays on top)."""
+        if not self._grouped or self._chain_equiv is None:
+            return [[c] for c in cands]
+        order: List[object] = []
+        groups: Dict[object, List[dict]] = {}
+        for i, c in enumerate(cands):
+            k = self._sig(c)
+            if k is None:
+                k = ("__solo__", i)                # ungroupable → its own row
+            if k not in groups:
+                groups[k] = []; order.append(k)
+            groups[k].append(c)
+        return [groups[k] for k in order]
+
+    def _would_group(self, cands: List[dict]) -> bool:
+        """True when grouping WOULD collapse ≥1 set of equivalent copies (drives the toggle's
+        visibility) — computed on the raw list regardless of the current toggle state."""
+        if self._chain_equiv is None:
+            return False
+        seen: set = set()
+        for c in cands:
+            k = self._sig(c)
+            if k is None:
+                continue
+            if k in seen:
+                return True
+            seen.add(k)
+        return False
+
+    @staticmethod
+    def _parse_float(v: str):
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _fmt_range(cls, vals: List[str]) -> str:
+        """Merge one column's values across a group's copies into a display cell: identical → the value;
+        differing numerics → a `lo–hi` range at the copies' own precision (surfacing real fold
+        asymmetry); differing non-numerics → the representative (best/first) value (the tooltip carries
+        the full per-copy detail either way)."""
+        uniq = list(dict.fromkeys(vals))
+        if len(uniq) == 1:
+            return uniq[0]
+        nums, decs = [], 0
+        for v in uniq:
+            f = cls._parse_float(v)
+            if f is None:
+                return uniq[0]
+            nums.append(f)
+            dot = str(v).strip().split(".")
+            decs = max(decs, len(dot[1]) if len(dot) == 2 else 0)
+        lo, hi = min(nums), max(nums)
+        if lo == hi:
+            return uniq[0]
+        return f"{lo:.{decs}f}–{hi:.{decs}f}"
+
+    @staticmethod
+    def _member_chain_label(c: dict) -> str:
+        """The chain(s) a candidate lives on — 'A' for a single residue, 'A' or 'A/B' for a pair."""
+        if c.get("resnum_a") is not None:
+            ca, cb = c.get("chain_a"), c.get("chain_b")
+            return str(ca) if ca == cb else f"{ca}/{cb}"
+        return str(c.get("chain") or "?")
+
+    def _members_tooltip(self, grp: List[dict], rowvals, headers: List[str]) -> str:
+        """Per-copy breakdown for a grouped row's tooltip — each chain copy's full row, so the exact
+        (not just range) geometry of every copy stays one hover away."""
+        lines = []
+        for c in grp:
+            cells = rowvals(c)
+            parts = ", ".join(f"{headers[j]} {cells[j]}" for j in range(1, len(cells)))
+            lines.append(f"chain {self._member_chain_label(c)}: {parts}")
+        return "Per-copy values (equivalent chains):\n" + "\n".join(lines)
+
+    def _fill_ranked(self, tbl: "QtWidgets.QTableWidget", cands: List[dict], rowvals) -> List[List[dict]]:
+        """Fill *tbl* from *cands* at the current grouping. Returns the visible-row model
+        ``rows[i] = [member candidates]`` (length 1 = ungrouped / singleton, representative = ``[0]``)
+        so row handlers map a table row back to its candidate(s). A grouped row shows the ×N badge on
+        column 0, per-column min–max ranges for values that vary across copies, and a per-copy tooltip."""
+        rows = self._group_rows(cands)
+        headers = [tbl.horizontalHeaderItem(j).text() if tbl.horizontalHeaderItem(j) else ""
+                   for j in range(tbl.columnCount())]
+        tbl.setRowCount(len(rows))
+        for i, grp in enumerate(rows):
+            member_cells = [rowvals(c) for c in grp]
+            ncols = len(member_cells[0])
+            merged = [self._fmt_range([mc[j] for mc in member_cells]) for j in range(ncols)]
+            tip = ""
+            if len(grp) > 1:
+                merged[0] = f"{merged[0]}  ×{len(grp)}"
+                tip = self._members_tooltip(grp, rowvals, headers)
+            for j, v in enumerate(merged):
+                it = QtWidgets.QTableWidgetItem(v)
+                if tip:
+                    it.setToolTip(tip)
+                tbl.setItem(i, j, it)
+        tbl.resizeColumnsToContents()
+        return rows
+
 
 # ── persistent Disulfides results tab (whole-suite home; replaces the transient dialogs) ──
 
@@ -685,9 +1001,9 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
     residue pairs with which; the 'Disulfide sites' colour mode is a complementary navigational index."""
 
     def __init__(self, *, on_highlight, on_declare, on_estimate_ddg=None, on_clear_glow=None,
-                 on_add_to_basket=None):
+                 on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare            # (cd, (a,b))     -> Mode C introduce→constrain
         self._on_estimate_ddg = on_estimate_ddg  # (cd, pair_dict) -> ΔΔG escalation (legacy bridge)
         # Explicit escape from the pair-click spotlight: restore the normal representation (un-ghost
@@ -735,7 +1051,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
         ph = QtWidgets.QLabel(placeholder); ph.setWordWrap(True); ph.setStyleSheet("color:#888;")
         gl.addWidget(ph)
         sec = {"box": box, "placeholder": ph, "cols": cols, "cd": None, "pairs": [],
-               "table": None, "caveat": None, "detail": None}
+               "table": None, "caveat": None, "detail": None, "rows": [], "rowvals": None}
         if caveat:
             cav = self._make_caveat(); gl.addWidget(cav); sec["caveat"] = cav
         if cols is not None:
@@ -770,46 +1086,48 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
         self._sec[key] = sec
         self._vl.addWidget(box)
 
-    def _add_to_basket(self, key: str) -> None:
+    def _row_group(self, key: str):
+        """(cd, member candidates) for the section's SELECTED display row — members is the group's
+        equivalent copies (one when ungrouped). (cd, None) when nothing valid is selected."""
         sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
+        rows, cd = sec.get("rows") or [], sec.get("cd")
         tbl = sec.get("table")
         row = tbl.currentRow() if tbl is not None else -1
-        if 0 <= row < len(pairs) and cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(cd, pairs[row])
+        if not (0 <= row < len(rows)) or cd is None:
+            return cd, None
+        return cd, rows[row]
+
+    def _add_to_basket(self, key: str) -> None:
+        cd, grp = self._row_group(key)
+        if grp is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(cd, grp[0])
 
     # ── row-click → highlight the RIGHT pair on the RIGHT construct (the §9 seam) ─────
     def _on_row(self, key: str, row: int) -> None:
         sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
-        if not (0 <= row < len(pairs)) or cd is None:
+        rows, cd = sec.get("rows") or [], sec.get("cd")
+        if not (0 <= row < len(rows)) or cd is None:
             return
-        p = pairs[row]
-        self._on_highlight(cd, p)                   # routes through the panel's existing seam
+        grp = rows[row]
+        self._on_highlight(cd, grp[0], grp)         # routes through the panel's existing seam (all copies)
         d = sec.get("detail")
         if d is not None:
-            d.setText(self._pair_detail(key, p)); d.setVisible(True)
+            d.setText(self._pair_detail(key, grp[0])); d.setVisible(True)
 
     def _declare(self, key: str) -> None:
-        sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
-        tbl = sec.get("table")
-        row = tbl.currentRow() if tbl is not None else -1
-        if not (0 <= row < len(pairs)) or cd is None:
+        cd, grp = self._row_group(key)
+        if grp is None:
             return
         # pass the FULL pair dict (carries chain_a/chain_b) so an INTERFACE (cross-chain) pair reaches
         # the cross-chain Mode-C declare; an intra Mode-D pair (chain_a == chain_b) takes the intra path.
-        self._on_declare(cd, pairs[row])
+        self._on_declare(cd, grp[0])
 
     def _estimate(self, key: str) -> None:
         """ΔΔG-escalate the SELECTED interface row → the panel's legacy-bridge route. Per-row, explicit."""
-        sec = self._sec.get(key) or {}
-        pairs, cd = sec.get("pairs") or [], sec.get("cd")
-        tbl = sec.get("table")
-        row = tbl.currentRow() if tbl is not None else -1
-        if not (0 <= row < len(pairs)) or cd is None or self._on_estimate_ddg is None:
+        cd, grp = self._row_group(key)
+        if grp is None or self._on_estimate_ddg is None:
             return
-        self._on_estimate_ddg(cd, pairs[row])
+        self._on_estimate_ddg(cd, grp[0])
 
     @staticmethod
     def _reach_detail(p: dict) -> str:
@@ -848,13 +1166,9 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
     # ── populate (each consumer calls its own) ──────────────────────────────────────
     def _fill_table(self, key: str, cd, pairs: List[dict], rowvals) -> None:
         sec = self._sec[key]
-        sec["cd"], sec["pairs"] = cd, list(pairs)
+        sec["cd"], sec["pairs"], sec["rowvals"] = cd, list(pairs), rowvals
         tbl = sec["table"]
-        tbl.setRowCount(len(pairs))
-        for i, p in enumerate(pairs):
-            for j, v in enumerate(rowvals(p)):
-                tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        tbl.resizeColumnsToContents()
+        sec["rows"] = self._fill_ranked(tbl, sec["pairs"], rowvals)   # grouping-aware fill
         has = len(pairs) > 0
         sec["placeholder"].setVisible(not has)
         tbl.setVisible(has)
@@ -864,8 +1178,24 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             sec["escalate_btn"].setEnabled(has)
         if sec.get("basket_btn") is not None:
             sec["basket_btn"].setEnabled(has and self._on_add_to_basket is not None)
+        self._refresh_group_toggle()
         if has:
             tbl.selectRow(0); self._on_row(key, 0)         # preselect + highlight the best/first
+            self._announce()                               # new results → tab-bar dot
+
+    def _refresh_group_toggle(self) -> None:
+        """Show the group-replicates toggle when ANY populated section has equivalent copies to
+        collapse (one toggle governs the whole suite's tables)."""
+        self._set_group_toggle_visible(
+            any(self._would_group(s.get("pairs") or []) for s in self._sec.values()))
+
+    def _rerender(self) -> None:
+        """Re-fill every populated section at the current grouping (driven by the header toggle)."""
+        for key, sec in self._sec.items():
+            if sec.get("table") is None or not sec.get("pairs") or sec.get("rowvals") is None:
+                continue
+            sec["rows"] = self._fill_ranked(sec["table"], sec["pairs"], sec["rowvals"])
+            sec["table"].selectRow(0); self._on_row(key, 0)
 
     def populate_assess(self, cd, pairs: List[dict]) -> None:
         self._fill_table("A", cd, pairs, lambda p: [
@@ -954,6 +1284,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             f"Measure its geometry with “Measure pair geometry” to read the as-produced bond.")
         sec["readout"].setVisible(True)
         sec["placeholder"].setVisible(False)
+        self._announce()                                   # new results → tab-bar dot
 
     def reset(self) -> None:
         """Clear EVERY section back to its dormant 'Run … to populate' placeholder. The tab itself
@@ -962,7 +1293,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
         loaded (stale-data-wrong). So `_reset_view_for_session` KEEPS the tab and calls this to empty
         it; the new session's scans repopulate. Parallel to the panel's own `reset()`."""
         for sec in self._sec.values():
-            sec["cd"], sec["pairs"] = None, []
+            sec["cd"], sec["pairs"], sec["rows"], sec["rowvals"] = None, [], [], None
             tbl = sec.get("table")
             if tbl is not None:
                 tbl.setRowCount(0)
@@ -978,6 +1309,7 @@ class DisulfidesResultsTab(_StabilizationResultsTab):
             if sec.get("basket_btn") is not None:
                 sec["basket_btn"].setEnabled(False)
             sec["placeholder"].setVisible(True)
+        self._set_group_toggle_visible(False)
         self.set_glow_active(False)              # a reset 3D scene has no active glow to clear
 
 
@@ -991,14 +1323,15 @@ class ProlineResultsTab(_StabilizationResultsTab):
     Persists across tab-switch + session reset (keep-and-clear, the disulfide-tab lesson)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_show_existing=None, on_add_to_basket=None):
+                 on_show_existing=None, on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare              # (cd, cand) -> substitute→Pro + validate (fold/compare)
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> X→Pro ΔΔG escalation (legacy bridge)
         self._on_show_existing = on_show_existing  # (cd)       -> highlight the existing prolines
         self._cd = None
         self._cands: List[dict] = []
+        self._rows: List[List[dict]] = []          # visible-row model (grouping): row -> member cands
         self._add_header(
             "Proline-stabilization candidates. X→Pro sites ranked by backbone φ/ψ proline-compatibility "
             "with a backbone-H-bond-donor penalty (proline can't donate the N–H···O bond helices/sheets "
@@ -1052,17 +1385,21 @@ class ProlineResultsTab(_StabilizationResultsTab):
         self._outer.addWidget(box)
         self._outer.addStretch(1)
 
+    def _row_rep(self, r: int) -> Optional[dict]:
+        """The representative (best) candidate for visible row *r* — the group's first member."""
+        return self._rows[r][0] if 0 <= r < len(self._rows) else None
+
     def _add_to_basket(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, c)
 
     def _on_row(self, r: int) -> None:
-        if not (0 <= r < len(self._cands)) or self._cd is None:
+        if not (0 <= r < len(self._rows)) or self._cd is None:
             return
-        c = self._cands[r]
-        self._on_highlight(self._cd, c)
-        self._detail.setText(self._cand_detail(c)); self._detail.setVisible(True)
+        grp = self._rows[r]
+        self._on_highlight(self._cd, grp[0], grp)      # glow all equivalent copies (one when ungrouped)
+        self._detail.setText(self._cand_detail(grp[0])); self._detail.setVisible(True)
 
     @staticmethod
     def _cand_detail(c: dict) -> str:
@@ -1078,14 +1415,21 @@ class ProlineResultsTab(_StabilizationResultsTab):
                 f"{don}.{ddg_s} Validate by substituting → re-folding → comparing.")
 
     def _declare(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_declare is not None:
-            self._on_declare(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, c)
 
     def _estimate(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_estimate_ddg is not None:
-            self._on_estimate_ddg(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, c)
+
+    @staticmethod
+    def _rowvals(c: dict) -> List[str]:
+        psi = c.get("psi")
+        return [f"{c.get('from_aa','')}{c.get('position')}P", f"{c.get('phi')}",
+                ("—" if psi is None else f"{psi}"), f"{c.get('score', 0):.2f}",
+                ("donor" if c.get("hbond_donates") else "—"), ProlineResultsTab._ddg_cell(c)]
 
     def populate(self, cd, scan: dict) -> None:
         """Fill the ranked table from a proline scan ({candidates, existing, caveat})."""
@@ -1100,23 +1444,27 @@ class ProlineResultsTab(_StabilizationResultsTab):
                if existing else "."))
         self._existing_lbl.setVisible(True)
         self._existing_btn.setEnabled(bool(existing))
-        self._tbl.setRowCount(len(cands))
-        for i, c in enumerate(cands):
-            psi = c.get("psi")
-            cells = [f"{c.get('from_aa','')}{c.get('position')}P", f"{c.get('phi')}",
-                     ("—" if psi is None else f"{psi}"), f"{c.get('score', 0):.2f}",
-                     ("donor" if c.get("hbond_donates") else "—"), self._ddg_cell(c)]
-            for j, v in enumerate(cells):
-                self._tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._tbl.resizeColumnsToContents()
+        self._render_rows()
         has = len(cands) > 0
         self._placeholder.setVisible(not has)
         self._tbl.setVisible(has)
         self._declare_btn.setEnabled(has)
         self._escalate_btn.setEnabled(has)
         self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
+        self._set_group_toggle_visible(self._would_group(self._cands))
         if has:
             self._tbl.selectRow(0); self._on_row(0)
+            self._announce()                               # new results → tab-bar dot
+
+    def _render_rows(self) -> None:
+        self._rows = self._fill_ranked(self._tbl, self._cands, self._rowvals)
+
+    def _rerender(self) -> None:
+        if not self._cands:
+            return
+        self._render_rows()
+        self._tbl.setVisible(True)
+        self._tbl.selectRow(0); self._on_row(0)
 
     @staticmethod
     def _ddg_cell(c: dict) -> str:
@@ -1126,12 +1474,13 @@ class ProlineResultsTab(_StabilizationResultsTab):
     def reset(self) -> None:
         """Clear back to the dormant placeholder (keep-and-clear on session reset — the disulfide-tab
         lesson: the tab PERSISTS as a sibling, but its content belongs to the prior session)."""
-        self._cd, self._cands = None, []
+        self._cd, self._cands, self._rows = None, [], []
         self._tbl.setRowCount(0); self._tbl.setVisible(False)
         self._caveat.setVisible(False); self._existing_lbl.setVisible(False)
         self._detail.setVisible(False); self._placeholder.setVisible(True)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
         self._existing_btn.setEnabled(False)
+        self._set_group_toggle_visible(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -1149,13 +1498,14 @@ class CavityResultsTab(_StabilizationResultsTab):
     across tab-switch + session reset (keep-and-clear)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_add_to_basket=None):
+                 on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare              # (cd, cand) -> substitute→fill + validate (fold/compare)
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> fill ΔΔG escalation (legacy bridge)
         self._cd = None
         self._cands: List[dict] = []
+        self._rows: List[List[dict]] = []          # visible-row model (grouping): row -> member cands
         self._add_header(
             "Cavity-filling candidates. Small→larger hydrophobic fills of detected INTERNAL voids, "
             "ranked by void-fill fraction × how well a rotamer reaches into the void clash-free. The "
@@ -1206,17 +1556,21 @@ class CavityResultsTab(_StabilizationResultsTab):
         self._outer.addWidget(box)
         self._outer.addStretch(1)
 
+    def _row_rep(self, r: int) -> Optional[dict]:
+        """The representative (best) candidate for visible row *r* — the group's first member."""
+        return self._rows[r][0] if 0 <= r < len(self._rows) else None
+
     def _add_to_basket(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, c)
 
     def _on_row(self, r: int) -> None:
-        if not (0 <= r < len(self._cands)) or self._cd is None:
+        if not (0 <= r < len(self._rows)) or self._cd is None:
             return
-        c = self._cands[r]
-        self._on_highlight(self._cd, c)
-        self._detail.setText(self._cand_detail(c)); self._detail.setVisible(True)
+        grp = self._rows[r]
+        self._on_highlight(self._cd, grp[0], grp)      # glow all equivalent copies (one when ungrouped)
+        self._detail.setText(self._cand_detail(grp[0])); self._detail.setVisible(True)
 
     @staticmethod
     def _cand_detail(c: dict) -> str:
@@ -1232,14 +1586,21 @@ class CavityResultsTab(_StabilizationResultsTab):
                 f"{ddg_s} Validate by substituting → re-folding → comparing.")
 
     def _declare(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_declare is not None:
-            self._on_declare(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, c)
 
     def _estimate(self) -> None:
-        r = self._tbl.currentRow()
-        if 0 <= r < len(self._cands) and self._cd is not None and self._on_estimate_ddg is not None:
-            self._on_estimate_ddg(self._cd, self._cands[r])
+        c = self._row_rep(self._tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, c)
+
+    @staticmethod
+    def _rowvals(c: dict) -> List[str]:
+        return [f"{c.get('from_aa','')}{c.get('position')}{c.get('to_aa','')}",
+                str(c.get("cavity_id", "")), f"{c.get('void_volume', 0):.0f}",
+                f"{c.get('fill_fraction', 0):.2f}", ("⚠" if c.get("clash") else "ok"),
+                f"{c.get('score', 0):.2f}", CavityResultsTab._ddg_cell(c)]
 
     def populate(self, cd, scan: dict) -> None:
         """Fill the ranked table from a cavity scan ({candidates, cavities, caveat})."""
@@ -1256,23 +1617,27 @@ class CavityResultsTab(_StabilizationResultsTab):
         else:
             self._cavities_lbl.setText("No internal cavities ≥ the volume floor (well-packed at this probe).")
         self._cavities_lbl.setVisible(True)
-        self._tbl.setRowCount(len(cands))
-        for i, c in enumerate(cands):
-            cells = [f"{c.get('from_aa','')}{c.get('position')}{c.get('to_aa','')}",
-                     str(c.get("cavity_id", "")), f"{c.get('void_volume', 0):.0f}",
-                     f"{c.get('fill_fraction', 0):.2f}", ("⚠" if c.get("clash") else "ok"),
-                     f"{c.get('score', 0):.2f}", self._ddg_cell(c)]
-            for j, v in enumerate(cells):
-                self._tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._tbl.resizeColumnsToContents()
+        self._render_rows()
         has = len(cands) > 0
         self._placeholder.setVisible(not has)
         self._tbl.setVisible(has)
         self._declare_btn.setEnabled(has)
         self._escalate_btn.setEnabled(has)
         self._basket_btn.setEnabled(has and self._on_add_to_basket is not None)
+        self._set_group_toggle_visible(self._would_group(self._cands))
         if has:
             self._tbl.selectRow(0); self._on_row(0)
+            self._announce()                               # new results → tab-bar dot
+
+    def _render_rows(self) -> None:
+        self._rows = self._fill_ranked(self._tbl, self._cands, self._rowvals)
+
+    def _rerender(self) -> None:
+        if not self._cands:
+            return
+        self._render_rows()
+        self._tbl.setVisible(True)
+        self._tbl.selectRow(0); self._on_row(0)
 
     @staticmethod
     def _ddg_cell(c: dict) -> str:
@@ -1282,11 +1647,12 @@ class CavityResultsTab(_StabilizationResultsTab):
     def reset(self) -> None:
         """Clear back to the dormant placeholder (keep-and-clear on session reset — the disulfide-tab
         lesson: the tab PERSISTS as a sibling, but its content belongs to the prior session)."""
-        self._cd, self._cands = None, []
+        self._cd, self._cands, self._rows = None, [], []
         self._tbl.setRowCount(0); self._tbl.setVisible(False)
         self._caveat.setVisible(False); self._cavities_lbl.setVisible(False)
         self._detail.setVisible(False); self._placeholder.setVisible(True)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
+        self._set_group_toggle_visible(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -1303,14 +1669,16 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
     Persists across tab-switch + session reset (keep-and-clear)."""
 
     def __init__(self, *, on_highlight, on_declare=None, on_estimate_ddg=None, on_clear_glow=None,
-                 on_add_to_basket=None):
+                 on_add_to_basket=None, on_chain_equiv=None):
         super().__init__(on_highlight=on_highlight, on_clear_glow=on_clear_glow,
-                         on_add_to_basket=on_add_to_basket)
+                         on_add_to_basket=on_add_to_basket, on_chain_equiv=on_chain_equiv)
         self._on_declare = on_declare              # (cd, cand) -> substitute BOTH positions + validate
         self._on_estimate_ddg = on_estimate_ddg    # (cd, cand) -> 2-residue ΔΔG escalation (legacy bridge)
         self._cd = None
         self._existing: List[dict] = []
         self._novel: List[dict] = []
+        self._ex_rows: List[List[dict]] = []       # visible-row models (grouping) for each table
+        self._nv_rows: List[List[dict]] = []
         self._add_header(
             "Salt-bridge candidates. Existing Asp/Glu↔Arg/Lys pairs (assessed by closest carboxyl-O↔"
             "basic-N distance + burial) and NOVEL complementary charge-pair sites (geometry × burial). "
@@ -1377,18 +1745,20 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
 
     # ── row handlers ──
     def _on_existing_row(self, r: int) -> None:
-        if not (0 <= r < len(self._existing)) or self._cd is None:
+        if not (0 <= r < len(self._ex_rows)) or self._cd is None:
             return
         self._nv_tbl.clearSelection()
-        self._on_highlight(self._cd, self._existing[r])
-        self._detail.setText(self._existing_detail(self._existing[r])); self._detail.setVisible(True)
+        grp = self._ex_rows[r]
+        self._on_highlight(self._cd, grp[0], grp)      # glow all equivalent copies
+        self._detail.setText(self._existing_detail(grp[0])); self._detail.setVisible(True)
 
     def _on_novel_row(self, r: int) -> None:
-        if not (0 <= r < len(self._novel)) or self._cd is None:
+        if not (0 <= r < len(self._nv_rows)) or self._cd is None:
             return
         self._ex_tbl.clearSelection()
-        c = self._novel[r]
-        self._on_highlight(self._cd, c)
+        grp = self._nv_rows[r]
+        c = grp[0]
+        self._on_highlight(self._cd, c, grp)           # glow all equivalent copies
         self._detail.setText(self._novel_detail(c)); self._detail.setVisible(True)
         has = self._cd is not None
         self._declare_btn.setEnabled(has)
@@ -1419,20 +1789,24 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
                 f"Cβ–Cβ {c.get('cb_cb')} Å, {bur}{clash}.{ddg_s} Validate by substituting both → "
                 f"re-folding (no constraint) → comparing.")
 
+    def _nv_rep(self, r: int) -> Optional[dict]:
+        """Representative (best) novel candidate for visible row *r* — the group's first member."""
+        return self._nv_rows[r][0] if 0 <= r < len(self._nv_rows) else None
+
     def _add_to_basket(self) -> None:
-        r = self._nv_tbl.currentRow()
-        if 0 <= r < len(self._novel) and self._cd is not None and self._on_add_to_basket is not None:
-            self._on_add_to_basket(self._cd, self._novel[r])
+        c = self._nv_rep(self._nv_tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_add_to_basket is not None:
+            self._on_add_to_basket(self._cd, c)
 
     def _declare(self) -> None:
-        r = self._nv_tbl.currentRow()
-        if 0 <= r < len(self._novel) and self._cd is not None and self._on_declare is not None:
-            self._on_declare(self._cd, self._novel[r])
+        c = self._nv_rep(self._nv_tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_declare is not None:
+            self._on_declare(self._cd, c)
 
     def _estimate(self) -> None:
-        r = self._nv_tbl.currentRow()
-        if 0 <= r < len(self._novel) and self._cd is not None and self._on_estimate_ddg is not None:
-            self._on_estimate_ddg(self._cd, self._novel[r])
+        c = self._nv_rep(self._nv_tbl.currentRow())
+        if c is not None and self._cd is not None and self._on_estimate_ddg is not None:
+            self._on_estimate_ddg(self._cd, c)
 
     @staticmethod
     def _burial_cell(p: dict) -> str:
@@ -1446,6 +1820,21 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
             return "—"
         return f"{da:+.1f} / {db:+.1f}"
 
+    @classmethod
+    def _ex_rowvals(cls, p: dict) -> List[str]:
+        on = f"{p.get('on_dist')}" + (" (opt)" if p.get("optimizable") else "")
+        return [pair_label(p), p.get("type", ""), on,
+                ("H-bond" if p.get("hbond_like") else "—"), cls._burial_cell(p),
+                f"{p.get('score', 0):.2f}"]
+
+    @classmethod
+    def _nv_rowvals(cls, c: dict) -> List[str]:
+        sub = (f"{c.get('from_aa_a','')}{c.get('resnum_a')}{c.get('to_aa_a','')}+"
+               f"{c.get('from_aa_b','')}{c.get('resnum_b')}{c.get('to_aa_b','')}")
+        return [sub, pair_label(c), f"{c.get('best_on')}", f"{c.get('cb_cb')}",
+                ("H-bond" if c.get("hbond_like") else "—"), cls._burial_cell(c),
+                ("⚠" if c.get("clash") else "ok"), f"{c.get('score', 0):.2f}", cls._ddg_cell(c)]
+
     def populate(self, cd, scan: dict) -> None:
         """Fill both tables from a salt-bridge scan ({existing, novel, caveat})."""
         existing = (scan or {}).get("existing") or []
@@ -1453,48 +1842,48 @@ class SaltBridgeResultsTab(_StabilizationResultsTab):
         self._cd, self._existing, self._novel = cd, list(existing), list(novel)
         self._caveat.setText("⚠ " + ((scan or {}).get("caveat") or "Geometric suggestion only."))
         self._caveat.setVisible(bool(existing or novel))
-        # existing table
-        self._ex_tbl.setRowCount(len(existing))
-        for i, p in enumerate(existing):
-            on = f"{p.get('on_dist')}" + (" (opt)" if p.get("optimizable") else "")
-            cells = [pair_label(p), p.get("type", ""), on,
-                     ("H-bond" if p.get("hbond_like") else "—"), self._burial_cell(p),
-                     f"{p.get('score', 0):.2f}"]
-            for j, v in enumerate(cells):
-                self._ex_tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._ex_tbl.resizeColumnsToContents()
+        self._render_rows()
         self._ex_tbl.setVisible(bool(existing))
         self._ex_placeholder.setVisible(not existing)
-        # novel table
-        self._nv_tbl.setRowCount(len(novel))
-        for i, c in enumerate(novel):
-            sub = (f"{c.get('from_aa_a','')}{c.get('resnum_a')}{c.get('to_aa_a','')}+"
-                   f"{c.get('from_aa_b','')}{c.get('resnum_b')}{c.get('to_aa_b','')}")
-            cells = [sub, pair_label(c), f"{c.get('best_on')}", f"{c.get('cb_cb')}",
-                     ("H-bond" if c.get("hbond_like") else "—"), self._burial_cell(c),
-                     ("⚠" if c.get("clash") else "ok"), f"{c.get('score', 0):.2f}", self._ddg_cell(c)]
-            for j, v in enumerate(cells):
-                self._nv_tbl.setItem(i, j, QtWidgets.QTableWidgetItem(v))
-        self._nv_tbl.resizeColumnsToContents()
         has_nv = bool(novel)
         self._nv_tbl.setVisible(has_nv)
         self._nv_placeholder.setVisible(not has_nv)
         self._declare_btn.setEnabled(has_nv)
         self._escalate_btn.setEnabled(has_nv)
         self._basket_btn.setEnabled(has_nv and self._on_add_to_basket is not None)
+        self._set_group_toggle_visible(self._would_group(self._existing) or self._would_group(self._novel))
         if has_nv:
             self._nv_tbl.selectRow(0); self._on_novel_row(0)
         elif existing:
+            self._ex_tbl.selectRow(0); self._on_existing_row(0)
+        if has_nv or existing:
+            self._announce()                               # new results → tab-bar dot
+
+    def _render_rows(self) -> None:
+        self._ex_rows = self._fill_ranked(self._ex_tbl, self._existing, self._ex_rowvals)
+        self._nv_rows = self._fill_ranked(self._nv_tbl, self._novel, self._nv_rowvals)
+
+    def _rerender(self) -> None:
+        if not (self._existing or self._novel):
+            return
+        self._render_rows()
+        self._ex_tbl.setVisible(bool(self._existing))
+        self._nv_tbl.setVisible(bool(self._novel))
+        if self._novel:
+            self._nv_tbl.selectRow(0); self._on_novel_row(0)
+        elif self._existing:
             self._ex_tbl.selectRow(0); self._on_existing_row(0)
 
     def reset(self) -> None:
         """Clear back to the dormant placeholders (keep-and-clear on session reset — the tab PERSISTS as
         a sibling, its content belongs to the prior session)."""
         self._cd, self._existing, self._novel = None, [], []
+        self._ex_rows, self._nv_rows = [], []
         for tbl, ph in ((self._ex_tbl, self._ex_placeholder), (self._nv_tbl, self._nv_placeholder)):
             tbl.setRowCount(0); tbl.setVisible(False); ph.setVisible(True)
         self._caveat.setVisible(False); self._detail.setVisible(False)
         self._declare_btn.setEnabled(False); self._escalate_btn.setEnabled(False)
+        self._set_group_toggle_visible(False)
         if getattr(self, "_basket_btn", None) is not None:
             self._basket_btn.setEnabled(False)
         self.set_glow_active(False)
@@ -1705,18 +2094,29 @@ class _FlowLayout(QtWidgets.QLayout):
         y = rect.y() + m.top()
         right = rect.right() - m.right()
         line_height = 0
+        row = 0
+        placed: List[Tuple[object, int, int, "QtCore.QSize", int]] = []   # (item, x, row_top, hint, row)
+        row_h: Dict[int, int] = {}                                        # row -> tallest item
         for item in self._items:
             hint = item.sizeHint()
             next_x = x + hint.width() + self._hspace
             if next_x - self._hspace > right and line_height > 0:    # wrap to the next row
                 x = rect.x() + m.left()
                 y = y + line_height + self._vspace
+                row += 1
                 next_x = x + hint.width() + self._hspace
                 line_height = 0
-            if not test_only:
-                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            placed.append((item, x, y, hint, row))
             x = next_x
             line_height = max(line_height, hint.height())
+            row_h[row] = max(row_h.get(row, 0), hint.height())
+        if not test_only:
+            # Vertically CENTER each item within its row's height so labels / menu buttons / combos
+            # of differing heights line up on a common centre line (not top-aligned, which left the
+            # shorter 'Substitute →' / 'Tools' items sitting high).
+            for item, ix, row_top, hint, r in placed:
+                iy = row_top + (row_h[r] - hint.height()) // 2
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(ix, iy), hint))
         return y + line_height - rect.y() + m.bottom()
 
 
@@ -1725,9 +2125,10 @@ class _FlowLayout(QtWidgets.QLayout):
 class VariantWorkbenchPanel(QtWidgets.QWidget):
     """Stage-3b Workbench panel. `controller` = a seq_editor.SequenceEditorController
     (shares the ChimeraX bridge). `load_model(model_id)` reads the structure, builds the
-    DesignSession, renders the tabs, persists it. Toolbar: add variant, substitute
-    (combo+Apply), color mode, AND the Stage-3b tool LAUNCH buttons ("Run ProteinMPNN…",
-    "Scan…"). Column-click toggles the position into the SCAN SET (the deterministic scan
+    DesignSession, renders the tabs, persists it. Toolbar groups: Edit (add variant /
+    add sequence), Analysis (Tools ▾ — scan / MPNN / per-variant tests / Disulfides +
+    Stabilize submenus), View (Fold ▾ / Align / Color / Deviation pill). Substitution is
+    residue-targeted via the cell right-click menu ("Substitute →"), not a toolbar control. Column-click toggles the position into the SCAN SET (the deterministic scan
     scope) and selects the whole set in 3D (all copies); a color mode paints the panel AND
     recolors the 3D by the active row.
 
@@ -1741,6 +2142,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
     # Stage 3b: panel → window. Payload = {tool, tool_inputs, user_input, confidence,
     # refresh}. The window turns it into engine.handle_tool_request on the worker thread.
     launchRequested = QtCore.Signal(dict)
+    batchLaunchRequested = QtCore.Signal(list)   # a list of specs to run in sequence (stabilize-all)
 
     def __init__(self, controller, session=None, pool=None):
         super().__init__()
@@ -1794,14 +2196,9 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "(no loaded structure). Fold it as a mono/di/tri/tetramer.")
         self._add_seq_btn.clicked.connect(self._on_add_sequence)
         bar.addWidget(self._add_seq_btn)
-        bar.addWidget(self._toolbar_vsep())
-        bar.addWidget(QtWidgets.QLabel("Substitute →"))
-        self._aa_combo = QtWidgets.QComboBox()
-        self._aa_combo.addItems(list(_AA_ORDER))
-        bar.addWidget(self._aa_combo)
-        self._apply_btn = QtWidgets.QPushButton("Apply")
-        self._apply_btn.clicked.connect(self._apply_substitution)
-        bar.addWidget(self._apply_btn)
+        # (Substitute combo + Apply were REMOVED from the toolbar — the same edit is reachable by
+        #  right-clicking a residue in a variant row: the cell menu's "Substitute →" runs the exact
+        #  same `edit_variant`, residue-targeted, so no capability is lost.)
         bar.addWidget(self._toolbar_vsep())
 
         # Tools ▾ — Stage-3b LAUNCH (Scan / Run ProteinMPNN, through the engine spine) +
@@ -1832,24 +2229,33 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._clear_scan_btn = tools_menu.addAction("Clear scan set")
         self._clear_scan_btn.setToolTip("Clear the scan set.")
         self._clear_scan_btn.triggered.connect(self._clear_scan_set)
-        self._tools_btn.setMenu(tools_menu)
-        bar.addWidget(self._tools_btn)
-        bar.addWidget(self._toolbar_vsep())
-
-        # Stage 4a: per-variant action buttons (act on the ACTIVE variant row).
-        # Stability runs the 4-axis voter on the variant's EXACT mutations through the
-        # engine spine (deep → confirm-gate); solubility is the pure CamSol scalar (instant).
-        self._stab_btn = QtWidgets.QPushButton("Test stability")
+        # ── Analysis group: per-variant tests (formerly top-level "Test stability/solubility"
+        #    buttons) collapsed under Tools ▾ as menu items — SAME handlers, just regrouped.
+        tools_menu.addSeparator()
+        self._stab_btn = tools_menu.addAction("Test stability")
         self._stab_btn.setToolTip("Score the ACTIVE variant's exact mutations (4-axis ddG "
                                   "voter) through the tool spine. Deep adds Rosetta (gated).")
-        self._stab_btn.clicked.connect(self._on_test_stability)
-        bar.addWidget(self._stab_btn)
-        self._sol_btn = QtWidgets.QPushButton("Test solubility")
+        self._stab_btn.triggered.connect(self._on_test_stability)
+        self._sol_btn = tools_menu.addAction("Test solubility")
         self._sol_btn.setToolTip("CamSol intrinsic-solubility of the ACTIVE variant vs the "
                                  "template (instant, local).")
-        self._sol_btn.clicked.connect(self._on_test_solubility)
-        bar.addWidget(self._sol_btn)
-        bar.addWidget(self._toolbar_vsep())
+        self._sol_btn.triggered.connect(self._on_test_solubility)
+        # (the Disulfides + Stabilize SUBMENUS are appended to this same Tools menu below, at
+        #  their build sites — menus are live, so order-of-construction doesn't matter.)
+        self._tools_btn.setMenu(tools_menu)
+        bar.addWidget(self._tools_btn)
+        # One-shot stabilization sweep: run every cheap geometric strategy scan (disulfide +
+        # interface + proline + salt-bridge + cavity) in sequence, each populating its existing
+        # results tab — so the user doesn't click through the five Stabilize/Disulfides items.
+        self._stabilize_all_btn = QtWidgets.QPushButton("Identify stabilizing mutations")
+        self._stabilize_all_btn.setToolTip(
+            "Run ALL stabilization-strategy scans at once — disulfide (intra + interface), "
+            "proline, salt-bridge and cavity — and fill their tabs. Each is a geometric "
+            "suggestion (reads coordinates, no fold); a starting point, not a recommendation "
+            "to mutate. Needs a folded construct or a loaded structure.")
+        self._stabilize_all_btn.clicked.connect(self._on_stabilize_all)
+        bar.addWidget(self._stabilize_all_btn)
+        bar.addWidget(self._toolbar_vsep())          # divider: Analysis | View
 
         # Fold ▾ — Stage-4b fold the ACTIVE variant (engine picker; ESMFold local) +
         # fold/reference visibility + the tile escape-hatch.
@@ -1999,12 +2405,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._show_align_ref_cb.setToolTip("Show the ACTIVE construct's US-align reference (the PDB "
                                            "its fold was aligned onto) in the overlay.")
         self._show_align_ref_cb.toggled.connect(self._on_align_ref_overlay_toggle)
-        self._fold_menu_btn.setMenu(fold_menu)
-        bar.addWidget(self._fold_menu_btn)
-        bar.addWidget(self._toolbar_vsep())
+        self._fold_menu_btn.setMenu(fold_menu)        # added to the View group (pill) below
 
-        # Disulfides ▾ — TOP-LEVEL (sibling of Fold ▾, not buried) so the cysteine/disulfide suite
-        # is discoverable. Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
+        # Disulfides — now a SUBMENU under Tools ▾ (Analysis group), no longer a top-level button.
+        # Three DISTINCT modes (A/B observe the unconstrained fold; C intervenes):
         # Labels surface the load-bearing distinction — OBSERVE existing cysteines (A/B) vs FIND
         # NOVEL installable sites (D) vs INTERVENE (C). "Find/discover/suggest" belongs ONLY to D
         # (the mode that finds sites not already present); A "assesses existing", never "discovers".
@@ -2014,12 +2418,13 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         #   C Declare cysteine bonds and fold — introduce Cys (substitution) + fold WITH the bond(s)
         # Each action is ENABLED by its real precondition (greyed = visibly unavailable, not a silent
         # no-op): A needs a de-novo construct; B/C/D need it FOLDED. Synced on tab-change/render/fold.
-        self._ss_menu_btn = QtWidgets.QToolButton()
-        self._ss_menu_btn.setText("Disulfides")
-        self._ss_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self._ss_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        ss_menu = QtWidgets.QMenu(self._ss_menu_btn)
-        ss_menu.setToolTipsVisible(True)
+        tools_menu.addSeparator()
+        # Explicit parent (the long-lived Tools button) + addMenu(object): the addMenu(str) overload
+        # returns a QMenu shiboken can let be GC'd; constructing with a parent keeps it alive.
+        self._ss_menu = QtWidgets.QMenu("Disulfides", self._tools_btn)
+        self._ss_menu.setToolTipsVisible(True)
+        tools_menu.addMenu(self._ss_menu)
+        ss_menu = self._ss_menu                        # actions below populate this nested submenu
         self._ss_discover_btn = ss_menu.addAction("Assess existing Cys pairs (multi-fold)…")
         self._ss_discover_btn.setToolTip("ASSESS the construct's EXISTING cysteine pairs: fold "
                                          "UNCONSTRAINED across N seeds and report how often each pair "
@@ -2054,20 +2459,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                           "it does NOT enforce geometry — the result is measured, "
                                           "never assumed. Needs a folded construct.")
         self._ss_constrain_btn.triggered.connect(self._on_disulfide_constrain)
-        self._ss_menu_btn.setMenu(ss_menu)
-        bar.addWidget(self._ss_menu_btn)
-        bar.addWidget(self._toolbar_vsep())
 
-        # Stabilize ▾ — TOP-LEVEL peer of Disulfides (stabilization is the program's core; the
-        # strategies are first-class peers). Proline-stabilization scan: per-residue X→Pro sites by
+        # Stabilize — now a SUBMENU under Tools ▾ (Analysis group), peer of Disulfides. Proline-
+        # stabilization scan: per-residue X→Pro sites by
         # backbone φ/ψ proline-compatibility + a backbone-H-bond-donor penalty. Cheap (reads the
         # structure, no fold); works on a de-novo fold OR a loaded crystal/model.
-        self._pro_menu_btn = QtWidgets.QToolButton()
-        self._pro_menu_btn.setText("Stabilize")
-        self._pro_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self._pro_menu_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        pro_menu = QtWidgets.QMenu(self._pro_menu_btn)
-        pro_menu.setToolTipsVisible(True)
+        self._pro_menu = QtWidgets.QMenu("Stabilize", self._tools_btn)
+        self._pro_menu.setToolTipsVisible(True)
+        tools_menu.addMenu(self._pro_menu)
+        pro_menu = self._pro_menu                       # actions below populate this nested submenu
         self._pro_scan_btn = pro_menu.addAction("Find proline-stabilization sites…")
         self._pro_scan_btn.setToolTip("FIND X→Pro stabilizing sites: rank residues by backbone φ/ψ "
                                       "proline-compatibility with a backbone-H-bond-donor penalty "
@@ -2100,9 +2500,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                      "geometric suggestion only, you judge the context. Cheap (no fold). "
                                      "Needs a folded construct or a loaded structure.")
         self._sb_scan_btn.triggered.connect(self._on_saltbridge_scan)
-        self._pro_menu_btn.setMenu(pro_menu)
-        bar.addWidget(self._pro_menu_btn)
-        bar.addWidget(self._toolbar_vsep())
         self._sync_disulfide_menu_enabled()           # initial precondition state (greyed until ready)
 
         # Stage 4c: per-residue Cα deviation of the ACTIVE folded variant vs a seed-pinned
@@ -2113,9 +2510,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "seed-pinned WT reference fold (same engine). Floor-gated: "
                                  "residues within the noise floor stay neutral. First use for "
                                  "an engine folds the WT reference + its noise floor (cached).")
-        self._dev_btn.clicked.connect(self._on_deviation_clicked)
-        bar.addWidget(self._dev_btn)
-        bar.addWidget(self._toolbar_vsep())
+        self._dev_btn.clicked.connect(self._on_deviation_clicked)   # added to the View group below
 
         # Stage 3: structurally align the DE-NOVO construct's fold onto a chosen PDB,
         # SEQUENCE-INDEPENDENTLY (US-align, LOCAL-ONLY) — the case ChimeraX matchmaker can't
@@ -2125,10 +2520,7 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                    "(sequence-independent, US-align LOCAL-ONLY). Captures TM-score "
                                    "+ RMSD and overlays the fold on the reference. De-novo only; "
                                    "fold the construct first.")
-        self._align_btn.clicked.connect(self._on_align_clicked)
-        bar.addWidget(self._align_btn)
-        bar.addWidget(self._toolbar_vsep())
-        bar.addWidget(QtWidgets.QLabel("Color:"))
+        self._align_btn.clicked.connect(self._on_align_clicked)   # added to the View group below
         self._mode_combo = QtWidgets.QComboBox()
         for m in all_modes():
             self._mode_combo.addItem(m.label, m.key)
@@ -2140,7 +2532,26 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._mode_combo.addItem("Cavity sites", _RESULT_CAVITY_MODE)        # cavity-filling best-fill
         self._mode_combo.addItem("Salt-bridge sites", _RESULT_SALTBRIDGE_MODE)  # salt-bridge charge-pair
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        bar.addWidget(self._mode_combo)
+        # ── View group: a segmented "pill" cluster (Fold ▾ · Align to PDB · Color · Deviation vs WT)
+        #    — lighter-weight controls on a grouped translucent background, visually distinct from the
+        #    Edit/Analysis buttons. PURE grouping + styling: every widget + handler is unchanged; only
+        #    the parent (this pill instead of the flow row) and a flat/auto-raise look differ.
+        self._view_group = QtWidgets.QFrame()
+        self._view_group.setObjectName("workbenchViewGroup")
+        self._view_group.setStyleSheet(
+            "#workbenchViewGroup{background:rgba(127,127,127,0.14);border-radius:7px;}")
+        _vg = QtWidgets.QHBoxLayout(self._view_group)
+        _vg.setContentsMargins(7, 2, 7, 2)
+        _vg.setSpacing(6)
+        self._fold_menu_btn.setAutoRaise(True)        # lighter-weight, segmented look
+        self._align_btn.setFlat(True)
+        self._dev_btn.setFlat(True)
+        _vg.addWidget(self._fold_menu_btn)
+        _vg.addWidget(self._align_btn)
+        _vg.addWidget(QtWidgets.QLabel("Color:"))
+        _vg.addWidget(self._mode_combo)
+        _vg.addWidget(self._dev_btn)
+        bar.addWidget(self._view_group)
         # The flow layout left-aligns + wraps; no trailing stretch (a stretch item would consume the
         # row and stop wrapping). The container carries every pill — nothing is ever hidden.
         lay.addWidget(self._toolbar_container)
@@ -2165,26 +2576,30 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             on_declare=self._declare_disulfide_pair,
             on_estimate_ddg=self._estimate_ddg_pair,
             on_clear_glow=self._clear_disulfide_glow,
-            on_add_to_basket=self._add_disulfide_to_basket)
+            on_add_to_basket=self._add_disulfide_to_basket,
+            on_chain_equiv=self._chain_equiv)                # replicate-row grouping (homo-oligomer copies)
         self.proline_tab = ProlineResultsTab(
             on_highlight=self._highlight_proline_residue,
             on_declare=self._declare_proline,
             on_estimate_ddg=self._estimate_proline_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
             on_show_existing=self._show_existing_prolines,
-            on_add_to_basket=self._add_proline_to_basket)
+            on_add_to_basket=self._add_proline_to_basket,
+            on_chain_equiv=self._chain_equiv)
         self.cavity_tab = CavityResultsTab(
             on_highlight=self._highlight_cavity_residue,
             on_declare=self._declare_cavity,
             on_estimate_ddg=self._estimate_cavity_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
-            on_add_to_basket=self._add_cavity_to_basket)
+            on_add_to_basket=self._add_cavity_to_basket,
+            on_chain_equiv=self._chain_equiv)
         self.saltbridge_tab = SaltBridgeResultsTab(
             on_highlight=self._highlight_saltbridge_pair,    # pairwise glow (reuses the disulfide seam)
             on_declare=self._declare_saltbridge,
             on_estimate_ddg=self._estimate_saltbridge_ddg,
             on_clear_glow=self._clear_disulfide_glow,        # the glow seam is shared (one _glow_state)
-            on_add_to_basket=self._add_saltbridge_to_basket)
+            on_add_to_basket=self._add_saltbridge_to_basket,
+            on_chain_equiv=self._chain_equiv)
         # The CROSS-STRATEGY design basket — the framework centerpiece (gui_app docks it on the right).
         self.design_basket = DesignBasketPanel(on_enact=self._enact_basket,
                                                on_chain_equiv=self._chain_equiv)
@@ -3415,6 +3830,8 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._cav_scan_btn.setEnabled(has_struct)          # reads coordinates (no fold), like proline
         if getattr(self, "_sb_scan_btn", None) is not None:
             self._sb_scan_btn.setEnabled(has_struct)           # reads coordinates (no fold), like cavity
+        if getattr(self, "_stabilize_all_btn", None) is not None:
+            self._stabilize_all_btn.setEnabled(has_struct)     # the sweep runs all of the above
 
     def _on_disulfide_discover(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -3486,6 +3903,31 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self._status.setText("Scanning the chain–chain interface for inter-subunit disulfide sites "
                              "(geometric compatibility only — a starting point)…")
         self.launchRequested.emit(spec)
+
+    # ── one-shot stabilization sweep (run every cheap geometric strategy scan) ─────────
+    def stabilization_batch_specs(self) -> List[dict]:
+        """The list of stabilization-strategy scan specs to run in sequence, in a sensible
+        order (disulfide → interface → proline → salt-bridge → cavity). Each builder returns
+        None when its precondition isn't met (no structure; interface needs a multimer), and
+        those are SKIPPED — so a monomer runs four scans, a multimer five, and an unfolded
+        construct runs none. Pure (builds specs; the window runs + routes them to the tabs)."""
+        builders = (self.disulfide_scan_launch_spec,
+                    self.disulfide_interface_scan_launch_spec,
+                    self.proline_scan_launch_spec,
+                    self.saltbridge_scan_launch_spec,
+                    self.cavity_scan_launch_spec)
+        return [spec for spec in (build() for build in builders) if spec is not None]
+
+    def _on_stabilize_all(self) -> None:
+        specs = self.stabilization_batch_specs()
+        if not specs:
+            self._status.setText("Stabilization scans need a readable structure — fold the construct, "
+                                 "or check the loaded model is still open.")
+            return
+        self._status.setText(f"Identifying stabilizing mutations — running {len(specs)} strategy "
+                             f"scan(s); results fill the Disulfides / Proline / Salt bridges / "
+                             f"Cavity tabs…")
+        self.batchLaunchRequested.emit(specs)
 
     def _on_disulfide_constrain(self) -> None:
         if self._design is None or self._design.source != "sequence":
@@ -3567,15 +4009,6 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return {str(observed[i]): v for i, v in enumerate(chains_ptm) if i < len(observed)}
         return {}
 
-    def _apply_substitution(self) -> None:
-        tab = self._cur_tab()
-        if tab is None:
-            return
-        if self._edit_target is None:
-            self._status.setText("Select a residue in a VARIANT row first (T is the immutable template).")
-            return
-        vid, col = self._edit_target
-        self._do_substitute(tab, vid, col, self._aa_combo.currentText())
 
     def _after_variant_edit(self, tab: _ChainDesignTab, vid: str, msg: str) -> None:
         """Shared post-edit refresh for substitute/delete/restore: re-lay the grid, keep the
@@ -4202,21 +4635,40 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return None, None
         return str(mid), f"#{mid}/{ch}:{pos}"
 
-    def _highlight_proline_residue(self, cd, cand: dict) -> None:
-        """Glow ONE proline candidate residue — the single-residue analog of the disulfide pair glow,
-        through the SAME `_glow_state`/`_consume_glow_restore` seam (restore prior glow first so it
-        never stacks; the Clear-view control + any colour-mode switch clear it)."""
-        mid, spec = self._proline_residue_spec(cd, cand)
-        if mid is None:
-            self._glow_state = None
-            self._sync_glow_clear_button()
-            return
+    def _residue_group_highlight(self, cd, members: List[dict]):
+        """(mid, union_spec, apply_cmds) glowing ONE OR MORE single-residue candidates — the members of
+        a grouped row (a trimer's equivalent copies) light TOGETHER via a union atom-spec. One member →
+        the exact single-residue glow (byte-identical to the ungrouped path). (None, None, []) when no
+        member resolves to a real rendered id."""
+        mid = None
+        specs: List[str] = []
+        for m in members:
+            mm, sp = self._proline_residue_spec(cd, m)
+            if mm is None:
+                continue
+            mid = mm
+            specs.append(sp)
+        if mid is None or not specs:
+            return None, None, []
+        spec = " ".join(specs)
         hue = self._GLOW_HUE
         apply = [
             f"show {spec} atoms", f"style {spec} sphere", f"color {spec} {hue} target a",
             f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
             f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
         ]
+        return mid, spec, apply
+
+    def _highlight_proline_residue(self, cd, cand: dict, members: Optional[List[dict]] = None) -> None:
+        """Glow the selected proline candidate residue — the single-residue analog of the disulfide pair
+        glow, through the SAME `_glow_state`/`_consume_glow_restore` seam (restore prior glow first so it
+        never stacks; the Clear-view control + any colour-mode switch clear it). *members* (a grouped
+        row's equivalent copies) glow together; absent → just *cand*."""
+        mid, spec, apply = self._residue_group_highlight(cd, members or [cand])
+        if mid is None:
+            self._glow_state = None
+            self._sync_glow_clear_button()
+            return
         self._apply_or_toggle_glow({"mid": mid, "both": spec}, apply)   # re-click toggles it off
 
     def _show_existing_prolines(self, cd) -> None:
@@ -4390,20 +4842,15 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         self.cavity_tab.populate(cd, cd.cavity_scan)
         self._status.setText(step.get("summary") or "Cavity scan complete.")
 
-    def _highlight_cavity_residue(self, cd, cand: dict) -> None:
-        """Glow ONE cavity-fill candidate residue — through the SAME `_glow_state` seam as the proline
-        single-residue glow (restore the prior glow first so it never stacks)."""
-        mid, spec = self._proline_residue_spec(cd, cand)         # same (mid, spec) resolver — residue glow
+    def _highlight_cavity_residue(self, cd, cand: dict, members: Optional[List[dict]] = None) -> None:
+        """Glow the selected cavity-fill candidate residue — through the SAME `_glow_state` seam as the
+        proline single-residue glow (restore the prior glow first so it never stacks). *members* (a
+        grouped row's equivalent copies) glow together; absent → just *cand*."""
+        mid, spec, apply = self._residue_group_highlight(cd, members or [cand])
         if mid is None:
             self._glow_state = None
             self._sync_glow_clear_button()
             return
-        hue = self._GLOW_HUE
-        apply = [
-            f"show {spec} atoms", f"style {spec} sphere", f"color {spec} {hue} target a",
-            f"transparency #{mid} 70 target c", f"transparency {spec} 0 target c",
-            f"graphics selection color {hue}", "graphics selection width 5", f"select {spec}",
-        ]
         self._apply_or_toggle_glow({"mid": mid, "both": spec}, apply)   # re-click toggles it off
 
     def _declare_cavity(self, cd, cand: dict) -> None:
@@ -4570,12 +5017,12 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 out[rn] = hexc
         return out
 
-    def _highlight_saltbridge_pair(self, cd, pair: dict) -> None:
+    def _highlight_saltbridge_pair(self, cd, pair: dict, members: Optional[List[dict]] = None) -> None:
         """Glow a salt-bridge pair's two members — REUSES the disulfide pair-glow seam (same two-chain
         pair shape), through the shared `_glow_state` (restore-then-apply, never stacking). Works for an
-        intra-chain pair AND a cross-chain one (`_disulfide_pair_specs` reads chain_a/chain_b)."""
-        apply = self._disulfide_scan_highlight_commands(cd, pair)
-        mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
+        intra-chain pair AND a cross-chain one (`_disulfide_pair_specs` reads chain_a/chain_b). *members*
+        (a grouped row's equivalent copies) glow together; absent → just *pair*."""
+        mid, both, apply = self._pair_group_highlight(cd, members or [pair])
         new_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
         self._apply_or_toggle_glow(new_state, apply)   # re-clicking the same pair toggles it off
 
@@ -4599,6 +5046,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "metrics_text": (f"O–N {cand.get('best_on')}Å Cβ–Cβ {cand.get('cb_cb')}Å; {bur}; "
                              + ("⚠ clash" if cand.get("clash") else "clash-free")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {pair_label(cand)} ({aa_a}{ra}{ta}+{aa_b}{rb}{tb}) to the design basket.")
 
@@ -4613,36 +5064,46 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         cd_map = self._chain_to_cd()
         ca, cb = pair_chains(cand)
         ca, cb = (ca or cd.rep_chain), (cb or cd.rep_chain)
-        subs = [(str(ca), cand.get("resnum_a"), cand.get("to_aa_a")),
-                (str(cb), cand.get("resnum_b"), cand.get("to_aa_b"))]
+        subs = [{"chain": str(ca), "position": cand.get("resnum_a"), "to_aa": cand.get("to_aa_a")},
+                {"chain": str(cb), "position": cand.get("resnum_b"), "to_aa": cand.get("to_aa_b")}]
         by_cd: Dict[int, tuple] = {}
-        for ch, pos, to_aa in subs:
-            tcd = cd_map.get(ch)
-            if tcd is None or pos is None or not to_aa:
-                self._status.setText("Can't substitute — a position isn't on the active design (re-scan).")
-                return
-            by_cd.setdefault(id(tcd), (tcd, []))[1].append((int(pos), str(to_aa)))
+        skipped: List[str] = []                       # same loud-not-silent discipline as _enact_basket
+        for s in subs:
+            tcd, col, reason = self._map_basket_sub(cd_map, s)
+            if reason:
+                skipped.append(reason)
+                continue
+            by_cd.setdefault(id(tcd), (tcd, []))[1].append(
+                (col, str(s["to_aa"]).strip().upper(), int(s["position"])))
         made: List[tuple] = []
-        for tcd, plist in by_cd.values():
+        for tcd, items in by_cd.values():
             vid = self._design.new_variant_id()
             tcd.add_variant(vid)
-            n = 0
-            for pos, to_aa in plist:
-                col = self._col_for_resnum(tcd, pos)
-                if col is None:
-                    continue
-                tcd.edit_variant(vid, col, to_aa)
-                n += 1
-            made.append((tcd, vid, n))
-        if not made or all(m[2] == 0 for m in made):
-            self._status.setText("Substitution failed — no positions mapped to the design.")
+            for col, to_aa, pos in items:
+                try:
+                    tcd.edit_variant(vid, col, to_aa)
+                except Exception as exc:
+                    skipped.append(f"{tcd.rep_chain}:{pos}→{to_aa} ({type(exc).__name__})")
+            v = tcd.get_variant(vid)
+            n = len(v.mutations) if v is not None else 0
+            if n == 0:
+                tcd.variants = [x for x in tcd.variants if x.id != vid]   # never leave an empty variant
+            else:
+                made.append((tcd, vid, n))
+        if not made:
+            msg = "Substitution failed — no positions mapped to the design"
+            if skipped:
+                msg += " (" + "; ".join(sorted(set(skipped))) + ")"
+            self._status.setText(msg + ".")
             return
         made.sort(key=lambda m: -m[2])
         primary_cd, primary_vid, _ = made[0]
         tab = self._focus_tab_for_design(primary_cd)
         msg = (f"{primary_vid}: {pair_label(cand)} charge pair substituted "
-               f"({'across 2 chains' if len(made) > 1 else 'both positions'}). Fold this variant to "
-               f"VALIDATE (re-fold + deviation — charged residues fold natively, no constraint).")
+               f"({'across 2 chains' if len(made) > 1 else 'both positions'}).")
+        if skipped:
+            msg += " Skipped " + "; ".join(sorted(set(skipped))) + "."
+        msg += " Fold this variant to VALIDATE (re-fold + deviation — charged residues fold natively, no constraint)."
         if tab is not None:
             self._after_variant_edit(tab, primary_vid, msg)
         else:
@@ -4741,6 +5202,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                              f"fills {cand.get('fill_fraction', 0):.0%}; "
                              + ("⚠ clash" if cand.get("clash") else "clash-free")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {cand.get('from_aa','')}{cand.get('position')}→{cand.get('to_aa','')} "
                              f"(cavity fill) to the design basket.")
@@ -4758,6 +5223,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                              + ("H-bond donor (penalized)" if cand.get("hbond_donates")
                                 else "no backbone H-bond donor")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {cand.get('from_aa','')}{cand.get('position')}→P to the design basket.")
 
@@ -4782,6 +5251,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "metrics_text": (f"Sγ–Sγ {sg if sg is not None else '—'}Å χSS {chi if chi is not None else '—'}°; "
                              + ("⚠ clash" if clash else "clash-free" if clash is False else "geometric")),
         }
+        reason = self._unstageable_reason(entry["subs"])
+        if reason:                                    # block a pick that can't land (no silent vanish at enact)
+            self._status.setText(f"Can't add — {reason}. Re-scan if the structure changed.")
+            return
         self.design_basket.add_entry(entry)
         self._status.setText(f"Added {pair_label(pair)} (both→Cys) to the design basket.")
 
@@ -4794,25 +5267,23 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         if self._design is None or not entries:
             return
         cd_map = self._chain_to_cd()
-        by_cd: Dict[int, tuple] = {}                  # id(cd) -> (cd, [subs]) — group atoms by owner cd
+        by_cd: Dict[int, tuple] = {}                  # id(cd) -> (cd, [(col, to_aa, pos)]) by owner cd
+        skipped: List[str] = []                       # human reasons a sub couldn't land — NEVER silent
         for e in entries:
             for s in e.get("subs", []):
-                tcd = cd_map.get(s["chain"])
-                if tcd is None:
+                tcd, col, reason = self._map_basket_sub(cd_map, s)
+                if reason:                            # off-template resnum / unmapped chain / bad target
+                    skipped.append(reason)
                     continue
-                by_cd.setdefault(id(tcd), (tcd, []))[1].append(s)
-        if not by_cd:
-            self._status.setText("Enact failed — the basket's chains aren't on the active design.")
-            return
+                by_cd.setdefault(id(tcd), (tcd, []))[1].append((col, s["to_aa"], int(s["position"])))
         # BACKSTOP (Fix 1b): two subs grouped onto the SAME cd at the SAME resnum but with DIFFERENT
         # target residues would silently overwrite (edit_variant dedups v.mutations by resnum) — the
         # homo-collapse loss. The basket conflict-check blocks this upstream; this is the defensive net
         # for any caller that reaches enact without it (programmatic basket construction, future seams).
         # Refuse the WHOLE enact rather than compose a half-built, last-write-wins variant.
-        for tcd, subs in by_cd.values():
+        for tcd, items in by_cd.values():
             want: Dict[int, str] = {}
-            for s in subs:
-                pos, aa = int(s["position"]), s["to_aa"]
+            for _col, aa, pos in items:
                 if want.get(pos, aa) != aa:
                     self._status.setText(
                         f"Enact blocked — conflicting substitutions at {tcd.rep_chain}:{pos} "
@@ -4821,26 +5292,37 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                     return
                 want[pos] = aa
         made: List[tuple] = []                        # (cd, vid, n_applied)
-        for tcd, subs in by_cd.values():
+        for tcd, items in by_cd.values():
             vid = self._design.new_variant_id()
             tcd.add_variant(vid)
-            seen_pos: set = set()
-            n = 0
-            for s in subs:
-                col = self._col_for_resnum(tcd, s["position"])
-                if col is None:
-                    continue
-                tcd.edit_variant(vid, col, s["to_aa"])
-                if int(s["position"]) not in seen_pos:    # count distinct residues (a homo dup → one)
-                    seen_pos.add(int(s["position"]))
-                    n += 1
-            made.append((tcd, vid, n))
+            for col, to_aa, pos in items:
+                try:
+                    tcd.edit_variant(vid, col, to_aa)
+                except Exception as exc:              # defensive — _map_basket_sub already validated
+                    skipped.append(f"{tcd.rep_chain}:{pos}→{to_aa} ({type(exc).__name__})")
+            v = tcd.get_variant(vid)
+            n = len(v.mutations) if v is not None else 0   # REAL changes (a to-WT sub reverts → 0)
+            if n == 0:
+                tcd.variants = [x for x in tcd.variants if x.id != vid]   # never leave an empty variant
+            else:
+                made.append((tcd, vid, n))
+        # Nothing landed → surface WHY (not a silent empty variant), and KEEP the basket so the picks
+        # are recoverable / re-targetable rather than consumed into nothing.
+        if not made:
+            msg = "Enact failed — no substitutions could be applied"
+            if skipped:
+                msg += " (" + "; ".join(sorted(set(skipped))) + ")"
+            self._status.setText(msg + ". The basket is unchanged — re-scan if the structure changed.")
+            return
         made.sort(key=lambda m: -m[2])                # refresh on the most-substituted cd's new variant
         primary_cd, primary_vid, _ = made[0]
         total = sum(m[2] for m in made)
-        msg = (f"Enacted {len(entries)} pick(s) → variant {primary_vid} ({total} substitution(s)"
-               + (f" across {len(made)} chains" if len(made) > 1 else "")
-               + "). Fold it to VALIDATE (the fold reveals the combination's effect).")
+        msg = (f"Enacted variant {primary_vid} — {total} substitution(s)"
+               + (f" across {len(made)} chains" if len(made) > 1 else "") + ".")
+        if skipped:                                   # partial success is reported, never hidden
+            uniq = sorted(set(skipped))
+            msg += f" Skipped {len(uniq)}: " + "; ".join(uniq) + "."
+        msg += " Fold it to VALIDATE (the fold reveals the combination's effect)."
         tab = self._focus_tab_for_design(primary_cd)
         if tab is not None:
             self._after_variant_edit(tab, primary_vid, msg)
@@ -4873,8 +5355,27 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._select_result_mode("none")          # current result has no data → revert
             self._mode_key = "none"
 
+    def _sync_deviation_enabled(self, tab: "_ChainDesignTab") -> None:
+        """Grey the Deviation button when the active variant's fold can't be compared to a WT
+        reference of the SAME engine+oligomer (an un-pinned fold at a different shape than the
+        construct baseline) — clearer than a click that then refuses. Enabled in every other case
+        (incl. no fold yet — the handler then tells you to fold first). Synced on render/active-row."""
+        btn = getattr(self, "_dev_btn", None)
+        if btn is None:
+            return
+        ok = True
+        v = self._active_variant(tab) if tab is not None else None
+        cd = tab.design if tab is not None else None
+        if (v is not None and v.results.fold and cd is not None
+                and self._design is not None and self._design.source == "sequence"):
+            combo = f"{v.results.fold.get('engine')}:{v.results.fold.get('target')}"
+            tf = cd.template_fold or {}
+            ok = combo in cd.wt_refs or f"{tf.get('engine')}:{tf.get('target')}" == combo
+        btn.setEnabled(ok)
+
     def _apply_color_to(self, tab: _ChainDesignTab) -> None:
         self._refresh_color_mode_availability(tab)    # grey result modes lacking data
+        self._sync_deviation_enabled(tab)             # grey Deviation on an un-comparable fold combo
         if self._mode_key == _RESULT_DDG_MODE:
             hexmap = {rn: ddg_color(d) for rn, d in self._active_ddg_map(tab).items()}
             tab.set_result_coloring(tab.active_row_id, {k: v for k, v in hexmap.items() if v})
@@ -5109,6 +5610,17 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                                  "score_mutations": score_mutations,
                                  # scope the deep-tier estimate to the scored positions
                                  "scan_positions": sorted(score_mutations)}
+        # De-novo construct: there is no downloadable PDB, so feed the WT fold's structure
+        # (saved fresh to a temp PDB) as pdb_path — otherwise the fast-tier STRUCTURE voters
+        # (ThermoMPNN, RaSP) and the author-resnum authority degrade to silence, leaving only
+        # CamSol + ESM. Loaded crystals are LEFT to the router's _ensure_pdb_file (canonical
+        # RCSB PDB) — UNCHANGED. Best-effort + fail-open: an unfolded / closed / unsaveable
+        # construct leaves pdb_path unset and the scan still runs sequence-only.
+        if self._design.source == "sequence":
+            src = self._active_structure()
+            pdb = self._save_structure_pdb(src["model_id"]) if src else None
+            if pdb:
+                ti["pdb_path"] = pdb
         if deep:
             ti["run_rosetta"] = True
         tier = "deep" if deep else "fast"
@@ -5170,7 +5682,10 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             return
         cd, v = cd_v
         candidates = self._candidates_from_result(result)
-        v.results.stability = stability_summary(candidates, v.mutations)
+        # MERGE, don't replace: a deep Rosetta run augments an earlier fast ThermoMPNN/RaSP run so
+        # ALL method axes survive (the export keeps every set, even after a higher-quality analysis).
+        v.results.stability = merge_stability(v.results.stability,
+                                              stability_summary(candidates, v.mutations))
         # restore the suggestion-scan cache the stability run overwrote
         snap = getattr(self, "_scan_cache_snapshot", None)
         if snap is not None and self._session is not None:
@@ -5237,29 +5752,45 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             boltz = False
         return {"esmfold": esm, "boltz": boltz}
 
-    def fold_launch_spec(self, engine: str, assembly: bool = False) -> Optional[dict]:
+    def fold_launch_spec(self, engine: str, assembly: bool = False,
+                         n_copies: Optional[int] = None) -> Optional[dict]:
         """Deterministic fold spec for the ACTIVE variant through *engine*: fold LOCAL-ONLY,
         open the model, pLDDT-colour it, matchmaker onto the WT reference. *assembly* (Boltz
-        only) folds the full homo-oligomer — one chain per `cd.members` copy, each the variant's
-        sequence — overlaid on the WT oligomer. confidence='low' → the spine's confirm-gate.
-        None when there is no active variant. The SAME spec shape every engine reuses."""
+        only) folds the full homo-oligomer. confidence='low' → the spine's confirm-gate.
+        None when there is no active variant. The SAME spec shape every engine reuses.
+
+        DE-NOVO oligomer:
+          • *n_copies* OMITTED (the disulfide-constrain caller + the loaded picker) → PINNED: the
+            variant folds at the CONSTRUCT's engine + oligomer and superposes onto the T-fold, so
+            the variant, the WT reference, and the floor seeds all fold the same (deviation-valid).
+          • *n_copies* GIVEN (the de-novo variant picker) → UN-PINNED: the user's engine + N-mer are
+            honoured — the variant is its OWN fold (the construct baseline is untouched). Superpose
+            onto the T-fold ONLY when engine + oligomer MATCH the baseline (you can't overlay a
+            monomer on a trimer reference); a mismatched fold is standalone (no_reference) and
+            deviation-vs-WT guards/greys on the combo (a per-oligomer reference is the follow-up)."""
         tab = self._cur_tab()
         v = self._active_variant(tab)
         if v is None or self._design is None:
             return None
         cd = tab.design
-        # DE-NOVO (sequence-seeded): the variant folds at the CONSTRUCT's engine + oligomer (GAP C)
-        # and superposes onto the construct's T-FOLD, not the synthetic design id (GAP A). The
-        # T-fold IS the de-novo analog of the crystal reference; engine/target are pinned from it,
-        # not the picker, so the variant, the WT reference, and the floor seeds all fold the same.
         denovo = self._design.source == "sequence"
         tf = cd.template_fold if denovo else {}
+        unpinned = denovo and n_copies is not None
+        n = matches = 0
         if denovo:
             if not tf.get("model_id"):
-                return None                       # construct not folded yet → no reference to fold against
-            engine     = tf.get("engine", engine)             # PIN engine from the construct fold
-            assembly   = (tf.get("target") == "assembly")     # PIN oligomer from the construct fold
-            compare_to = tf.get("model_id")                   # superpose onto the T-fold (GAP A)
+                return None                       # construct not folded yet → no baseline/reference
+            if unpinned:
+                n = max(1, int(n_copies))
+                if n > 1 and engine not in ("boltz", "colabfold"):
+                    return None                   # ESMFold is monomer-only
+                assembly   = n > 1
+                matches    = (engine == tf.get("engine") and n == len(cd.members))   # baseline shape?
+                compare_to = tf.get("model_id") if matches else None                 # superpose iff matched
+            else:
+                engine     = tf.get("engine", engine)             # PIN engine from the construct fold
+                assembly   = (tf.get("target") == "assembly")     # PIN oligomer from the construct fold
+                compare_to = tf.get("model_id")                   # superpose onto the T-fold
         else:
             compare_to = self._design.model_id    # crystal design: matchmaker onto the loaded WT
         ti: Dict[str, object] = {
@@ -5267,11 +5798,19 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             "chain":      cd.rep_chain,
             "engine":     engine,
             "open_model": True,
-            "local_only": True,                   # LOCAL-ONLY: no remote Atlas/MSA server
-            "compare_to": compare_to,
+            "local_only": (engine in _LOCAL_FOLD_ENGINES) if unpinned else True,
         }
+        if compare_to is not None:
+            ti["compare_to"] = compare_to         # superpose onto the WT reference
+        else:
+            ti["no_reference"] = True             # mismatched-shape variant fold → standalone (no overlay)
         if engine == "boltz" and assembly:
-            if denovo:
+            if unpinned:
+                ids = ([ch for (_m, ch) in cd.members] if matches
+                       else [chr(ord("A") + i) for i in range(n)])    # reuse baseline ids iff matched
+                ti["chains"] = [{"id": ch, "sequence": v.sequence} for ch in ids]
+                target = f"{len(ids)}-chain assembly"
+            elif denovo:
                 # FULL-COMPLEX composition (Stage 2b): a hetero construct's variant folds the
                 # WHOLE declared assembly, not the active chain alone. The ACTIVE cd contributes
                 # the variant's sequence × its members; EVERY OTHER cd contributes its own
@@ -5373,6 +5912,44 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         for i, c in enumerate(cd.template_cells):
             if (not c.is_gap) and c.resnum == int(resnum):
                 return i
+        return None
+
+    def _map_basket_sub(self, cd_map: Dict[str, "ChainDesign"], sub: dict):
+        """Resolve ONE basket sub → ``(cd, col, None)`` when it can land, or ``(None, None, reason)``
+        with a human reason when it can't: the target isn't a standard residue, its chain isn't on
+        the active design, or its resnum isn't a column on that design's template. The SINGLE source
+        of truth for "can this pick land?" — used to GUARD staging AND to apply-and-REPORT at enact,
+        so a pick that can't land is surfaced loud, NEVER silently dropped into an empty variant.
+        The standard-residue check uses the SAME `_STD_AA` set `edit_variant` enforces, so the guard
+        can't disagree with the editor."""
+        chain = str(sub.get("chain"))
+        pos = sub.get("position")
+        raw = sub.get("to_aa")
+        to_aa = (str(raw) if raw is not None else "").strip().upper()
+        if to_aa not in _STD_AA:
+            return None, None, f"{chain}:{pos}→{raw!r} (not a standard residue)"
+        tcd = cd_map.get(chain)
+        if tcd is None:
+            return None, None, f"{chain}:{pos} (chain not on the active design)"
+        try:
+            col = self._col_for_resnum(tcd, pos)
+        except (TypeError, ValueError):
+            col = None
+        if col is None:
+            return None, None, f"{chain}:{pos} (residue not in the design template)"
+        return tcd, col, None
+
+    def _unstageable_reason(self, subs) -> Optional[str]:
+        """First reason any of *subs* can't land on the active design, or None if all can — the
+        curate-time guard so a pick that would silently vanish at enact is blocked AT STAGING
+        (the deferred "zero substitutions landed" gap: stale/mismatched chain or off-template resnum)."""
+        if self._design is None:
+            return "no active design"
+        cd_map = self._chain_to_cd()
+        for s in (subs or []):
+            _cd, _col, reason = self._map_basket_sub(cd_map, s)
+            if reason:
+                return reason
         return None
 
     def _normalize_ss_pairs(self, pairs):
@@ -5748,13 +6325,36 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             if tab is not None:
                 tab.set_glow_active(active)
 
-    def _highlight_disulfide_pair(self, cd, pair: dict) -> None:
+    def _pair_group_highlight(self, cd, members: List[dict]):
+        """(mid, union_both, apply_cmds) glowing ONE OR MORE pair candidates — the members of a grouped
+        row (equivalent copies) light TOGETHER. Reuses `_disulfide_scan_highlight_commands` per member
+        (so a single member is byte-identical to the ungrouped glow, incl. its Cβ–Cβ distance); when >1
+        member a final union `select` lights every copy's halo at once (the per-member selects overwrite
+        one another). (None, None, []) when no member resolves to a real rendered id."""
+        mid = None
+        boths: List[str] = []
+        cmds: List[str] = []
+        for m in members:
+            mm, _a, _b, both = self._disulfide_pair_specs(cd, m)
+            if mm is None:
+                continue
+            mid = mm
+            boths.append(both)
+            cmds += self._disulfide_scan_highlight_commands(cd, m)
+        if mid is None or not cmds:
+            return None, None, []
+        union = " ".join(boths)
+        if len(boths) > 1:
+            cmds.append(f"select {union}")            # union halo across all equivalent copies
+        return mid, union, cmds
+
+    def _highlight_disulfide_pair(self, cd, pair: dict, members: Optional[List[dict]] = None) -> None:
         """Glow a pair's two members in 3D — the §9 unified-highlighting GOOD CITIZEN: routes through
         the EXISTING `_run_commands_bg` selection seam (no new scattered highlight path; this tab is
         the convergence surface). RESTORE the prior glow FIRST (so A un-glows + the scene un-ghosts
-        before B glows — non-destructive, never stacking), apply the new glow, then record its state."""
-        apply = self._disulfide_scan_highlight_commands(cd, pair)
-        mid, _a, _b, both = self._disulfide_pair_specs(cd, pair)
+        before B glows — non-destructive, never stacking), apply the new glow, then record its state.
+        *members* (a grouped row's equivalent copies) glow together; absent → just *pair*."""
+        mid, both, apply = self._pair_group_highlight(cd, members or [pair])
         new_state = {"mid": mid, "both": both} if (mid is not None and apply) else None
         self._apply_or_toggle_glow(new_state, apply)   # re-clicking the same pair toggles it off
 
@@ -5794,15 +6394,41 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
             self._status.setText("Select a VARIANT row first (T is the template baseline).")
             return
         cd = self._cur_tab().design
-        # DE-NOVO: no engine picker — the variant folds at the CONSTRUCT's engine + oligomer
-        # (pinned in fold_launch_spec from cd.template_fold). Requires the construct be folded first.
+        # DE-NOVO: a variant folds against the construct's baseline (T-fold), which must exist first.
+        # Engine + oligomer are now USER-CHOSEN (un-pinned) — the result lands on the variant's OWN
+        # fold (the baseline is untouched); deviation-vs-WT guards/greys when the chosen combo differs
+        # from the baseline. Same picker idea as a loaded variant, with mono/di/tri/tetramer.
         if self._design is not None and self._design.source == "sequence":
-            tf = cd.template_fold
-            if not tf.get("model_id"):
+            if not (cd.template_fold or {}).get("model_id"):
                 self._status.setText("Fold the construct first (Fold ▾ → Fold construct) — a "
-                                     "variant folds at the construct's engine + oligomer.")
+                                     "variant folds against the construct's baseline.")
                 return
-            spec = self.fold_launch_spec(tf.get("engine", "boltz"))   # engine/target pinned inside
+            avail = self._fold_engine_availability()
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Fold variant")
+            box.setText(f"Fold {v.id} ({len(v.sequence)} aa) — pick engine + oligomer:")
+            box.setInformativeText(
+                "ESMFold = local monomer (fast). Boltz-2 = higher-quality, LOCAL-ONLY, seed-pinned; "
+                "folds mono/di/tri/tetramer. Deviation-vs-WT needs the SAME oligomer as the construct "
+                "baseline (it greys otherwise — re-fold to match).")
+            combos = [("ESMFold (monomer)", "esmfold", 1), ("Boltz-2 (monomer)", "boltz", 1),
+                      ("Boltz-2 (dimer)", "boltz", 2), ("Boltz-2 (trimer)", "boltz", 3),
+                      ("Boltz-2 (tetramer)", "boltz", 4)]
+            dn_btns: Dict[object, Tuple[str, int]] = {}
+            for label, eng, nc in combos:
+                b = box.addButton(label, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                if not avail.get(eng, False):
+                    b.setEnabled(False)
+                    b.setToolTip("Boltz env (~/boltz_env) not available" if eng == "boltz"
+                                 else "Local ESMFold worker (venv312) not installed")
+                dn_btns[b] = (eng, nc)
+            box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            dn_choice = dn_btns.get(box.clickedButton())
+            if dn_choice is None:
+                return
+            dn_eng, dn_nc = dn_choice
+            spec = self.fold_launch_spec(dn_eng, n_copies=dn_nc)       # UN-PINNED: user's engine + N-mer
             if spec is not None:
                 self.launchRequested.emit(spec)
             return
@@ -5952,9 +6578,14 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
         wt_ref = cd.wt_refs.get(combo)
         if not wt_ref and self._design.source == "sequence" and cd.template_fold.get("model_id"):
             tf = cd.template_fold
-            wt_ref = {"engine":   tf.get("engine"),  "target": tf.get("target"),
-                      "seed":     tf.get("seed"),    "model_id": tf.get("model_id"),
-                      "path":     tf.get("cif_path") or tf.get("pdb_path")}
+            # Reuse the construct T-fold as the reference ONLY when it was folded the SAME way as the
+            # variant (engine:oligomer). An un-pinned variant folded at a different shape has no valid
+            # baseline reference → leave None (the _on_deviation_clicked guard refuses; a per-oligomer
+            # reference fold is the deferred "adapt" follow-up).
+            if f"{tf.get('engine')}:{tf.get('target')}" == combo:
+                wt_ref = {"engine":   tf.get("engine"),  "target": tf.get("target"),
+                          "seed":     tf.get("seed"),    "model_id": tf.get("model_id"),
+                          "path":     tf.get("cif_path") or tf.get("pdb_path")}
         ti: Dict[str, object] = {
             "variant_model_id": fold["model_id"],
             "engine":           engine,
@@ -6000,6 +6631,20 @@ class VariantWorkbenchPanel(QtWidgets.QWidget):
                 f"indel-aware deviation is monomer-only for now. Fold {v.id} as a MONOMER "
                 f"to compare (refusing to mis-pair the multimer deletion).")
             return
+        # GREY-OUT + WARN (un-pinned-fold guard): deviation compares per-residue vs a WT reference
+        # folded the SAME way (engine:oligomer). A variant folded at a different shape than the
+        # construct baseline (now possible) has no valid reference — refuse rather than mis-compare a
+        # monomer to a trimer. (The per-oligomer WT reference fold is the deferred "adapt" follow-up.)
+        if self._design.source == "sequence":
+            combo = f"{v.results.fold.get('engine')}:{v.results.fold.get('target')}"
+            tf = tab.design.template_fold or {}
+            if combo not in tab.design.wt_refs and f"{tf.get('engine')}:{tf.get('target')}" != combo:
+                self._status.setText(
+                    f"Deviation-vs-WT needs a WT reference folded the same way as {v.id} ({combo}); "
+                    f"the construct baseline is {tf.get('engine')}:{tf.get('target')}. Re-fold {v.id} "
+                    f"to match the baseline (a per-oligomer reference is coming) — refusing to "
+                    f"compare different fold shapes.")
+                return
         spec = self.deviation_launch_spec()
         if spec is not None:
             self.launchRequested.emit(spec)

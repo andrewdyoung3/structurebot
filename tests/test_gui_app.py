@@ -27,6 +27,44 @@ def _app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+# ── _DotTabBar: a "new / unviewed results" dot per tab ───────────────────────────
+
+def test_dot_tab_bar_tracks_and_paints(_app):
+    bar = gui_app._DotTabBar()
+    tabs = QtWidgets.QTabWidget()
+    tabs.setTabBar(bar)
+    for name in ("A", "B", "C"):
+        tabs.addTab(QtWidgets.QWidget(), name)
+    bar.set_new(1, True)
+    assert 1 in bar._new
+    bar.set_new(1, False)
+    assert 1 not in bar._new
+    bar.set_new(2, True)
+    bar.size()                                          # realize geometry
+    bar.repaint()                                       # paintEvent over a dotted tab must not raise
+
+
+def test_dot_marks_on_new_results_and_clears_on_view(_app):
+    # the gui wire (without a full window): a result-tab signal sets the dot when it's not current;
+    # activating that tab clears it. Driven through the same _mark_tab_new / _on_tab_activated methods.
+    bar = gui_app._DotTabBar()
+    tabs = QtWidgets.QTabWidget()
+    tabs.setTabBar(bar)
+    home, results = QtWidgets.QWidget(), QtWidgets.QWidget()
+    tabs.addTab(home, "Home"); tabs.addTab(results, "Results")
+    tabs.setCurrentIndex(0)
+
+    class _Stub:
+        def __init__(self): self.tabs = tabs
+        _mark_tab_new = gui_app.StructureBotWindow._mark_tab_new
+        _on_tab_activated = gui_app.StructureBotWindow._on_tab_activated
+    s = _Stub()
+    s._mark_tab_new(results)                             # results not current → dot
+    assert tabs.indexOf(results) in bar._new
+    s._on_tab_activated(tabs.indexOf(results))           # user opens it → cleared
+    assert tabs.indexOf(results) not in bar._new
+
+
 # ── QtPresenter: output renders to an HTML signal, never a widget ─────────────────
 
 def test_output_emits_html_signal(_app):
@@ -111,8 +149,9 @@ def test_engine_drives_qt_presenter(_app):
 
 def test_handle_tool_request_enters_the_spine(_app):
     sig = PresenterSignals()
-    out = []
+    out, act = [], []
     sig.append_html.connect(lambda h: out.append(h))
+    sig.activity.connect(lambda h: act.append(h))                 # planning warnings → Activity panel
     sig.ask.connect(lambda kind, payload, q: q.put("proceed"))   # the confirm-gate → proceed
     pres = QtPresenter(sig)
 
@@ -143,10 +182,10 @@ def test_handle_tool_request_enters_the_spine(_app):
     assert built["confidence"] == "low"
     host.router.execute.assert_called_once()
     host.translator.translate.assert_not_called()
-    # the deep-tier estimate reached the pane before the gate
+    # the deep-tier estimate reached the user (via the Activity panel) before the gate
     import re as _re
-    text = _re.sub(r"<[^>]+>", "", " ".join(out))
-    assert "approximate runtime" in text.lower()
+    act_text = _re.sub(r"<[^>]+>", "", " ".join(act))
+    assert "approximate runtime" in act_text.lower()
 
 
 def test_handle_tool_request_on_result_seam(_app):
@@ -533,7 +572,8 @@ def _fakew(**attrs):
     """Bind the session-menu methods to a non-QWidget stand-in (avoids the full QMainWindow)."""
     obj = types.SimpleNamespace(**attrs)
     for name in ("_on_load_session", "_on_clear_session", "_on_save_session",
-                 "_redisplay_designs", "_reset_view_for_session", "show_model"):
+                 "_redisplay_designs", "_reset_view_for_session", "show_model",
+                 "_close_own_models"):
         setattr(obj, name, types.MethodType(getattr(W, name), obj))
     return obj
 
@@ -574,19 +614,100 @@ def test_load_session_replaces_and_redisplays_denovo(_app, monkeypatch):
     wb.rehydrate_denovo.assert_called_once()        # de-novo design re-displayed via the contract
 
 
+# ── stabilization sweep: the batch queue runs specs one at a time (single-in-flight) ──
+
+def _batch_stub(**attrs):
+    attrs.setdefault("_in_flight", False)
+    attrs.setdefault("_scan_queue", [])
+    attrs.setdefault("presenter", _MM())
+    obj = types.SimpleNamespace(**attrs)
+    for name in ("_on_batch_launch", "_advance_scan_queue"):
+        setattr(obj, name, types.MethodType(getattr(W, name), obj))
+    return obj
+
+def test_stabilization_sweep_runs_specs_in_sequence(_app):
+    launched = []
+    obj = _batch_stub()
+    def fake_launch(spec):
+        launched.append(spec["refresh"])
+        obj._in_flight = True                        # mirror the real single-in-flight setup
+    obj._on_tool_launch = fake_launch
+    specs = [{"refresh": r} for r in ("disulfide_scan", "proline_scan", "cavity_scan")]
+    obj._on_batch_launch(specs)
+    assert launched == ["disulfide_scan"]            # only the first — the rest wait in the queue
+    for _ in range(4):                               # each completion advances the sweep
+        obj._in_flight = False
+        obj._advance_scan_queue()
+    assert launched == ["disulfide_scan", "proline_scan", "cavity_scan"]
+    assert obj._scan_queue == []
+
+def test_stabilization_sweep_declined_when_busy(_app):
+    obj = _batch_stub(_in_flight=True)
+    obj._on_tool_launch = lambda spec: pytest.fail("must not launch while a run is in flight")
+    obj._on_batch_launch([{"refresh": "proline_scan"}])
+    obj.presenter.warn.assert_called_once()
+    assert obj._scan_queue == []                     # nothing queued while busy
+
+
+class _CloseBridge:
+    """Bridge stub for the Clear path: `info models` returns a controllable id listing;
+    every command is recorded so the test can assert which models were closed."""
+    def __init__(self, models_value="", raise_conn=False):
+        self._models_value = models_value
+        self._raise_conn = raise_conn
+        self.commands = []
+    def run_command(self, cmd, timeout=None):
+        self.commands.append(cmd)
+        if self._raise_conn:
+            raise ConnectionError("ChimeraX connection lost")
+        if cmd == "info models":
+            return {"value": self._models_value, "error": None}
+        return {"value": "", "error": None}
+
+
 def test_clear_session_resets_state_and_view(_app, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(QtWidgets.QMessageBox, "question",
                         lambda *a, **k: QtWidgets.QMessageBox.StandardButton.Yes)
     monkeypatch.setattr(gui_app, "ToolRouter", lambda *a, **k: _MM())
     orig = _SS(); wb = _MM()
-    w = _fakew(bridge=_MM(), session=orig, router=_MM(), workbench=wb, presenter=_MM(),
-               tabs=QtWidgets.QTabWidget(), _grids={"x": 1})
+    br = _CloseBridge(models_value="#1 atomic 5HRZ\n#2 atomic 1ABC")
+    w = _fakew(bridge=br, session=orig, router=_MM(), workbench=wb, presenter=_MM(),
+               tabs=QtWidgets.QTabWidget(), _grids={"x": 1}, _foreign_mids=set())
     w._on_clear_session()
     assert w.session is not orig and isinstance(w.session, _SS)   # fresh state
     wb.attach_session.assert_called_once()
     wb.reset.assert_called_once()
     assert w._grids == {}                            # view reset
+    assert "close #1,2" in br.commands               # this session's models were CLOSED
+
+
+def test_close_own_models_excludes_foreign(_app):
+    br = _CloseBridge(models_value="#1 atomic foreign\n#2 atomic mine\n#3 atomic mine")
+    w = _fakew(bridge=br, _foreign_mids={"1"})       # #1 belongs to another window
+    w._close_own_models()
+    assert br.commands == ["info models", "close #2,3"]   # foreign #1 spared
+
+
+def test_close_own_models_numeric_sort(_app):
+    br = _CloseBridge(models_value="#1 a\n#2 a\n#10 a")
+    w = _fakew(bridge=br, _foreign_mids=set())
+    w._close_own_models()
+    assert br.commands == ["info models", "close #1,2,10"]  # numeric, not lexical
+
+
+def test_close_own_models_noop_when_nothing_mine(_app):
+    br = _CloseBridge(models_value="#1 a")
+    w = _fakew(bridge=br, _foreign_mids={"1"})       # the only model is foreign
+    w._close_own_models()
+    assert br.commands == ["info models"]            # nothing closed
+
+
+def test_close_own_models_survives_connection_loss(_app):
+    br = _CloseBridge(raise_conn=True)               # ChimeraX closed → run_command raises
+    w = _fakew(bridge=br, _foreign_mids=set())
+    w._close_own_models()                            # must not raise (best-effort)
+    assert br.commands == ["info models"]            # tried once; no close attempted
 
 
 def test_save_session_reports_success(_app, monkeypatch):
@@ -742,14 +863,17 @@ def test_remap_rewrites_structural_align_reference(_app):
     assert set(s.structures) == {"11"}                            # the reference structure rekeyed
 
 
-def test_reconnect_clicked_noop_without_structures(_app):
+def test_reconnect_clicked_relaunches_even_without_structures(_app):
+    # On an EMPTY session the button must STILL relaunch ChimeraX (the documented recovery
+    # for a closed window) — it must NOT bail. _do_reconnect handles zero structures fine.
     w = _fakew(session=_SS(), presenter=_MM(),
                reconnect_action=_MM(), statusBar=lambda: _MM(), _pool=_MM())
     # bind the reconnect handler too
     w._on_reconnect_clicked = types.MethodType(W._on_reconnect_clicked, w)
+    w._on_reconnect_done = lambda *a, **k: None       # slot the worker signal connects to
     w._on_reconnect_clicked()
-    w.presenter.dim.assert_called_once()                         # "nothing to re-open"
-    w._pool.start.assert_not_called()
+    w._pool.start.assert_called_once()                           # the relaunch worker DID start
+    w.reconnect_action.setEnabled.assert_called_with(False)      # disabled while reconnecting
 
 
 def test_reconnect_done_applies_remap_and_relinks(_app, monkeypatch):

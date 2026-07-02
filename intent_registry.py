@@ -238,6 +238,59 @@ def _has_display_verb(low: str) -> bool:
     return False
 
 
+# ── Structured view resolver: verb-AGNOSTIC noun + polarity → intent ───────────
+# The fixed alias lists only cover a handful of verb phrasings ("show as sticks"),
+# so "display/render/draw/make it/switch to/... as sticks" fell through to the LLM
+# (unreliable / offline in some sessions) and then to a graceful miss.  This layer
+# resolves the COMMON case deterministically: pull the representation NOUN out of
+# the phrase, read the show/hide POLARITY from the verb, and map the pair to an
+# intent — no exact phrase or LLM needed.  Runs after the alias tier and before the
+# LLM, so it never overrides a more specific alias.
+
+_REP_HIDE_VERBS: frozenset = frozenset([
+    "hide", "remove", "turn off", "get rid", "ditch", "lose", "drop",
+    "no more", "without", "unshow", "clear",
+])
+
+# Noun groups, MOST-SPECIFIC FIRST (ball-and-stick before stick/ball; each maps to
+# its show-intent and its hide-intent — hiding any atom style is view.hide_atoms).
+_VIEW_NOUN_GROUPS: tuple = (
+    (("ball-and-stick", "ball and stick", "ball & stick", "ball stick",
+      "balls and sticks"), "view.ball_and_stick", "view.hide_atoms"),
+    (("cartoon", "ribbon"), "view.cartoon_only", "view.hide_cartoon"),
+    (("surface",), "view.surface", "view.hide_surface"),
+    (("spacefill", "space-fill", "space fill", "spheres", "sphere", "cpk",
+      "vdw", "van der waals"), "view.spacefill", "view.hide_atoms"),
+    (("licorice", "sticks", "stick"), "view.sticks", "view.hide_atoms"),
+    (("atoms", "atom"), "view.show_atoms", "view.hide_atoms"),
+)
+
+
+def _is_hide_polarity(low: str) -> bool:
+    """True if the phrase asks to REMOVE a representation (else the default is SHOW)."""
+    for verb in _REP_HIDE_VERBS:
+        if " " in verb:
+            if verb in low:
+                return True
+        elif re.search(r"\b" + re.escape(verb) + r"\b", low):
+            return True
+    return bool(re.search(r"\boff\b", low))          # "cartoon off", "atoms off"
+
+
+def structured_view_intent(text: str) -> Optional[str]:
+    """Deterministic (noun + show/hide polarity) → view intent key, or None when no
+    representation noun is present.  Verb-agnostic: 'display/render/draw/make it/
+    switch to/turn into ... as sticks/spheres/cartoon/surface/…' all resolve."""
+    if not text:
+        return None
+    low = text.lower()
+    hide = _is_hide_polarity(low)
+    for nouns, show_key, hide_key in _VIEW_NOUN_GROUPS:
+        if any(n in low for n in nouns):
+            return hide_key if hide else show_key
+    return None
+
+
 def _representation_noun_floor(low: str) -> bool:
     """
     Conservative noun-floor for representation detection.

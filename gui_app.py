@@ -60,6 +60,44 @@ def _async_raise(tid: int, exctype=KeyboardInterrupt) -> None:
         pass
 
 
+# ── tab bar with a "new results" dot ─────────────────────────────────────────────
+
+class _DotTabBar(QtWidgets.QTabBar):
+    """Tab bar that paints a small accent dot in a tab's top-right corner when that tab has new,
+    UNVIEWED results. Membership is index-keyed in ``_new``; a tab clears its dot when activated.
+    Pure presentation — it never changes which tab is current or what a tab contains."""
+
+    _DOT_COLOR = "#e06c2a"
+    _R = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._new: set = set()
+
+    def set_new(self, index: int, on: bool = True) -> None:
+        if index < 0:
+            return
+        if on:
+            self._new.add(index)
+        else:
+            self._new.discard(index)
+        self.update()
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)                              # normal tabs first
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(self._DOT_COLOR))
+        for i in list(self._new):
+            if i >= self.count():
+                continue
+            r = self.tabRect(i)
+            painter.drawEllipse(
+                QtCore.QPoint(r.right() - self._R - 4, r.top() + self._R + 4), self._R, self._R)
+        painter.end()
+
+
 # ── workers ─────────────────────────────────────────────────────────────────────
 
 class _RequestSignals(QtCore.QObject):
@@ -311,6 +349,71 @@ class _HistoryLineEdit(QtWidgets.QLineEdit):
         super().keyPressEvent(e)
 
 
+class _ActivityPanel(QtWidgets.QWidget):
+    """Collapsible 'Activity' strip that sits between the chat log and the input.
+
+    It is the home for the tool-run LIFECYCLE — the tool-pipeline plan and the planning
+    warnings that used to be interleaved into the chat QTextEdit — plus a live status
+    line fed by the busy signal. Lifting these out keeps the chat log conversational.
+
+    Pure view: a header row (collapse toggle + always-visible status label) over a body
+    QTextEdit. The header status stays visible even when collapsed (status at a glance);
+    the body auto-expands when a run posts pipeline/warning content."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._toggle = QtWidgets.QToolButton()
+        self._toggle.setText("Activity")
+        self._toggle.setCheckable(True)
+        self._toggle.setArrowType(QtCore.Qt.RightArrow)
+        self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setStyleSheet("QToolButton{color:#bbbbbb;font-weight:bold;border:none;}")
+        self._toggle.toggled.connect(self._on_toggled)
+
+        self._status = QtWidgets.QLabel("idle")
+        self._status.setStyleSheet("color:#888888;")
+
+        header = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(header)
+        hl.setContentsMargins(4, 0, 4, 0)
+        hl.addWidget(self._toggle)
+        hl.addWidget(self._status, 1)
+
+        self._body = QtWidgets.QTextEdit(readOnly=True)
+        self._body.setStyleSheet("QTextEdit{background:#191919;color:#cccccc;}")
+        self._body.setMaximumHeight(150)
+        self._body.setVisible(False)
+
+        lay.addWidget(header)
+        lay.addWidget(self._body)
+
+    def _on_toggled(self, on: bool) -> None:
+        self._toggle.setArrowType(QtCore.Qt.DownArrow if on else QtCore.Qt.RightArrow)
+        self._body.setVisible(on)
+
+    def _expand(self) -> None:
+        if not self._toggle.isChecked():
+            self._toggle.setChecked(True)          # → _on_toggled shows the body
+
+    # ── presenter slots (UI thread) ──────────────────────────────────────────────
+    @QtCore.Slot(str)
+    def add_activity(self, html: str) -> None:
+        """Append a rendered pipeline table / planning-warning fragment and reveal it."""
+        self._body.append(html if html else "")
+        self._body.moveCursor(QtGui.QTextCursor.End)
+        self._expand()
+
+    @QtCore.Slot(bool, str)
+    def set_status(self, busy: bool, label: str) -> None:
+        self._status.setText(label if busy else "idle")
+        self._status.setStyleSheet("color:%s;" % ("#e0b040" if busy else "#888888"))
+
+
 # ── the window (== the engine host) ───────────────────────────────────────────────
 
 class StructureBotWindow(QtWidgets.QMainWindow):
@@ -342,6 +445,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._pool = QtCore.QThreadPool.globalInstance()
         self._grids: dict = {}            # (model, chain) -> _ChainGrid
         self._in_flight = False
+        self._scan_queue: List[dict] = []  # remaining specs of a stabilization sweep (run in sequence)
         self._pending_q = None            # clarification answer queue (input-box driven)
         self._worker: Optional[_RequestWorker] = None
         self._pending_focus: List[str] = []   # next_model_id() guesses — focus FALLBACK
@@ -371,6 +475,10 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.resize(1000, 720)
 
         self.tabs = QtWidgets.QTabWidget()
+        # Custom tab bar that can paint a "new / unviewed results" dot per tab (set BEFORE adding
+        # tabs so every tab uses it). Result tabs raise their dot via the resultsArrived signal below.
+        self.tabs.setTabBar(_DotTabBar(self.tabs))
+        self.tabs.currentChanged.connect(self._on_tab_activated)
         self.tabs.addTab(self.workbench, "Variant Workbench")   # Stage-1 panel (first tab)
         # PERSISTENT Disulfides results tab (whole-suite home) — a sibling top-level tab. It survives
         # switching back to "Variant Workbench" + panel rebuilds (the old modeless dialog vanished).
@@ -382,6 +490,12 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.workbench.cavity_tab, "Cavity")
         # PERSISTENT Salt-bridge results tab — the fourth peer strategy. Same contract.
         self.tabs.addTab(self.workbench.saltbridge_tab, "Salt bridges")
+        # "New results" dots — REAL wire: each strategy tab raises its dot when a scan populates it
+        # (resultsArrived), cleared when the user opens that tab. (Chain tabs #N/C are stubbed below —
+        # mark_chain_tab_new is ready; hook it to a per-chain result event when one exists.)
+        for _rt in (self.workbench.disulfides_tab, self.workbench.proline_tab,
+                    self.workbench.cavity_tab, self.workbench.saltbridge_tab):
+            _rt.resultsArrived.connect(lambda _w=_rt: self._mark_tab_new(_w))
         self.output = QtWidgets.QTextEdit(readOnly=True)
         self.output.setStyleSheet("QTextEdit{background:#1e1e1e;color:#dddddd;}")
         self.output.append(render_html(
@@ -390,10 +504,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.input = _HistoryLineEdit()
         self.input.setPlaceholderText("Ask StructureBot…  (e.g. \"open 1hsg and show it as a cartoon\")")
 
+        # Activity strip: the tool-pipeline plan + planning warnings + run status, lifted
+        # OUT of the chat log so the conversation stays clean (item 4).
+        self.activity = _ActivityPanel()
+
         bottom = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.addWidget(self.output)
+        bl.addWidget(self.activity)
         bl.addWidget(self.input)
 
         # Sequence-favored vertical split: the workbench grid gets the majority (3:2 vs the
@@ -444,11 +563,14 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     def _connect(self) -> None:
         self._sig.append_html.connect(self._on_append)
+        self._sig.activity.connect(self.activity.add_activity)     # tool pipeline + warnings → panel
         self._sig.set_busy.connect(self._on_busy)
+        self._sig.set_busy.connect(self.activity.set_status)       # run status → panel header
         self._sig.ask.connect(self._on_ask)
         self.input.returnPressed.connect(self._on_submit)
         # Stage 3b: the Workbench requests a tool launch → run it on the engine spine.
         self.workbench.launchRequested.connect(self._on_tool_launch)
+        self.workbench.batchLaunchRequested.connect(self._on_batch_launch)
 
     # ── presenter signal slots (UI thread) ───────────────────────────────────────
     @QtCore.Slot(str)
@@ -567,6 +689,25 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     # ── Stage 3b: tool launch from the Variant Workbench ──────────────────────────
     @QtCore.Slot(dict)
+    def _on_batch_launch(self, specs: list) -> None:
+        """Stabilization sweep: run a LIST of workbench scan specs one at a time (the engine
+        spine is single-in-flight). Each result routes to its tab via the existing per-refresh
+        path; the queue is advanced when each run finishes (in _on_tool_done / _on_request_failed).
+        """
+        if self._in_flight:
+            self.presenter.warn("A request is already running — wait for it to finish.")
+            return
+        if not specs:
+            return
+        self._scan_queue = list(specs)
+        self._advance_scan_queue()
+
+    def _advance_scan_queue(self) -> None:
+        """Launch the next queued scan, if any (called after each run finishes)."""
+        if self._in_flight or not self._scan_queue:
+            return
+        self._on_tool_launch(self._scan_queue.pop(0))
+
     def _on_tool_launch(self, spec: dict) -> None:
         """Run a Workbench-built tool spec through the engine spine on a worker thread.
         On completion, fire the S3a consume path so the result auto-renders in the panel
@@ -754,6 +895,7 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self._finish_request()
         if opened:                              # a fold opened a model → isolate from other windows
             self._isolate_foreign_models()
+        self._advance_scan_queue()              # continue a stabilization sweep, if one is running
 
     @QtCore.Slot()
     def _on_request_done(self) -> None:
@@ -817,9 +959,11 @@ class StructureBotWindow(QtWidgets.QMainWindow):
     def _on_request_failed(self, err: str) -> None:
         if err == "cancelled":
             self.output.append(render_html("[warn]Cancelled.[/warn]"))
+            self._scan_queue = []               # cancel aborts the whole stabilization sweep
         else:
             self.output.append(render_html(f"[err]Request failed: {escape(err)}[/err]"))
         self._finish_request()
+        self._advance_scan_queue()              # one scan failing still runs the rest of the sweep
 
     def _finish_request(self) -> None:
         self._in_flight = False
@@ -894,6 +1038,32 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(grid, f"#{ch.model}/{ch.chain}  ({len(ch.cells)} aa)")
         return grid
 
+    # ── tab "new results" dots ───────────────────────────────────────────────────
+    def _mark_tab_new(self, widget) -> None:
+        """Dot the tab hosting *widget* as having new, unviewed results — unless it's already the
+        current tab (then there's nothing unviewed). Index-keyed; the result tabs hold fixed early
+        indices, so the index stays valid."""
+        bar = self.tabs.tabBar()
+        i = self.tabs.indexOf(widget)
+        if isinstance(bar, _DotTabBar) and i >= 0 and i != self.tabs.currentIndex():
+            bar.set_new(i, True)
+
+    def _on_tab_activated(self, index: int) -> None:
+        """Opening a tab clears its new-results dot (the results are now viewed)."""
+        bar = self.tabs.tabBar()
+        if isinstance(bar, _DotTabBar):
+            bar.set_new(index, False)
+
+    def mark_chain_tab_new(self, model, chain) -> None:
+        """STUB hook for per-chain (#N/C) tab dots. The infrastructure is ready — call this when a
+        result tied to a specific chain lands (e.g. a fold / per-chain scan completing). HOOK POINT:
+        wire it from the workbench's per-chain result handlers (the `apply_*` seams in
+        variant_workbench that target one chain) once a per-chain 'new result' event is identified.
+        No auto-marking today, so chain tabs never show a spurious dot."""
+        grid = self._grids.get((str(model), str(chain))) or self._grids.get((model, chain))
+        if grid is not None:
+            self._mark_tab_new(grid)
+
     def _focus_model(self, model_id: str) -> None:
         for key, grid in self._grids.items():
             if key[0] == model_id:
@@ -938,9 +1108,9 @@ class StructureBotWindow(QtWidgets.QMainWindow):
                 if "all" in s:
                     self.session.clear_all_structures()
                 else:
-                    m = re.search(r"#(\d+)", cmd)
-                    if m:
-                        self.session.remove_structure(m.group(1))
+                    ids = re.findall(r"#(\d+)", cmd)   # `close #1,3` → ['1','3']
+                    if ids:
+                        self.session.close_models(ids)
             for kw in ("cartoon", "surface", "style", "color", "show", "hide",
                        "transparency", "rainbow", "mlp", "coulombic", "preset"):
                 if s.startswith(kw):
@@ -1021,7 +1191,8 @@ class StructureBotWindow(QtWidgets.QMainWindow):
         `self.tabs`, so a blanket `clear()` would destroy the panel + its toolbar — leaving no way
         to start a new session). The workbench is cleared to its no-design state via `reset()`.
         Does NOT close ChimeraX models — a named Load reopens scene.cxs (replacing the scene
-        itself); Clear leaves the user's models untouched (parity with the CLI)."""
+        itself), and Clear closes its own models separately in `_on_clear_session` (via
+        `_close_own_models`) BEFORE calling this."""
         # KEEP the persistent suite tabs (the workbench + its toolbar AND the sibling Disulfides tab —
         # a sibling, not the workbench, so it was being swept out with the chain grids and never
         # re-added). Drop only the chain-grid tabs.
@@ -1113,9 +1284,15 @@ class StructureBotWindow(QtWidgets.QMainWindow):
     def _on_clear_session(self) -> None:
         if QtWidgets.QMessageBox.question(
                 self, "Clear session",
-                "Start a fresh session? Workbench designs + analysis are cleared. "
-                "Loaded ChimeraX models are left open.") != QtWidgets.QMessageBox.StandardButton.Yes:
+                "Start a fresh session? Workbench designs + analysis are cleared and "
+                "this session's ChimeraX models are closed.") != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        # Close THIS window's ChimeraX models so Clear is a TRULY fresh start (matches the CLI
+        # `clear`). Leaving models open used to DESYNC: session.structures emptied while the model
+        # stayed on screen, so its id was invisible to the translator and "remove that model"
+        # couldn't resolve it. Close BEFORE wiping the session (the close reads the live model set,
+        # not session.structures). Best-effort — a closed/unreachable ChimeraX never blocks the reset.
+        self._close_own_models()
         self.session = SessionState()
         self.router = ToolRouter(self.bridge, self.session)
         self.workbench.attach_session(self.session)
@@ -1125,7 +1302,24 @@ class StructureBotWindow(QtWidgets.QMainWindow):
             Path("session.json").unlink()
         except OSError:
             pass
-        self.presenter.dim("Session cleared — fresh start. Loaded ChimeraX models are untouched.")
+        self.presenter.dim("Session cleared — fresh start. This session's ChimeraX models were closed.")
+
+    def _close_own_models(self) -> None:
+        """Close every ChimeraX model THIS window owns — all open models EXCEPT the foreign
+        baseline (`_foreign_mids`: models another StructureBot window had open when this one
+        connected; those are only ever HIDDEN, never closed, so a shared ChimeraX is respected).
+        Best-effort: a closed or unreachable ChimeraX (run_command raises ConnectionError, which
+        we deliberately do NOT auto-relaunch from here) is a silent no-op so the session reset
+        always completes."""
+        try:
+            res = self.bridge.run_command("info models")
+            val = (res.get("value") or "") if isinstance(res, dict) else ""
+            all_ids = set(re.findall(r"#(\d+)", val))
+            mine = sorted(all_ids - getattr(self, "_foreign_mids", set()), key=int)
+            if mine:
+                self.bridge.run_command("close #" + ",".join(mine))
+        except Exception:
+            pass
 
     def _on_save_as_session(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(self, "Save As", "New session name:")
@@ -1176,12 +1370,19 @@ class StructureBotWindow(QtWidgets.QMainWindow):
 
     # ── Reconnect / refresh the ChimeraX view (relaunch + re-open + re-link) ──────────
     def _on_reconnect_clicked(self) -> None:
-        if not self.session.structures:
-            self.presenter.dim("Nothing to re-open — no structures in this session yet.")
-            return
+        # Always (re)launch ChimeraX — even on an EMPTY session. The button is the user's
+        # documented recovery for a closed window ("Re-open the ChimeraX window (if closed)…"),
+        # and the normal command path deliberately never auto-relaunches (the anti-window-pile
+        # guard). An early-return on an empty session left the user with NO way to bring
+        # ChimeraX back after closing it in a fresh session. `_do_reconnect` handles zero
+        # structures fine (ensure_visible_gui then a no-op re-open loop).
         self.reconnect_action.setEnabled(False)
         self.statusBar().showMessage("Reconnecting ChimeraX…")
-        self.presenter.info("Reconnecting ChimeraX (relaunching if closed; re-opening structures)…")
+        if not self.session.structures:
+            self.presenter.info("Reconnecting ChimeraX (relaunching the window if closed; "
+                                "no structures in this session to re-open)…")
+        else:
+            self.presenter.info("Reconnecting ChimeraX (relaunching if closed; re-opening structures)…")
         w = _ReconnectWorker(self)
         w.signals.done.connect(self._on_reconnect_done)
         self._pool.start(w)

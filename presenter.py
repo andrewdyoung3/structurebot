@@ -124,6 +124,15 @@ class Presenter(ABC):
     def show_commands(self, commands: List[str], explanations: List[str], confidence: str) -> None: ...
     @abstractmethod
     def show_tool_pipeline(self, result: dict) -> None: ...
+
+    def show_warnings(self, warnings: List[str]) -> None:
+        """Planning-stage warnings that accompany the tool-pipeline preview. Concrete
+        (not abstract) so the console + stubs keep the historical inline behavior — one
+        warn line per item. The GUI overrides this to route them into its Activity panel
+        instead of the chat log."""
+        for w in warnings:
+            self.warn(f"⚠ {w}")
+
     @abstractmethod
     def show_interface_summary(self, result: dict) -> None: ...
     @abstractmethod

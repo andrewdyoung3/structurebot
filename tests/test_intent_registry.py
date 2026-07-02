@@ -646,17 +646,36 @@ class TestRunRepresentation:
         assert result.error is not None
 
     def test_llm_fallback_called_when_no_alias(self):
-        """When intent_key=None, LLM classifier is invoked."""
+        """When intent_key=None AND no representation noun is present (so the deterministic
+        structured tier also misses), the LLM classifier is invoked."""
         ok     = _cx_ok("")
         router = self._router_with_bridge([ok, ok, ok, _cx_ok("0")])
 
         with patch("intent_registry.make_llm_classify_fn") as mock_factory:
             mock_factory.return_value = lambda t, ls: "view.cartoon_only"
             result = router._run_representation(
-                {"_user_input": "display the protein as a ribbon diagram", "intent_key": None},
+                {"_user_input": "display the protein the usual publication way", "intent_key": None},
             )
         assert result.success is True
         assert result.data.get("resolution") == "llm"
+
+    def test_structured_resolves_verb_agnostic_noun_without_llm(self):
+        """The reported gap: "display chain A as sticks" — a verb the alias list doesn't cover
+        ("display" vs "show as") — resolves DETERMINISTICALLY via the structured tier (noun +
+        polarity), never touching the LLM, and executes the stick style scoped to chain A."""
+        mb = MagicMock(); mb.run_command.return_value = {"value": "", "error": None}
+        ms = MagicMock(); ms.structures = {"1": {"name": "1hsg"}}
+        ms.get_structure.return_value = {"name": "1hsg"}
+        router = ToolRouter(bridge=mb, session=ms)
+        with patch("intent_registry.make_llm_classify_fn") as mock_factory:
+            mock_factory.side_effect = AssertionError("LLM must not be consulted for a noun phrase")
+            result = router._run_representation(
+                {"_user_input": "display chain A as sticks", "intent_key": None})
+        assert result.success is True
+        assert result.data.get("intent_key") == "view.sticks"
+        assert result.data.get("resolution") == "structured"
+        assert result.data.get("chain") == "A"
+        assert any("style" in c and "stick" in c for c in result.data.get("commands", []))
 
     def test_graceful_miss_when_llm_returns_none(self):
         """LLM returning None → graceful miss, success=False."""

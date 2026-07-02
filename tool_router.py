@@ -125,7 +125,14 @@ _design_classify_fn = None
 
 
 # ── biological-assembly chain-id normalization (pure helpers; unit-testable) ───────────
-_SUBMODEL_CHAIN_RE = re.compile(r"chain id #(\d+\.\d+)/(\S+)")
+# Matches submodel addressing `#N.M/<chain>` in BOTH `info chains` (`chain id #2.1/A …`) and
+# `info residues` (`residue id #2.1/A:12 …`) output — the char class stops at ':' so a residue
+# spec's chain id is captured cleanly. `info residues` is the canonical source because it ALSO
+# reports NON-POLYMER chains (glycans/ligands); `info chains` lists polymer chains only, and that
+# omission was the glyco-assembly "1 chain" bug: a NAG-bearing copy's glycan chains (B, C, …) were
+# invisible to the planner, so the copy-rename targets collided with them (`changechains` rejected)
+# and `combine retainIds` then refused the duplicate chain-A copies.
+_SUBMODEL_CHAIN_RE = re.compile(r"#(\d+\.\d+)/([^:/\s]+)")
 _INT_MODEL_RE = re.compile(r"model id #(\d+)\b")
 
 
@@ -142,9 +149,14 @@ def _chain_id_candidates():
 
 
 def _parse_submodel_chains(text: str, group_model_id: str):
-    """`info chains #N` text → ordered [(submodel_id, [chain_ids]), …] for SUBMODELS of the group
+    """`info residues #N` text → ordered [(submodel_id, [chain_ids]), …] for SUBMODELS of the group
     (`#N.M/chain` lines only). [] when the text has no submodel addressing (already a flat model →
-    nothing to normalize). Preserves first-seen order of submodels and of chains within each."""
+    nothing to normalize). Preserves first-seen order of submodels and of chains within each.
+
+    Sourced from `info residues` (not `info chains`) so NON-POLYMER chains — glycans/ligands like
+    NAG, which sit in their own chain ids B, C, … — are enumerated too; otherwise the copy-rename
+    plan collides with those hidden chains and normalization fails (the glyco-assembly bug). The
+    regex also accepts `info chains` lines, so this stays usable either way."""
     prefix = f"{group_model_id}."
     order: List[str] = []
     by_sub: Dict[str, List[str]] = {}
@@ -1434,7 +1446,10 @@ class ToolRouter:
             and not _claimed
         )
         if _ba_intent:
-            _ba_model_id   = self._primary_model_id()
+            # Target the VISIBLE model (what the user is focused on), not the always-#1
+            # heuristic — else "show as assembly" with A+B open re-assembles the first-opened
+            # A instead of the visible B. Falls back to _primary_model_id when no visible info.
+            _ba_model_id   = self._visible_focus_model_id() or self._primary_model_id()
             _ba_assembly_id = self._parse_bio_assembly_id(user_input)
             tools_needed = ["bio_assembly"]
             tool_inputs  = {
@@ -4579,7 +4594,7 @@ class ToolRouter:
         """
         try:
             submodel_chains = _parse_submodel_chains(
-                self._cx_value(f"info chains #{group_model_id}"), group_model_id)
+                self._cx_value(f"info residues #{group_model_id}"), group_model_id)
             if not submodel_chains:
                 return None, None, None                 # not submodel-addressed → already flat (no-op)
             renames, final_chains = plan_assembly_chain_renames(submodel_chains)
@@ -4616,7 +4631,9 @@ class ToolRouter:
         t0 = _time.perf_counter()
         user_input = user_input or inputs.get("_user_input", "")
 
-        model_id    = str(inputs.get("model_id") or self._primary_model_id())
+        model_id    = str(inputs.get("model_id")
+                          or self._visible_focus_model_id()
+                          or self._primary_model_id())
         assembly_id = int(inputs.get("assembly_id") or 1)
 
         # Guard: must have a loaded model
@@ -5006,13 +5023,18 @@ class ToolRouter:
                     "  Load a structure first, or pass a sequence explicitly."
                 ),
             )
-        if not pdb_path:
+        # Only the DEEP (Rosetta) tier hard-requires a local PDB. The fast tier is
+        # sequence-driven (CamSol + ESM) with structure-based voters (ThermoMPNN, RaSP)
+        # that degrade to silence when no structure is present — so a de-novo construct
+        # with no downloadable PDB still gets a fast stability result.
+        if run_rosetta and not pdb_path:
             return ToolStepResult(
                 tool="mutation_scan", success=False,
                 error=(
-                    "Mutation scan requires a local PDB file for Rosetta ddG.\n"
+                    "The deep (Rosetta) stability tier requires a local PDB file.\n"
                     "  StructureBot will attempt to download from RCSB if the\n"
-                    "  structure has a 4-letter PDB ID and internet is available."
+                    "  structure has a 4-letter PDB ID and internet is available.\n"
+                    "  For a de-novo construct, re-run the FAST tier (no Rosetta)."
                 ),
             )
 
@@ -9262,6 +9284,33 @@ class ToolRouter:
             return "1"
         return next(iter(structures))
 
+    def _visible_focus_model_id(self) -> Optional[str]:
+        """The model the user is focused on — i.e. what's VISIBLE on screen — so an
+        unspecified prompt acts on it rather than on a stale heuristic (the always-#1
+        bias of `_primary_model_id`). Read from the bridge's live display state:
+          • exactly one visible tracked structure → that one (the clear case);
+          • several visible → the most-recently-added (highest numeric id), a proxy for
+            "what the user just brought up";
+          • no bridge / nothing visible / probe fails → None, so the caller falls back to
+            `_primary_model_id()` unchanged (tests + headless stay deterministic).
+        Submodel ids collapse to top level (visible_model_ids already returns top-level)."""
+        if self.bridge is None:
+            return None
+        try:
+            visible = list(self.bridge.visible_model_ids() or [])
+        except Exception:
+            return None
+        if not visible:
+            return None
+        # Prefer visible ids that are tracked structures (skip e.g. a bare surface/volume).
+        tracked = [v for v in visible if v in self.session.structures]
+        pool = tracked or visible
+        if not pool:
+            return None
+        if len(pool) == 1:
+            return pool[0]
+        return max(pool, key=lambda s: int(s) if str(s).isdigit() else -1)
+
     def available_tools(self) -> Dict[str, str]:
         """Return {tool_name: status_string} for all tools."""
         status: Dict[str, str] = {"chimerax": "active"}
@@ -9687,7 +9736,8 @@ class ToolRouter:
         Commands are executed via bridge.run_command() directly and verified
         via post-command probe.  viz_commands=[] (already run); summary carries result.
         """
-        from intent_registry import VIEWER_REGISTRY, make_llm_classify_fn
+        from intent_registry import (VIEWER_REGISTRY, make_llm_classify_fn,
+                                      structured_view_intent)
         from translator import _scope_chain_refs_to_macromolecule
 
         user_input = user_input or inputs.get("_user_input", "")
@@ -9706,7 +9756,16 @@ class ToolRouter:
                 "representation", inputs.get("_translator_commands") or [])
         spec = tgt["spec"]
 
-        # Tier (b): LLM constrained classifier — fires when alias match missed
+        # Tier (a2): deterministic structured resolver — verb-AGNOSTIC noun + show/hide
+        # polarity → intent, WITHOUT the LLM.  Covers the common "display/render/draw/
+        # make it/switch to ... as sticks/spheres/cartoon/surface" phrasings the fixed
+        # alias lists miss (the reported "display chain A as sticks" gap).
+        if intent_key is None:
+            intent_key = structured_view_intent(user_input)
+            if intent_key is not None:
+                resolution = "structured"
+
+        # Tier (b): LLM constrained classifier — fires when alias + structured missed
         if intent_key is None:
             global _repr_classify_fn
             if _repr_classify_fn is None:

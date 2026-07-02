@@ -64,8 +64,9 @@ def render_html(renderable, width: int = 100) -> str:
 
 class PresenterSignals(QtCore.QObject):
     """The worker→UI bridge. Created on the UI thread; emits cross-thread are queued."""
-    append_html = QtCore.Signal(str)            # output → pane
-    set_busy    = QtCore.Signal(bool, str)      # (busy, label) → status bar
+    append_html = QtCore.Signal(str)            # chat output → pane
+    activity    = QtCore.Signal(str)            # tool-pipeline / planning warnings → Activity panel
+    set_busy    = QtCore.Signal(bool, str)      # (busy, label) → status bar + Activity header
     ask         = QtCore.Signal(str, object, object)   # (kind, payload, reply_queue:Queue)
 
 
@@ -79,6 +80,11 @@ class QtPresenter(Presenter):
     # ── helpers ─────────────────────────────────────────────────────────────────
     def _emit(self, renderable) -> None:
         self._sig.append_html.emit(render_html(renderable))
+
+    def _emit_activity(self, renderable) -> None:
+        # tool-run lifecycle (pipeline plan + planning warnings) → the Activity panel,
+        # not the chat log.
+        self._sig.activity.emit(render_html(renderable))
 
     # ── text ──────────────────────────────────────────────────────────────────
     def info(self, text: str) -> None:
@@ -132,7 +138,12 @@ class QtPresenter(Presenter):
             tool = step.get("tool", "?")
             desc = step.get("description", "")
             table.add_row(str(i), f"{icon} {tool}", escape(desc))
-        self._emit(table)
+        self._emit_activity(table)      # → Activity panel (not the chat log)
+
+    def show_warnings(self, warnings: List[str]) -> None:
+        # planning warnings ride with the pipeline preview → the Activity panel
+        for w in warnings:
+            self._emit_activity(f"[warn]⚠ {escape(w)}[/warn]")
 
     def show_interface_summary(self, result: dict) -> None:
         for step in result.get("tool_step_results", []):

@@ -542,16 +542,40 @@ from tool_router import plan_assembly_chain_renames, _parse_submodel_chains
 
 
 def test_parse_submodel_chains_homotrimer():
-    """`info chains #2` for a 3-copy homo assembly → 3 submodels each with chain A."""
-    txt = ("chain id #2.1/A chain_id A\n"
-           "chain id #2.2/A chain_id A\n"
-           "chain id #2.3/A chain_id A")
+    """`info residues #2` for a 3-copy homo assembly → 3 submodels each with chain A."""
+    txt = ("residue id #2.1/A:0 name VAL index 0\n"
+           "residue id #2.2/A:0 name VAL index 0\n"
+           "residue id #2.3/A:0 name VAL index 0")
     assert _parse_submodel_chains(txt, "2") == [("2.1", ["A"]), ("2.2", ["A"]), ("2.3", ["A"])]
+
+
+def test_parse_submodel_chains_includes_nonpolymer_glycan_chains():
+    """REGRESSION (glyco-assembly "1 chain" bug): each homotrimer copy carries a polymer chain A
+    PLUS non-polymer glycan chains B, C. `info residues` reports all three per copy (whereas
+    `info chains` would show only A), so the planner sees the FULL chain namespace and relabels
+    every colliding chain — copy 2 → D,E,F and copy 3 → G,H,I — leaving no collision for
+    `changechains`/`combine retainIds`."""
+    txt = ("residue id #2.1/A:0 name VAL index 0\n"     # protein
+           "residue id #2.1/B:1 name NAG index 1\n"     # glycan (hidden from `info chains`)
+           "residue id #2.1/C:1 name NAG index 2\n"
+           "residue id #2.2/A:0 name VAL index 0\n"
+           "residue id #2.2/B:1 name NAG index 1\n"
+           "residue id #2.2/C:1 name NAG index 2\n"
+           "residue id #2.3/A:0 name VAL index 0\n"
+           "residue id #2.3/B:1 name NAG index 1\n"
+           "residue id #2.3/C:1 name NAG index 2")
+    sub = _parse_submodel_chains(txt, "2")
+    assert sub == [("2.1", ["A", "B", "C"]), ("2.2", ["A", "B", "C"]), ("2.3", ["A", "B", "C"])]
+    renames, final = plan_assembly_chain_renames(sub)
+    assert final == ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
+    assert len(final) == len(set(final))                    # every chain id globally unique
+    assert renames == [("2.2", "A", "D"), ("2.2", "B", "E"), ("2.2", "C", "F"),
+                       ("2.3", "A", "G"), ("2.3", "B", "H"), ("2.3", "C", "I")]
 
 
 def test_parse_submodel_chains_flat_returns_empty():
     """A flat model (no submodel addressing) → [] (nothing to normalize)."""
-    assert _parse_submodel_chains("chain id #2/A chain_id A", "2") == []
+    assert _parse_submodel_chains("residue id #2/A:0 name VAL index 0", "2") == []
 
 
 def test_plan_renames_homotrimer_relabels_only_duplicates():
@@ -583,9 +607,9 @@ def test_normalize_assembly_emits_changechains_and_combine():
     returns the new flat model id + unique chain list."""
     router = _make_router(structures={"1": {"name": "2OMF"}})
     router.bridge.run_command.side_effect = [
-        _chimerax_result("chain id #2.1/A chain_id A\n"
-                         "chain id #2.2/A chain_id A\n"
-                         "chain id #2.3/A chain_id A"),     # info chains #2
+        _chimerax_result("residue id #2.1/A:0 name VAL index 0\n"
+                         "residue id #2.2/A:0 name VAL index 0\n"
+                         "residue id #2.3/A:0 name VAL index 0"),   # info residues #2
         _chimerax_result("changed"),                        # changechains #2.2/A B
         _chimerax_result("changed"),                        # changechains #2.3/A C
         _chimerax_result("model id #1 ...\nmodel id #2 ..."),  # info models (before)
@@ -606,7 +630,7 @@ def test_normalize_assembly_flat_input_is_noop():
     """A flat (non-submodel) model → no changechains/combine, returns (None, None)."""
     router = _make_router(structures={"1": {"name": "2OMF"}})
     router.bridge.run_command.side_effect = [
-        _chimerax_result("chain id #2/A chain_id A"),       # info chains #2 (already flat)
+        _chimerax_result("residue id #2/A:0 name VAL index 0"),   # info residues #2 (already flat)
     ]
     flat_id, final, note = router._normalize_assembly_to_flat_model("2", "x")
     assert flat_id is None and final is None and note is None    # no-op (already flat) → not an error
@@ -619,8 +643,8 @@ def test_normalize_assembly_failure_returns_reason():
     (so the fallback is never silent)."""
     router = _make_router(structures={"1": {"name": "2OMF"}})
     router.bridge.run_command.side_effect = [
-        _chimerax_result("chain id #2.1/A chain_id A\n"
-                         "chain id #2.2/A chain_id A"),     # info chains #2 (submodels present)
+        _chimerax_result("residue id #2.1/A:0 name VAL index 0\n"
+                         "residue id #2.2/A:0 name VAL index 0"),   # info residues #2 (submodels present)
         _chimerax_result("changed"),                        # changechains #2.2/A B
         _chimerax_result("model id #1\nmodel id #2"),       # info models (before)
         _chimerax_result("combine failed"),                 # combine
@@ -640,8 +664,8 @@ def test_run_bio_assembly_surfaces_normalization_failure_in_summary():
         _chimerax_result("Made 3 copies for 2omf assembly 1"),                 # sym
         _chimerax_result('model id #1 type AtomicStructure name 2omf\n'
                          'model id #2 type Model name "2omf assembly 1"'),     # info models (parse)
-        _chimerax_result("chain id #2.1/A chain_id A\n"
-                         "chain id #2.2/A chain_id A"),                        # info chains #2
+        _chimerax_result("residue id #2.1/A:0 name VAL index 0\n"
+                         "residue id #2.2/A:0 name VAL index 0"),             # info residues #2
         _chimerax_result("changed"),                                          # changechains
         _chimerax_result("model id #1\nmodel id #2"),                         # info models before
         _chimerax_result("combine failed"),                                   # combine
@@ -665,9 +689,9 @@ def test_run_bio_assembly_normalizes_and_records_flat_model():
         _chimerax_result("Made 3 copies for 2omf assembly 1"),                 # sym
         _chimerax_result('model id #1 type AtomicStructure name 2omf\n'
                          'model id #2 type Model name "2omf assembly 1"'),     # info models (parse)
-        _chimerax_result("chain id #2.1/A chain_id A\n"
-                         "chain id #2.2/A chain_id A\n"
-                         "chain id #2.3/A chain_id A"),                        # info chains #2
+        _chimerax_result("residue id #2.1/A:0 name VAL index 0\n"
+                         "residue id #2.2/A:0 name VAL index 0\n"
+                         "residue id #2.3/A:0 name VAL index 0"),             # info residues #2
         _chimerax_result("changed"),                                          # changechains B
         _chimerax_result("changed"),                                          # changechains C
         _chimerax_result("model id #1\nmodel id #2"),                         # info models before combine
@@ -821,3 +845,59 @@ def test_session_generated_assemblies_roundtrip(tmp_path):
     assert rec["assembly_model_id"] == "2"
     assert rec["assembly_type"] == "homotetramer"
     assert rec["n_subunits"] == 4
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. _visible_focus_model_id — bio_assembly targets the VISIBLE model
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_visible_focus_single_visible_returns_it():
+    """Only B (#3) visible → focus is B, not the always-#1 heuristic (the reported repro)."""
+    router = _make_router(structures={"1": {"name": "A"}, "3": {"name": "B"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=["3"])
+    assert router._visible_focus_model_id() == "3"
+
+
+def test_visible_focus_multiple_visible_returns_most_recent():
+    """A's assembly (#2) + B's monomer (#3) both visible → most-recently-added (#3)."""
+    router = _make_router(structures={"1": {"name": "A"}, "2": {"name": "A"}, "3": {"name": "B"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=["2", "3"])
+    assert router._visible_focus_model_id() == "3"
+
+
+def test_visible_focus_none_visible_returns_none():
+    """Nothing visible → None (caller falls back to _primary_model_id)."""
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=[])
+    assert router._visible_focus_model_id() is None
+
+
+def test_visible_focus_no_bridge_returns_none():
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge = None
+    assert router._visible_focus_model_id() is None
+
+
+def test_visible_focus_probe_failure_returns_none():
+    """A probe error must not crash — returns None so the caller falls back."""
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge.visible_model_ids = MagicMock(side_effect=RuntimeError("REST down"))
+    assert router._visible_focus_model_id() is None
+
+
+def test_bio_assembly_routing_targets_visible_model():
+    """route('show as trimeric assembly') with A+B open targets the VISIBLE B (#3), not #1."""
+    router = _make_router(structures={"1": {"name": "A"}, "2": {"name": "A"}, "3": {"name": "B"}})
+    router.bridge.visible_model_ids = MagicMock(return_value=["2", "3"])
+    routed = router.route(_translator_result_chimerax(), user_input="show as trimeric assembly")
+    inp = routed["tool_inputs"].get("bio_assembly", {})
+    assert inp.get("model_id") == "3", f"expected visible B (#3), got {inp.get('model_id')}"
+
+
+def test_bio_assembly_routing_falls_back_when_no_visible_info():
+    """No visible info (probe fails) → unchanged _primary_model_id() default (#1)."""
+    router = _make_router(structures={"1": {"name": "A"}})
+    router.bridge.visible_model_ids = MagicMock(side_effect=RuntimeError("REST down"))
+    routed = router.route(_translator_result_chimerax(), user_input="show as trimeric assembly")
+    inp = routed["tool_inputs"].get("bio_assembly", {})
+    assert inp.get("model_id") == "1", f"expected fallback #1, got {inp.get('model_id')}"

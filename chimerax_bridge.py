@@ -154,6 +154,13 @@ class ChimeraXBridge:
             f"remotecontrol rest start port {self.port}",
         ]
 
+        # A FRESH ChimeraX is about to launch with default panels (Log/Models) + toolbars
+        # shown. The lean layout is applied once-per-session and guarded by this flag; if it
+        # carried over True from a prior (now-closed) instance, the relaunched window would
+        # keep its panels until the next structure open. Reset so the lean layout re-applies
+        # to the new window (the reconnect/preflight path calls _maybe_apply_lean_layout).
+        self._lean_layout_applied = False
+
         self._process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

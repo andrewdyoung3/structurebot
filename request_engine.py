@@ -267,9 +267,8 @@ class RequestEngine:
             presenter.warn("No commands generated.")
             return
 
-        # 4. Show warnings
-        for w in warnings:
-            presenter.warn(f"⚠ {w}")
+        # 4. Show warnings (GUI routes these to its Activity panel; console prints inline)
+        presenter.show_warnings(warnings)
 
         # 5. Preview
         presenter.blank()

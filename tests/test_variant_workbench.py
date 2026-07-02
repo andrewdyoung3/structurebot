@@ -107,9 +107,7 @@ class TestStage2:
         tab = p._cur_tab()
         p._add_variant()
         vid = tab.design.variants[0].id
-        p._on_cell(tab, vid, 1)                  # click V1 col1 → edit target (K)
-        p._aa_combo.setCurrentText("A")
-        p._apply_substitution()
+        p._do_substitute(tab, vid, 1, "A")       # K2A via the residue path (toolbar combo removed)
         assert tab.design.get_variant(vid).cells[1].aa == "A"
         assert sess.add_design_session.call_count == 3          # load + add + edit
 
@@ -135,9 +133,8 @@ class TestStage2:
         p._add_variant()
         vid = tab.design.variants[0].id
         _set_mode(p, "charge")
-        p._on_cell(tab, vid, 2)                  # V col2 (V) active + edit target
-        p._aa_combo.setCurrentText("D")
-        p._apply_substitution()                  # V→D : col2 now negative
+        p._on_cell(tab, vid, 2)                  # V col2 (V) active (drives the 3D recolor target)
+        p._do_substitute(tab, vid, 2, "D")       # V→D : col2 now negative (toolbar combo removed)
         cmds = p.color_commands_for(tab)
         red = get_mode("charge").color_for("D")
         # active row is the edited variant → resnum 3 colored red on BOTH copies
@@ -343,6 +340,17 @@ class TestRowHeaderSelect:
         # the detail modal is removed/parked — the header has no detail signal anymore
         tab = self._tab_with_variant(badge="pLDDT 80")
         assert not hasattr(tab, "rowHeaderClicked")
+
+    def test_badge_header_paints_chips_without_error(self, _app):
+        # Force _BadgeHeaderView.paintSection (offscreen tests don't normally expose-paint)
+        # by rendering the header to a pixmap — a runtime paint error would raise here. Also
+        # asserts the header WIDENED to make room for the chips vs. a name-only header.
+        tab = self._tab_with_variant(badge="ddG -2.1▼ · sol +0.30▲ · pLDDT 88 · ⚠ remote-MSA")
+        vh = tab._blocks[0].verticalHeader()
+        plain = self._tab_with_variant(badge=None)._blocks[0].verticalHeader()
+        assert vh.sizeHint().width() > plain.sizeHint().width()
+        pm = QtGui.QPixmap(vh.sizeHint().width(), max(1, vh.length()))
+        vh.render(pm)          # drives paintSection for every section; raises on paint bugs
 
     def test_select_variant_row_sets_active_silently(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV"), _chainseq("1", "B", "MKV")],
@@ -606,6 +614,42 @@ class TestStage4a:
         assert spec["tool_inputs"]["run_rosetta"] is True
         assert spec["confidence"] == "low"          # deep → confirm-gate, no auto-proceed
 
+    def test_stability_spec_loaded_model_omits_pdb_path(self, _app):
+        # Loaded crystal → left to the router's _ensure_pdb_file (canonical RCSB PDB); the
+        # spec must NOT feed a pdb_path (that path is unchanged by the de-novo structure feed).
+        p, tab, vid = self._variant_panel()
+        spec = p.stability_launch_spec(deep=False)
+        assert "pdb_path" not in spec["tool_inputs"]
+
+    def test_stability_spec_feeds_denovo_fold_structure(self, _app, monkeypatch):
+        # De-novo construct: the fast-tier STRUCTURE voters (ThermoMPNN/RaSP) need a
+        # structure, so the spec saves the WT fold to a PDB and passes it as pdb_path.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAC")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        p._add_variant()                            # V1 active
+        tab = p._cur_tab()
+        vid = tab.design.variants[0].id
+        tab.design.edit_variant(vid, 0, "W")        # M1W
+        # _save_structure_pdb saves the live model via ChimeraX — stub it (no REST in tests).
+        monkeypatch.setattr(p, "_save_structure_pdb", lambda mid: f"/tmp/wt_{mid}.pdb")
+        spec = p.stability_launch_spec(deep=False)
+        assert spec["tool_inputs"]["pdb_path"] == "/tmp/wt_7.pdb"    # WT fold model → PDB
+        assert spec["tool_inputs"]["score_mutations"] == {1: "W"}
+
+    def test_stability_spec_denovo_unfolded_stays_sequence_only(self, _app):
+        # Not yet folded → no structure to feed → pdb_path omitted (fast tier degrades to
+        # CamSol + ESM), never a crash.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAC")   # no template_fold
+        p._add_variant()
+        tab = p._cur_tab()
+        tab.design.edit_variant(tab.design.variants[0].id, 0, "W")
+        spec = p.stability_launch_spec(deep=False)
+        assert "pdb_path" not in spec["tool_inputs"]
+
     def test_stability_spec_none_for_template_or_no_mutations(self, _app):
         p, _ = _panel([_chainseq("1", "A", "MKV")], session=MagicMock())
         p.load_model("1")
@@ -630,6 +674,20 @@ class TestStage4a:
         assert v.results.stability["per_resnum"] == {1: 2.0}
         assert v.results.stability["sum_ddg"] == 2.0
         assert "ddG +2.0" in tab.badges[vid]        # inline badge rendered
+
+    def test_apply_stability_result_merges_fast_then_deep_keeping_both(self, _app):
+        # the user's flow: a fast ThermoMPNN run, THEN a deep Rosetta run that didn't recompute
+        # ThermoMPNN — the stored slot must keep BOTH axes (deep augments, never overwrites).
+        p, tab, vid = self._variant_panel()
+        p._scan_cache_snapshot = ("1", None)
+        p.apply_stability_result(vid, {"tool_step_results": [{"tool": "mutation_scan", "data": {
+            "candidates": [{"resnum": 1, "from_aa": "M", "to_aa": "W", "thermompnn_ddg": -0.4}]}}]})
+        p._scan_cache_snapshot = ("1", None)
+        p.apply_stability_result(vid, {"tool_step_results": [{"tool": "mutation_scan", "data": {
+            "candidates": [{"resnum": 1, "from_aa": "M", "to_aa": "W", "ddg": 1.8}]}}]})  # rosetta only
+        row = tab.design.get_variant(vid).results.stability["rows"][0]
+        assert row["thermompnn_ddg"] == -0.4 and row["rosetta_ddg"] == 1.8      # both kept
+        assert tab.design.get_variant(vid).results.stability["tier"] == "deep"
 
     def test_solubility_pure_compute_fills_slot(self, _app):
         p, tab, vid = self._variant_panel()
@@ -1602,6 +1660,55 @@ class TestDeNovoPanel:
         assert ti["wt_ref"]["path"] == "/tmp/dimer.cif"      # reopen path carried from template_fold
         assert spec["confidence"] == "low"                   # first deviation → gate (the floor folds)
 
+    def test_denovo_variant_fold_unpinned_picks_engine_and_oligomer(self, _app):
+        # UN-PINNED: with n_copies the user's engine + oligomer are honoured (the variant is its OWN
+        # fold). Superpose onto the T-fold ONLY when the chosen shape matches the baseline.
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)            # baseline = boltz dimer (A,B), T-fold "7"
+        p._add_variant(); v = cd.variants[-1]
+        p._cur_tab().set_active_row(v.id)
+        m = p.fold_launch_spec("boltz", n_copies=2)               # MATCHES baseline → superpose
+        assert m["tool"] == "boltz" and [c["id"] for c in m["tool_inputs"]["chains"]] == ["A", "B"]
+        assert m["tool_inputs"]["compare_to"] == "7" and "no_reference" not in m["tool_inputs"]
+        t = p.fold_launch_spec("boltz", n_copies=3)               # different oligomer → standalone
+        assert [c["id"] for c in t["tool_inputs"]["chains"]] == ["A", "B", "C"]
+        assert t["tool_inputs"].get("no_reference") is True and "compare_to" not in t["tool_inputs"]
+        assert all(c["sequence"] == v.sequence for c in t["tool_inputs"]["chains"])
+        e = p.fold_launch_spec("esmfold", n_copies=1)             # different engine + monomer
+        assert e["tool"] == "esmfold" and e["tool_inputs"]["sequence"] == v.sequence
+        assert e["tool_inputs"].get("no_reference") is True
+
+    def test_denovo_variant_fold_unpinned_esmfold_assembly_rejected(self, _app):
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)
+        p._add_variant(); p._cur_tab().set_active_row(cd.variants[-1].id)
+        assert p.fold_launch_spec("esmfold", n_copies=2) is None  # ESMFold is monomer-only
+
+    def test_denovo_variant_fold_pinned_path_unchanged_without_n_copies(self, _app):
+        # back-compat: no n_copies → still PINNED to the construct (the disulfide-constrain caller).
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)
+        p._add_variant(); p._cur_tab().set_active_row(cd.variants[-1].id)
+        fs = p.fold_launch_spec("esmfold")            # asks esmfold/monomer → OVERRIDDEN to boltz dimer
+        assert fs["tool"] == "boltz" and fs["tool_inputs"]["compare_to"] == "7"
+
+    def test_denovo_deviation_refuses_and_greys_on_combo_mismatch(self, _app):
+        # un-pinned-fold guard: a variant folded at a different shape than the baseline has no valid
+        # WT reference → no T-fold reuse, the click refuses, and the Deviation button greys.
+        p, _ = self._denovo_panel()
+        cd = self._fold_dimer_construct(p)            # baseline boltz:assembly
+        p._add_variant(); v = cd.variants[-1]
+        tab = p._cur_tab(); tab.set_active_row(v.id)
+        v.results.fold = {"engine": "boltz", "target": "monomer", "model_id": "8"}   # MISMATCH
+        assert p.deviation_launch_spec()["tool_inputs"]["wt_ref"] is None            # no dimer-as-monomer
+        p._on_deviation_clicked()
+        assert "same way" in p._status.text() and "boltz:monomer" in p._status.text()
+        p._sync_deviation_enabled(tab)
+        assert not p._dev_btn.isEnabled()                        # greyed on mismatch
+        v.results.fold = {"engine": "boltz", "target": "assembly", "model_id": "9"}  # MATCHES baseline
+        p._sync_deviation_enabled(tab)
+        assert p._dev_btn.isEnabled()                            # re-enabled when comparable
+
     def test_denovo_monomer_deviation_has_identity_column_map(self, _app):
         # column-pairing holds for a de-novo monomer: substitution-only → identity map; reference
         # reused from the monomer T-fold.
@@ -2310,6 +2417,20 @@ class TestColabFoldComparative:
         badge = VariantWorkbenchPanel._badge_for(v)
         assert "remote-MSA" not in badge and "ipTM 0.95" in badge
 
+    def test_chip_kind_maps_badge_segments_to_colors(self):
+        # The badge STRING stays the source-of-truth; _BadgeHeaderView paints each ` · `
+        # segment as a colored chip. Direction is the subtle bit: ddG stabilizes when
+        # NEGATIVE, solubility helps when its delta is POSITIVE (opposite sign convention).
+        from variant_workbench import _BadgeHeaderView as H
+        assert H._chip_kind("ddG -2.1▼") == "good"      # stabilizing
+        assert H._chip_kind("ddG +2.1▲") == "bad"       # destabilizing
+        assert H._chip_kind("sol +0.30▲") == "good"     # more soluble
+        assert H._chip_kind("sol -0.30▼") == "bad"      # less soluble
+        assert H._chip_kind("pLDDT 88") == "neutral"
+        assert H._chip_kind("ipTM 0.95") == "neutral"
+        assert H._chip_kind("SS-bond×2") == "neutral"   # provenance
+        assert H._chip_kind("⚠ remote-MSA") == "warn"
+
     def test_build_align_folds_spec_pairs_two_folds(self):
         spec = VariantWorkbenchPanel.build_align_folds_spec(
             {"label": "#1 boltz", "path": "a.cif", "model_id": "1", "engine": "boltz", "remote_msa": False},
@@ -2335,6 +2456,35 @@ class TestColabFoldComparative:
         assert {d["model_id"] for d in descs} == {"1", "2"}       # crystal excluded
         cf = next(d for d in descs if d["model_id"] == "2")
         assert cf["remote_msa"] is True and "remote MSA" in cf["label"]
+
+
+# ── One-shot stabilization sweep (run every cheap geometric strategy scan at once) ──
+class TestStabilizeAll:
+    def _folded_construct(self, p, copies=1):
+        p._add_sequence_construct("binder", "MKVLWAACGTDECAAC")
+        cd = next(iter(p._design.chains.values()))
+        if copies > 1:                                   # homo-oligomer → ≥2 members (interface)
+            cd.members = [("binder", chr(ord("A") + i)) for i in range(copies)]
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7",
+                            "cif_path": "/tmp/binder.cif"}
+        return cd
+
+    def test_batch_specs_monomer_are_four_scans_no_interface(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._folded_construct(p, copies=1)
+        refreshes = [s["refresh"] for s in p.stabilization_batch_specs()]
+        assert refreshes == ["disulfide_scan", "proline_scan", "saltbridge_scan", "cavity_scan"]
+
+    def test_batch_specs_multimer_include_interface(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        self._folded_construct(p, copies=2)
+        refreshes = [s["refresh"] for s in p.stabilization_batch_specs()]
+        assert "disulfide_interface_scan" in refreshes and len(refreshes) == 5
+
+    def test_batch_specs_empty_without_a_structure(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAC")   # not folded → no structure
+        assert p.stabilization_batch_specs() == []
 
 
 # ── Fold-based disulfide suite (Modes A discovery / B geometry / C introduce-constrain) ──
@@ -2398,13 +2548,15 @@ class TestDisulfideSuite:
         assert p.build_disulfide_introduce_spec((5, 5)) is None         # same column
         assert p.build_disulfide_introduce_spec((2, 999)) is None       # out of range
 
-    # ── GUI-SURFACE guard: the Disulfides menu actually RENDERS at top level, the actions are
+    # ── GUI-SURFACE guard: the Disulfides menu RENDERS (now a SUBMENU of Tools ▾), the actions are
     #    wired (trigger reaches the handler), and enabled-state tracks the precondition. This is
     #    the test the no-ChimeraX v1 verify lacked — it closes the discoverability blind spot.
-    def test_disulfide_menu_top_level_with_renamed_four_actions(self, _app):
+    def test_disulfide_menu_nested_under_tools_with_four_actions(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
-        assert p._ss_menu_btn.text() == "Disulfides"             # a TOP-LEVEL toolbar button…
-        acts = p._ss_menu_btn.menu().actions()
+        # Disulfides is now a SUBMENU under Tools ▾ (Analysis group), not a top-level button.
+        tools_subs = [a.menu() for a in p._tools_btn.menu().actions() if a.menu() is not None]
+        assert p._ss_menu in tools_subs and p._ss_menu.title() == "Disulfides"
+        acts = p._ss_menu.actions()
         # FOUR actions now: A assess / B measure / D find / C declare — and the labels carry the
         # load-bearing scope language (find/discover ONLY on D; A says "existing", never "discover")
         assert {p._ss_discover_btn, p._ss_geometry_btn, p._ss_scan_btn, p._ss_constrain_btn} <= set(acts)
@@ -3502,6 +3654,19 @@ class TestCavityMode:
         t.reset()
         assert t._tbl.rowCount() == 0 and not t._tbl.isVisible()
 
+    def test_populate_announces_new_results_for_tab_dot(self, _app):
+        # the tab-bar "new results" dot wire: a populate that produces rows emits resultsArrived;
+        # an empty scan does NOT (nothing new to view).
+        from variant_workbench import CavityResultsTab
+        t = CavityResultsTab(on_highlight=lambda *a, **k: None)
+        fired = []
+        t.resultsArrived.connect(lambda: fired.append(1))
+        t.populate(MagicMock(), self._scan())            # 2 candidates → announces once
+        assert fired == [1]
+        fired.clear()
+        t.populate(MagicMock(), {"candidates": []})      # no candidates → no announce
+        assert fired == []
+
 
 class TestDesignBasket:
     """The cross-strategy substitution-staging panel: curate picks → compose ONE variant."""
@@ -3592,6 +3757,65 @@ class TestDesignBasket:
         p.design_basket.reset()
         assert p.design_basket.entries == [] and not p.design_basket._list.isVisible()
 
+    # ── enact is LOUD, never silent/partial: an unmappable sub is REPORTED, mappable subs still land,
+    #    one bad target never aborts the compose, and a zero-landed enact leaves NO empty variant. ──
+    def _cav(self, chain, pos, to_aa, from_aa="V"):
+        return {"chain": chain, "position": pos, "from_aa": from_aa, "to_aa": to_aa,
+                "void_volume": 40.0, "cavity_id": 1, "fill_fraction": 0.6, "clash": False, "score": 0.5}
+
+    def test_enact_offtemplate_resnum_makes_no_empty_variant_and_reports(self, _app):
+        # the "no sequence changes" failure: a position not on the template used to compose an EMPTY
+        # variant silently. Now: no variant, the basket is kept, and the reason is surfaced.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)                                   # template resnums 1..12
+        n0 = len(cd.variants)
+        p._enact_basket([{"cls": "Cavity", "subs": [
+            {"chain": "A", "position": 105, "from_aa": "V", "to_aa": "C"}]}])
+        assert len(cd.variants) == n0                             # NO empty variant left behind
+        assert "no substitutions could be applied" in p._status.text()
+        assert "105" in p._status.text()                         # the offending residue is named
+
+    def test_enact_partial_applies_good_subs_and_reports_skips(self, _app):
+        # the "only a few cysteines" failure: a mix of mappable + unmappable subs must land the
+        # mappable ones AND report the rest — not abort, not silently drop.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._enact_basket([{"cls": "Disulfide", "subs": [
+            {"chain": "A", "position": 5, "from_aa": "W", "to_aa": "C"},     # maps
+            {"chain": "A", "position": 999, "from_aa": "G", "to_aa": "C"}]}])  # off-template
+        v = cd.variants[-1]
+        assert [(m.resnum, m.to_aa) for m in v.mutations] == [(5, "C")]       # good sub landed
+        assert "Skipped" in p._status.text() and "999" in p._status.text()    # the rest reported
+
+    def test_enact_one_bad_target_does_not_abort_the_rest(self, _app):
+        # a non-standard to_aa (e.g. a mode emitting a 3-letter code) must NOT raise mid-loop and
+        # leave a half-built variant — the good subs land, the bad one is reported.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._enact_basket([{"cls": "Mix", "subs": [
+            {"chain": "A", "position": 3, "from_aa": "V", "to_aa": "C"},
+            {"chain": "A", "position": 5, "from_aa": "W", "to_aa": "GLU"},    # invalid (3-letter)
+            {"chain": "A", "position": 8, "from_aa": "G", "to_aa": "C"}]}])
+        v = cd.variants[-1]
+        assert [(m.resnum, m.to_aa) for m in v.mutations] == [(3, "C"), (8, "C")]
+        assert "Skipped" in p._status.text() and "GLU" in p._status.text()
+
+    def test_curate_guard_blocks_offtemplate_pick_at_staging(self, _app):
+        # block-at-staging: a pick whose residue isn't on the active design is refused when added,
+        # so it can never silently vanish at enact.
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_cavity_to_basket(cd, self._cav("A", 105, "W"))
+        assert p.design_basket.entries == []                     # not staged
+        assert "Can't add" in p._status.text() and "105" in p._status.text()
+
+    def test_curate_guard_blocks_unknown_chain_at_staging(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        cd = self._construct(p)
+        p._add_cavity_to_basket(cd, self._cav("Z", 3, "W"))      # chain Z not on the design
+        assert p.design_basket.entries == []
+        assert "Can't add" in p._status.text() and "chain not on the active design" in p._status.text()
+
     # ── cd-EQUIVALENCE keying: homo-oligomer copies share one cd, so a same-resnum pick on two
     #    copies is the SAME residue. Two divergent picks must BLOCK (not silently last-write-wins at
     #    edit_variant); two identical picks dedupe to one; distinct-cd (hetero) chains are unaffected.
@@ -3665,18 +3889,26 @@ class TestToolbarWraps:
     """The Workbench toolbar uses a WRAPPING flow layout — at a narrow width its pills wrap onto a
     second row instead of clipping behind an overflow chevron, so every action stays reachable."""
 
-    def test_toolbar_uses_flow_layout_with_every_action(self, _app):
+    def test_toolbar_flow_layout_groups_every_control(self, _app):
         from variant_workbench import _FlowLayout
         p, _ = _panel([], session=__import__("session_state").SessionState())
         flow = p._toolbar_layout
         assert isinstance(flow, _FlowLayout)
         widgets = [flow.itemAt(i).widget() for i in range(flow.count())]
-        # every high-frequency pill + menu button + the colour combo is in the layout (nothing
-        # hidden behind a ">>" chevron the way a QToolBar would clip them).
-        for btn in (p._add_btn, p._add_seq_btn, p._apply_btn, p._tools_btn, p._stab_btn,
-                    p._sol_btn, p._fold_menu_btn, p._ss_menu_btn, p._pro_menu_btn,
-                    p._dev_btn, p._align_btn, p._mode_combo):
-            assert btn in widgets
+        # Edit group + Tools ▾ + the View pill are direct flow items (nothing hidden behind a ">>"
+        # chevron the way a QToolBar would clip them).
+        for w in (p._add_btn, p._add_seq_btn, p._tools_btn, p._view_group):
+            assert w in widgets
+        # View group (pill) carries fold / align / colour / deviation.
+        view_kids = p._view_group.findChildren(QtWidgets.QWidget)
+        for w in (p._fold_menu_btn, p._align_btn, p._mode_combo, p._dev_btn):
+            assert w in view_kids
+        # Analysis controls live under Tools ▾ — the two per-variant tests as actions, and the two
+        # stabilization-strategy SUBMENUS (Disulfides / Stabilize).
+        tmenu = p._tools_btn.menu()
+        assert p._stab_btn in tmenu.actions() and p._sol_btn in tmenu.actions()
+        subs = [a.menu() for a in tmenu.actions() if a.menu() is not None]
+        assert p._ss_menu in subs and p._pro_menu in subs
 
     def test_toolbar_wraps_taller_at_narrow_width(self, _app):
         p, _ = _panel([], session=__import__("session_state").SessionState())
@@ -3685,3 +3917,137 @@ class TestToolbarWraps:
         wide = flow.heightForWidth(4000)       # comfortably one row
         assert wide > 0
         assert narrow > wide                   # narrow WRAPPED (grew taller) rather than clipping
+
+    def test_flow_layout_centers_items_vertically_in_a_row(self, _app):
+        from variant_workbench import _FlowLayout
+        host = QtWidgets.QWidget()
+        flow = _FlowLayout(host, margin=0, hspacing=6, vspacing=4)
+        short, tall = QtWidgets.QLabel("x"), QtWidgets.QPushButton("Y")
+        tall.setMinimumHeight(40)              # force a height difference within the row
+        flow.addWidget(short); flow.addWidget(tall)
+        flow.setGeometry(QtCore.QRect(0, 0, 1000, 80))      # wide → a single row
+        # both items share a common vertical CENTRE line (not top-aligned, which left labels high).
+        assert abs(short.geometry().center().y() - tall.geometry().center().y()) <= 1
+
+
+class TestReplicateGrouping:
+    """Homo-oligomer replicate-row grouping — a trimer scans the SAME site on all three chains, so the
+    stabilization tabs showed each substitution three times. Grouping collapses those into ONE row
+    (keyed by cd-equivalence) WITHOUT discarding the real per-copy geometry spread (a predicted
+    assembly is not perfectly symmetric): a varying column shows its min–max range and the row's
+    tooltip lists every copy. Default grouped, toggle in the header, all four stabilization tabs."""
+
+    _EQUIV3 = staticmethod(lambda ch: ["A", "B", "C"])       # a homotrimer: A/B/C share one cd
+
+    def _tri_scan(self, ca=(5.51, 5.52, 5.53)):
+        """Three copies of ONE engineerable site (290–299) on chains A/B/C — geometry differs slightly."""
+        pairs = [{"chain_a": chain, "resnum_a": 290, "chain_b": chain, "resnum_b": 299,
+                  "score": 0.99, "ca_ca": cav, "cb_cb": 3.74,
+                  "best_sg_sg": 2.07, "best_chi_ss": -104, "clash": False, "orientation": 87}
+                 for chain, cav in zip("ABC", ca)]
+        return {"pairs": pairs, "caveat": "geom only"}
+
+    def _tab(self, equiv=None):
+        from variant_workbench import DisulfidesResultsTab
+        return DisulfidesResultsTab(on_highlight=lambda *a, **k: None, on_declare=lambda *a, **k: None,
+                                    on_chain_equiv=equiv or self._EQUIV3)
+
+    def test_trimer_collapses_to_one_row_with_badge(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan())
+        tbl = t._sec["D"]["table"]
+        assert tbl.rowCount() == 1                            # three copies → one grouped row
+        assert "×3" in tbl.item(0, 0).text()                 # copy-count badge
+        assert not t._group_chk.isHidden()                   # toggle offered (there ARE equivalents)
+
+    def test_varying_geometry_shows_range_identical_stays_single(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan(ca=(5.51, 5.52, 5.53)))
+        tbl = t._sec["D"]["table"]
+        assert tbl.item(0, 2).text() == "5.51–5.53"          # Cα–Cα varies → min–max range (real asymmetry)
+        assert tbl.item(0, 1).text() == "0.99"               # score identical → single value
+        assert tbl.item(0, 3).text() == "3.74"               # Cβ–Cβ identical → single value
+        assert tbl.item(0, 7).text() == "87"                 # orientation identical → single value
+
+    def test_tooltip_lists_each_copy(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan())
+        tip = t._sec["D"]["table"].item(0, 0).toolTip()
+        assert "chain A" in tip and "chain B" in tip and "chain C" in tip
+        assert "5.51" in tip and "5.53" in tip               # each copy's EXACT value one hover away
+
+    def test_toggle_off_shows_individual_rows(self, _app):
+        t = self._tab()
+        t.populate_scan(MagicMock(), self._tri_scan())
+        assert t._sec["D"]["table"].rowCount() == 1
+        t._group_chk.setChecked(False)                       # ungroup
+        tbl = t._sec["D"]["table"]
+        assert tbl.rowCount() == 3                            # one row per chain copy
+        assert "×" not in tbl.item(0, 0).text()              # no badge when ungrouped
+        assert tbl.item(0, 2).text() == "5.51"               # each copy's own geometry, exact
+
+    def test_monomer_or_hetero_no_toggle_no_collapse(self, _app):
+        t = self._tab(equiv=lambda ch: [ch])                 # each chain its own class (monomer / hetero)
+        t.populate_scan(MagicMock(), self._tri_scan())
+        assert t._sec["D"]["table"].rowCount() == 3          # nothing collapses (not equivalent)
+        assert t._group_chk.isHidden()                       # no equivalents → no toggle clutter
+
+    def test_grouped_row_click_highlights_all_copies(self, _app):
+        from variant_workbench import DisulfidesResultsTab
+        captured = {}
+        t = DisulfidesResultsTab(
+            on_highlight=lambda cd, rep, members=None: captured.update(rep=rep, members=members),
+            on_declare=lambda *a, **k: None, on_chain_equiv=self._EQUIV3)
+        t.populate_scan(MagicMock(), self._tri_scan())       # populate auto-selects + highlights row 0
+        assert captured["members"] is not None and len(captured["members"]) == 3   # all 3 copies passed
+        assert captured["rep"] is captured["members"][0]                            # best = representative
+
+    def test_grouped_row_stages_representative_into_basket(self, _app):
+        from variant_workbench import DisulfidesResultsTab
+        staged = []
+        t = DisulfidesResultsTab(on_highlight=lambda *a, **k: None, on_declare=lambda *a, **k: None,
+                                 on_add_to_basket=lambda cd, item: staged.append(item),
+                                 on_chain_equiv=self._EQUIV3)
+        t.populate_scan(MagicMock(), self._tri_scan())
+        t._sec["D"]["table"].selectRow(0)
+        t._add_to_basket("D")
+        assert len(staged) == 1 and staged[0]["chain_a"] == "A"   # one entry, the representative copy
+
+    def test_proline_tab_also_groups(self, _app):
+        from variant_workbench import ProlineResultsTab
+        t = ProlineResultsTab(on_highlight=lambda *a, **k: None, on_chain_equiv=self._EQUIV3)
+        cands = [{"chain": c, "position": 5, "from_aa": "L", "to_aa": "P", "phi": -63, "psi": 150,
+                  "score": round(0.9 + i * 0.0, 2), "hbond_donates": False} for i, c in enumerate("ABC")]
+        t.populate(MagicMock(), {"candidates": cands, "existing": [], "caveat": "x"})
+        assert t._tbl.rowCount() == 1 and "×3" in t._tbl.item(0, 0).text()   # single-residue tab groups too
+
+    def test_residue_union_spec_glows_all_copies(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAGTDER")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "trimer", "model_id": "7", "cif_path": "/tmp/b.cif"}
+        members = [{"chain": c, "position": 5} for c in "ABC"]
+        mid, spec, apply = p._residue_group_highlight(cd, members)
+        assert mid == "7" and spec == "#7/A:5 #7/B:5 #7/C:5"        # union atom-spec across all copies
+        assert f"select {spec}" in apply                           # one halo lights every copy
+
+    def test_pair_union_spec_glows_all_copies(self, _app):
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAGTDER")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "trimer", "model_id": "7", "cif_path": "/tmp/b.cif"}
+        members = [{"chain_a": c, "resnum_a": 290, "chain_b": c, "resnum_b": 299} for c in "ABC"]
+        mid, both, apply = p._pair_group_highlight(cd, members)
+        assert mid == "7" and both == "#7/A:290,299 #7/B:290,299 #7/C:290,299"
+        assert f"select {both}" in apply
+
+    def test_single_member_glow_is_byte_identical(self, _app):
+        # a monomer / ungrouped click must glow EXACTLY as before (no union select, same recipe)
+        p, _ = _panel([], session=__import__("session_state").SessionState())
+        p._add_sequence_construct("binder", "MKVLWAAGTDER")
+        cd = next(iter(p._design.chains.values()))
+        cd.template_fold = {"engine": "boltz", "target": "monomer", "model_id": "7", "cif_path": "/tmp/b.cif"}
+        pair = {"chain_a": "A", "resnum_a": 290, "chain_b": "A", "resnum_b": 299}
+        mid, both, apply = p._pair_group_highlight(cd, [pair])
+        assert both == "#7/A:290,299"
+        assert apply == p._disulfide_scan_highlight_commands(cd, pair)   # unchanged single-pair recipe
